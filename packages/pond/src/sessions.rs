@@ -1068,15 +1068,16 @@ impl Store {
     /// handler's final flush. Receives N completed substreams from the
     /// validator and:
     ///
-    ///   1. Runs the immutable-fields check (spec.md#protocol) against the stored row
-    ///      per session, sequentially. Sessions that fail produce one Error
-    ///      outcome and are excluded from the write batch.
+    ///   1. Runs the immutable-fields check (spec.md 7.6) against the stored
+    ///      row per session, sequentially. A session whose `source_agent` or
+    ///      `project` disagrees is rewritten to the STORED values and still
+    ///      written, so its new messages land; the disagreement is counted in
+    ///      `relabeled_sessions` and logged with both values.
     ///   2. Deduplicates in-batch at the substream level: when two substreams
     ///      in the same batch share a `session_id` (Claude Code's subagent
-    ///      files reuse their parent's id), the first occurrence wins. The
-    ///      second is either *merged* (same `source_agent` + `project`:
-    ///      messages/parts append, no duplicate rows) or *rejected*
-    ///      (different `project` - the subagent-vs-parent case). Row-level
+    ///      files reuse their parent's id), the first occurrence wins and its
+    ///      `source_agent` + `project` are the ones kept; the second's
+    ///      messages/parts append either way (no duplicate rows). Row-level
     ///      duplicates that slip past here are caught downstream by Lance's
     ///      `SourceDedupeBehavior::FirstSeen` in `substrate::merge_insert`
     ///      (invariant 17): this layer's job is preserving substream merge
@@ -1110,43 +1111,20 @@ impl Store {
                 if existing.session.source_agent != substream.session.source_agent
                     || existing.session.project != substream.session.project
                 {
-                    // Subagent-vs-parent class. The first occurrence's
-                    // metadata stays authoritative; this substream is
-                    // rejected on the same immutable-field axis as the
-                    // storage-side check.
-                    let reason = if existing.session.source_agent != substream.session.source_agent
-                    {
-                        IngestError::ImmutableField {
-                            field: "source_agent",
-                            session_id: substream.session.id.clone(),
-                            stored: existing.session.source_agent.clone(),
-                            attempted: substream.session.source_agent.clone(),
-                        }
-                    } else {
-                        IngestError::ImmutableField {
-                            field: "project",
-                            session_id: substream.session.id.clone(),
-                            stored: (*existing.session.project).clone(),
-                            attempted: (*substream.session.project).clone(),
-                        }
-                    };
-                    let field = match &reason {
-                        IngestError::ImmutableField { field, .. } => Some(*field),
-                    };
-                    let reason_key = match field {
-                        Some("project") => DROP_REASON_IMMUTABLE_PROJECT,
-                        Some("source_agent") => DROP_REASON_IMMUTABLE_SOURCE_AGENT,
-                        _ => DROP_REASON_UNCATEGORIZED,
-                    };
-                    outcomes.extend(error_outcomes_for_substream(
-                        substream.session_index,
-                        &substream.session,
-                        &substream.messages,
-                        reason.to_string(),
-                        field,
-                        reason_key,
-                    ));
-                    continue;
+                    // Subagent-vs-parent class. The first occurrence's metadata
+                    // stays authoritative, on the same immutable-field axis as
+                    // the storage-side check below - and, like it, the messages
+                    // are merged under those labels rather than thrown away.
+                    tracing::warn!(
+                        session_id = %substream.session.id,
+                        stored_source_agent = %existing.session.source_agent,
+                        stored_project = %*existing.session.project,
+                        attempted_source_agent = %substream.session.source_agent,
+                        attempted_project = %*substream.session.project,
+                        "session re-submitted in one batch under different labels; \
+                         keeping the first occurrence's and merging the rows under them"
+                    );
+                    counts.relabeled_sessions += 1;
                 }
                 // Same session, same metadata: merge messages. Dedup message
                 // ids defensively (within one batch, the validator's seen
@@ -1199,35 +1177,32 @@ impl Store {
         let existing_message_pks = Arc::new(self.present_message_pks(&session_id_values).await?);
         let existing_part_pks = Arc::new(self.present_part_pks(&session_id_values).await?);
 
-        let mut writeable: Vec<CompletedSubstream> = Vec::with_capacity(merged.len());
-        for substream in merged {
+        // Nothing is rejected here any more, so this rewrites in place rather
+        // than filtering into a second vector.
+        let mut writeable = merged;
+        for substream in &mut writeable {
             if let Some(existing) = existing_sessions.get(&substream.session.id)
                 && let Err(failure) = ensure_immutable_match(existing, &substream.session)
             {
-                let field = match &failure {
-                    IngestError::ImmutableField { field, .. } => Some(*field),
-                };
-                let reason_key = match field {
-                    Some("project") => DROP_REASON_IMMUTABLE_PROJECT,
-                    Some("source_agent") => DROP_REASON_IMMUTABLE_SOURCE_AGENT,
-                    _ => DROP_REASON_UNCATEGORIZED,
-                };
-                outcomes.extend(error_outcomes_for_substream(
-                    substream.session_index,
-                    &substream.session,
-                    &substream.messages,
-                    failure.to_string(),
-                    field,
-                    reason_key,
-                ));
-                continue;
+                // spec.md 7.6: the stored labels win, and the substream is
+                // still written under them. Rejecting it instead would lose the
+                // session's new messages outright, and an adapter that learns to
+                // derive a better `project` (openclaw's cron keys, issue #224)
+                // would strand every session it had already stored. The stored
+                // value stays authoritative so the field remains immutable; only
+                // the incoming disagreement is discarded, loudly.
+                tracing::warn!(
+                    session_id = %substream.session.id,
+                    stored_source_agent = %existing.source_agent,
+                    stored_project = %*existing.project,
+                    attempted_source_agent = %substream.session.source_agent,
+                    attempted_project = %*substream.session.project,
+                    "{failure}; keeping the stored labels and writing the new rows under them"
+                );
+                substream.session.source_agent = existing.source_agent.clone();
+                substream.session.project = existing.project.clone();
+                counts.relabeled_sessions += 1;
             }
-            writeable.push(substream);
-        }
-
-        if writeable.is_empty() {
-            outcomes.sort_by_key(|outcome| outcome.index);
-            return Ok((outcomes, counts));
         }
 
         // The sessions merge is insert-only (`WhenMatched::DoNothing`), so a
@@ -3632,11 +3607,20 @@ pub struct IngestSummary {
     /// adapters may rely on. If this bucket grows on a clean adapter,
     /// inspect `drop_reasons` for the top contributors.
     pub dropped_events: usize,
-    /// Sessions whose Session-level invariants (immutable `source_agent` /
-    /// `project` against the stored row) failed at flush time and
-    /// whose substream got rejected wholesale. Always small relative to
-    /// `inserted`; if not, there's a real problem to investigate.
+    /// Sessions whose Session-level invariants failed validation (an empty
+    /// `source_agent`, a `parent_message_id` with no parent session) and whose
+    /// substream got rejected wholesale. An immutable-field disagreement is NOT
+    /// counted here - it keeps the stored labels instead, see
+    /// `relabeled_sessions`. Always small relative to `inserted`; if not,
+    /// there's a real problem to investigate.
     pub dropped_sessions: usize,
+    /// Sessions re-submitted under a `source_agent`/`project` that disagrees
+    /// with the stored row. The stored labels stay authoritative and the new
+    /// rows land under them (spec.md 7.6), so this is not a drop - it is how
+    /// many stored sessions still carry a label an updated adapter would no
+    /// longer derive. Expected to be non-zero exactly once, right after an
+    /// adapter changes how it derives those fields.
+    pub relabeled_sessions: usize,
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
@@ -3681,8 +3665,6 @@ pub const DROP_REASON_PART_BEFORE_MESSAGE: &str = "part_before_message";
 pub const DROP_REASON_PART_MESSAGE_MISMATCH: &str = "part_message_mismatch";
 pub const DROP_REASON_EMPTY_SOURCE_AGENT: &str = "empty_source_agent";
 pub const DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION: &str = "parent_message_without_session";
-pub const DROP_REASON_IMMUTABLE_PROJECT: &str = "immutable_project";
-pub const DROP_REASON_IMMUTABLE_SOURCE_AGENT: &str = "immutable_source_agent";
 pub const DROP_REASON_UNCATEGORIZED: &str = "uncategorized";
 
 /// Honest per-table outcome of one batched flush. Built from `merge_insert`'s
@@ -3702,6 +3684,10 @@ pub struct BatchCounts {
     pub messages_matched_searchable: usize,
     pub parts_inserted: usize,
     pub parts_matched: usize,
+    /// Sessions re-submitted with a `source_agent`/`project` that disagrees with
+    /// the stored row. The stored labels were kept and the rows written under
+    /// them (spec.md 7.6); nothing was dropped.
+    pub relabeled_sessions: usize,
 }
 
 impl IngestSummary {
@@ -3721,6 +3707,7 @@ impl IngestSummary {
         self.messages_matched_searchable += counts.messages_matched_searchable;
         self.parts_inserted += counts.parts_inserted;
         self.parts_matched += counts.parts_matched;
+        self.relabeled_sessions += counts.relabeled_sessions;
         self.inserted +=
             counts.sessions_inserted + counts.messages_inserted_total + counts.parts_inserted;
         self.matched +=
@@ -3743,6 +3730,7 @@ impl IngestSummary {
         self.parts_matched += other.parts_matched;
         self.dropped_events += other.dropped_events;
         self.dropped_sessions += other.dropped_sessions;
+        self.relabeled_sessions += other.relabeled_sessions;
         self.skipped_files += other.skipped_files;
         self.skipped_empty += other.skipped_empty;
         self.skipped_fresh += other.skipped_fresh;
@@ -3810,8 +3798,9 @@ impl IngestSummary {
                 }
                 OutcomeStatus::Error => {
                     // Session-level rejection: exactly one session-kind Error
-                    // outcome (see `error_outcomes_for_substream`). Per-event
-                    // drop: one Error per message/part. The two populations
+                    // outcome (an invalid Session row - e.g. an empty
+                    // `source_agent`). Per-event drop: one Error per
+                    // message/part. The two populations
                     // are counted separately so the operator can tell a
                     // structural reject from a row-level skip.
                     if outcome.kind == "session" {
@@ -3862,10 +3851,8 @@ pub enum OutcomeStatus {
 pub struct RowError {
     pub message: String,
     pub field: Option<&'static str>,
-    pub reason: Option<&'static str>,
-    /// Stable key for histogramming - see `DROP_REASON_*` constants. The
-    /// `reason` field above is human-prose; `reason_key` is the machine
-    /// bucket. `None` means uncategorized; consumers attribute to
+    /// Stable key for histogramming - see `DROP_REASON_*` constants. `None`
+    /// means uncategorized; consumers attribute to
     /// `DROP_REASON_UNCATEGORIZED`.
     pub reason_key: Option<&'static str>,
 }
@@ -4032,7 +4019,6 @@ impl IngestValidator {
                 error: Some(RowError {
                     message: format!("session {} has empty source_agent after trim", session.id),
                     field: Some("source_agent"),
-                    reason: None,
                     reason_key: Some(DROP_REASON_EMPTY_SOURCE_AGENT),
                 }),
                 searchable: false,
@@ -4054,7 +4040,6 @@ impl IngestValidator {
                         session.id,
                     ),
                     field: Some("parent_message_id"),
-                    reason: None,
                     reason_key: Some(DROP_REASON_PARENT_MESSAGE_WITHOUT_SESSION),
                 }),
                 searchable: false,
@@ -4253,39 +4238,10 @@ fn error_outcome(
         error: Some(RowError {
             message: message.to_owned(),
             field,
-            reason: None,
             reason_key: Some(reason_key),
         }),
         searchable: false,
     }
-}
-
-/// Session-level rejection (immutable `source_agent` / `project` violation):
-/// emit exactly one Error outcome on the Session row. The buffered messages
-/// and parts of this substream are *not* surfaced as per-row errors - their
-/// loss is implied by the single session-rejection (spec.md#adapter-integrity-event-ordering).
-fn error_outcomes_for_substream(
-    session_index: usize,
-    session: &Session,
-    _messages: &[BufferedMessage],
-    message: impl Into<String>,
-    field: Option<&'static str>,
-    reason_key: &'static str,
-) -> Vec<RowOutcome> {
-    let reason = field.map(|_| "immutable");
-    vec![RowOutcome {
-        index: session_index,
-        kind: "session",
-        pk: Value::String(session.id.clone()),
-        status: OutcomeStatus::Error,
-        error: Some(RowError {
-            message: message.into(),
-            field,
-            reason,
-            reason_key: Some(reason_key),
-        }),
-        searchable: false,
-    }]
 }
 
 /// Batched-path success helper. Each row's Inserted/Matched status is read
@@ -4399,10 +4355,11 @@ fn success_outcome(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IngestError {
-    /// spec.md#protocol: `Session.source_agent` and `Session.project` are
-    /// immutable post-first-write because the denormalized copies on
-    /// `messages` were stamped from the prior Session at first ingest.
-    /// A re-write that changes either would silently desync.
+    /// spec.md 7.6: `Session.source_agent` and `Session.project` are immutable
+    /// post-first-write because the denormalized copies on `messages` were
+    /// stamped from the prior Session at first ingest. A re-write that changes
+    /// either would silently desync, so the stored value is kept and this
+    /// reports the disagreement; it is a warning, not a per-row error.
     ImmutableField {
         field: &'static str,
         session_id: String,
@@ -4423,8 +4380,8 @@ impl std::fmt::Display for IngestError {
                 formatter,
                 "session {session_id} {field} is immutable: stored {stored:?}, attempted \
                  {attempted:?} - if the attempted value is the correct one, the stored row \
-                 predates a change in how the adapter derives it and only a fresh store \
-                 picks it up",
+                 predates a change in how the adapter derives it, and only erasing that \
+                 session and re-syncing picks the new value up",
             ),
         }
     }
@@ -7180,7 +7137,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn re_ingesting_with_changed_source_agent_is_rejected() -> anyhow::Result<()> {
+    async fn re_ingesting_with_changed_source_agent_keeps_the_stored_label() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
 
@@ -7190,41 +7147,68 @@ mod tests {
         let mut tampered = base_session();
         tampered.source_agent = "codex-cli".to_owned();
         let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
-        assert_eq!(count_status(&second, OutcomeStatus::Error), 1);
-        let err_row = second
-            .iter()
-            .find(|outcome| outcome.status == OutcomeStatus::Error)
-            .expect("error outcome present");
-        let err = err_row.error.as_ref().expect("error body present");
-        assert_eq!(err.field, Some("source_agent"));
-        assert_eq!(err.reason, Some("immutable"));
+        assert_eq!(
+            count_status(&second, OutcomeStatus::Error),
+            0,
+            "spec.md 7.6: the stored label wins, which is not a per-row error: {second:?}",
+        );
 
         // The stored row stayed on the original adapter - no silent rewrite.
         let stored = store
             .get_session(&base_session().id)
             .await?
-            .expect("session row survives the rejected re-ingest");
+            .expect("session row survives the re-ingest");
         assert_eq!(stored.session.source_agent, "claude-code");
 
         Ok(())
     }
 
+    /// spec.md 7.6. An adapter that corrects how it derives `project` - a new
+    /// source of truth, a fixed parse - re-submits stored sessions under a
+    /// different value. The stored value stays authoritative, but the new
+    /// MESSAGES must still land: rejecting the substream would strand every
+    /// session the adapter had already stored, which is how issue #224's fix
+    /// would have destroyed data on exactly the hosts that needed it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn re_ingesting_with_changed_project_is_rejected() -> anyhow::Result<()> {
+    async fn re_ingesting_with_changed_project_keeps_stored_label_and_lands_new_messages()
+    -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
+        let session = base_session();
 
-        let first = ingest_events(&store, vec![IngestEvent::Session(base_session())]).await?;
+        let user_message = |id: &str| Message::User {
+            id: id.to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+
+        let first = ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(session.clone()),
+                IngestEvent::Message(user_message("m1")),
+            ],
+        )
+        .await?;
         assert_eq!(count_status(&first, OutcomeStatus::Error), 0);
 
-        let mut tampered = base_session();
-        tampered.project = crate::adapter::Extracted::from_test_value("/somewhere/else".to_owned());
-        let second = ingest_events(&store, vec![IngestEvent::Session(tampered)]).await?;
-        let err_row = second
-            .iter()
-            .find(|outcome| outcome.status == OutcomeStatus::Error)
-            .expect("project change must surface an error outcome");
-        assert_eq!(err_row.error.as_ref().unwrap().field, Some("project"));
+        let mut relabeled = base_session();
+        relabeled.project =
+            crate::adapter::Extracted::from_test_value("/somewhere/else".to_owned());
+        let second = ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(relabeled),
+                IngestEvent::Message(user_message("m2")),
+            ],
+        )
+        .await?;
+        assert_eq!(
+            count_status(&second, OutcomeStatus::Error),
+            0,
+            "keeping the stored label is not a per-row error: {second:?}",
+        );
 
         let stored = store
             .get_session(&base_session().id)
@@ -7234,6 +7218,12 @@ mod tests {
             stored.session.project.as_str(),
             "/home/me/proj",
             "stored project must remain the original",
+        );
+        let ids: Vec<&str> = stored.messages.iter().map(|m| m.message.id()).collect();
+        assert!(
+            ids.contains(&"m1") && ids.contains(&"m2"),
+            "the re-submitted session's new message must land under the stored \
+             project, not be discarded with it: {ids:?}",
         );
 
         Ok(())

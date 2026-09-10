@@ -4,8 +4,14 @@
 //! archive/legacy files in a tempdir, ingests through the adapter into a real
 //! `Store`, and asserts the canonical shape for every plan case (a)-(h), the
 //! native round-trip conformance (spec.md#adapter conformance), and the sync
-//! summary signals. All fixture data is synthetic - never copied from any real
-//! `~/.openclaw`.
+//! summary signals. The in-file fixture data is synthetic - never copied from
+//! any real `~/.openclaw`.
+//!
+//! The real-capture suite at the bottom is the deliberate exception: it runs
+//! against `tests/fixtures/adapter/openclaw-captures/`, four complete state
+//! roots driven out of the actual OpenClaw runtime in a throwaway `$HOME` with a
+//! stub model. Synthetic trees are what let issue #224 hide - they encoded what
+//! we believed OpenClaw writes, and that belief was wrong.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::Path;
@@ -807,5 +813,262 @@ async fn source_rewrite_re_syncs_additively_keeping_the_superset() -> anyhow::Re
         ids.contains(&"m1") && ids.contains(&"m2"),
         "pond keeps the superset after a rewrite"
     );
+    Ok(())
+}
+
+// -- Real-capture suite (issue #224) -----------------------------------------
+//
+// The cases above build synthetic trees, which is exactly what let issue #224
+// hide: the adapter matched what we believed OpenClaw writes. These four
+// fixtures are complete state roots copied out of the real runtime
+// (2026.7.1-2), so they assert against what it actually wrote. See
+// `tests/fixtures/README.md`, section `openclaw-captures`.
+
+const CAPTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/openclaw-captures"
+);
+
+fn capture(pass: &str) -> std::path::PathBuf {
+    Path::new(CAPTURES).join(pass)
+}
+
+/// Every transcript in a captured root, by session id. A `.trajectory.jsonl`
+/// sidecar is not a transcript, and a `<ts>_<id>.jsonl` successor is named by
+/// its id, not by its whole stem.
+fn transcript_ids(pass: &str) -> Vec<String> {
+    let dir = capture(pass).join("agents").join("main").join("sessions");
+    let mut ids: Vec<String> = std::fs::read_dir(&dir)
+        .expect("captured sessions dir")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_str()?.to_owned();
+            if name.contains(".trajectory") {
+                return None;
+            }
+            // `<id>.jsonl`, `<id>.jsonl.<reason>.<ts>`, `<ts>_<id>.jsonl`
+            let stem = name[..name.find(".jsonl")?].to_owned();
+            Some(match stem.split_once('_') {
+                Some((head, rest)) if head.ends_with('Z') => rest.to_owned(),
+                _ => stem,
+            })
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+async fn ingest_capture(pass: &str) -> (Store, TempDir, Vec<String>) {
+    let (store, dir) = ingest(&capture(pass)).await;
+    (store, dir, transcript_ids(pass))
+}
+
+/// The bug in #224: only the newest session per routing key survived, because
+/// keys came from `sessions.json` `sessionId` and that file names only the
+/// CURRENT session for each key. Every rotated-out generation must now land.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_captured_transcript_is_ingested() -> anyhow::Result<()> {
+    for pass in ["rotate-reply", "cron", "compaction", "hooks-heartbeat"] {
+        let (store, _dir, ids) = ingest_capture(pass).await;
+        assert!(!ids.is_empty(), "{pass}: fixture has transcripts");
+        for id in &ids {
+            let session = store.get_session(id).await?.unwrap_or_else(|| {
+                panic!(
+                    "{pass}: transcript {id} was dropped; every generation must be ingested \
+                     (spec.md#adapter-integrity-no-silent-drops)"
+                )
+            });
+            assert!(
+                !session.session.project.is_empty(),
+                "{pass}: {id} has an empty project (spec.md#model-project-non-empty)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Cron runs group under their JOB, not one project per run: a
+/// `sessionTarget: "main"` run stores its own
+/// `...:cron:<jobId>:run:<startedAtMs>` key, and a project per run would make
+/// cron unsearchable. The exact run key is kept alongside, so nothing is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn cron_runs_group_under_the_job_key() -> anyhow::Result<()> {
+    let (store, _dir, ids) = ingest_capture("cron").await;
+    let mut cron_projects: Vec<String> = Vec::new();
+    for id in &ids {
+        let Some(session) = store.get_session(id).await? else {
+            continue;
+        };
+        if session.session.source_agent != "openclaw/cron" {
+            continue;
+        }
+        let project = (*session.session.project).clone();
+        assert!(
+            !project.contains(":run:"),
+            "{id}: project {project} still carries the per-run suffix"
+        );
+        let openclaw = session.session.options.get("openclaw").expect("options");
+        if let Some(exact) = openclaw.get("session_key_exact").and_then(Value::as_str) {
+            assert!(
+                exact.starts_with(&format!("{project}:run:")),
+                "{id}: exact key {exact} is not a run of {project}"
+            );
+        }
+        cron_projects.push(project);
+    }
+    assert!(
+        !cron_projects.is_empty(),
+        "the cron capture must classify cron sessions; a stored key is \
+         `agent:<id>:cron:<job>`, never a bare `cron:`"
+    );
+    let runs = cron_projects.len();
+    cron_projects.sort();
+    cron_projects.dedup();
+    assert!(
+        cron_projects.len() < runs,
+        "several runs must share one job project, else grouping did not happen"
+    );
+    Ok(())
+}
+
+/// Each rung of the recovery ladder tags what resolved the key, and the tag must
+/// name a rung the adapter actually has. A transcript nothing resolves is still
+/// ingested, under its agent directory, with no invented `session_key`.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_keys_record_their_source() -> anyhow::Result<()> {
+    const RUNGS: &[&str] = &[
+        "sessions_json",
+        "usage_family",
+        "session_file",
+        "system_prompt_report",
+        "trajectory",
+        "cron_run_logs",
+        "audit_events",
+        "cron_prompt_prefix",
+        "agent_dir_fallback",
+    ];
+    let mut seen: Vec<String> = Vec::new();
+    for pass in ["rotate-reply", "cron", "compaction", "hooks-heartbeat"] {
+        let (store, _dir, ids) = ingest_capture(pass).await;
+        for id in &ids {
+            let Some(session) = store.get_session(id).await? else {
+                continue;
+            };
+            let openclaw = session.session.options.get("openclaw").expect("options");
+            let source = openclaw
+                .get("session_key_source")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{pass}/{id}: no session_key_source recorded"));
+            assert!(
+                RUNGS.contains(&source),
+                "{pass}/{id}: unknown key source {source}"
+            );
+            if source == "agent_dir_fallback" {
+                assert!(
+                    openclaw.get("session_key").is_none(),
+                    "{pass}/{id}: the fallback must not invent a session_key \
+                     (spec.md#model-no-synthesis)"
+                );
+                assert_eq!(
+                    *session.session.project, "agent:main",
+                    "{pass}/{id}: the fallback attributes to the owning agent directory"
+                );
+            } else {
+                assert_eq!(
+                    openclaw.get("session_key").and_then(Value::as_str),
+                    Some(session.session.project.as_str()),
+                    "{pass}/{id}: a resolved key is the project"
+                );
+            }
+            seen.push(source.to_owned());
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    // The captures were chosen to exercise the deeper rungs; if this shrinks, a
+    // rung silently stopped being reachable.
+    for rung in ["sessions_json", "trajectory", "cron_run_logs"] {
+        assert!(
+            seen.iter().any(|s| s == rung),
+            "no captured transcript resolved via {rung}; saw {seen:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A compaction successor and a checkpoint branch are both `<ts>_<id>.jsonl`
+/// with an absolute-path `parentSession`. The path must reduce to the parent's
+/// id, and the branch must read as a fork rather than a spawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_lineage_resolves_paths_to_ids() -> anyhow::Result<()> {
+    let (store, _dir, ids) = ingest_capture("compaction").await;
+    let mut relations: Vec<String> = Vec::new();
+    for id in &ids {
+        let Some(session) = store.get_session(id).await? else {
+            continue;
+        };
+        let openclaw = session.session.options.get("openclaw").expect("options");
+        let Some(relation) = openclaw.get("relation").and_then(Value::as_str) else {
+            continue;
+        };
+        relations.push(relation.to_owned());
+        if let Some(parent) = &session.session.parent_session_id {
+            assert!(
+                !parent.contains('/') && !parent.contains(".jsonl"),
+                "{id}: parent_session_id {parent} is still a path"
+            );
+            assert!(
+                ids.iter().any(|known| known == parent),
+                "{id}: parent {parent} is not one of the captured transcripts"
+            );
+        }
+        // spec.md 4: a cut-point is incoherent without a parent to cut from.
+        assert!(
+            session.session.parent_message_id.is_none()
+                || session.session.parent_session_id.is_some(),
+            "{id}: parent_message_id without parent_session_id"
+        );
+        if relation == "fork" {
+            assert!(
+                session.session.parent_session_id.is_some(),
+                "{id}: a checkpoint branch must name the session it branched from"
+            );
+        }
+    }
+    assert!(
+        relations.iter().any(|r| r == "compaction_successor"),
+        "the compaction capture must contain a successor; saw {relations:?}"
+    );
+    assert!(
+        relations.iter().any(|r| r == "fork"),
+        "the checkpoint branch must read as a fork, not a spawn; saw {relations:?}"
+    );
+    Ok(())
+}
+
+/// Re-syncing an unchanged captured root is a no-op
+/// (spec.md#adapter-integrity-additive-sync), and it must not disagree with the
+/// labels it stored a moment ago.
+#[tokio::test(flavor = "multi_thread")]
+async fn resyncing_a_capture_is_additive() -> anyhow::Result<()> {
+    let root = capture("cron");
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = OpenClawAdapter::new(&root);
+
+    let first = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+    let second = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    assert_eq!(first.dropped_sessions, 0, "first sync dropped a session");
+    assert_eq!(second.dropped_sessions, 0, "re-sync dropped a session");
+    assert_eq!(
+        second.relabeled_sessions, 0,
+        "an unchanged source must not disagree with its own stored labels"
+    );
+    assert_eq!(
+        second.sessions_inserted, 0,
+        "a re-sync of an unchanged source inserts nothing"
+    );
+    assert_eq!(second.messages_inserted_total, 0, "no new messages");
     Ok(())
 }

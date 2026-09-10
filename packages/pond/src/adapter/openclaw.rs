@@ -27,10 +27,30 @@
 //! (`adapter-integrity-additive-sync`); pond becomes a superset of the source
 //! after destructive rewrites, which is the product.
 //!
-//! `project` = `session_key` verbatim (decision 2). `source_agent` is
+//! `project` = `session_key` verbatim (decision 2), with one normalization: a
+//! cron RUN key (`...:cron:<jobId>:run:<segment>`) becomes its job key, so a
+//! job's runs group under one project instead of one project per run. The exact
+//! key survives in `options.openclaw.session_key_exact`. `source_agent` is
 //! `openclaw` for main/channel conversations and `openclaw/{subagent,cron,hook,
-//! probe}` for the derived kinds (decision 4), which inherit pond's default
-//! search exclusion (spec.md#search) while staying fully stored.
+//! probe,heartbeat}` for the derived kinds (decision 4), which inherit pond's
+//! default search exclusion (spec.md#search) while staying fully stored.
+//!
+//! ## File-era session keys (issue #224)
+//!
+//! On every OpenClaw through 2026.7.1 the transcripts are files and
+//! `agents/<id>/sessions/sessions.json` maps a routing key to the session it
+//! points at RIGHT NOW - not to every session that key ever had. Each rotation
+//! (an isolated cron run, a hook run, a heartbeat beat, a compaction, a reset)
+//! mints a new session id and overwrites the entry, leaving the previous
+//! transcript on disk with no entry naming it. Reading keys from `sessionId`
+//! alone therefore ingested only the newest generation per key and dropped the
+//! rest silently. [`FileKey`] walks the other places OpenClaw records a key
+//! (the usage family, the entry's `sessionFile`, the system-prompt report, the
+//! `.trajectory.jsonl` sidecar, the state DB's `cron_run_logs` and
+//! `audit_events`, and an isolated cron run's `[cron:<jobId> ...]` prompt
+//! stamp), and a transcript that resolves nowhere is ingested under its agent
+//! directory rather than dropped. `options.openclaw.session_key_source` records
+//! which rung answered.
 //!
 //! The same SQLite `seq` is NOT stable: `replaceSqliteTranscriptEventsInTransaction`
 //! deletes and rewrites rows with new seqs on repairs/rewinds. Identity is the
@@ -41,13 +61,14 @@
 //! the DB's derived projections (`transcript_event_identities`,
 //! `session_transcript_active_events`, `session_transcript_fts`) are not data
 //! sources; foreign artifacts (`trajectory_runtime_events`, `board_*`,
-//! `heartbeat_outcomes`, `acp_parent_stream_events`) are not ingested; legacy
-//! `<id>.trajectory.jsonl` / `<id>.checkpoint.<uuid>.jsonl` shapes are skipped;
-//! and `skip_kinds` lets an operator exclude whole session kinds.
+//! `heartbeat_outcomes`, `acp_parent_stream_events`) are not ingested; the
+//! `<id>.trajectory.jsonl` sidecar is not a transcript (it is read only for the
+//! `sessionKey` it carries) and `<id>.checkpoint.<uuid>.jsonl` shapes are
+//! skipped; and `skip_kinds` lets an operator exclude whole session kinds.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use async_stream::stream;
@@ -67,7 +88,7 @@ use super::{
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text,
-    jsonl::{parse_bounded, peek_last_mapped},
+    jsonl::{parse_bounded, peek_first_line, peek_last_mapped},
     jsonl_bytes, part_id, part_ordinal, raw_record,
     sqlite::{self, CHANNEL_CAP, ColKind, columns_sql, emit, row_to_json},
 };
@@ -89,6 +110,8 @@ const INTER_SESSION_PROMPT_EXPLANATION: &str = "This content was routed by OpenC
 const AGENTS_SUBDIR: &str = "agents";
 const AGENT_DB_RELATIVE: &[&str] = &["agent", "openclaw-agent.sqlite"];
 const SESSIONS_SUBDIR: &str = "sessions";
+/// Root-level state DB, shared by every agent (`cron_run_logs`, `audit_events`).
+const STATE_DB_RELATIVE: &[&str] = &["state", "openclaw.sqlite"];
 
 /// Stateless factory: opens [`OpenClawAdapter`] instances and probes for the
 /// canonical `~/.openclaw` (or `$OPENCLAW_STATE_DIR` / legacy `~/.clawdbot`)
@@ -269,14 +292,16 @@ enum SessionSource {
         session_id: String,
         session_key: String,
     },
-    /// A standalone archive or legacy transcript file whose key resolved via a
-    /// legacy `sessions.json`.
+    /// A standalone archive or legacy transcript file, with the key the
+    /// [`FileKey`] ladder recovered for it.
     File {
         agent_id: String,
         path: PathBuf,
         session_id: String,
-        session_key: String,
+        key: FileKey,
         compressed: bool,
+        entry: Option<Arc<Value>>,
+        cut_points: Arc<HashMap<String, String>>,
     },
 }
 
@@ -346,6 +371,13 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
     let mut entries = Vec::new();
     let mut errors = Vec::new();
     let mut superseded = 0usize;
+    // Transcripts no rung of the key ladder resolved. They ARE ingested, under
+    // the agent-directory fallback, so this is not a skip count - it is how many
+    // sessions carry pond's own attribution instead of an OpenClaw key.
+    let mut fallback_keys = 0usize;
+    // Root-level and lazy: shared by every agent, opened only if some transcript
+    // reaches that far down the ladder.
+    let state_keys = StateDbKeys::new(&adapter.root);
 
     let agents = match list_agents(adapter) {
         Ok(agents) => agents,
@@ -405,8 +437,8 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
             }
         }
 
-        // Archive + legacy files, keyed via a legacy `sessions.json`.
-        match collect_file_sessions(adapter, &agent) {
+        // Archive + legacy files, keyed through the `FileKey` ladder.
+        match collect_file_sessions(adapter, &agent, &state_keys) {
             Ok(files) => {
                 for file in files {
                     if db_ids.contains(&file.session_id) {
@@ -418,13 +450,18 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
                     } else {
                         None
                     };
+                    if file.key.is_fallback() {
+                        fallback_keys += 1;
+                    }
                     entries.push(HeadEntry {
                         source: SessionSource::File {
                             agent_id: agent.agent_id.clone(),
                             path: file.path,
                             session_id: file.session_id,
-                            session_key: file.session_key,
+                            key: file.key,
                             compressed: file.compressed,
+                            entry: file.entry,
+                            cut_points: file.cut_points,
                         },
                         source_ts,
                     });
@@ -435,6 +472,14 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
                 errors.push(error);
             }
         }
+    }
+
+    if fallback_keys > 0 {
+        tracing::info!(
+            count = fallback_keys,
+            "openclaw: transcripts ingested under the agent-directory fallback \
+             (no session key on disk); see options.openclaw.session_key_source"
+        );
     }
 
     Enumerated {
@@ -494,9 +539,22 @@ fn read_survivors(
                 agent_id,
                 path,
                 session_id,
-                session_key,
+                key,
                 compressed,
-            } => read_file_session(&agent_id, &path, &session_id, &session_key, compressed, tx),
+                entry,
+                cut_points,
+            } => read_file_session(
+                FileRead {
+                    agent_id: &agent_id,
+                    path: &path,
+                    enumerated_id: &session_id,
+                    key: &key,
+                    compressed,
+                    entry: entry.as_deref(),
+                    cut_points: &cut_points,
+                },
+                tx,
+            ),
         };
         if !keep {
             return;
@@ -571,6 +629,7 @@ fn read_db_session(
             schema_version,
             lineage: &lineage,
             resolved_parent_id: resolved_parent,
+            file_key: None,
         },
     );
     let anchor = session.created_at;
@@ -584,14 +643,30 @@ fn read_db_session(
     true
 }
 
-fn read_file_session(
-    agent_id: &str,
-    path: &Path,
-    session_id: &str,
-    session_key: &str,
+struct FileRead<'a> {
+    agent_id: &'a str,
+    path: &'a Path,
+    /// The id the filename gave at enumeration; the header's `id` overrides it.
+    enumerated_id: &'a str,
+    key: &'a FileKey,
     compressed: bool,
+    entry: Option<&'a Value>,
+    cut_points: &'a HashMap<String, String>,
+}
+
+fn read_file_session(
+    read: FileRead<'_>,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
+    let FileRead {
+        agent_id,
+        path,
+        enumerated_id,
+        key,
+        compressed,
+        entry,
+        cut_points,
+    } = read;
     let lines = match read_entry_lines(path, compressed) {
         Ok(lines) => lines,
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
@@ -610,23 +685,55 @@ fn read_file_session(
         .find(|value| entry_type(value) == Some("session"))
         .cloned();
 
-    // Archive/legacy files carry no routing table, so a spawn/fork parent key
-    // cannot resolve to a session_id here; it survives in options for a later
-    // linking pass.
-    let lineage = resolve_lineage(header.as_ref(), None);
+    // Identity is the id enumeration derived from the filename, and it stays
+    // that way even when the header disagrees. Enumeration is where identity is
+    // USED: the DB-supersession check, the freshness oracle, and the
+    // in-directory dedup set all key on it. Emitting under a different id here
+    // would mean the session escaped all three - superseded copies re-read,
+    // fresh sessions re-ingested - which is worse than an id that mirrors the
+    // filename. They agree on every observed OpenClaw version; a disagreement
+    // means the file was renamed out from under its header, so say so and carry
+    // the header's own claim in options rather than acting on it.
+    let session_id = enumerated_id;
+    if let Some(header_id) = header
+        .as_ref()
+        .and_then(|h| h.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && *id != enumerated_id)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            filename_id = enumerated_id,
+            %header_id,
+            "openclaw: transcript filename disagrees with its header id; \
+             keeping the filename id, which is what dedup and freshness key on"
+        );
+    }
+
+    // Archive/legacy files carry no routing table, so a spawn parent key cannot
+    // resolve to a session_id here; it survives in options for a later linking
+    // pass. A fork off a compaction checkpoint is the exception: its parent is
+    // named by path in the header, so it resolves to an id and to a cut-point.
+    let mut lineage = resolve_lineage(header.as_ref(), entry);
+    if lineage.relation == Some("fork")
+        && let Some(parent_id) = &lineage.header_parent_id
+    {
+        lineage.parent_message_id = cut_points.get(parent_id).cloned();
+    }
     let session = build_session(
         agent_id,
         session_id,
-        session_key,
+        &key.project_key,
         SessionInputs {
             row: None,
             header: header.as_ref(),
-            entry: None,
+            entry,
             generation: None,
             leaf_event_id: None,
             schema_version: None,
             lineage: &lineage,
             resolved_parent_id: None,
+            file_key: Some(key),
         },
     );
     let anchor = session.created_at;
@@ -673,12 +780,14 @@ enum DbSessions {
     NoSessionsTable,
 }
 
-/// Detect the `sessions` table via `sqlite_master` before preparing the SELECT,
-/// so its absence is a clean control-flow signal (not a swallowed prepare error).
-fn has_sessions_table(conn: &Connection) -> rusqlite::Result<bool> {
+/// Detect a table via `sqlite_master` before preparing a SELECT against it, so
+/// its absence is a clean control-flow signal (not a swallowed prepare error).
+/// OpenClaw's schema differs across versions in which tables exist at all, so
+/// every optional-table read goes through this.
+fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
     conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions' LIMIT 1",
-        [],
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        [table],
         |_| Ok(()),
     )
     .optional()
@@ -686,7 +795,7 @@ fn has_sessions_table(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 fn list_db_sessions(conn: &Connection, db_path: &Path) -> Result<DbSessions, AdapterError> {
-    if !has_sessions_table(conn)
+    if !has_table(conn, "sessions")
         .map_err(|error| db_error(db_path, "probe sessions table", &error))?
     {
         return Ok(DbSessions::NoSessionsTable);
@@ -846,6 +955,9 @@ struct SessionInputs<'a> {
     schema_version: Option<i64>,
     lineage: &'a Lineage,
     resolved_parent_id: Option<String>,
+    /// File-era only: how the session key was recovered. `None` for a DB
+    /// session, whose key is authoritative and needs no provenance.
+    file_key: Option<&'a FileKey>,
 }
 
 fn build_session(
@@ -863,6 +975,7 @@ fn build_session(
         schema_version,
         lineage,
         resolved_parent_id,
+        file_key,
     } = inputs;
     // spec.md#model-project-non-empty: project = session_key verbatim (decision
     // 2), routed through the seam so it cannot be synthesized. The literal is
@@ -886,6 +999,11 @@ fn build_session(
     // A compaction successor names its parent by session_id (header
     // `parentSession`); a spawn/fork names it by key, resolved to an id upstream.
     let parent_session_id = lineage.header_parent_id.clone().or(resolved_parent_id);
+    // spec.md 4: a cut-point with no parent session to cut from is incoherent.
+    let parent_message_id = lineage
+        .parent_message_id
+        .clone()
+        .filter(|_| parent_session_id.is_some());
 
     let mut openclaw = serde_json::Map::new();
     if let Some(Value::Object(map)) = row {
@@ -893,7 +1011,25 @@ fn build_session(
             openclaw.insert(key.clone(), value.clone());
         }
     }
-    openclaw.insert("session_key".to_owned(), json!(session_key));
+    match file_key {
+        // A file-era key is recovered, so record which rung produced it. On the
+        // agent-directory fallback no `session_key` is written at all: pond
+        // chose that project, OpenClaw never stored such a key, and inventing
+        // one here would be synthesis (spec.md#model-no-synthesis).
+        Some(key) => {
+            openclaw.insert("session_key_source".to_owned(), json!(key.source));
+            if let Some(exact) = &key.exact {
+                openclaw.insert("session_key".to_owned(), json!(session_key));
+                if exact != session_key {
+                    // A cron run key, normalized to its job key for `project`.
+                    openclaw.insert("session_key_exact".to_owned(), json!(exact));
+                }
+            }
+        }
+        None => {
+            openclaw.insert("session_key".to_owned(), json!(session_key));
+        }
+    }
     if let Some(cwd) = header.and_then(|h| h.get("cwd")).filter(|v| !v.is_null()) {
         openclaw.insert("cwd".to_owned(), cwd.clone());
     }
@@ -933,7 +1069,7 @@ fn build_session(
     Session {
         id: session_id.to_owned(),
         parent_session_id,
-        parent_message_id: None,
+        parent_message_id,
         source_agent: session_kind(session_key).source_agent(),
         created_at,
         project,
@@ -953,7 +1089,26 @@ struct Lineage {
     /// A parent named by session_key (spawn / fork), resolved to an id via the
     /// routing table by the caller when a live DB is available.
     parent_session_key: Option<String>,
+    /// The cut-point in the parent, for a fork that has one. Never set without
+    /// a parent session id (spec.md 4).
+    parent_message_id: Option<String>,
     relation: Option<&'static str>,
+}
+
+/// `sessions.json` `label` marking a session branched off a compaction
+/// checkpoint (`gateway/session-create-service.ts`).
+const CHECKPOINT_BRANCH_LABEL: &str = "Checkpoint branch";
+
+/// Reduce a header `parentSession` to a session id. Upstream writes the parent
+/// transcript's absolute path there, so the id is its filename minus the
+/// archive suffix, the `.jsonl` extension and any `<ts>_` successor prefix. A
+/// value that is already a bare id passes through unchanged.
+fn parent_session_id_from_path(parent: &str) -> String {
+    let name = Path::new(parent)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(parent);
+    transcript_stem(name)
 }
 
 fn resolve_lineage(header: Option<&Value>, entry: Option<&Value>) -> Lineage {
@@ -969,33 +1124,53 @@ fn resolve_lineage(header: Option<&Value>, entry: Option<&Value>) -> Lineage {
         return Lineage {
             header_parent_id: None,
             parent_session_key: Some(parent_key.to_owned()),
+            parent_message_id: None,
             relation: Some("fork"),
         };
     }
-    // subagent spawn: spawnedBy (parent session key) or a dashboard-set
-    // parentSessionKey.
-    if let Some(parent_key) = entry_str("spawnedBy").or_else(|| entry_str("parentSessionKey")) {
+    // subagent spawn: spawnedBy (parent session key).
+    if let Some(parent_key) = entry_str("spawnedBy") {
         return Lineage {
             header_parent_id: None,
             parent_session_key: Some(parent_key.to_owned()),
+            parent_message_id: None,
             relation: Some("spawn"),
         };
     }
-    // compaction successor: the header's `parentSession` is a parent transcript
-    // sessionId (already an id).
-    if let Some(parent) = header
+    // The header's `parentSession` is the parent transcript's PATH, not an id
+    // (verified against OpenClaw 2026.7.1-2), so it is reduced to an id here.
+    let header_parent = header
         .and_then(|h| h.get("parentSession"))
         .and_then(Value::as_str)
-    {
+        .map(parent_session_id_from_path);
+
+    // A checkpoint branch is a fork, not a spawn: the dashboard branches a
+    // session off a compaction checkpoint (`sessions.compaction.branch`), and
+    // the entry marks it with `parentSessionKey` + `label: "Checkpoint branch"`.
+    // Its file is `<ts>_<uuid>.jsonl` with a path `parentSession`, exactly like a
+    // compaction successor, so the entry is the only discriminator.
+    if let Some(parent_key) = entry_str("parentSessionKey") {
+        let branch = entry_str("label") == Some(CHECKPOINT_BRANCH_LABEL);
         return Lineage {
-            header_parent_id: Some(parent.to_owned()),
+            header_parent_id: header_parent.filter(|_| branch),
+            parent_session_key: Some(parent_key.to_owned()),
+            parent_message_id: None,
+            relation: Some(if branch { "fork" } else { "spawn" }),
+        };
+    }
+    // compaction successor.
+    if let Some(parent_id) = header_parent {
+        return Lineage {
+            header_parent_id: Some(parent_id),
             parent_session_key: None,
+            parent_message_id: None,
             relation: Some("compaction_successor"),
         };
     }
     Lineage {
         header_parent_id: None,
         parent_session_key: None,
+        parent_message_id: None,
         relation: None,
     }
 }
@@ -1026,18 +1201,39 @@ enum Kind {
     Cron,
     Hook,
     Probe,
+    Heartbeat,
+}
+
+/// Strip the `agent:<agentId>:` prefix every stored key carries
+/// (`routing/session-key.ts:115` `toAgentStoreSessionKey`). The kind lives in
+/// the remainder, so classification must not test the raw key: `cron:` and
+/// `hook:` never lead a stored key.
+fn key_remainder(session_key: &str) -> &str {
+    session_key
+        .strip_prefix("agent:")
+        .and_then(|rest| rest.split_once(':'))
+        .map_or(session_key, |(_agent_id, remainder)| remainder)
 }
 
 fn session_kind(session_key: &str) -> Kind {
-    if session_key.starts_with("cron:") {
+    let remainder = key_remainder(session_key);
+    if remainder.starts_with("cron:") {
         Kind::Cron
-    } else if session_key.starts_with("hook:") {
+    } else if remainder.starts_with("hook:") || remainder == "hook" {
         Kind::Hook
-    } else if session_key.contains(":subagent:") {
+    } else if remainder == "heartbeat" || remainder.ends_with(":heartbeat") {
+        // Isolated heartbeat beats (`agent:<id>:main:heartbeat`); the entry also
+        // carries `heartbeatIsolatedBaseSessionKey`.
+        Kind::Heartbeat
+    } else if remainder.contains("subagent:") {
         Kind::Subagent
-    } else if session_key.contains(":explicit:model-run-") || session_key.contains("model-run-") {
+    } else if remainder.contains("model-run-") {
         Kind::Probe
     } else {
+        // `dashboard:<uuid>` (checkpoint branches, dashboard-created sessions)
+        // stays Main on purpose: it holds the operator's own conversation, so it
+        // belongs in default search. Its branch nature is carried by lineage
+        // (`relation = "fork"`), not by a source_agent subpath.
         Kind::Main
     }
 }
@@ -1050,6 +1246,7 @@ impl Kind {
             Kind::Cron => format!("{NAME}/cron"),
             Kind::Hook => format!("{NAME}/hook"),
             Kind::Probe => format!("{NAME}/probe"),
+            Kind::Heartbeat => format!("{NAME}/heartbeat"),
         }
     }
 
@@ -1060,6 +1257,7 @@ impl Kind {
             Kind::Cron => Some("cron"),
             Kind::Hook => Some("hook"),
             Kind::Probe => Some("probe"),
+            Kind::Heartbeat => Some("heartbeat"),
         }
     }
 }
@@ -1558,8 +1756,400 @@ fn tool_result_options(message_value: &Value) -> ProviderOptions {
 struct FileSession {
     path: PathBuf,
     session_id: String,
-    session_key: String,
+    key: FileKey,
     compressed: bool,
+    /// This session's `sessions.json` entry, when its key still has one. Shared
+    /// rather than cloned: one entry runs to ~14 KB and many rotated generations
+    /// resolve to the same key.
+    entry: Option<Arc<Value>>,
+    /// Shared per directory: `parent sessionId -> fork cut-point entry id`.
+    cut_points: Arc<HashMap<String, String>>,
+}
+
+/// The session key a file-era transcript resolved to, plus the rung of the
+/// ladder that produced it (issue #224).
+///
+/// `sessions.json` maps a routing key to its CURRENT session only, so every
+/// rotated-out generation - isolated cron runs, hook runs, isolated heartbeat
+/// beats, compaction predecessors, reset archives - has no entry there. Those
+/// transcripts used to be dropped silently. The ladder recovers a key from the
+/// other places OpenClaw records one, and a transcript that resolves nowhere is
+/// still ingested under the owning agent directory rather than discarded
+/// (spec.md#adapter-integrity-no-silent-drops).
+struct FileKey {
+    /// The key that becomes `project` and drives kind classification. A cron
+    /// run key is normalized to its job key here.
+    project_key: String,
+    /// The key exactly as stored on disk. `None` when no source named one and
+    /// `project_key` is the agent-directory fallback, which is pond's own
+    /// attribution rather than something OpenClaw wrote
+    /// (spec.md#model-no-synthesis).
+    exact: Option<String>,
+    source: &'static str,
+}
+
+impl FileKey {
+    fn resolved(exact: String, source: &'static str) -> Self {
+        FileKey {
+            project_key: cron_job_key(&exact).unwrap_or_else(|| exact.clone()),
+            exact: Some(exact),
+            source,
+        }
+    }
+
+    fn fallback(agent_id: &str) -> Self {
+        FileKey {
+            project_key: fallback_project(agent_id),
+            exact: None,
+            source: KEY_SOURCE_AGENT_DIR,
+        }
+    }
+
+    /// True when the key is pond's own fallback attribution.
+    fn is_fallback(&self) -> bool {
+        self.exact.is_none()
+    }
+}
+
+const KEY_SOURCE_SESSIONS_JSON: &str = "sessions_json";
+const KEY_SOURCE_USAGE_FAMILY: &str = "usage_family";
+const KEY_SOURCE_SESSION_FILE: &str = "session_file";
+const KEY_SOURCE_SYSTEM_PROMPT_REPORT: &str = "system_prompt_report";
+const KEY_SOURCE_TRAJECTORY: &str = "trajectory";
+const KEY_SOURCE_CRON_RUN_LOGS: &str = "cron_run_logs";
+const KEY_SOURCE_AUDIT_EVENTS: &str = "audit_events";
+const KEY_SOURCE_CRON_PROMPT_PREFIX: &str = "cron_prompt_prefix";
+const KEY_SOURCE_AGENT_DIR: &str = "agent_dir_fallback";
+
+/// The `project` a transcript gets when no source names a key: its owning agent
+/// directory. `reconcile_deletions` recognizes a fallback row by comparing the
+/// stored project against this, so both sides MUST derive it here - a format
+/// changed in one place only would silently stop matching, and the consequence
+/// is a preserved session becoming an erase target.
+fn fallback_project(agent_id: &str) -> String {
+    format!("agent:{agent_id}")
+}
+
+/// Normalize a cron RUN key to its job key, or `None` when the key is not one.
+///
+/// A `sessionTarget: "main"` cron run stores its own top-level key
+/// `agent:<id>:cron:<jobId>:run:<startedAtMs>` (`cron/service/task-runs.ts:30-36`),
+/// one per run, while `sessions.json` only ever stores the base
+/// `agent:<id>:cron:<jobId>`. Projects must not depend on which rung resolved a
+/// key (`project` is immutable, spec.md 7.6), and a project per run would make
+/// cron unsearchable, so the `:run:<segment>` suffix - upstream's own delimiter,
+/// not a guess - is stripped. The exact key survives in
+/// `options.openclaw.session_key_exact`.
+fn cron_job_key(session_key: &str) -> Option<String> {
+    if session_kind(session_key) != Kind::Cron {
+        return None;
+    }
+    let (job, _run) = session_key.split_once(":run:")?;
+    Some(job.to_owned())
+}
+
+/// Strip a transcript filename down to its session id: archive suffixes
+/// (`.jsonl.reset.<ts>`), the `.jsonl` extension, and the `<ts>_` prefix a
+/// compaction successor or checkpoint branch carries.
+fn transcript_stem(name: &str) -> String {
+    let base = match parse_archive_name(name) {
+        Some((id, _, _)) => id,
+        None => name.strip_suffix(".jsonl").unwrap_or(name).to_owned(),
+    };
+    strip_ts_prefix(&base).to_owned()
+}
+
+/// Drop the `2026-09-10T15-59-30-484Z_` prefix upstream prepends to a
+/// compaction successor / checkpoint branch filename.
+fn strip_ts_prefix(stem: &str) -> &str {
+    let Some((head, rest)) = stem.split_once('_') else {
+        return stem;
+    };
+    let looks_like_ts = head.len() >= 20
+        && head.ends_with('Z')
+        && head.starts_with(|c: char| c.is_ascii_digit())
+        && head
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | 'T' | 'Z'));
+    if looks_like_ts { rest } else { stem }
+}
+
+/// The parsed `sessions.json` (Record<sessionKey, SessionEntry>): every
+/// `sessionId -> sessionKey` mapping it carries, gathered rung by rung so a
+/// higher rung always wins, plus the entries themselves - a file-era session
+/// wants its entry for lineage and for `options.openclaw.session_entry`, exactly
+/// like a DB session.
+#[derive(Default)]
+struct SessionsJson {
+    keys: HashMap<String, (String, &'static str)>,
+    entries: serde_json::Map<String, Value>,
+}
+
+fn load_sessions_json(dir: &Path) -> SessionsJson {
+    let mut map: HashMap<String, (String, &'static str)> = HashMap::new();
+    let Ok(bytes) = std::fs::read(dir.join("sessions.json")) else {
+        return SessionsJson::default();
+    };
+    let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) else {
+        return SessionsJson::default();
+    };
+    let add = |id: &str, key: &str, source: &'static str, map: &mut HashMap<_, _>| {
+        if !id.is_empty() && !key.is_empty() {
+            map.entry(id.to_owned())
+                .or_insert_with(|| (key.to_owned(), source));
+        }
+    };
+    // Rung 1: the entry's current session.
+    for (session_key, entry) in &entries {
+        if let Some(id) = entry.get("sessionId").and_then(Value::as_str) {
+            add(id, session_key, KEY_SOURCE_SESSIONS_JSON, &mut map);
+        }
+    }
+    // Rung 2: the usage family - predecessors of reply-path rollovers and of
+    // automatic overflow compaction (never written for manual compaction, cron,
+    // hooks or heartbeats).
+    for (session_key, entry) in &entries {
+        if let Some(ids) = entry.get("usageFamilySessionIds").and_then(Value::as_array) {
+            for id in ids.iter().filter_map(Value::as_str) {
+                add(id, session_key, KEY_SOURCE_USAGE_FAMILY, &mut map);
+            }
+        }
+    }
+    // Rung 3: the entry's transcript path - the only source that covers a
+    // `<ts>_<id>.jsonl` successor whose id is not the entry's `sessionId`.
+    for (session_key, entry) in &entries {
+        if let Some(file) = entry.get("sessionFile").and_then(Value::as_str) {
+            let name = Path::new(file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file);
+            add(
+                &transcript_stem(name),
+                session_key,
+                KEY_SOURCE_SESSION_FILE,
+                &mut map,
+            );
+        }
+    }
+    // Rung 4: the compiled system-prompt report, which records the RUN key.
+    for (session_key, entry) in &entries {
+        let report = entry.get("systemPromptReport");
+        let id = report
+            .and_then(|r| r.get("sessionId"))
+            .and_then(Value::as_str);
+        let key = report
+            .and_then(|r| r.get("sessionKey"))
+            .and_then(Value::as_str)
+            .unwrap_or(session_key);
+        if let Some(id) = id {
+            add(id, key, KEY_SOURCE_SYSTEM_PROMPT_REPORT, &mut map);
+        }
+    }
+    SessionsJson { keys: map, entries }
+}
+
+/// `parent sessionId -> cut-point entry id`, from the `compactionCheckpoints[]`
+/// records on every `sessions.json` entry.
+///
+/// A checkpoint branch's own entry does not name its checkpoint - its
+/// `dashboard:<uuid>` key is a freshly minted uuid, not a `checkpointId` - so
+/// the branch is matched to its checkpoint through the parent session id its
+/// header `parentSession` resolves to. `postCompaction.entryId` is the last
+/// entry the branch inherited, which is exactly the fork cut-point (spec.md 4).
+///
+/// A parent with conflicting records is dropped rather than guessed
+/// (spec.md#model-no-synthesis): compaction without `truncateAfterCompaction`
+/// appends in place and writes a degenerate record whose `preCompaction` and
+/// `postCompaction` name the SAME session, so one session can hold several
+/// records pointing at itself.
+fn checkpoint_cut_points(entries: &serde_json::Map<String, Value>) -> HashMap<String, String> {
+    let mut found: HashMap<String, String> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for entry in entries.values() {
+        let records = entry
+            .get("compactionCheckpoints")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for record in records {
+            let Some(post) = record.get("postCompaction") else {
+                continue;
+            };
+            let (Some(parent_id), Some(entry_id)) = (
+                post.get("sessionId").and_then(Value::as_str),
+                post.get("entryId").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            match found.get(parent_id) {
+                Some(seen) if seen != entry_id => {
+                    ambiguous.insert(parent_id.to_owned());
+                }
+                Some(_) => {}
+                None => {
+                    found.insert(parent_id.to_owned(), entry_id.to_owned());
+                }
+            }
+        }
+    }
+    for parent_id in ambiguous {
+        found.remove(&parent_id);
+    }
+    found
+}
+
+/// Just the routing key off a trajectory line. Deserializing into this instead
+/// of a `Value` lets serde walk past the rest of the line - which embeds the
+/// whole compiled system prompt and every tool schema - without building a tree
+/// for it. Tool schemas nested in the line also declare a `sessionKey` property;
+/// naming the field at the top level is what keeps those out.
+#[derive(Deserialize)]
+struct TrajectoryKeyLine {
+    #[serde(rename = "sessionKey")]
+    session_key: Option<String>,
+}
+
+/// Rung 5: the `<transcript>.trajectory.jsonl` sidecar. EVERY line carries a
+/// top-level `sessionKey` (`trajectory/runtime.ts`), which is why the sidecar's
+/// 10 MB head-trimming window can never lose it - and why reading the first line
+/// is enough. A sidecar exists only for a transcript that ran a turn.
+fn trajectory_key(dir: &Path, name: &str) -> Option<String> {
+    let base = match parse_archive_name(name) {
+        Some((id, _, _)) => format!("{id}.jsonl"),
+        None => name.to_owned(),
+    };
+    let stem = base.strip_suffix(".jsonl")?;
+    let path = dir.join(format!("{stem}.trajectory.jsonl"));
+    // `peek_first_line` caps the read, which matters here: one trajectory line
+    // routinely runs to ~150 KB and the file may reach 10 MB.
+    let line = peek_first_line(&path)?;
+    serde_json::from_str::<TrajectoryKeyLine>(&line)
+        .ok()?
+        .session_key
+        .filter(|key| !key.is_empty())
+}
+
+/// Rungs 6 and 7, loaded at most once per root and only if some transcript
+/// actually needs them.
+///
+/// The state DB lives at the ROOT, not per agent, so an N-agent root would
+/// otherwise open and scan it N times. And on a healthy root the cheap rungs
+/// resolve nearly everything, so the common case should never open it at all -
+/// `audit_events` keeps one row per gateway-dispatched run for the life of the
+/// install, and loading it eagerly means paying for a table nothing will read.
+struct StateDbKeys {
+    root: PathBuf,
+    loaded: std::cell::OnceCell<HashMap<String, (String, &'static str)>>,
+}
+
+impl StateDbKeys {
+    fn new(root: &Path) -> Self {
+        StateDbKeys {
+            root: root.to_owned(),
+            loaded: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn get(&self, session_id: &str) -> Option<(String, &'static str)> {
+        self.loaded
+            .get_or_init(|| load_state_db_keys(&self.root))
+            .get(session_id)
+            .cloned()
+    }
+}
+
+/// `cron_run_logs` records one row per cron run (`session_id`, `session_key`);
+/// `audit_events` maps a session to its key for every gateway-dispatched run,
+/// which is how a hook or heartbeat beat is recovered when its sidecar is
+/// missing. Absent or unreadable -> an empty map, never an error: these are
+/// recovery rungs, and a host that has neither table is the normal file-era case.
+fn load_state_db_keys(root: &Path) -> HashMap<String, (String, &'static str)> {
+    let mut map: HashMap<String, (String, &'static str)> = HashMap::new();
+    let mut path = root.to_owned();
+    for segment in STATE_DB_RELATIVE {
+        path.push(segment);
+    }
+    if !path.is_file() {
+        return map;
+    }
+    let conn = match open_db(&path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "openclaw: state DB unreadable; cron/audit key recovery is unavailable");
+            return map;
+        }
+    };
+    for (table, source) in [
+        ("cron_run_logs", KEY_SOURCE_CRON_RUN_LOGS),
+        ("audit_events", KEY_SOURCE_AUDIT_EVENTS),
+    ] {
+        // Probe rather than letting `prepare` fail: absence is a clean
+        // control-flow signal, while a swallowed prepare error would hide a
+        // genuinely broken DB behind the same silent `continue`.
+        match has_table(&conn, table) {
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), table, %error, "openclaw: probing the state DB failed");
+                continue;
+            }
+            Ok(true) => {}
+        }
+        let sql = format!(
+            "SELECT session_id, session_key FROM {table} \
+             WHERE session_id IS NOT NULL AND session_key IS NOT NULL"
+        );
+        let rows = conn.prepare(&sql).and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.flatten().collect::<Vec<_>>())
+        });
+        match rows {
+            Ok(rows) => {
+                for (id, key) in rows {
+                    if !id.is_empty() && !key.is_empty() {
+                        map.entry(id).or_insert((key, source));
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), table, %error, "openclaw: reading the state DB failed");
+            }
+        }
+    }
+    map
+}
+
+/// Rung 8: an isolated cron run stamps its first user message with
+/// `[cron:<jobId> <jobName>]` (`cron/isolated-agent/run.ts:865`), which names the
+/// job even when nothing else on disk does.
+fn cron_prompt_prefix_key(agent_id: &str, first_user_text: &str) -> Option<String> {
+    let rest = first_user_text.trim_start().strip_prefix("[cron:")?;
+    let (inner, _) = rest.split_once(']')?;
+    let job_id = inner.split_whitespace().next()?;
+    (!job_id.is_empty()).then(|| format!("agent:{agent_id}:cron:{job_id}"))
+}
+
+/// The leading text of a `message` entry whose role is `user`. `content` is
+/// either a bare string or an array of parts, depending on how the turn was
+/// dispatched.
+fn first_user_text(value: &Value) -> Option<String> {
+    if entry_type(value) != Some("message") {
+        return None;
+    }
+    let message = value.get("message")?;
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => items.iter().find_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        }),
+        _ => None,
+    }
 }
 
 /// Parse `<sessionId>.jsonl.<reason>.<ts>[.zst]` into `(sessionId, reason, compressed)`.
@@ -1579,19 +2169,37 @@ fn parse_archive_name(name: &str) -> Option<(String, String, bool)> {
     Some((session_id.to_owned(), reason.to_owned(), compressed))
 }
 
-/// Collect ingestible archive + legacy sessions for one agent. Session keys
-/// resolve from a legacy `sessions.json` (Record<sessionKey, SessionEntry>);
-/// files with no resolvable key are documented non-ingest and skipped by the
-/// caller. `.deleted.` archives are excluded unless `ingest_deleted`.
+/// Collect ingestible archive + legacy sessions for one agent.
+///
+/// Every transcript in the directory is ingested. A session key is recovered
+/// through the [`FileKey`] ladder, and a transcript no rung resolves is
+/// attributed to its owning agent directory rather than dropped (issue #224,
+/// spec.md#adapter-integrity-no-silent-drops). `.deleted.` archives stay
+/// excluded unless `ingest_deleted`, except for cron run archives, which the
+/// retention reaper writes as routine cleanup rather than a user deletion.
 fn collect_file_sessions(
     adapter: &OpenClawAdapter,
     agent: &AgentDir,
+    state_keys: &StateDbKeys,
 ) -> Result<Vec<FileSession>, AdapterError> {
     let dir = &agent.sessions_dir;
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
-    let key_map = load_legacy_key_map(dir);
+    let SessionsJson {
+        keys: key_map,
+        entries: json_entries,
+    } = load_sessions_json(dir);
+    let cut_points = Arc::new(checkpoint_cut_points(&json_entries));
+    // One shared copy per directory: rungs 2-4 map many rotated ids onto the
+    // same key, so cloning the entry per session would duplicate the same
+    // ~14 KB `systemPromptReport` once per generation, and every clone is held
+    // for the whole root before the first read - including for the sessions the
+    // freshness oracle is about to drop.
+    let shared_entries: HashMap<&str, Arc<Value>> = json_entries
+        .iter()
+        .map(|(key, entry)| (key.as_str(), Arc::new(entry.clone())))
+        .collect();
     let io = |source| AdapterError::io(NAME, dir.display().to_string(), source);
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(io)? {
@@ -1615,59 +2223,97 @@ fn collect_file_sessions(
         {
             continue;
         }
-        let (session_id, compressed, is_archive) = match parse_archive_name(name) {
-            Some((session_id, reason, compressed)) => {
-                if reason == "deleted" && !adapter.ingest_deleted {
-                    continue;
-                }
-                (session_id, compressed, true)
-            }
+        let (compressed, is_archive, archive_reason) = match parse_archive_name(name) {
+            Some((_, reason, compressed)) => (compressed, true, Some(reason)),
             // Legacy primary transcript `<id>.jsonl` (not an archive suffix).
-            None => match name.strip_suffix(".jsonl") {
-                Some(session_id) if !session_id.is_empty() => (session_id.to_owned(), false, false),
-                _ => continue,
-            },
+            None if name.ends_with(".jsonl") && name.len() > ".jsonl".len() => (false, false, None),
+            None => continue,
         };
-        let Some(session_key) = key_map.get(&session_id).cloned() else {
-            // No resolvable session_key -> cannot attribute a project
-            // (spec.md#model-project-non-empty). Documented non-ingest.
-            continue;
-        };
-        if adapter.is_skipped(&session_key) {
+        // A compaction successor / checkpoint branch is `<ts>_<id>.jsonl`, so the
+        // id is the stem with that prefix removed, not the whole stem.
+        let session_id = transcript_stem(name);
+        if session_id.is_empty() {
             continue;
         }
         // One session id ingests once; the primary legacy transcript wins over
-        // an archive of the same id.
+        // an archive of the same id. `names` is sorted, so `<id>.jsonl` always
+        // precedes `<id>.jsonl.reset.<ts>`. This depends only on the id, so it
+        // runs BEFORE the key ladder - otherwise every superseded archive would
+        // have its sidecar opened, and possibly its whole body decompressed and
+        // parsed, only to be thrown away here.
         if is_archive && seen.contains(&session_id) {
             continue;
         }
+        // A `.deleted.` archive is a user deletion unless it is a cron RUN,
+        // which the retention reaper renames on a timer as routine cleanup
+        // (`session-key-utils.ts`). Rung 8 can never rescue one: it yields a
+        // bare job key with no `:run:` segment, so it would fail the test below
+        // after reading the entire transcript. Skipping it keeps the cheap
+        // rungs, which are the only ones that can resolve a run key anyway.
+        let excluded_deletion =
+            archive_reason.as_deref() == Some("deleted") && !adapter.ingest_deleted;
+        let path = dir.join(name);
+        let key = key_map
+            .get(&session_id)
+            .cloned()
+            .or_else(|| trajectory_key(dir, name).map(|key| (key, KEY_SOURCE_TRAJECTORY)))
+            .or_else(|| state_keys.get(&session_id))
+            .map(|(key, source)| FileKey::resolved(key, source))
+            .or_else(|| {
+                (!excluded_deletion)
+                    .then(|| cron_prompt_prefix_key_of(&path, compressed, &agent.agent_id))
+                    .flatten()
+                    .map(|key| FileKey::resolved(key, KEY_SOURCE_CRON_PROMPT_PREFIX))
+            })
+            // Nothing on disk names a key. Recover the session under its owning
+            // agent directory rather than dropping it; `project` stays non-empty
+            // (spec.md#model-project-non-empty) and the fallback is tagged so it
+            // never reads as something OpenClaw recorded.
+            .unwrap_or_else(|| FileKey::fallback(&agent.agent_id));
+
+        // A cron RUN key (`...:cron:<jobId>:run:<segment>`) is the reaper's
+        // signature; anything else under a `.deleted.` name is a real deletion.
+        if excluded_deletion
+            && key
+                .exact
+                .as_deref()
+                .is_none_or(|exact| cron_job_key(exact).is_none())
+        {
+            continue;
+        }
+        if adapter.is_skipped(&key.project_key) {
+            continue;
+        }
         seen.insert(session_id.clone());
+        let entry = key
+            .exact
+            .as_deref()
+            .and_then(|exact| shared_entries.get(exact))
+            .map(Arc::clone);
         out.push(FileSession {
-            path: dir.join(name),
+            path,
             session_id,
-            session_key,
+            key,
             compressed,
+            entry,
+            cut_points: Arc::clone(&cut_points),
         });
     }
     Ok(out)
 }
 
-/// Load the legacy `sessions.json` (Record<sessionKey, SessionEntry>) into a
-/// `sessionId -> sessionKey` map. Missing / malformed -> empty map.
-fn load_legacy_key_map(dir: &Path) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let Ok(bytes) = std::fs::read(dir.join("sessions.json")) else {
-        return map;
-    };
-    let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) else {
-        return map;
-    };
-    for (session_key, entry) in entries {
-        if let Some(session_id) = entry.get("sessionId").and_then(Value::as_str) {
-            map.insert(session_id.to_owned(), session_key);
-        }
-    }
-    map
+/// Rung 8 applied to one transcript: look for the `[cron:<jobId> ...]` stamp on
+/// its first user message. The stamp is on the run's opening prompt, so the scan
+/// stops at the first user message rather than materializing the transcript -
+/// the file can be multi-MB and this is the last rung before the fallback, so it
+/// runs on exactly the roots that have the most unresolved transcripts.
+fn cron_prompt_prefix_key_of(path: &Path, compressed: bool, agent_id: &str) -> Option<String> {
+    let lines = read_entry_lines(path, compressed).ok()?;
+    let text = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|value| first_user_text(&value))?;
+    cron_prompt_prefix_key(agent_id, &text)
 }
 
 fn read_entry_lines(path: &Path, compressed: bool) -> Result<Vec<String>, AdapterError> {
@@ -1800,6 +2446,44 @@ impl OpenClawAdapter {
                     continue;
                 };
                 let session_key = (*session.project).clone();
+                // The stored project is only a session key when a key was
+                // actually recovered. The agent-directory fallback names no
+                // key, so nothing can prove the session is gone upstream.
+                if session_key == fallback_project(&agent.agent_id) {
+                    report.preserved.push(PreserveNote {
+                        agent_id: agent.agent_id.clone(),
+                        session_id,
+                        reason:
+                            "ingested under the agent-directory fallback; no session key to check"
+                                .to_owned(),
+                    });
+                    continue;
+                }
+                // Machine-generated sessions are archived by OpenClaw's own
+                // retention, not by a person: the cron reaper renames a finished
+                // run to `.deleted.` on a timer, and hook/heartbeat runs rotate
+                // the same way. A `.deleted.` archive is only evidence of a USER
+                // deletion for a session a user could have been looking at.
+                //
+                // Deliberately broader than the ingest-side exemption in
+                // `collect_file_sessions`, which admits only cron `:run:` keys:
+                // that gate decides whether to READ a file and can afford to be
+                // narrow, while this one decides whether to ERASE stored history,
+                // which is irreversible. The two predicates differ because the
+                // costs of being wrong differ.
+                if matches!(
+                    session_kind(&session_key),
+                    Kind::Cron | Kind::Hook | Kind::Heartbeat
+                ) {
+                    report.preserved.push(PreserveNote {
+                        agent_id: agent.agent_id.clone(),
+                        session_id,
+                        reason: "machine-generated session archived by OpenClaw retention, \
+                                 not deleted by the user"
+                            .to_owned(),
+                    });
+                    continue;
+                }
                 let Some(conn) = &conn else {
                     report.preserved.push(PreserveNote {
                         agent_id: agent.agent_id.clone(),
@@ -1838,10 +2522,15 @@ fn deleted_archive_ids(dir: &Path) -> Vec<String> {
     };
     for entry in read.flatten() {
         if let Some(name) = entry.file_name().to_str()
-            && let Some((session_id, reason, _)) = parse_archive_name(name)
+            && let Some((_, reason, _)) = parse_archive_name(name)
             && reason == "deleted"
         {
-            ids.push(session_id);
+            // Must derive the id exactly as ingest does, or the lookup below
+            // misses: `parse_archive_name` alone leaves the `<ts>_` prefix on a
+            // deleted compaction successor or checkpoint branch, and the stored
+            // row is keyed without it, so a real deletion of one could never be
+            // reconciled.
+            ids.push(transcript_stem(name));
         }
     }
     ids.sort();
@@ -2110,12 +2799,11 @@ mod tests {
         assert_eq!(entries.len(), 1, "the file session is enumerated");
         match &entries[0].source {
             SessionSource::File {
-                session_id,
-                session_key,
-                ..
+                session_id, key, ..
             } => {
                 assert_eq!(session_id, "sess-file");
-                assert_eq!(session_key, "agent:bot:main");
+                assert_eq!(key.project_key, "agent:bot:main");
+                assert_eq!(key.source, KEY_SOURCE_SESSIONS_JSON);
             }
             SessionSource::Db { .. } => panic!("expected a file session, not a DB session"),
         }
@@ -2139,11 +2827,147 @@ mod tests {
             ),
             ("cron:nightly", Kind::Cron, "openclaw/cron"),
             ("hook:9f", Kind::Hook, "openclaw/hook"),
+            // Every key OpenClaw actually STORES is `agent:<id>:`-prefixed
+            // (`routing/session-key.ts` `toAgentStoreSessionKey`), so the bare
+            // forms above never occur on disk. Classifying only those left cron
+            // and hook sessions labelled `openclaw` and made `skip_kinds` dead.
+            ("agent:main:cron:9f3a-job", Kind::Cron, "openclaw/cron"),
+            (
+                "agent:main:cron:9f3a-job:run:1789055808553",
+                Kind::Cron,
+                "openclaw/cron",
+            ),
+            ("agent:main:hook:ingress", Kind::Hook, "openclaw/hook"),
+            ("agent:main:hook:2b17ce08-0487", Kind::Hook, "openclaw/hook"),
+            (
+                "agent:main:main:heartbeat",
+                Kind::Heartbeat,
+                "openclaw/heartbeat",
+            ),
+            // A checkpoint branch holds the operator's own conversation, so it
+            // stays in default search; its branch nature rides on lineage.
+            ("agent:main:dashboard:0ffe2a4d-e64a", Kind::Main, "openclaw"),
         ];
         for (key, kind, agent) in cases {
             assert_eq!(session_kind(key), kind, "kind for {key}");
             assert_eq!(session_kind(key).source_agent(), agent, "agent for {key}");
         }
+    }
+
+    #[test]
+    fn cron_run_keys_normalize_to_the_job_key() {
+        assert_eq!(
+            cron_job_key("agent:main:cron:job-1:run:1789055808553").as_deref(),
+            Some("agent:main:cron:job-1"),
+        );
+        // Already a job key, a hook uuid, and a non-cron key: unchanged. A hook
+        // uuid is a real identity - stripping it would merge distinct sessions.
+        for key in [
+            "agent:main:cron:job-1",
+            "agent:main:hook:2b17ce08-0487",
+            "agent:main:main",
+        ] {
+            assert_eq!(cron_job_key(key), None, "must not rewrite {key}");
+        }
+    }
+
+    #[test]
+    fn transcript_stem_drops_suffixes_and_the_successor_prefix() {
+        let cases = [
+            ("1ec642b4-2649.jsonl", "1ec642b4-2649"),
+            (
+                "1ec642b4-2649.jsonl.reset.2026-09-10T16-21-45.297Z",
+                "1ec642b4-2649",
+            ),
+            ("1ec642b4-2649.jsonl.deleted.1789055808553", "1ec642b4-2649"),
+            // Compaction successor / checkpoint branch.
+            (
+                "2026-09-10T15-59-30-484Z_95256a97-e3b0.jsonl",
+                "95256a97-e3b0",
+            ),
+            // An id that merely contains an underscore keeps it.
+            ("my_session.jsonl", "my_session"),
+        ];
+        for (name, id) in cases {
+            assert_eq!(transcript_stem(name), id, "stem of {name}");
+        }
+    }
+
+    #[test]
+    fn parent_session_path_reduces_to_an_id() {
+        assert_eq!(
+            parent_session_id_from_path(
+                "/home/user/.openclaw/agents/main/sessions/2026-09-10T15-59-30-484Z_95256a97.jsonl"
+            ),
+            "95256a97",
+        );
+        // A bare id (what the field was believed to hold) passes through.
+        assert_eq!(parent_session_id_from_path("95256a97"), "95256a97");
+    }
+
+    #[test]
+    fn cron_prompt_prefix_names_the_job() {
+        assert_eq!(
+            cron_prompt_prefix_key(
+                "main",
+                "[cron:bea4b2e5-44c2 beta] beta job message\nCurrent time: ...",
+            )
+            .as_deref(),
+            Some("agent:main:cron:bea4b2e5-44c2"),
+        );
+        // An ordinary turn names no job.
+        assert_eq!(cron_prompt_prefix_key("main", "what is the plan?"), None);
+    }
+
+    #[test]
+    fn first_user_text_reads_both_content_shapes() {
+        // A gateway-dispatched turn stores `content` as a bare string; a
+        // TUI turn stores an array of parts.
+        let string_form = json!({
+            "type": "message",
+            "id": "7b6e5a3a",
+            "message": { "role": "user", "content": "plain string turn" },
+        });
+        let array_form = json!({
+            "type": "message",
+            "message": { "role": "user", "content": [{ "type": "text", "text": "array turn" }] },
+        });
+        assert_eq!(
+            first_user_text(&string_form).as_deref(),
+            Some("plain string turn")
+        );
+        assert_eq!(first_user_text(&array_form).as_deref(), Some("array turn"));
+        // Assistant turns and non-message entries are not user text.
+        let assistant = json!({
+            "type": "message",
+            "message": { "role": "assistant", "content": "reply" },
+        });
+        assert_eq!(first_user_text(&assistant), None);
+        assert_eq!(first_user_text(&json!({ "type": "session" })), None);
+    }
+
+    #[test]
+    fn checkpoint_cut_points_skip_ambiguous_parents() {
+        // In-place compaction (no `truncateAfterCompaction`) writes a record
+        // whose pre and post name the SAME session, so one session can carry
+        // several records pointing at itself with different entry ids.
+        let entries = serde_json::from_value(json!({
+            "agent:main:main": {
+                "compactionCheckpoints": [
+                    { "postCompaction": { "sessionId": "clean", "entryId": "f72ac723" } },
+                    { "postCompaction": { "sessionId": "muddled", "entryId": "aaa" } },
+                    { "postCompaction": { "sessionId": "muddled", "entryId": "bbb" } },
+                ],
+            },
+        }))
+        .expect("object");
+        let cuts = checkpoint_cut_points(&entries);
+        assert_eq!(cuts.get("clean").map(String::as_str), Some("f72ac723"));
+        assert_eq!(
+            cuts.get("muddled"),
+            None,
+            "an ambiguous parent is left unset rather than guessed"
+        );
     }
 
     #[test]
