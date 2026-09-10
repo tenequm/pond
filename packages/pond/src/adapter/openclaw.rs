@@ -9,8 +9,10 @@
 //!   `<root>/agents/<agentId>/sessions/`: `sessions.json` (a routing key ->
 //!   CURRENT session map, see "File-era session keys" below), live
 //!   `<sessionId>.jsonl` transcripts, and archives
-//!   (`<sessionId>.jsonl.<reason>.<ts>[.zst]`, reason in {reset, bak,
-//!   deleted}). On 2026.6.5-2026.7.1 `openclaw-agent.sqlite` already exists but
+//!   (`<sessionId>.jsonl.<reason>.<ts>[.<generation>][.zst]`, reason in
+//!   {reset, bak, deleted}; everything after the reason token is untyped and
+//!   ignored, see `parse_archive_name`). On 2026.6.5-2026.7.1
+//!   `openclaw-agent.sqlite` already exists but
 //!   holds only auth/agent state, so the file store is the sole source.
 //! - **DB era v1, 2026.7.2-2026.7.x.** The per-agent WAL database at
 //!   `<root>/agents/<agentId>/agent/openclaw-agent.sqlite` (the Gateway is the
@@ -755,6 +757,10 @@ fn read_survivors(
                                 entry: None,
                                 cut_points: &HashMap::new(),
                                 preloaded: Some(lines),
+                                // `session_transcript_archives` exists only in
+                                // the v2 layout, and these rows are reclaimed
+                                // `session_windows` generations.
+                                resequenced: true,
                             },
                             tx,
                         )
@@ -781,6 +787,7 @@ fn read_survivors(
                     entry: entry.as_deref(),
                     cut_points: &cut_points,
                     preloaded: None,
+                    resequenced: false,
                 },
                 tx,
             ),
@@ -832,14 +839,20 @@ fn read_db_session(
     };
     // `session_nodes.entry_json` is the 2026.8.1-and-later home of what
     // `session_entries.entry_json` held; both are keyed by session_key.
-    let entry_sql = match era {
-        DbEra::Windows => "SELECT entry_json FROM session_nodes WHERE session_key = ?1",
-        DbEra::Sessions | DbEra::FileEra | DbEra::Unrecognized { .. } => {
-            "SELECT entry_json FROM session_entries WHERE session_key = ?1"
-        }
+    let (entry_table, entry_sql) = match era {
+        DbEra::Windows => (
+            "session_nodes",
+            "SELECT entry_json FROM session_nodes WHERE session_key = ?1",
+        ),
+        DbEra::Sessions | DbEra::FileEra | DbEra::Unrecognized { .. } => (
+            "session_entries",
+            "SELECT entry_json FROM session_entries WHERE session_key = ?1",
+        ),
     };
-    let entry =
-        query_one_opt::<String>(conn, entry_sql, [session_key]).map(|text| json_or_string(&text));
+    let entry = match query_one_required::<String>(conn, entry_table, entry_sql, [session_key]) {
+        Ok(found) => found.map(|text| json_or_string(&text)),
+        Err(error) => return tx.blocking_send(Err(error)).is_ok(),
+    };
     // `session_transcript_generations` was dropped in 2026.8.1.
     // `query_one_opt` swallows the missing-table prepare error to `None`, so
     // asking anyway would work - but it would be a query issued once per
@@ -879,18 +892,49 @@ fn read_db_session(
             // only path that sets `fork_source_entry_id`;
             // `sessions.compaction.branch` sets the key/id without one, and
             // then `parent_message_id` stays unset rather than invented.
-            let (fork_parent, cut_point) = fork_source(conn, session_key);
+            //
+            // Both sources below are per-KEY - `session_nodes` has one row per
+            // key, and `entry_json` comes from that same row - while this
+            // function runs once per GENERATION. Only the generation the key
+            // was created as may carry the edge; a later rollover asking the
+            // same question gets the same answer and would assert a cut-point
+            // it never had.
+            let root = match is_root_generation(conn, session_key, session_id) {
+                Ok(root) => root,
+                Err(error) => return tx.blocking_send(Err(error)).is_ok(),
+            };
+            let (fork_parent, cut_point) = if root {
+                match fork_source(conn, session_key) {
+                    Ok(found) => found,
+                    Err(error) => return tx.blocking_send(Err(error)).is_ok(),
+                }
+            } else {
+                (None, None)
+            };
             if let Some(parent) = fork_parent {
                 if lineage.parent_message_id.is_none() {
                     lineage.parent_message_id = cut_point;
                 }
                 lineage.relation = Some("fork");
                 Some(parent)
+            } else if root {
+                match lineage.parent_session_key.as_deref() {
+                    Some(key) => match resolve_window_key(conn, key) {
+                        Ok(resolved) => resolved,
+                        Err(error) => return tx.blocking_send(Err(error)).is_ok(),
+                    },
+                    None => None,
+                }
             } else {
-                lineage
-                    .parent_session_key
-                    .as_deref()
-                    .and_then(|key| resolve_window_key(conn, key))
+                // A rotation of a spawned key is not itself spawned. The key
+                // survives in `options.openclaw` either way, but the relation
+                // tag must not: `entry_json` is the per-key row, so a tag
+                // derived from it alone describes how the KEY began. Only a
+                // tag the generation's own transcript header supports stays.
+                if lineage.header_parent_id.is_none() && lineage.parent_session_key.is_some() {
+                    lineage.relation = None;
+                }
+                None
             }
         }
         _ => lineage
@@ -935,7 +979,10 @@ fn read_db_session(
 struct FileRead<'a> {
     agent_id: &'a str,
     path: &'a Path,
-    /// The id the filename gave at enumeration; the header's `id` overrides it.
+    /// The id the filename gave at enumeration, and the id this session is
+    /// stored under. A header `id` that disagrees does NOT override it - it is
+    /// warned about and kept in options instead, because enumeration is where
+    /// identity is used (see the read below).
     enumerated_id: &'a str,
     key: &'a FileKey,
     compressed: bool,
@@ -949,6 +996,15 @@ struct FileRead<'a> {
     /// handling, lineage, entry emission - is identical for both, which is the
     /// point: an archived generation is a transcript, wherever its bytes live.
     preloaded: Option<Vec<String>>,
+    /// Whether an id-less entry gets the v2 content digest rather than
+    /// `<session_id>:<seq>`. Carries the era across the one seam where it would
+    /// otherwise be lost: `session_transcript_archives` is a v2-only table
+    /// holding generations that WERE live `session_windows` rows, so an entry
+    /// read from a blob must land on the id it had while live. Without this the
+    /// same record is stored twice under two primary keys the moment OpenClaw
+    /// reclaims a generation between syncs, and `WhenMatched::DoNothing` cannot
+    /// collapse them (`adapter-integrity-dedup`). File-era reads pass `false`.
+    resequenced: bool,
 }
 
 fn read_file_session(
@@ -964,6 +1020,7 @@ fn read_file_session(
         entry,
         cut_points,
         preloaded,
+        resequenced,
     } = read;
     let lines = match preloaded {
         Some(lines) => lines,
@@ -1046,7 +1103,7 @@ fn read_file_session(
         // A file or an archive blob is immutable once written, so the line
         // number is a stable ordering key and the id-less fallback keeps the
         // spelling every earlier pond version stored.
-        for event in entry_events(session_id, line_no as i64, &value, anchor, false) {
+        for event in entry_events(session_id, line_no as i64, &value, anchor, resequenced) {
             emit!(tx, Ok(AdapterYield::Event(event)));
         }
     }
@@ -1369,6 +1426,26 @@ fn query_one_opt<T: rusqlite::types::FromSql>(
         .flatten()
 }
 
+/// The same fetch where absence is normal but FAILURE is not: the era has
+/// already decided the table exists, and the value feeds a session row that is
+/// written exactly once. Losing lineage to a transient error would strand the
+/// edge for the life of the store while the source DB still holds it
+/// (`adapter-lineage-complete-restore`), so the two cases stay distinct.
+fn query_one_required<T: rusqlite::types::FromSql>(
+    conn: &Connection,
+    table: &str,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Option<T>, AdapterError> {
+    let mut stmt = conn
+        .prepare_cached(sql)
+        .map_err(|error| db_error(Path::new(table), "prepare lineage read", &error))?;
+    stmt.query_row(params, |row| row.get::<_, Option<T>>(0))
+        .optional()
+        .map_err(|error| db_error(Path::new(table), "query lineage read", &error))
+        .map(|found| found.flatten())
+}
+
 /// Per-DB (not per-session) schema version, read once and memoized by the
 /// caller alongside the connection cache.
 fn query_schema_version(conn: &Connection) -> Option<i64> {
@@ -1482,11 +1559,18 @@ fn entry_content_id(session_id: &str, value: &Value) -> String {
 /// Two statements on purpose. `transcript_events` is keyed
 /// `(session_id, seq)` with no index on `created_at`, so ordering by
 /// `created_at` needs a sorter - and a one-statement form would put the whole
-/// `event_json` payload into every sorter record, turning a one-row read into
-/// a read of the entire transcript, once per session, on every sync. Selecting
-/// `seq` alone sorts two integers per row, then the payload comes back through
-/// a primary-key point lookup. Same answer, and the sorter no longer carries
-/// the transcript.
+/// `event_json` payload into every sorter record. Selecting `seq` alone sorts
+/// two integers per row, then the payload comes back through a primary-key
+/// point lookup.
+///
+/// What that does NOT buy is a one-row read. `created_at` is unindexed, so
+/// SQLite still visits every row of the session in the table b-tree - pages
+/// that hold `event_json` inline - to read the column it sorts on. The split
+/// keeps the transcript out of the SORTER; it does not keep it out of the
+/// pages. Ordering on `seq` alone would be a pure index seek, but `seq` is an
+/// insertion counter and nothing in the schema promises it agrees with
+/// `created_at`, so that is a change to make against evidence, not on the
+/// strength of the plan it would produce (#234).
 fn db_session_watermark(conn: &Connection, session_id: &str) -> Option<i64> {
     let mut newest = conn
         .prepare_cached(
@@ -1590,7 +1674,8 @@ fn build_session(
         }
     }
     match file_key {
-        // A file-era key is recovered, so record which rung produced it. On the
+        // A key was recovered - by the file-era ladder, or stated outright by an
+        // archive row or the state DB - so record what produced it. On the
         // agent-directory fallback no `session_key` is written at all: pond
         // chose that project, OpenClaw never stored such a key, and inventing
         // one here would be synthesis (spec.md#model-no-synthesis).
@@ -1775,30 +1860,75 @@ fn resolve_route(conn: &Connection, session_key: &str) -> Option<String> {
 /// real-looking wrong id, which `model-no-synthesis` treats as worse than an
 /// absent one. `fork_source_session_id` is the id recorded at fork time and
 /// never moves.
-fn fork_source(conn: &Connection, session_key: &str) -> (Option<String>, Option<String>) {
-    let mut stmt = match conn.prepare_cached(
-        "SELECT fork_source_session_id, fork_source_entry_id FROM session_nodes \
-         WHERE session_key = ?1",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return (None, None),
-    };
-    stmt.query_row([session_key], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-        ))
-    })
-    .optional()
-    .ok()
-    .flatten()
-    // A cut-point without a parent id is incoherent (spec.md 4): drop it
-    // rather than emit a dangling `parent_message_id`.
-    .map(|(parent, entry)| match parent {
-        Some(parent) => (Some(parent), entry),
-        None => (None, None),
-    })
-    .unwrap_or((None, None))
+/// Errors propagate rather than reading as "no parent". A session row is
+/// written once - `sessions_owned` filters to sessions absent from the store -
+/// so a lineage edge lost to a transient `SQLITE_BUSY` here is lost for the
+/// life of the store, with the source DB still holding it
+/// (`adapter-lineage-complete-restore`).
+fn fork_source(
+    conn: &Connection,
+    session_key: &str,
+) -> Result<(Option<String>, Option<String>), AdapterError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT fork_source_session_id, fork_source_entry_id FROM session_nodes \
+             WHERE session_key = ?1",
+        )
+        .map_err(|error| db_error(Path::new("session_nodes"), "prepare fork source", &error))?;
+    let found = stmt
+        .query_row([session_key], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .optional()
+        .map_err(|error| db_error(Path::new("session_nodes"), "query fork source", &error))?;
+    Ok(found
+        // A cut-point without a parent id is incoherent (spec.md 4): drop it
+        // rather than emit a dangling `parent_message_id`.
+        .map(|(parent, entry)| match parent {
+            Some(parent) => (Some(parent), entry),
+            None => (None, None),
+        })
+        .unwrap_or((None, None)))
+}
+
+/// Whether `session_id` is the generation its key was CREATED as, which is the
+/// only generation a per-key lineage edge may be stamped on.
+///
+/// `session_nodes` holds one row per `session_key`; `session_windows` holds one
+/// per generation. So a fork's `fork_source_*`, and a spawn's parent key in
+/// `entry_json`, describe the moment the key came into being - not the
+/// rotations that follow it. Applying them per generation would tell the store
+/// that a rollover was cut from an entry it never touched, which is the
+/// synthesis spec.md 4 forbids: "a rotation that starts a fresh context
+/// without carrying the predecessor's history forward is NOT lineage".
+///
+/// The root is the generation with no `previous_session_id`. That column is
+/// only ever WRITTEN by the rollover path, so it is read here only to DECLINE
+/// an edge, never to assert one - a successor that carries it is definitively
+/// not the root. If a key has more than one row without it, the layout cannot
+/// say which generation the key started as, and every generation declines:
+/// `model-no-synthesis` prefers an absent edge to a real-looking wrong one,
+/// and `resolve_window_key` below already resolves its own ambiguity this way.
+fn is_root_generation(
+    conn: &Connection,
+    session_key: &str,
+    session_id: &str,
+) -> Result<bool, AdapterError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT session_id FROM session_windows \
+             WHERE session_key = ?1 AND previous_session_id IS NULL LIMIT 2",
+        )
+        .map_err(|error| db_error(Path::new("session_windows"), "prepare root probe", &error))?;
+    let roots: Vec<String> = stmt
+        .query_map([session_key], |row| row.get::<_, String>(0))
+        .map_err(|error| db_error(Path::new("session_windows"), "query root probe", &error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| db_error(Path::new("session_windows"), "read root probe", &error))?;
+    Ok(matches!(roots.as_slice(), [only] if only == session_id))
 }
 
 /// Resolve a parent named only by KEY to a session id, in the v2 layout, and
@@ -1807,19 +1937,27 @@ fn fork_source(conn: &Connection, session_key: &str) -> (Option<String>, Option<
 /// the parent, and picking the newest would be a guess
 /// (`model-no-synthesis`) - the key stays in `options.openclaw` instead, where
 /// it is recoverable without asserting a relationship.
-fn resolve_window_key(conn: &Connection, session_key: &str) -> Option<String> {
+///
+/// Ambiguity and failure are different answers and are reported differently:
+/// several generations is `Ok(None)` (the source cannot say), while an
+/// unreadable table is an error, for the same write-once reason as
+/// `fork_source`.
+fn resolve_window_key(
+    conn: &Connection,
+    session_key: &str,
+) -> Result<Option<String>, AdapterError> {
     let mut stmt = conn
         .prepare_cached("SELECT session_id FROM session_windows WHERE session_key = ?1 LIMIT 2")
-        .ok()?;
+        .map_err(|error| db_error(Path::new("session_windows"), "prepare key resolve", &error))?;
     let mut ids: Vec<String> = stmt
         .query_map([session_key], |row| row.get::<_, String>(0))
-        .ok()?
-        .filter_map(Result::ok)
-        .collect();
-    match ids.len() {
+        .map_err(|error| db_error(Path::new("session_windows"), "query key resolve", &error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| db_error(Path::new("session_windows"), "read key resolve", &error))?;
+    Ok(match ids.len() {
         1 => ids.pop(),
         _ => None,
-    }
+    })
 }
 
 fn parse_ts(text: &str) -> Option<DateTime<Utc>> {
@@ -2414,8 +2552,14 @@ struct FileSession {
     cut_points: Arc<HashMap<String, String>>,
 }
 
-/// The session key a file-era transcript resolved to, plus the rung of the
-/// ladder that produced it (issue #224).
+/// The session key a transcript resolved to, plus the rung of the ladder that
+/// produced it (issue #224).
+///
+/// Named for the file era because that is where the ladder is needed, but not
+/// limited to it: `FileKey::from_row` carries the key a
+/// `session_transcript_archives` row states outright, and a v2 cron session
+/// takes its exact key from the root state DB. Both record "no ladder" as
+/// their source rather than pretending to a rung.
 ///
 /// `sessions.json` maps a routing key to its CURRENT session only, so every
 /// rotated-out generation - isolated cron runs, hook runs, isolated heartbeat
@@ -2765,23 +2909,23 @@ fn load_state_db_keys(root: &Path) -> HashMap<String, (String, &'static str)> {
             "SELECT session_id, session_key FROM {table} \
              WHERE session_id IS NOT NULL AND session_key IS NOT NULL"
         );
-        let rows = conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map([], |row| {
+        // Straight from the cursor into the map. `audit_events` is documented
+        // above as one row per gateway-dispatched run for the life of the
+        // install, so collecting into a Vec first would hold the whole table
+        // and the map it feeds in memory at the same time.
+        let read = conn.prepare(&sql).and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map(|rows| rows.flatten().collect::<Vec<_>>())
-        });
-        match rows {
-            Ok(rows) => {
-                for (id, key) in rows {
-                    if !id.is_empty() && !key.is_empty() {
-                        map.entry(id).or_insert((key, source));
-                    }
+            })?;
+            for (id, key) in rows.flatten() {
+                if !id.is_empty() && !key.is_empty() {
+                    map.entry(id).or_insert((key, source));
                 }
             }
-            Err(error) => {
-                tracing::warn!(path = %path.display(), table, %error, "openclaw: reading the state DB failed");
-            }
+            Ok(())
+        });
+        if let Err(error) = read {
+            tracing::warn!(path = %path.display(), table, %error, "openclaw: reading the state DB failed");
         }
     }
     map
@@ -2917,7 +3061,25 @@ fn collect_file_sessions(
         // runs BEFORE the key ladder - otherwise every superseded archive would
         // have its sidecar opened, and possibly its whole body decompressed and
         // parsed, only to be thrown away here.
-        if is_archive && seen.contains(&session_id) {
+        //
+        // The guard is NOT conditional on `is_archive`, though it was when the
+        // stem and the id were the same string and a non-archive collision was
+        // impossible by construction. `transcript_stem` now strips a `<ts>_`
+        // successor prefix, so `<ts>_<id>.jsonl` and `<id>.jsonl` reduce to one
+        // id, and emitting both would put two different transcripts into one
+        // session under the same primary key - the "same key, different
+        // content are not duplicates" hazard this module's header names. That
+        // pairing should not occur (a successor's id is freshly minted), so it
+        // is reported rather than absorbed quietly.
+        if seen.contains(&session_id) {
+            if !is_archive {
+                tracing::warn!(
+                    file = %name,
+                    session_id = %session_id,
+                    "openclaw: two transcripts reduce to one session id; keeping the first, \
+                     which is what dedup and freshness key on"
+                );
+            }
             continue;
         }
         // A `.deleted.` archive is a user deletion unless it is a cron RUN,
@@ -2979,10 +3141,17 @@ fn collect_file_sessions(
 }
 
 /// Rung 8 applied to one transcript: look for the `[cron:<jobId> ...]` stamp on
-/// its first user message. The stamp is on the run's opening prompt, so the scan
-/// stops at the first user message rather than materializing the transcript -
-/// the file can be multi-MB and this is the last rung before the fallback, so it
-/// runs on exactly the roots that have the most unresolved transcripts.
+/// its first user message. The stamp is on the run's opening prompt, so only
+/// the JSON PARSING is lazy - the `find_map` stops at the first user message.
+///
+/// The read is not. `read_entry_lines` reads the whole file, decompresses it in
+/// full when it is `.zst`, and allocates every line as an owned `String` before
+/// the search begins, so a multi-MB transcript is materialized to answer a
+/// question about its opening prompt. This is the last rung before the
+/// fallback, so it runs on exactly the roots with the most unresolved
+/// transcripts - the ones that can least afford it. `jsonl::peek_nth_line`
+/// bounds each read and would fix the uncompressed case; the compressed one
+/// needs a streaming decoder rather than `decode_all` (#234).
 fn cron_prompt_prefix_key_of(path: &Path, compressed: bool, agent_id: &str) -> Option<String> {
     let lines = read_entry_lines(path, compressed).ok()?;
     let text = lines
@@ -3042,10 +3211,18 @@ fn fetch_archive_lines(
         ));
     }
 
+    // The compressed blob has done its job once the digest is verified and the
+    // bytes are out. Holding it to the end of the function would keep the
+    // archive in memory twice - three times once `text` exists - for every
+    // archived generation enumerated.
     let bytes = match encoding.as_str() {
         "identity" => blob,
-        "zstd" => zstd::decode_all(blob.as_slice())
-            .map_err(|source| AdapterError::io(NAME, location.clone(), source))?,
+        "zstd" => {
+            let decoded = zstd::decode_all(blob.as_slice())
+                .map_err(|source| AdapterError::io(NAME, location.clone(), source))?;
+            drop(blob);
+            decoded
+        }
         other => {
             return Err(AdapterError::schema(
                 NAME,
@@ -3163,8 +3340,8 @@ pub struct ReconciliationReport {
 
 impl OpenClawAdapter {
     /// Reconcile `.deleted.` archives (decision 7). A deleted-reason archive
-    /// whose session_key has NO live `session_entries` row is an explicit user
-    /// deletion -> [`EraseTarget`]; the same archive with a live entry (its
+    /// whose session_key has NO live entry row is an explicit user deletion ->
+    /// [`EraseTarget`]; the same archive with a live entry (its
     /// session_key still routed) is a budget eviction of an old generation ->
     /// PRESERVE. Ambiguity (unreadable DB, key unknown, session absent from
     /// pond) always resolves to preserve. This is a pure detection pass: it
@@ -3180,6 +3357,12 @@ impl OpenClawAdapter {
         let agents = list_agents(self).map_err(anyhow::Error::new)?;
         for agent in agents {
             let conn = agent.db_path.as_deref().and_then(|p| open_db(p).ok());
+            // Once per agent DB. The schema cannot change under an open
+            // connection, and the loop below runs once per `.deleted.` archive.
+            let entry_table = match &conn {
+                Some(conn) => live_entry_table(conn),
+                None => Ok(None),
+            };
             let deleted = deleted_archive_ids(&agent.sessions_dir);
             for session_id in deleted {
                 // Only sessions pond already stored can be erased; the archived
@@ -3249,7 +3432,16 @@ impl OpenClawAdapter {
                     });
                     continue;
                 };
-                match session_entry_exists(conn, &session_key) {
+                let probe = match &entry_table {
+                    Ok(Some(table)) => {
+                        session_entry_exists(conn, table, &session_key).map_err(|e| e.to_string())
+                    }
+                    Ok(None) => Ok(None),
+                    // The resolution failed once, for the whole agent DB; each
+                    // archive still reports its own outcome.
+                    Err(error) => Err(error.to_string()),
+                };
+                match probe {
                     Ok(Some(true)) => report.preserved.push(PreserveNote {
                         agent_id: agent.agent_id.clone(),
                         session_id,
@@ -3341,26 +3533,38 @@ fn deleted_archive_ids(dir: &Path) -> Vec<String> {
 /// `None` means "no probe applies here" - an unknown schema - and the caller
 /// preserves. That is deliberately distinct from `Ok(false)`, which means the
 /// probe ran and found nothing.
-fn session_entry_exists(
-    conn: &Connection,
-    session_key: &str,
-) -> Result<Option<bool>, AdapterError> {
-    // Propagated, not `unwrap_or(false)`: a busy or corrupt DB is a third
-    // case, and folding it into `None` would report "unknown schema" for a
-    // schema we simply could not read - the same swallowed-error shape this
-    // function was rewritten to remove. The caller preserves on `Err` too, so
-    // the safe direction is unchanged; only the reason it logs gets honest.
+/// Which table holds live session entries on this agent DB, or `None` for a
+/// schema with neither.
+///
+/// Resolved once per connection by the caller rather than per session key: the
+/// answer cannot change while a connection is open, `sqlite_master` carries no
+/// index on `name`, and the loop that asks runs once per `.deleted.` archive -
+/// a population the cron reaper grows on a timer.
+///
+/// Errors propagate rather than reading as "no such schema": a busy or corrupt
+/// DB is a third case, and folding it into `None` would report "unknown
+/// schema" for a schema we simply could not read. The caller preserves on
+/// `Err` too, so the safe direction is unchanged; only the reason it logs
+/// gets honest.
+fn live_entry_table(conn: &Connection) -> Result<Option<&'static str>, AdapterError> {
     let probe = |table: &'static str| {
         has_table(conn, table)
             .map_err(|error| db_error(Path::new(table), "probe live-entry table", &error))
     };
-    let table = if probe("session_nodes")? {
-        "session_nodes"
+    if probe("session_nodes")? {
+        Ok(Some("session_nodes"))
     } else if probe("session_entries")? {
-        "session_entries"
+        Ok(Some("session_entries"))
     } else {
-        return Ok(None);
-    };
+        Ok(None)
+    }
+}
+
+fn session_entry_exists(
+    conn: &Connection,
+    table: &'static str,
+    session_key: &str,
+) -> Result<Option<bool>, AdapterError> {
     let sql = format!("SELECT 1 FROM {table} WHERE session_key = ?1 LIMIT 1");
     let mut stmt = conn
         .prepare_cached(&sql)

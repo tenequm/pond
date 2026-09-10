@@ -8,10 +8,11 @@
 //! any real `~/.openclaw`.
 //!
 //! The real-capture suite at the bottom is the deliberate exception: it runs
-//! against `tests/fixtures/adapter/openclaw-captures/`, four complete state
+//! against `tests/fixtures/adapter/openclaw-captures/`, five complete state
 //! roots driven out of the actual OpenClaw runtime in a throwaway `$HOME` with a
-//! stub model. Synthetic trees are what let issue #224 hide - they encoded what
-//! we believed OpenClaw writes, and that belief was wrong.
+//! stub model - four file-era (2026.7.1-2) and one DB-era (2026.9.3). Synthetic
+//! trees are what let issue #224 hide - they encoded what we believed OpenClaw
+//! writes, and that belief was wrong.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::Path;
@@ -819,9 +820,10 @@ async fn source_rewrite_re_syncs_additively_keeping_the_superset() -> anyhow::Re
 // -- Real-capture suite (issue #224) -----------------------------------------
 //
 // The cases above build synthetic trees, which is exactly what let issue #224
-// hide: the adapter matched what we believed OpenClaw writes. These four
-// fixtures are complete state roots copied out of the real runtime
-// (2026.7.1-2), so they assert against what it actually wrote. See
+// hide: the adapter matched what we believed OpenClaw writes. These fixtures
+// are complete state roots copied out of the real runtime, so they assert
+// against what it actually wrote. The four file-era roots below are
+// 2026.7.1-2; the DB-era root in its own section further down is 2026.9.3. See
 // `tests/fixtures/README.md`, section `openclaw-captures`.
 
 const CAPTURES: &str = concat!(
@@ -1178,6 +1180,107 @@ async fn db_era_forks_carry_a_cut_point_and_rollovers_carry_none() -> anyhow::Re
     Ok(())
 }
 
+/// Copy a captured root so a test can add a row the capture does not contain.
+fn copy_tree(from: &Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A fork whose key later rolls over.
+///
+/// `session_nodes` holds ONE row per `session_key`, so `fork_source_session_id`
+/// and `fork_source_entry_id` describe the moment the KEY was created;
+/// `session_windows` holds one row per generation and the read runs per
+/// generation. Ask the per-key table once per generation and every generation
+/// claims the same cut-point - so a rollover, which starts a fresh context and
+/// carries nothing forward, ends up asserting it was cut from an entry it never
+/// touched (spec.md 4, `model-no-synthesis`).
+///
+/// The committed capture cannot catch this and neither can
+/// `db_era_forks_carry_a_cut_point_and_rollovers_carry_none`: the only forked
+/// key there has exactly one generation, and the two multi-generation keys have
+/// no fork source. The combination has to be constructed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forked_key_that_rolls_over_gives_the_rollover_no_lineage() -> anyhow::Result<()> {
+    // The capture's one forked generation, and its key.
+    const FORKED: &str = "8e3f8044-14d1-4db5-b61b-ac60abaa591c";
+    const KEY: &str = "agent:main:dashboard:01ee5473-28f2-4312-8112-2998d903624f";
+    // The rollover successor this test adds; not in the capture.
+    const ROLLED: &str = "00000000-0000-4000-8000-0000000f0175";
+
+    let scratch = TempDir::new()?;
+    let root = scratch.path().join("root");
+    copy_tree(&capture("db-era"), &root)?;
+    {
+        let conn = Connection::open(
+            root.join("agents")
+                .join("main")
+                .join("agent")
+                .join("openclaw-agent.sqlite"),
+        )?;
+        // The capture is a trimmed DB: `session_windows` declares a foreign key
+        // into `conversations`, which the capture does not carry, and SQLite
+        // resolves a parent table at prepare time even for a NULL child value.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        conn.execute(
+            "INSERT INTO session_windows \
+             (session_id, session_key, previous_session_id, reason, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'rollover', 1, 1)",
+            rusqlite::params![ROLLED, KEY, FORKED],
+        )?;
+    }
+
+    let (store, _store_dir) = ingest(&root).await;
+
+    let rolled = store
+        .get_session(ROLLED)
+        .await?
+        .expect("the rollover generation is ingested");
+    assert!(
+        rolled.session.parent_session_id.is_none(),
+        "a rollover must not inherit its key's fork parent: {:?}",
+        rolled.session.parent_session_id
+    );
+    assert!(
+        rolled.session.parent_message_id.is_none(),
+        "a rollover must not claim a cut-point it never had: {:?}",
+        rolled.session.parent_message_id
+    );
+    assert_eq!(
+        rolled
+            .session
+            .options
+            .get("openclaw")
+            .and_then(|o| o.get("relation")),
+        None,
+        "nor keep the relation tag, which would say 'fork' with nothing to point at"
+    );
+
+    // The edge is declined for the successor, not lost for the fork itself.
+    let forked = store
+        .get_session(FORKED)
+        .await?
+        .expect("the forked generation is ingested");
+    assert!(
+        forked.session.parent_session_id.is_some(),
+        "the generation the key was created as still carries the real fork edge"
+    );
+    assert!(
+        forked.session.parent_message_id.is_some(),
+        "and its cut-point"
+    );
+    Ok(())
+}
+
 /// A deleted session survives only as a `session_transcript_archives` blob.
 /// Deletion is an erasure intent, so it stays out by default - but it must be
 /// ACCOUNTED FOR, not silently dropped, which is what `reconcile_deletions`
@@ -1189,10 +1292,24 @@ async fn db_era_deleted_archive_is_excluded_but_reported() -> anyhow::Result<()>
     let (store, _dir) = ingest(&root).await;
     let adapter = OpenClawAdapter::new(&root);
     let report = adapter.reconcile_deletions(&store).await?;
+    // WHICH bucket is the whole point: `erase.len() + preserved.len() == 1`
+    // would pass whether the archive is preserved or slated for an
+    // irreversible purge, which is the one distinction this pass exists to
+    // draw.
+    assert!(
+        report.erase.is_empty(),
+        "a deleted archive pond never ingested must not be an erase target: {:?}",
+        report.erase
+    );
+    assert_eq!(report.preserved.len(), 1, "and it must still be REPORTED");
+    // The two policies compose: `.deleted.` archives are excluded from ingest,
+    // so reconciliation finds no stored session and stops there. It never
+    // reaches the live-entry probe, which is why that probe's DB-era behaviour
+    // is asserted by `an_auth_only_db_stays_quiet_and_is_not_an_error` and the
+    // file-era cases rather than here.
     assert_eq!(
-        report.erase.len() + report.preserved.len(),
-        1,
-        "the one deleted archive is accounted for either way"
+        report.preserved[0].reason, "not stored in pond; nothing to erase",
+        "the reason must name the actual finding, not a classification it never made"
     );
     Ok(())
 }

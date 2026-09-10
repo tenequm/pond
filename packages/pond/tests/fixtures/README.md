@@ -594,7 +594,10 @@ the file session store entirely, so on 2026.9.3 there is no file tier at all:
 file it then holds is a compressed archive blob, not a transcript. Everything
 the file-era adapter reads - `sessions.json`, `<id>.jsonl`,
 `.trajectory.jsonl`, `.trajectory-path.json` - is absent, and pond ingested 0
-of this root's 6 sessions before the fix.
+of this root's 8 session generations before the fix. Those 8 generations
+(`session_windows` rows) sit across 6 routing keys (`session_nodes` rows); pond
+now ingests all 8, which is what the `every_db_era_generation_is_ingested`
+integration test asserts.
 
 - Provenance: OpenClaw `2026.9.3` (commit `1391f7c`; the fixture's own
   `schema_meta` row records `2026.9.3` at agent schema version 19) on official

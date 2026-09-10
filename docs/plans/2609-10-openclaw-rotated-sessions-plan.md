@@ -8,22 +8,29 @@ rotated-out generation - isolated cron runs, hook runs, isolated heartbeats, com
 predecessors, reset archives - is dropped without a count. The reporter's host ingested 13
 sessions out of ~1.8k real transcripts.
 
-Status (2026-09-10 21:28): BOTH ERAS IMPLEMENTED, committed and pushed on
+Status (2026-09-10): BOTH ERAS IMPLEMENTED, committed and pushed on
 `fix/openclaw-rotated-sessions`. Draft PR #228, CI fully green on `5bc4f8b`
-(build-and-test, flake-check, windows-verify, release-note-lint).
+(build-and-test, flake-check, windows-verify, release-note-lint); the three
+commits after it are one origin/main merge and two documentation commits.
 
 - `3b70b7b` file-era fixtures, `63495c4` file-era fix (OpenClaw <= 2026.7.1)
 - `087c185` merge of origin/main, which brought in #225 (agy adapter)
 - `6f0757f` DB-era reader + the silent-skip fix + three spec corrections
 - `1e5ece4` DB-era tests, cron exact keys, first polish round
 - `5bc4f8b` `discover()` propagation, dry-run/status reporting, `has_table` shared
+- `136fb1d` `docs(benchmarks): record the contaminated gate row and the openclaw
+  ingest arms`
+- `92c32c4` merge of origin/main, which brought in `df9bb1a` = #232 (a rebuilt
+  store no longer inherits the old store's rowmap), the prerequisite section 8
+  was waiting on
+- `88ea4ad` `docs(benchmarks): the quiet gate re-run, and what it refutes` - the
+  clean row section 8 deferred, now taken
 
 Proven end to end on the captured 2026.9.3 root: 8 sessions / 86 messages, up
 from 0. 564 tests pass; clippy `--all-targets -D warnings` and fmt clean.
 
-UNCOMMITTED: `docs/benchmarks/{results.md,bench-gate-baseline.jsonl}` and this
-plan. See section 8 - the gate row in that jsonl is CONTAMINATED and results.md
-is what explains it, so the two belong in one commit.
+`docs/benchmarks/{results.md,bench-gate-baseline.jsonl}` and this plan are all
+committed on the branch.
 
 Every delta in section 4 and every adjudicated decision in section 6 is approved
 and built (user OK 2026-09-10).
@@ -48,9 +55,15 @@ Two deviations from the plan as written, both decided during implementation:
 - `docs/spec.md`: `model-project-non-empty` (4.5), `model-no-synthesis`,
   `adapter-integrity-no-silent-drops`, 5.2 composite keys, 7.6 immutable `source_agent`/`project`.
 - `packages/pond/src/sessions.rs:1203-1222`: the immutable-field rejection path.
-- Capture evidence (durable, outside the repo): `/home/tenequm/pj/openclaw-capture/out/<pass>/REPORT.md`
-  for passes `rotate-reply`, `cron`, `compaction`, `hooks-heartbeat`; upstream source at
-  `~/pjv/openclaw/openclaw` tag `v2026.7.1-2`.
+- Capture evidence, in-repo: `packages/pond/tests/fixtures/adapter/openclaw-captures/` holds one
+  state root per pass (`rotate-reply`, `cron`, `compaction`, `hooks-heartbeat`, plus `db-era`),
+  each with its own `capture.sh`. `packages/pond/tests/fixtures/README.md` documents provenance,
+  census and sanitization per pass under its `openclaw-captures/*` sections - read those, not the
+  capture kit. The kit that produced them (an external, machine-local checkout that drives a
+  pinned OpenClaw under a throwaway `$HOME` against a stub model, writing a `REPORT.md` per pass)
+  is not part of this repo and is not needed to work on #224; the committed fixtures and their
+  README carry everything the plan relies on. Upstream OpenClaw source for the file era is tag
+  `v2026.7.1-2`.
 
 ## 1. Verified facts (OpenClaw 2026.7.1-2, real captures)
 
@@ -155,8 +168,9 @@ path and the section-3 ladder already helps those hosts". **Both halves are refu
 `agents/<id>/sessions/` DOES NOT EXIST until something is deleted - no `sessions.json`, no
 `<id>.jsonl`, no `.trajectory.jsonl`. There is no writer for any of them
 (`session-sqlite-target.ts:224-250`, `session-manager-persistence.ts:198-203`). The file-era
-ladder has nothing to read, and pond ingests **0 of 6** sessions from the capture fixture
-(H9). Severity is HIGHER than first stated, not lower.
+ladder has nothing to read, and pond ingests **0 of the 8** session generations in the capture
+fixture - 8 `session_windows` rows across 6 routing keys (H9). Severity is HIGHER than first
+stated, not lower.
 
 2026.8.1 dropped `sessions` / `session_entries` / `session_routes`. The replacements
 (`v2026.9.3:src/state/openclaw-agent-schema.sql`):
@@ -211,8 +225,13 @@ silent-skip in this PR; fix all ten extras in this PR.
   was narrower than 5.2 AND than the shipped adapter. Added: a rotation starting a fresh
   context is NOT lineage (`model-no-synthesis`) - this is what keeps rollover out.
 
-### Adapter work - TODO
-1. **Silent skip is a live `session-movement-complete` (L502) violation.** Probing one table
+### Adapter work - DONE
+
+All six landed in `6f0757f`, `1e5ece4` and `5bc4f8b` and are covered by the
+DB-era integration tests. The items below are kept as written, as the record of
+what was decided and built, not as work outstanding.
+
+1. **Silent skip was a live `session-movement-complete` (L502) violation.** Probing one table
    name, finding no `sessions`, and reporting "up to date" against a DB with 8 windows / 94
    events is "a skip that outruns durability". Era detect from the TABLE SET:
    (1) `session_windows`+`session_nodes`+`transcript_events` -> DB v2;
@@ -306,23 +325,39 @@ Deferred refactors from the first polish pass (all real, none behavioural):
 duplication between `fetch_archive_lines` and `read_entry_lines`; four functions
 past ~100 lines; wildcard `_ =>` arms in the era dispatch.
 
-## 8. Deferred: a clean bench-gate re-run
+## 8. The clean bench-gate re-run - DONE
 
 The 2026-09-10 gate row (`5bc4f8b-dirty`, in `bench-gate-baseline.jsonl`) is
 CONTAMINATED - builds, tests and another bench ran on the same VM throughout its
-30-minute window, and the CPU-bound write/index columns moved up to +176% with no
-substrate change in the bracket. `docs/benchmarks/results.md` documents it as
-such so nobody reads it as a regression.
+30-minute window. `docs/benchmarks/results.md` documents it as such so nobody
+reads it as a regression.
 
-Re-run ONE quiet gate after PR #232 merges (user's call, 2026-09-10). Not before:
-#232 replaces `oracle_warm_ms` (which times `Store::session_last_message_ids`, a
-function with no production callers) with `rowmap_cold_ms` / `rowmap_warm_ms`
-against `ensure_rowmap`, the path sync actually takes. Re-running earlier buys a
-quiet row that still carries a dead column.
+The quiet re-run this section deferred has now happened, after #232 merged so the
+row carries `rowmap_cold_ms` / `rowmap_warm_ms` instead of the dead
+`oracle_warm_ms`. It is recorded in `docs/benchmarks/results.md` under
+"bench-gate: quiet Linux re-run (openclaw DB era, #228)": `92c32c4`, clean tree,
+`pond schedule stop` for the window, nothing else on the VM, `EQUIVALENCE OK`.
 
-Prerequisites for that run: `pond schedule stop` first (see results.md 2026-08-25
-incident), nothing else running on the VM, and a fresh store path if any
-ingest timing is involved (#226).
+It confirmed contention for half the call and refuted the other half:
+
+- **Confirmed for the `write_copy` family.** `write_copy_ms` 7353 -> 3777 and
+  `write_copy_noop_ms` 1086 -> 481 once the machine was quiet.
+- **Refuted for `write_index_build_ms`.** It did not recover: 14480 loaded vs
+  14284 quiet, a 1% difference. It had already stepped up (9063 -> 12982) between
+  two earlier rows that predate this branch's code, and stayed at 13-14.5s for
+  every row after. Calling it CPU-bound evidence of contention was wrong twice: it
+  did not move with load, and `write_bench` builds its index against an S3 scratch
+  prefix, so the time is round trips, not CPU.
+
+The durable conclusion, and the reason this section is worth keeping: **on this
+store a single gate row brackets a change only to within roughly a factor of
+two**, and running quiet does not fix that. Read a printed delta against the
+immediately preceding row as "nothing moved by more than the noise floor", or not
+at all. Same conclusion #226 reached from the other direction.
+
+Prerequisites, for the next such run: `pond schedule stop` first (see results.md
+2026-08-25 incident), nothing else running on the VM, and a fresh store path if
+any ingest timing is involved (#226).
 
 ## 9. Benchmark run notes (user request, 2026-09-10)
 

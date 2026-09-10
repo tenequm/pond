@@ -3772,8 +3772,14 @@ pub struct IngestSummary {
     /// with the stored row. The stored labels stay authoritative and the new
     /// rows land under them (spec.md 7.6), so this is not a drop - it is how
     /// many stored sessions still carry a label an updated adapter would no
-    /// longer derive. Expected to be non-zero exactly once, right after an
-    /// adapter changes how it derives those fields.
+    /// longer derive.
+    ///
+    /// Two populations land here, and only the first is one-off. A STORED
+    /// disagreement is expected to be non-zero once, right after an adapter
+    /// changes how it derives those fields. An IN-BATCH disagreement - two
+    /// substreams of one sync claiming the same session id with different
+    /// labels - recurs on every sync of a corpus that produces them, so a
+    /// steady non-zero count is that case, not an unfinished migration.
     pub relabeled_sessions: usize,
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
@@ -4532,10 +4538,19 @@ impl std::fmt::Display for IngestError {
                 attempted,
             } => write!(
                 formatter,
+                // Deliberately names no remedy. `pond erase` was the one this
+                // used to give, and spec.md 7.6 now records why it is wrong:
+                // the resurrection denylist (5.4) blocks the re-sync a relabel
+                // would need, so erasing a mislabelled session deletes it
+                // instead of repairing it. Correcting a stored label is a
+                // migration the specification does not yet define, and an
+                // operator acting on this line must not lose a session to a
+                // cosmetic disagreement.
                 "session {session_id} {field} is immutable: stored {stored:?}, attempted \
-                 {attempted:?} - if the attempted value is the correct one, the stored row \
-                 predates a change in how the adapter derives it, and only erasing that \
-                 session and re-syncing picks the new value up",
+                 {attempted:?} - the rows are written under the stored value. If the attempted \
+                 value is the correct one, the stored row predates a change in how the adapter \
+                 derives it; there is no supported way to relabel it in place yet, and erasing \
+                 the session does NOT repair it (spec.md 5.4 blocks the re-sync)",
             ),
         }
     }
@@ -4544,7 +4559,7 @@ impl std::fmt::Display for IngestError {
 impl std::error::Error for IngestError {}
 
 /// Compare an incoming Session row against the stored row on the two
-/// immutable fields (spec.md#protocol). The `Option<String>` `project` field
+/// immutable fields (spec.md 7.6). The `Option<String>` `project` field
 /// counts a NULL-vs-non-NULL change as a mismatch.
 fn ensure_immutable_match(
     existing: &Session,
