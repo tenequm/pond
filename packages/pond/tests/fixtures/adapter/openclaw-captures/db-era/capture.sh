@@ -24,7 +24,7 @@ run() { OC_RT="$OC_RT" OC_HOME="$H" "$OC" "$@"; }
 say() { printf '\n=== %s\n' "$*"; }
 
 # --- preflight ---------------------------------------------------------------
-[ -x "$OC" ] || { echo "missing $OC — run: OPENCLAW_VERSION=2026.9.3 RT=$OC_RT setup.sh" >&2; exit 1; }
+[ -x "$OC" ] || { echo "missing $OC - run: OPENCLAW_VERSION=2026.9.3 RT=$OC_RT setup.sh" >&2; exit 1; }
 curl -s --max-time 5 "$STUB/models" >/dev/null || { echo "stub LLM down at $STUB" >&2; exit 1; }
 
 # --- clean slate (only ever our own run dir) ---------------------------------

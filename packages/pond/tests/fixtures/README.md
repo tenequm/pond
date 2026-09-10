@@ -584,6 +584,153 @@ the first user message.
   Node will NOT work - it links SQLite 3.51.2 and OpenClaw's WAL guard
   requires 3.51.3+; the official nodejs.org build bundles a new enough one.
 
+### openclaw-captures/db-era
+
+A fifth OpenClaw state root, captured the same way as the four passes above but
+from a version past the storage rewrite. The four above are the FILE era
+(OpenClaw `<= 2026.7.1-2`); this one is the DB era. OpenClaw 2026.8.1 replaced
+the file session store entirely, so on 2026.9.3 there is no file tier at all:
+`agents/main/sessions/` does not exist until something is deleted, and the one
+file it then holds is a compressed archive blob, not a transcript. Everything
+the file-era adapter reads - `sessions.json`, `<id>.jsonl`,
+`.trajectory.jsonl`, `.trajectory-path.json` - is absent, and pond ingested 0
+of this root's 6 sessions before the fix.
+
+- Provenance: OpenClaw `2026.9.3` (commit `1391f7c`; the fixture's own
+  `schema_meta` row records `2026.9.3` at agent schema version 19) on official
+  Node v24.21.0, captured 2026-09-10 on a real host driven through its own
+  gateway (local mode, loopback, port 18840) by `capture.sh`, which is
+  committed inside the fixture directory. Throwaway `$HOME` and an
+  OpenAI-compatible stub model on `127.0.0.1`, so no real provider was called
+  and no real conversation is present - assistant turns read `stub reply N:`.
+- Layout: the pass directory IS an OpenClaw root. Point the adapter's `root` at
+  it directly. Four files, 575,446 bytes:
+
+  | bytes | path |
+  | --- | --- |
+  | 413,696 | `agents/main/agent/openclaw-agent.sqlite` |
+  | 151,552 | `state/openclaw.sqlite` |
+  | 9,296 | `capture.sh` |
+  | 902 | `agents/main/sessions/9b08ee68-1f8d-4ae1-bdf8-251b02e76fdb.jsonl.deleted.2026-09-10T18-51-19.016Z.3c20490d108847ee9f86861e3acc663d.zst` |
+
+  That `.zst` is the whole of `agents/main/sessions/`: the directory exists only
+  because the capture deleted a session. Its name is the file-era archive shape
+  plus two segments - `<id>.jsonl.<reason>.<ts>.<generation-32hex>.zst`.
+
+- Agent DB (`agents/main/agent/openclaw-agent.sqlite`), trimmed to the seven
+  session tables. `session_transcript_generations` does not exist at 2026.9.3;
+  `session_transcript_index_state` does.
+
+  | table | rows |
+  | --- | --- |
+  | `schema_meta` | 2 |
+  | `session_nodes` | 6 |
+  | `session_windows` | 8 |
+  | `transcript_events` | 94 |
+  | `transcript_event_identities` | 94 |
+  | `session_transcript_index_state` | 8 |
+  | `session_transcript_archives` | 1 |
+
+- State DB (`state/openclaw.sqlite`), trimmed to three tables:
+
+  | table | rows |
+  | --- | --- |
+  | `audit_events` | 30 |
+  | `task_runs` | 13 |
+  | `cron_run_receipts` | 2 |
+
+- The seven session keys the capture produced. "generations" is
+  `session_windows` rows for that key; 6 nodes / 8 windows / 94 events, and the
+  counts sum.
+
+  | session key | generations | events | `created_via` | what it is |
+  | --- | --- | --- | --- | --- |
+  | `agent:main:main` | 1 | 29 | NULL | two baseline `--local` turns plus two in-transcript resets; the only row with `session_scope = 'shared-main'` (every other row is `'conversation'`) |
+  | `agent:main:dashboard:01ee5473-...` | 1 | 27 | `operator` | the fork of `agent:main:main` |
+  | `agent:main:dashboard:compactme` | 1 | 5 | `run` | three turns, then `sessions compact --max-lines 5` |
+  | `agent:main:cron:556dc024-...` | 2 | 6 + 6 | `cron` | one isolated cron job, run twice |
+  | `agent:main:dashboard:rollover` | 2 | 7 + 7 | `run` | idle rollover, `session.reset.mode=idle` / `idleMinutes=1` across a 70 s gap |
+  | `agent:main:dashboard:doomed-archive` | 1 | 7 | `run` | `sessions archive`, a SOFT archive: it sets `session_nodes.archived_at` (`1789066281620`) and writes nothing else |
+  | `agent:main:dashboard:doomed-delete` | 0 | 0 | - | `sessions delete`; no node and no window row survive it |
+
+- The structural facts this fixture pins, each with the evidence in the tree:
+  - **`session_windows` holds one row per generation.** 8 rows over 6 keys: the
+    cron key has two (one per run) and the rollover key has two. This is the
+    thing the file era forced a reader to reconstruct from sidecars.
+  - **`session_windows.reason` is NULL on all 8 rows.**
+    `SELECT count(*) FROM session_windows WHERE reason IS NOT NULL` returns 0.
+    The runtime hardcodes it; the column's CHECK enum
+    (`initial|reset|rollover|fork|rewind|switch|recovery|compaction`) is
+    vestigial, and nothing here should be classified by it.
+  - **`previous_session_id` is set on exactly 1 of 8 rows** - the second
+    `rollover` generation, pointing at the first. The cron key's two
+    generations are NOT chained to each other, so `previous_session_id` walks
+    only the idle/daily rollover path; grouping by `session_key` is the
+    reliable primitive.
+  - **A reset does not rotate a session.** It appends an in-transcript event
+    instead: `transcript_events` for `agent:main:main` carries
+    `{"type":"reset","id":"0723e4cd",...,"reason":"reset"}` at seq 13 and
+    `{"type":"reset","id":"3fc2fc88",...,"reason":"new"}` at seq 19, both inside
+    the one `session_id`, with no extra window row and no archive. `reason` is
+    the verbatim RPC argument and `id` is an 8-hex short id unlike every other
+    event's uuid, so reset-delimited generations live on the event-sequence
+    axis, not the session-id axis.
+  - **Truncating compaction deletes events with no archive at all.** In
+    rehearsal `--max-lines 5` cut a 25-row transcript to 5, keeping the same
+    `session_id` and writing no archive row and no file. `compactme` is that
+    scenario in the capture: three turns are left as 5 events re-sequenced from
+    0 with a regenerated header (`session`, `custom`, `message`, `message`,
+    `custom`), and the one `session_transcript_archives` row belongs to the
+    delete, not to this. There is no cold copy of what was cut.
+  - **Fork lineage IS first-class.** The fork's `session_nodes` row carries
+    `parent_session_key`, `fork_source_session_key` (`agent:main:main`),
+    `fork_source_session_id` (`53ced050-...`) and `fork_source_entry_id`
+    (`8c3aeed5-...`), and that entry id is a real
+    `transcript_event_identities.event_id` in the parent. A fork is a new key
+    rather than a new generation, so its window row's `previous_session_id` is
+    NULL. It also copies the parent's events with their `event_id`s intact -
+    42 identity rows share an `event_id` with a row in another session (21
+    events, twice each) - so an event id is unique only per session, and a
+    naive global dedupe merges a fork into its parent.
+  - **A deleted session leaves NO `session_windows` row.** `9b08ee68-...` has
+    zero window rows and zero `session_nodes` rows; the delete cascades them
+    away. Its only traces are the archive blob (whose
+    `session_transcript_archives.session_key` names
+    `agent:main:dashboard:doomed-delete`) and `audit_events`. The window table
+    is therefore not a complete history of everything that ran.
+  - **`session_transcript_archives.archive_sha256` covers the COMPRESSED
+    bytes.** The row's `archive_sha256` is
+    `341155e2100db1e8c0579eb1a1b88b546036572fb4b8d98ebab750b95bc2cbf8`, which is
+    exactly `sha256sum` of the 902-byte `.zst` file, and `length(archive_blob)`
+    is 902 too. `encoding` is `zstd`; the payload decompresses to 7 JSONL lines
+    of file-era transcript with a `{"type":"session","version":4,...}` header.
+- Sanitization: the capture home was already throwaway, so no substitution was
+  needed at all - not even the hostname the file-era passes had to replace,
+  because the preamble that carries `os.hostname()` lives in
+  `trajectory_runtime_events`, a table this fixture drops. Absolute paths under
+  `/tmp/openclaw-db/db-era/capture-home/home/` are left as-is. The agent DB was
+  trimmed from 1,495,040 B by dropping 36 tables and 16 triggers (including
+  `auth_profile_store`, `auth_profile_state`, `trajectory_runtime_events` and
+  every `memory_*` and FTS shadow table); the state DB from 3,350,528 B by
+  dropping 104 tables, among them every `device_*` table,
+  `secret_store_entries`, `mcp_oauth_stores`, `worker_environment_credentials`,
+  `audit_identity_keys`, `user_profiles` and `user_profile_identities`. No
+  auth, identity, device or credential table remains in either file. Both DBs
+  are `journal_mode=delete` with no `-wal`/`-shm` sidecars, matching the four
+  file-era passes - note that a read-only `node:sqlite` open RECREATES those
+  sidecars, so anything that inspects the fixture must delete them afterwards.
+  gitleaks and trufflehog scan clean over the tree and over a materialized text
+  dump of every TEXT cell plus the decompressed archive (the dump matters:
+  gitleaks skips binaries, so it reads almost nothing of a bare SQLite
+  fixture).
+- Deliberate deviation, flagged: the state DB keeps `task_runs` and
+  `cron_run_receipts` alongside `audit_events`. `cron_run_logs`, the table the
+  `cron` pass above is trimmed to, does not exist at 2026.9.3, and
+  `task_runs.child_session_key` is its functional replacement - it is the one
+  place besides `audit_events` where the cron `:run:<sessionId>` keys appear,
+  and its 8 distinct child keys cover every key in the capture including the
+  deleted one.
+
 ### opencode
 
 opencode has TWO on-disk formats and this fixture carries BOTH, because the

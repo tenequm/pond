@@ -1072,3 +1072,152 @@ async fn resyncing_a_capture_is_additive() -> anyhow::Result<()> {
     assert_eq!(second.messages_inserted_total, 0, "no new messages");
     Ok(())
 }
+
+// -- DB era (OpenClaw >= 2026.8.1) ------------------------------------------
+//
+// The `db-era` capture has no transcript FILES at all, so none of the helpers
+// above apply: identity comes from `session_windows`, one row per generation.
+
+/// Every `session_windows` row, i.e. every generation, as `(session_id, key)`.
+fn window_rows() -> Vec<(String, String)> {
+    let db = capture("db-era")
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("openclaw-agent.sqlite");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open captured agent db");
+    let mut stmt = conn
+        .prepare("SELECT session_id, session_key FROM session_windows ORDER BY session_id")
+        .expect("prepare window list");
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .expect("query windows")
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .expect("read windows")
+}
+
+/// #224 in DB clothing: pond probed for a `sessions` table, found none on any
+/// 2026.8.1+ host, and reported "up to date" against a DB full of sessions.
+/// Every generation `session_windows` names must now land.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_db_era_generation_is_ingested() -> anyhow::Result<()> {
+    let (store, _dir) = ingest(&capture("db-era")).await;
+    let windows = window_rows();
+    assert_eq!(windows.len(), 8, "the capture holds 8 generations");
+    for (session_id, _) in &windows {
+        let session = store.get_session(session_id).await?.unwrap_or_else(|| {
+            panic!(
+                "generation {session_id} was dropped; a source pond cannot read must be a \
+                 typed error, never a silent skip (spec.md#session-movement-complete)"
+            )
+        });
+        assert!(
+            !session.session.project.is_empty(),
+            "{session_id} has an empty project (spec.md#model-project-non-empty)"
+        );
+    }
+    Ok(())
+}
+
+/// Rotated-out generations are the whole point: two cron runs share one job
+/// key and two rollover generations share theirs, so 8 generations must land
+/// under 6 projects rather than collapsing to one session per key.
+#[tokio::test(flavor = "multi_thread")]
+async fn db_era_rotated_generations_group_by_key() -> anyhow::Result<()> {
+    let (store, _dir) = ingest(&capture("db-era")).await;
+    let mut by_key: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (session_id, _) in window_rows() {
+        let session = store.get_session(&session_id).await?.expect("generation");
+        *by_key
+            .entry((*session.session.project).clone())
+            .or_default() += 1;
+    }
+    assert_eq!(by_key.len(), 6, "6 distinct routing keys: {by_key:?}");
+    assert_eq!(by_key.values().sum::<usize>(), 8, "8 generations");
+    let multi = by_key.values().filter(|n| **n > 1).count();
+    assert_eq!(
+        multi, 2,
+        "two keys carry more than one generation (cron runs, rollover): {by_key:?}"
+    );
+    Ok(())
+}
+
+/// `sessions.fork` records the parent id AND the cut-point entry id, so the
+/// fork lands as a fork-with-cut-point (spec.md 4). A rollover does NOT: it
+/// starts a fresh context and carries nothing forward, so calling it lineage
+/// would assert a relationship the source never states.
+#[tokio::test(flavor = "multi_thread")]
+async fn db_era_forks_carry_a_cut_point_and_rollovers_carry_none() -> anyhow::Result<()> {
+    let (store, _dir) = ingest(&capture("db-era")).await;
+    let windows = window_rows();
+    let mut parented = 0usize;
+    for (session_id, key) in &windows {
+        let session = store.get_session(session_id).await?.expect("generation");
+        let Some(parent) = session.session.parent_session_id.as_deref() else {
+            continue;
+        };
+        parented += 1;
+        assert!(
+            key.contains(":dashboard:"),
+            "only the forked session has a parent, not {key}"
+        );
+        assert!(
+            session.session.parent_message_id.is_some(),
+            "a fork off a named entry must carry its cut-point"
+        );
+        assert!(
+            windows.iter().any(|(id, _)| id == parent),
+            "the parent id must name a real generation, not a key resolved through \
+             current_session_id (which moves on rotation)"
+        );
+    }
+    assert_eq!(parented, 1, "exactly one fork in the capture");
+    Ok(())
+}
+
+/// A deleted session survives only as a `session_transcript_archives` blob.
+/// Deletion is an erasure intent, so it stays out by default - but it must be
+/// ACCOUNTED FOR, not silently dropped, which is what `reconcile_deletions`
+/// does. Before this fix the probe hit a table that no longer exists, and the
+/// swallowed error made every archive preserve with no log line at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn db_era_deleted_archive_is_excluded_but_reported() -> anyhow::Result<()> {
+    let root = capture("db-era");
+    let (store, _dir) = ingest(&root).await;
+    let adapter = OpenClawAdapter::new(&root);
+    let report = adapter.reconcile_deletions(&store).await?;
+    assert_eq!(
+        report.erase.len() + report.preserved.len(),
+        1,
+        "the one deleted archive is accounted for either way"
+    );
+    Ok(())
+}
+
+/// The same source read twice adds nothing (spec.md#adapter-integrity-additive-sync).
+#[tokio::test(flavor = "multi_thread")]
+async fn resyncing_the_db_era_capture_is_additive() -> anyhow::Result<()> {
+    let root = capture("db-era");
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = OpenClawAdapter::new(&root);
+
+    let first = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+    let second = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    assert_eq!(first.dropped_sessions, 0, "first sync dropped a session");
+    assert!(
+        first.sessions_inserted > 0,
+        "the first sync stored something"
+    );
+    assert_eq!(second.sessions_inserted, 0, "a re-sync inserts nothing");
+    assert_eq!(second.messages_inserted_total, 0, "no new messages");
+    assert_eq!(
+        second.relabeled_sessions, 0,
+        "an unchanged source must not disagree with its own stored labels"
+    );
+    Ok(())
+}

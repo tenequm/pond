@@ -100,12 +100,16 @@
 //! is an erasure intent, and re-ingesting what a user deleted would undo it.
 //! ONE exception, both eras: a cron RUN key, where `.deleted.` is the retention
 //! reaper firing on a timer rather than a person deleting anything.
-//! `ingest_deleted = true` opts the whole class back in. These archives are not
-//! invisible: `reconcile_deletions` enumerates them every sync and reports each
-//! as preserved or as an erase target. With `reconcile_deletions = false` AND
-//! `ingest_deleted = false` they are excluded with no count at all - that
-//! combination is the one configuration in which a deleted session leaves no
-//! trace in pond's output.
+//! `ingest_deleted = true` opts the whole class back in. `reconcile_deletions`
+//! then reports each one it can see as preserved or as an erase target - but
+//! it enumerates FILENAMES, so it sees a deleted archive only while the
+//! derived `.deleted.` file still exists. On 2026.8.1 and later retention
+//! removes that file BEFORE the row, so in the window between the two a
+//! deleted archive is excluded from ingest and invisible to reconciliation at
+//! the same time. The same blind spot follows from `reconcile_deletions =
+//! false` in either era. Teaching the reconciliation pass to enumerate
+//! `session_transcript_archives` rows would close it; until then this
+//! paragraph is the honest statement of what an operator can and cannot see.
 //!
 //! The adapter never dedups by entry id ACROSS sessions. Entry ids repeat
 //! between sessions by design - a fork copies its parent's entries verbatim,
@@ -343,11 +347,20 @@ enum SessionSource {
         session_id: String,
         session_key: String,
         era: DbEra,
+        /// The exact routing key the state DB recorded for this session, when
+        /// it is more specific than the one the session table carries. v2's
+        /// `session_windows.session_key` holds a cron JOB key, while the
+        /// `...:run:<id>` key the run actually used survives only in
+        /// `audit_events` / `task_runs`. Without this the DB era would break
+        /// the contract the file era states: the exact key survives in
+        /// `options.openclaw.session_key_exact`.
+        exact_key: Option<FileKey>,
     },
     /// An archived generation living only as a `session_transcript_archives`
-    /// row (>= 2026.8.1). Its key comes from the row itself, so no ladder runs
-    /// - and that also reaches deletions whose derived file retention already
-    /// removed, which the filename-driven path structurally cannot see.
+    /// row (2026.8.1 and later). Its key comes from the row itself, so no
+    /// ladder runs, and it also reaches deletions whose derived file retention
+    /// already removed - which the filename-driven path structurally cannot
+    /// see.
     DbArchive {
         db_path: PathBuf,
         agent_id: String,
@@ -457,11 +470,24 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
     for agent in agents {
         let mut db_ids: HashSet<String> = HashSet::new();
 
-        if let Some(db_path) = &agent.db_path {
-            match open_db(db_path)
-                .and_then(|conn| list_db_sessions(&conn, db_path).map(|rows| (conn, rows)))
-            {
-                Ok((_, DbSessions::FileEra)) => {
+        // One connection per agent, shared by the session and archive
+        // enumerations below: opening twice also builds two statement caches
+        // and two page caches for the same file.
+        let agent_conn = match &agent.db_path {
+            Some(db_path) => match open_db(db_path) {
+                Ok(conn) => Some(conn),
+                Err(error) => {
+                    tracing::warn!(path = %db_path.display(), %error, "openclaw: opening the agent DB failed");
+                    errors.push(error);
+                    None
+                }
+            },
+            None => None,
+        };
+
+        if let (Some(db_path), Some(conn)) = (&agent.db_path, &agent_conn) {
+            match list_db_sessions(conn, db_path) {
+                Ok(DbSessions::FileEra) => {
                     // Stable pre-2026.7.2 host: openclaw-agent.sqlite exists but
                     // carries only auth/agent state, so the file store below is
                     // the session source. Not an error - it is the production
@@ -471,17 +497,40 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
                         "openclaw: openclaw-agent.sqlite carries no session tables; using file sessions",
                     );
                 }
-                Ok((conn, DbSessions::Present { era, rows })) => {
+                Ok(DbSessions::Present { era, rows }) => {
                     for (session_id, session_key) in rows {
                         if adapter.is_skipped(&session_key) {
                             continue;
                         }
                         db_ids.insert(session_id.clone());
                         let source_ts = if peek {
-                            db_session_watermark(&conn, &session_id)
+                            db_session_watermark(conn, &session_id)
                         } else {
                             None
                         };
+                        // Cron only, and that gate is load-bearing rather than
+                        // an optimization: `StateDbKeys` is lazy by design
+                        // (see its doc) because `audit_events` keeps a row per
+                        // gateway run for the life of the install, and the
+                        // first `get` full-scans it. A cron JOB key is the one
+                        // case where the session table is less specific than
+                        // the state DB - it drops the `...:run:<id>` spelling
+                        // - so every other kind would pay that scan to learn
+                        // nothing.
+                        //
+                        // Accepted only when the recovered key normalizes to
+                        // the key the session table already carries: agreeing
+                        // sources make it a more specific spelling of one key,
+                        // while a disagreement would be two claims, and
+                        // picking one would be a guess.
+                        let exact_key = (session_kind(&session_key) == Kind::Cron)
+                            .then(|| {
+                                state_keys.get(&session_id).and_then(|(exact, source)| {
+                                    let key = FileKey::resolved(exact, source);
+                                    (key.project_key == session_key).then_some(key)
+                                })
+                            })
+                            .flatten();
                         entries.push(HeadEntry {
                             source: SessionSource::Db {
                                 db_path: db_path.clone(),
@@ -489,6 +538,7 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
                                 session_id,
                                 session_key,
                                 era: era.clone(),
+                                exact_key,
                             },
                             source_ts,
                         });
@@ -504,7 +554,8 @@ fn enumerate_and_peek(adapter: &OpenClawAdapter, peek: bool) -> Enumerated {
             // the windows so `db_ids` is already populated: a generation still
             // present as a live window is the same session, and the archive
             // copy of it is superseded rather than a second session.
-            match open_db(db_path).and_then(|conn| list_db_archives(&conn, db_path)) {
+            //
+            match list_db_archives(conn, db_path) {
                 Ok(rows) => {
                     for (session_id, generation, session_key, reason) in rows {
                         if adapter.is_skipped(&session_key) {
@@ -642,6 +693,7 @@ fn read_survivors(
                 session_id,
                 session_key,
                 era,
+                exact_key,
             } => match connection(&mut conns, &db_path) {
                 Ok(conn) => {
                     let schema_version = match schema_versions.get(&db_path) {
@@ -653,12 +705,15 @@ fn read_survivors(
                         }
                     };
                     read_db_session(
-                        conn,
-                        &agent_id,
-                        &session_id,
-                        &session_key,
-                        schema_version,
-                        &era,
+                        DbRead {
+                            conn,
+                            agent_id: &agent_id,
+                            session_id: &session_id,
+                            session_key: &session_key,
+                            schema_version,
+                            era: &era,
+                            exact_key: exact_key.as_ref(),
+                        },
                         tx,
                     )
                 }
@@ -673,8 +728,10 @@ fn read_survivors(
             } => match connection(&mut conns, &db_path) {
                 Ok(conn) => match fetch_archive_lines(conn, &session_id, &generation) {
                     Ok(lines) => {
-                        let label =
-                            PathBuf::from(format!("{}#{session_id}/{generation}", db_path.display()));
+                        let label = PathBuf::from(format!(
+                            "{}#{session_id}/{generation}",
+                            db_path.display()
+                        ));
                         read_file_session(
                             FileRead {
                                 agent_id: &agent_id,
@@ -723,15 +780,33 @@ fn read_survivors(
     }
 }
 
-fn read_db_session(
-    conn: &Connection,
-    agent_id: &str,
-    session_id: &str,
-    session_key: &str,
+/// One DB-backed session to read, mirroring [`FileRead`] for the other tier.
+struct DbRead<'a> {
+    conn: &'a Connection,
+    agent_id: &'a str,
+    session_id: &'a str,
+    /// The key the session table carries. For a v2 cron run this is the JOB
+    /// key; `exact_key` holds the `...:run:<id>` spelling when a state-DB
+    /// source agrees on the same job.
+    session_key: &'a str,
     schema_version: Option<i64>,
-    era: &DbEra,
+    era: &'a DbEra,
+    exact_key: Option<&'a FileKey>,
+}
+
+fn read_db_session(
+    read: DbRead<'_>,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
+    let DbRead {
+        conn,
+        agent_id,
+        session_id,
+        session_key,
+        schema_version,
+        era,
+        exact_key,
+    } = read;
     let row = match fetch_session_row(conn, session_id, era) {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -744,19 +819,30 @@ fn read_db_session(
         }
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
     };
-    // `session_nodes.entry_json` is the >= 2026.8.1 home of what
+    // `session_nodes.entry_json` is the 2026.8.1-and-later home of what
     // `session_entries.entry_json` held; both are keyed by session_key.
     let entry_sql = match era {
         DbEra::Windows => "SELECT entry_json FROM session_nodes WHERE session_key = ?1",
-        _ => "SELECT entry_json FROM session_entries WHERE session_key = ?1",
+        DbEra::Sessions | DbEra::FileEra | DbEra::Unrecognized { .. } => {
+            "SELECT entry_json FROM session_entries WHERE session_key = ?1"
+        }
     };
-    let entry = query_one_opt::<String>(conn, entry_sql, [session_key])
-        .map(|text| json_or_string(&text));
-    let generation = query_one_opt::<String>(
-        conn,
-        "SELECT generation FROM session_transcript_generations WHERE session_id = ?1",
-        [session_id],
-    );
+    let entry =
+        query_one_opt::<String>(conn, entry_sql, [session_key]).map(|text| json_or_string(&text));
+    // `session_transcript_generations` was dropped in 2026.8.1.
+    // `query_one_opt` swallows the missing-table prepare error to `None`, so
+    // asking anyway would work - but it would be a query issued once per
+    // session that can only ever fail, with its failure indistinguishable from
+    // a genuine absence. That is the silent-absence pattern this whole change
+    // exists to remove, so the era decides instead.
+    let generation = match era {
+        DbEra::Windows => None,
+        DbEra::Sessions | DbEra::FileEra | DbEra::Unrecognized { .. } => query_one_opt::<String>(
+            conn,
+            "SELECT generation FROM session_transcript_generations WHERE session_id = ?1",
+            [session_id],
+        ),
+    };
     let leaf: Option<String> = query_one_opt(
         conn,
         "SELECT leaf_event_id FROM session_transcript_index_state WHERE session_id = ?1",
@@ -815,14 +901,20 @@ fn read_db_session(
             schema_version,
             lineage: &lineage,
             resolved_parent_id: resolved_parent,
-            file_key: None,
+            file_key: exact_key,
         },
     );
     let anchor = session.created_at;
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
 
     for (seq, value) in entries {
-        for event in entry_events(session_id, seq, &value, anchor) {
+        for event in entry_events(
+            session_id,
+            seq,
+            &value,
+            anchor,
+            matches!(era, DbEra::Windows),
+        ) {
             emit!(tx, Ok(AdapterYield::Event(event)));
         }
     }
@@ -940,7 +1032,10 @@ fn read_file_session(
     // Archive/legacy rows carry no stable seq; the file line order IS the
     // append order, so line number is a faithful ordering key.
     for (line_no, value) in entries.into_iter().enumerate() {
-        for event in entry_events(session_id, line_no as i64, &value, anchor) {
+        // A file or an archive blob is immutable once written, so the line
+        // number is a stable ordering key and the id-less fallback keeps the
+        // spelling every earlier pond version stored.
+        for event in entry_events(session_id, line_no as i64, &value, anchor, false) {
             emit!(tx, Ok(AdapterYield::Event(event)));
         }
     }
@@ -1011,8 +1106,8 @@ fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 /// is an error rather than a quiet fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DbEra {
-    /// >= 2026.8.1. `session_windows` holds one row per generation - natively
-    /// what the file era forced us to reconstruct from sidecars.
+    /// 2026.8.1 and later. `session_windows` holds one row per generation -
+    /// natively what the file era forced us to reconstruct from sidecars.
     Windows,
     /// 2026.7.2 - 2026.7.x. `sessions` + `session_entries`.
     Sessions,
@@ -1248,11 +1343,7 @@ fn fetch_session_row(
         )
     });
     let (table, sql, columns) = match era {
-        DbEra::Windows => (
-            "session_windows",
-            &*WINDOW_ROW_SQL,
-            SESSION_WINDOW_COLUMNS,
-        ),
+        DbEra::Windows => ("session_windows", &*WINDOW_ROW_SQL, SESSION_WINDOW_COLUMNS),
         _ => ("sessions", &*SESSION_ROW_SQL, SESSION_COLUMNS),
     };
     let mut stmt = conn
@@ -1345,14 +1436,32 @@ fn fetch_transcript_entries(
 /// blake3 (already used by the substrate) is pond's own choice here: this id
 /// is internal identity, unlike `archive_sha256`, whose algorithm the source
 /// dictates.
+///
+/// SCOPED TO [`DbEra::Windows`] ONLY, and that scope is the point. The hazard
+/// is v2-specific: nothing else re-sequences. Applying the digest everywhere
+/// would change the id of every id-less entry that earlier pond versions
+/// already stored as `<session_id>:<seq>` on file-era and v1 hosts, so a
+/// re-sync would insert the same source entry a second time under a new PK
+/// rather than matching it - trading a v2 bug for a duplication bug on every
+/// working host (`adapter-integrity-additive-sync`). Those tiers keep
+/// `<session_id>:<seq>`, which is also what nine sibling adapters use,
+/// `pi_coding_agent` among them - and openclaw's transcript IS a
+/// pi-coding-agent stream, so the same record must not get two identities
+/// depending on which adapter read it.
 fn entry_content_id(session_id: &str, value: &Value) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(session_id.as_bytes());
     hasher.update(b"\0");
-    // to_string on a serde_json::Value is key-ordered (serde_json preserves
-    // insertion order, and these come from a parsed document), so the same
-    // bytes in produce the same digest out.
+    // Deterministic because this workspace pins `jsonb` with
+    // `default-features = false` (Cargo.toml): jsonb's defaults would turn on
+    // serde_json's `preserve_order` crate-wide, and `Map` would become an
+    // insertion-ordered IndexMap instead of the sorted BTreeMap it is here.
+    // Either way one document serializes the same twice - but if that pin ever
+    // lapses, previously stored digests stop matching and every id-less entry
+    // re-inserts. The pin is load-bearing for this function.
     hasher.update(value.to_string().as_bytes());
+    // 128 bits of a 256-bit digest: collision-resistant far past any single
+    // session's entry count, and half the PK bytes.
     format!("blake3:{}", &hasher.finalize().to_hex()[..32])
 }
 
@@ -1373,12 +1482,32 @@ fn entry_content_id(session_id: &str, value: &Value) -> String {
 /// A source watermark that is too SMALL over-skips a subset (harmless: pond
 /// already holds a superset). Too LARGE only costs a re-read. So on any doubt
 /// this returns `None` rather than a guess.
+/// Two statements on purpose. `transcript_events` is keyed
+/// `(session_id, seq)` with no index on `created_at`, so ordering by
+/// `created_at` needs a sorter - and a one-statement form would put the whole
+/// `event_json` payload into every sorter record, turning a one-row read into
+/// a read of the entire transcript, once per session, on every sync. Selecting
+/// `seq` alone sorts two integers per row, then the payload comes back through
+/// a primary-key point lookup. Same answer, and the sorter no longer carries
+/// the transcript.
 fn db_session_watermark(conn: &Connection, session_id: &str) -> Option<i64> {
-    let mut stmt = conn
-        .prepare_cached("SELECT event_json FROM transcript_events WHERE session_id = ?1 ORDER BY created_at DESC, seq DESC LIMIT 1")
+    let mut newest = conn
+        .prepare_cached(
+            "SELECT seq FROM transcript_events WHERE session_id = ?1 \
+             ORDER BY created_at DESC, seq DESC LIMIT 1",
+        )
         .ok()?;
-    let data: String = stmt
+    let seq: i64 = newest
         .query_row([session_id], |row| row.get(0))
+        .optional()
+        .ok()??;
+    let mut payload = conn
+        .prepare_cached(
+            "SELECT event_json FROM transcript_events WHERE session_id = ?1 AND seq = ?2",
+        )
+        .ok()?;
+    let data: String = payload
+        .query_row(rusqlite::params![session_id, seq], |row| row.get(0))
         .optional()
         .ok()??;
     let value: Value = serde_json::from_str(&data).ok()?;
@@ -1401,8 +1530,14 @@ struct SessionInputs<'a> {
     schema_version: Option<i64>,
     lineage: &'a Lineage,
     resolved_parent_id: Option<String>,
-    /// File-era only: how the session key was recovered. `None` for a DB
-    /// session, whose key is authoritative and needs no provenance.
+    /// How the session key was recovered, when something other than the
+    /// session row supplied it. `None` when the row's own key is the whole
+    /// story, which is the common DB case. Set for every file-era session (the
+    /// ladder), for an archive row (which states its key outright), and for a
+    /// v2 cron run, where the session table carries only the JOB key and the
+    /// `...:run:<id>` spelling had to come from the state DB. It contributes
+    /// `session_key_source` / `session_key_exact` only - `project` always
+    /// comes from the `session_key` argument, so this can never relabel.
     file_key: Option<&'a FileKey>,
 }
 
@@ -1776,11 +1911,17 @@ fn entry_type(value: &Value) -> Option<&str> {
 /// ordering key (never identity). Every entry is placed; nothing is skipped
 /// (spec.md#adapter-integrity-no-silent-drops) - unknown types land as rule-3
 /// System carriers.
+///
+/// `resequenced` says the source may renumber `seq` under this entry - true
+/// only for [`DbEra::Windows`]. It selects the fallback identity for an
+/// id-less entry; see [`entry_content_id`] for why that choice is era-scoped
+/// rather than global.
 fn entry_events(
     session_id: &str,
     seq: i64,
     value: &Value,
     anchor: DateTime<Utc>,
+    resequenced: bool,
 ) -> Vec<IngestEvent> {
     let kind = entry_type(value);
     let timestamp = value
@@ -1788,10 +1929,16 @@ fn entry_events(
         .and_then(Value::as_str)
         .and_then(parse_ts)
         .unwrap_or(anchor);
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map_or_else(|| entry_content_id(session_id, value), ToOwned::to_owned);
+    let id = value.get("id").and_then(Value::as_str).map_or_else(
+        || {
+            if resequenced {
+                entry_content_id(session_id, value)
+            } else {
+                format!("{session_id}:{seq}")
+            }
+        },
+        ToOwned::to_owned,
+    );
 
     match kind {
         // Consumed for the Session (cwd/parentSession); its data survives in
@@ -2431,7 +2578,17 @@ fn load_sessions_json(dir: &Path) -> SessionsJson {
     // Rung 3: the entry's transcript path - the only source that covers a
     // `<ts>_<id>.jsonl` successor whose id is not the entry's `sessionId`.
     for (session_key, entry) in &entries {
-        if let Some(file) = entry.get("sessionFile").and_then(Value::as_str) {
+        // `sessionFile` must actually name a transcript FILE. On >= 2026.8.1
+        // the field survives as a compatibility shim that returns the session
+        // KEY instead of a path (`transcript-file-resolve.ts`), so without
+        // this guard a stale `sessions.json` on an upgraded host would feed a
+        // routing key through `transcript_stem` and register it as a
+        // transcript id - mapping a real key to an id that names nothing.
+        if let Some(file) = entry
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .filter(|file| file.contains(".jsonl"))
+        {
             let name = Path::new(file)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -2840,10 +2997,11 @@ fn cron_prompt_prefix_key_of(path: &Path, compressed: bool, agent_id: &str) -> O
 
 /// One archived generation out of `session_transcript_archives`, verified.
 ///
-/// >= 2026.8.1 makes this table the canonical owner of a reclaimed generation
-/// and the `.reset`/`.deleted` FILE a derived artifact that retention removes
-/// FIRST (the row goes last). Reading only the file would therefore lose
-/// exactly the generations issue #224 is about, one retention pass later.
+/// OpenClaw 2026.8.1 makes this table the canonical owner of a reclaimed
+/// generation, and the `.reset`/`.deleted` FILE a derived artifact that
+/// retention removes FIRST (the row goes last). Reading only the file would
+/// therefore lose exactly the generations issue #224 is about, one retention
+/// pass later.
 ///
 /// `archive_sha256` is verified over the RAW blob, before decompression -
 /// measured against a real host, the digest covers the compressed bytes and
@@ -2889,9 +3047,8 @@ fn fetch_archive_lines(
 
     let bytes = match encoding.as_str() {
         "identity" => blob,
-        "zstd" => zstd::decode_all(blob.as_slice()).map_err(|source| {
-            AdapterError::io(NAME, location.clone(), source)
-        })?,
+        "zstd" => zstd::decode_all(blob.as_slice())
+            .map_err(|source| AdapterError::io(NAME, location.clone(), source))?,
         other => {
             return Err(AdapterError::schema(
                 NAME,
@@ -2900,9 +3057,8 @@ fn fetch_archive_lines(
             ));
         }
     };
-    let text = String::from_utf8(bytes).map_err(|err| {
-        AdapterError::schema(NAME, location, format!("archive not utf-8: {err}"))
-    })?;
+    let text = String::from_utf8(bytes)
+        .map_err(|err| AdapterError::schema(NAME, location, format!("archive not utf-8: {err}")))?;
     Ok(text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -3071,10 +3227,14 @@ impl OpenClawAdapter {
                 // plausibly has no `session_nodes` row either - so without
                 // this guard first, routine cron retention would look exactly
                 // like a user deletion and erase every finished run.
-                if matches!(
-                    session_kind(&session_key),
-                    Kind::Cron | Kind::Hook | Kind::Heartbeat
-                ) {
+                // Everything except `Main`, stated as a negation on purpose: a
+                // kind added to the taxonomy later is machine-generated until
+                // someone says otherwise, and this way it is preserved by
+                // default rather than silently becoming erasable. `Probe`
+                // (`model-run-` connectivity checks) and `Subagent` belong
+                // here for the same reason cron does - neither is a session a
+                // user could have been looking at.
+                if session_kind(&session_key) != Kind::Main {
                     report.preserved.push(PreserveNote {
                         agent_id: agent.agent_id.clone(),
                         session_id,
@@ -3452,7 +3612,9 @@ mod tests {
                 assert_eq!(key.project_key, "agent:bot:main");
                 assert_eq!(key.source, KEY_SOURCE_SESSIONS_JSON);
             }
-            SessionSource::Db { .. } => panic!("expected a file session, not a DB session"),
+            SessionSource::Db { .. } | SessionSource::DbArchive { .. } => {
+                panic!("expected a file session, not a DB session")
+            }
         }
         Ok(())
     }
