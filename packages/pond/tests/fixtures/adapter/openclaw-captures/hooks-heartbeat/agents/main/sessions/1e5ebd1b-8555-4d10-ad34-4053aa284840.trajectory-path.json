@@ -1,0 +1,6 @@
+{
+  "traceSchema": "openclaw-trajectory-pointer",
+  "schemaVersion": 1,
+  "sessionId": "1e5ebd1b-8555-4d10-ad34-4053aa284840",
+  "runtimeFile": "/tmp/openclaw-fixture/hooks-heartbeat/capture-home/home/.openclaw/agents/main/sessions/1e5ebd1b-8555-4d10-ad34-4053aa284840.trajectory.jsonl"
+}

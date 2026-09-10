@@ -55,6 +55,7 @@ adapter/
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
   oh-my-pi/                  oh-my-pi (`omp`), a pi fork with its own sessions root
   openclaw/                  openclaw runtime
+  openclaw-captures/         openclaw state roots captured from the real runtime
   opencode/                  opencode CLI
   pi-coding-agent/           pi-coding-agent CLI
 ```
@@ -402,6 +403,77 @@ sample tree.
 - Samples: 3 sessions across 3 delivery channels (telegram, subagent,
   heartbeat) plus the `sessions.json` index. The index entries' `sessionFile`
   paths are updated to resolve against the local sample layout.
+
+### openclaw-captures
+
+Four complete OpenClaw state roots, each produced by driving the REAL runtime
+and copying what it wrote. They exist because the hand-written `openclaw/`
+fixture above encodes what we believed OpenClaw does; issue #224 was a case
+where that belief was wrong in a way no synthetic fixture would catch. Several
+findings here contradict both the old fixture and the upstream source read:
+`parentSession` holds a path rather than an id, a stored session key always
+carries an `agent:<id>:` prefix, and an isolated cron run stamps its job onto
+the first user message.
+
+- Provenance: OpenClaw `2026.7.1-2` (npm, commit `0790d9f`) on official Node
+  v24.21.0, captured 2026-09-10. Every run used a throwaway `$HOME` and an
+  OpenAI-compatible stub model on `127.0.0.1`, so no real provider was called
+  and no real conversation is present - assistant turns read `stub reply N:`.
+- Layout: each pass directory IS an OpenClaw root. Point the adapter's `root`
+  at it directly.
+
+  ```
+  <pass>/
+    agents/main/sessions/       transcripts, .trajectory.jsonl sidecars,
+                                .trajectory-path.json pointers, sessions.json
+    state/openclaw.sqlite       only where the pass needs it (see below)
+    capture.sh                  the script that drove the runtime
+  ```
+
+  `rotate-reply` additionally carries `lineage.jsonl`, a snapshot of its
+  `sessions.json` entry taken after every rotation. It is derived evidence, not
+  something OpenClaw wrote, which is why it sits beside the tree rather than in
+  it - and it is the only surviving record that `usageFamilySessionIds`
+  accumulated across the generations, because the final `sessions.json` has that
+  field wiped by the two `sessions.reset` calls.
+
+- The four passes and what each one is for. "ingested before #224" is how many
+  transcripts the adapter picked up when it read session keys only from
+  `sessions.json` `sessionId`; the rest were dropped silently.
+
+  | pass | transcripts | ingested before #224 | exercises |
+  | --- | --- | --- | --- |
+  | `rotate-reply` | 3 | 2 | reply-path reset rotation, `.jsonl.reset.<ts>` archives, `usageFamilySessionIds` |
+  | `cron` | 9 | 4 | isolated + main-target + `session:<key>`-target cron, `:run:` keys, reaper `.deleted.` archives, `cron_run_logs` |
+  | `compaction` | 7 | 4 | `truncateAfterCompaction` successors (`<ts>_<id>.jsonl`), in-place compaction, `compactionCheckpoints`, a checkpoint branch |
+  | `hooks-heartbeat` | 8 | 5 | every hook run is `forceNew`, isolated heartbeat beats, `audit_events` |
+
+- Three passes carry a `state/openclaw.sqlite`, each trimmed to the one table
+  its pass needs: `cron_run_logs` (13 rows) for `cron`, `audit_events` for
+  `hooks-heartbeat` (14 rows) and `rotate-reply` (24 rows). `compaction` needs
+  neither and has no `state/`. Everything else OpenClaw writes into that DB is
+  unrelated to session keys and would only add weight. Each DB is checkpointed
+  to a plain rollback journal (`journal_mode=delete`) so the fixture is a
+  single file with no `-wal`/`-shm` sidecars, matching the opencode fixture.
+- The `.trajectory.jsonl` sidecars are the bulkiest part (~150 KB each: each
+  embeds the full compiled system prompt) and are committed verbatim. They are
+  the single most productive recovery source - every line carries a top-level
+  `sessionKey` - so trimming them would remove the evidence that the head of
+  the file is enough.
+- Sanitization: the capture homes were already throwaway, so the only
+  substitution is the machine hostname, which OpenClaw writes into sidecars as
+  `host=<hostname>` and which became `sandbox-host`. Absolute paths under
+  `/tmp/openclaw-fixture/<pass>/capture-home/` are left as-is - they are the
+  capture sandbox, name nobody, and `sessions.json` `sessionFile` values are
+  read by basename anyway. gitleaks and trufflehog both scan clean; gitleaks'
+  generic-api-key rule matches OpenClaw's per-request `idempotencyKey` uuids,
+  allowlisted in `.github/gitleaks.toml`.
+- To re-capture, work from each pass's `capture.sh`: install the pinned
+  OpenClaw under a throwaway `$HOME`, point it at a stub OpenAI-compatible
+  server on localhost, run the script, then copy `agents/` (and the trimmed
+  `state/openclaw.sqlite` where the pass needs it) out. Note that a nixpkgs
+  Node will NOT work - it links SQLite 3.51.2 and OpenClaw's WAL guard
+  requires 3.51.3+; the official nodejs.org build bundles a new enough one.
 
 ### opencode
 

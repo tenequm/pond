@@ -19,3 +19,10 @@ regexTarget = "line"
 regexes = [
   '''"local:[^"]+-[0-9a-f]{32}":\s*(true|false)''',
 ]
+
+[[allowlists]]
+description = "`idempotencyKey` in openclaw transcript fixtures is a per-request UUID OpenClaw mints to deduplicate provider calls, not a credential."
+regexTarget = "line"
+regexes = [
+  '''"idempotencyKey":\s*"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"''',
+]
