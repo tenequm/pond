@@ -309,6 +309,18 @@ pub struct MessageWrite<'a> {
     pub search_text: Option<&'a str>,
 }
 
+/// Whether a cached chain claims to describe the store in full.
+///
+/// A chain discovered at the store's current version does: it was built from
+/// exactly these rows, so a row-count mismatch proves it belongs to another
+/// store. A chain the caller is about to EXTEND deliberately trails the store,
+/// so only the identity half of the check applies to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    Complete,
+    Trailing,
+}
+
 impl Store {
     /// Open against a local filesystem URL or a remote one for which the
     /// caller has no extra options to pass (env vars suffice). CLI verbs
@@ -1972,17 +1984,20 @@ impl Store {
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
         {
-            if self.rowmap_matches_store(&set).await? {
+            if self.rowmap_matches_store(&set, Coverage::Complete).await? {
                 self.rowmap.store(Some(Arc::new(set)));
                 Self::sweep_stale_rowmaps(cache_dir, &store_key, chain.base_version);
                 return Ok(());
             }
+            // Fall through to the build below, which purges under the lock. NOT
+            // purged here: this runs unlocked, and unlinking by prefix while a
+            // sibling builder holds the flock can delete the base it just
+            // renamed into place, failing its build outright.
             tracing::warn!(
                 store = store_key,
                 version,
                 "cached rowmap describes a different store at this path; rebuilding"
             );
-            Self::purge_rowmaps(cache_dir, &store_key);
         }
         if let Some(set) = self
             .extend_rowmap_coordinated(cache_dir, &store_key, version)
@@ -1996,12 +2011,32 @@ impl Store {
     /// Open the newest locally cached rowmap chain regardless of the store's
     /// current version, without installing it. Read-only estimate seam for
     /// `pond status`: the chain is as-of this host's last sync - exactly the
-    /// baseline "pending since then" wants - and a version-matched load would
-    /// cost a remote manifest read. Never assigned to `self.rowmap`: searches
-    /// must not hydrate from a possibly-stale map.
-    pub fn open_cached_rowmap(&self, cache_dir: &Path) -> Option<Arc<RowMetaSet>> {
+    /// baseline "pending since then" wants. Never assigned to `self.rowmap`:
+    /// searches must not hydrate from a possibly-stale map.
+    ///
+    /// Deliberately version-agnostic - a trailing chain is the right baseline
+    /// here - so the only thing checked is that the chain is not a *previous
+    /// store's*. Without that, a store rebuilt at this path leaves `pond status`
+    /// reporting every source fresh and nothing pending: the same lie `pond
+    /// sync` used to tell, on a surface nobody thinks to distrust.
+    ///
+    /// Only the row-count half of [`Self::rowmap_matches_store`] applies here.
+    /// This is the one caller documented as costing no remote scan, and a count
+    /// is a manifest read rather than a data read. It catches the
+    /// emptied-and-rebuilt case outright; a same-size foreign store would slip
+    /// through, and an estimate is the one place that is tolerable.
+    pub async fn open_cached_rowmap(&self, cache_dir: &Path) -> Option<Arc<RowMetaSet>> {
         let chain = discover_chain(cache_dir, &self.store_key())?;
-        RowMetaSet::open(&chain).ok().map(Arc::new)
+        let set = RowMetaSet::open(&chain).ok()?;
+        let live = self.handle.dataset(Table::Messages).await.ok()?;
+        if set.len() > live.count_rows(None).await.ok()? {
+            tracing::debug!(
+                store = self.store_key(),
+                "cached rowmap holds more rows than the store; ignoring it for the estimate"
+            );
+            return None;
+        }
+        Some(Arc::new(set))
     }
 
     /// Install an already-published rowmap chain for the current version if a
@@ -2025,7 +2060,7 @@ impl Store {
             // left by a previous store at this path would not merely gate
             // freshness wrongly - it would answer with rows attributed to
             // sessions they do not belong to.
-            if !self.rowmap_matches_store(&set).await? {
+            if !self.rowmap_matches_store(&set, Coverage::Complete).await? {
                 tracing::warn!(
                     store = self.store_key(),
                     "cached rowmap describes a different store at this path; ignoring it"
@@ -2065,7 +2100,7 @@ impl Store {
         if let Some(chain) = discover_chain(cache_dir, store_key)
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
-            && self.rowmap_matches_store(&set).await?
+            && self.rowmap_matches_store(&set, Coverage::Complete).await?
         {
             return Ok(Some(set));
         }
@@ -2085,7 +2120,7 @@ impl Store {
                 // A chain from a previous store at this path is worse than no
                 // chain: extending it would layer this store's new rows onto
                 // another store's rows and call the result current.
-                Ok(set) if !self.rowmap_matches_store(&set).await? => {
+                Ok(set) if !self.rowmap_matches_store(&set, Coverage::Trailing).await? => {
                     tracing::warn!(
                         store = store_key,
                         "cached rowmap describes a different store at this path; rebuilding"
@@ -2641,13 +2676,37 @@ impl Store {
     /// its row ids still resolve to the same messages - and it stays true for a
     /// store restored from a backup, where the rows really are the same.
     ///
+    /// Two checks, because either alone is a proxy:
+    ///
+    /// - **Coverage** (`Coverage::Complete` callers only): at a version the
+    ///   chain claims to describe in full, a valid map holds exactly as many
+    ///   rows as the store does. pond appends and merge-updates but never
+    ///   deletes, and stable row ids survive compaction, so the count is an
+    ///   equality, not a bound. One metadata read, no data pages.
+    /// - **Identity**: the store's oldest rows must resolve, through the map, to
+    ///   the messages they actually are. A row id naming a different message is
+    ///   proof of a foreign chain.
+    ///
+    /// Coverage alone would accept a same-size map from a different store;
+    /// identity alone accepts a foreign map that happens to share a prefix -
+    /// which is not exotic, since a store re-synced from the same sources
+    /// replays its oldest session first, and the divergence only starts wherever
+    /// a session grew. That case matters more than the empty-store one: the
+    /// chain feeds search hydration (`message_metas_by_rowids`) and
+    /// `session_scan_rows_resident`, which serve message text, session ids and
+    /// timestamps out of the map without reading the store at all.
+    ///
     /// The probe reads from the store rather than `take_rows`-ing the map's ids,
     /// so a row the map holds and the store has since deleted cannot be mistaken
-    /// for a foreign dataset. Cost is one small scan per sync that finds a
-    /// chain, against the hundreds of calls a sync already makes.
-    async fn rowmap_matches_store(&self, set: &RowMetaSet) -> Result<bool> {
+    /// for a foreign dataset. Cost is one metadata read plus one small scan per
+    /// sync that finds a chain, against the hundreds of calls a sync makes.
+    async fn rowmap_matches_store(&self, set: &RowMetaSet, coverage: Coverage) -> Result<bool> {
         if set.is_empty() {
             return Ok(true);
+        }
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        if coverage == Coverage::Complete && set.len() != dataset.count_rows(None).await? {
+            return Ok(false);
         }
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
@@ -2663,8 +2722,6 @@ impl Store {
                     continue;
                 };
                 match set.lookup(rowids.value(row)) {
-                    // The same row id naming a different message is proof: this
-                    // chain was built from another dataset.
                     Some((_, cached)) if cached != message_id => return Ok(false),
                     Some(_) => known += 1,
                     // Unknown is not proof on its own - a row appended after the
@@ -2681,9 +2738,9 @@ impl Store {
         Ok(known > 0)
     }
 
-    /// Rows the freshness probe reads from the store. Three, because the check
-    /// is for a wholesale identity mismatch, not for drift: one row settles it
-    /// unless that row is itself deleted or newly appended.
+    /// Rows the identity probe reads from the store. Three, because the check is
+    /// for a wholesale mismatch, not for drift: one row settles it unless that
+    /// row is itself newly appended.
     const ROWMAP_PROBE_ROWS: i64 = 3;
 
     /// Row metas for the rows appended since the base segment - the input to a

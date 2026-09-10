@@ -390,14 +390,16 @@ Three minutes to build the map from scratch is what a first sync on a fresh host
 
 `pond sync --dry-run` builds the freshness map through `ensure_rowmap` (`main.rs:4476`) and writes nothing to the store, so it isolates the change. `XDG_CACHE_HOME` was redirected per arm, both arms seeded from one cold build of the operator's real chain (base `v8917`, 477 MB, plus delta `d8921`), so neither arm read or wrote `~/.cache/pond`.
 
-`hyperfine --warmup 2 --runs 12`:
+`hyperfine --warmup 2 --runs 15`, medians rather than means because S3 throws the occasional multi-second outlier and the effect is a few hundred ms (one earlier run had a 6.1 s flyer that dragged an arm's mean below the other's):
 
 ```
-before (0.17.1, no guard)   757.8 ms ± 218.5 ms   [455.1 … 1115.8]
-after  (identity guard)      1.202 s ±  0.306 s   [ 0.860 …  1.883]
+before   median  599.6 ms   p25  499.3   p75  712.9   [457.6 … 837.5]
+after    median 1056.2 ms   p25  966.6   p75 1256.5   [916.7 … 1631.1]
 ```
 
-**~+440 ms per `ensure_rowmap`**, one S3 probe read. The ranges barely overlap (before max 1.116 s, after min 0.860 s), so this is the probe rather than jitter. In proportion: it roughly doubles `sync --dry-run`, which is sub-second, and is ~1% of a real sync against this store, where the oracle alone is ~27 s. A sync that imports rows calls `ensure_rowmap` twice (once before the import, once to republish the chain after), so it pays this twice.
+**+457 ms per `ensure_rowmap`, x1.76 on medians.** The two distributions do not overlap at all here - the slowest before-run (837.5 ms) is faster than the fastest after-run (916.7 ms) across 15 runs each - so this is the guard, not jitter. In proportion: it roughly doubles `sync --dry-run`, which is sub-second either way, and is ~1% of a real sync against this store, where the oracle alone is ~27 s. A sync that imports rows calls `ensure_rowmap` twice and pays it twice.
+
+The guard reads a row count as well as probing rows: identity alone accepts a foreign chain that happens to share a prefix, which is not exotic - a store re-synced from the same sources replays its oldest session first, and only diverges where a session grew. The count costs ~13 ms against the probe-only version measured earlier (444 ms), because it is manifest metadata rather than data pages.
 
 **No false positive on the real store**, which was the thing worth checking: the guard kept the 477 MB chain (`v8917` + `d8921` still present in the after arm), rather than deciding a live production map was foreign and forcing a full rebuild over ~2M rows.
 

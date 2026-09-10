@@ -134,6 +134,7 @@ async fn the_read_path_ignores_a_rowmap_from_a_previous_store() -> anyhow::Resul
     .await?;
     store.ensure_rowmap(&cache).await?;
     assert!(!RowmapOracle(store.rowmap_snapshot()).is_empty());
+    let chain_version = store.messages_version().await?;
     drop(store);
 
     std::fs::remove_dir_all(&store_dir)?;
@@ -146,6 +147,20 @@ async fn the_read_path_ignores_a_rowmap_from_a_previous_store() -> anyhow::Resul
     )
     .await?;
 
+    // The precondition this test rests on: `load_rowmap_if_present` installs a
+    // chain only at a matching version, so unless the two corpora land the
+    // messages dataset on the same version the guard is never reached and the
+    // assertion below passes for the wrong reason. Both fixture sets sit well
+    // under `ADAPTER_FLUSH_BATCH`, so both take one flush - but assert it
+    // rather than rely on it, or growing a fixture makes this test vacuous in
+    // silence.
+    assert_eq!(
+        rebuilt.messages_version().await?,
+        chain_version,
+        "the cached chain must sit at the rebuilt store's version, or the read \
+         path skips it for a reason unrelated to the guard",
+    );
+
     // The read path installs a chain, it never builds one - so with the guard
     // holding, this store has no resident map at all rather than another
     // store's.
@@ -153,6 +168,14 @@ async fn the_read_path_ignores_a_rowmap_from_a_previous_store() -> anyhow::Resul
     assert!(
         RowmapOracle(rebuilt.rowmap_snapshot()).is_empty(),
         "a read command must not hydrate from the previous store's map",
+    );
+
+    // `pond status` reads the same cache through its own estimate seam, which
+    // is version-agnostic by design, so it needs the check just as much: a
+    // rebuilt store must not be reported as fully synced.
+    assert!(
+        rebuilt.open_cached_rowmap(&cache).await.is_none(),
+        "the status estimate must not use the previous store's map",
     );
     Ok(())
 }
