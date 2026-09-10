@@ -26,6 +26,7 @@ use crate::{
     wire::ProviderOptions,
 };
 
+mod agy;
 mod claude_ai_export;
 mod claude_code;
 mod claude_desktop_app;
@@ -43,6 +44,7 @@ mod opencode;
 mod pi_coding_agent;
 mod sqlite;
 
+pub use agy::{AgyAdapter, AgyFactory};
 pub use claude_ai_export::{ClaudeAiExportAdapter, ClaudeAiExportFactory};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
@@ -541,6 +543,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &OhMyPiFactory,
         &LettaCodeFactory,
         &GrokBuildFactory,
+        &AgyFactory,
     ]
 }
 

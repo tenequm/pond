@@ -25,6 +25,7 @@ use pond::{
 };
 use tempfile::TempDir;
 
+mod agy;
 mod claude_ai_export;
 mod claude_code;
 mod codex_cli;

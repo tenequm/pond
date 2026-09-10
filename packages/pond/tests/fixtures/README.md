@@ -1,7 +1,7 @@
 # Session samples
 
 Curated, anonymized (or, where a real capture is infeasible, fully synthetic)
-session samples from 12 agentic-client platforms. These files
+session samples from 13 agentic-client platforms. These files
 ground pond's canonical-type design (see `docs/spec.md`) and
 serve as the test fixtures for the v1 adapter implementations (see
 `docs/spec.md#adapters`).
@@ -11,7 +11,8 @@ claude_code nested workflow-subagent sample added 2026-06-04; opencode
 `opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15;
 synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
 transcripts captured 2026-08-24 from letta-code 0.30.30; grok-build sessions
-captured 2026-08-24 from grok-build 1.0.5).
+captured 2026-08-24 from grok-build 1.0.5; agy conversations captured
+2026-09-10 from agy 1.2.0 and its ACP server).
 
 ## Why
 
@@ -44,6 +45,7 @@ Constraints baked in:
 ```
 adapter/
   README.md                  this file
+  agy/                       Antigravity CLI (`agy`) and its ACP server, a Gemini home (`~/.gemini`)
   claude_ai_export/          claude.ai data export (synthetic conversations.json)
   claude_code/               Claude Code CLI
   claude_desktop_app/        Claude Desktop (macOS), Cowork / local-agent-mode
@@ -65,6 +67,113 @@ adapter can be tested by pointing its discovery code directly at the
 sample tree.
 
 ## Per-platform notes
+
+### agy (Antigravity CLI and its ACP server)
+
+- Source path: the Gemini home, `~/.gemini/` (`%USERPROFILE%\.gemini` on
+  Windows; `$GEMINI_HOME` relocates it - the ACP server's startup log says so
+  itself: `Gemini home resolved to ... (default; $GEMINI_HOME is unset)`). Two
+  writers share it, each with its own subtree: `antigravity-cli/` (the `agy`
+  binary, TUI and `-p` headless) and `antigravity-acp/` (Google's ACP server,
+  `agy_acp_server.par`). Both keep one SQLite database per conversation at
+  `<lane>/conversations/<uuid>.db`: WAL mode, `PRAGMA user_version = 1`, tables
+  `steps`, `trajectory_meta`, `trajectory_metadata_blob`, `parent_references`,
+  `battle_mode_infos`, `gen_metadata`, `executor_metadata`, every payload a
+  protobuf blob (`steps.step_payload` is a `gemini_coder.Step`). Sidecars: the
+  CLI lane writes `brain/<uuid>/.system_generated/` (the `logs/transcript*.jsonl`
+  display mirror, `steps/<n>/output.txt` tool spill, `tasks/*.log`,
+  `messages/*.json`, `subagents/<child>.json`), a lagging
+  `conversation_summaries.db` index and the TUI's `history.jsonl` prompt recall;
+  the ACP lane writes `conversations/<uuid>.meta` (`{"cwd": ...}`) and no brain.
+- Samples: captured 2026-09-10 by sandbox self-capture on Linux (NixOS) - agy
+  1.2.0 and the ACP server build `release blaze-2026.08.18-1`, under a
+  throwaway `HOME` at the neutral base path `/tmp/agy-fixture/home`, project cwd
+  `/tmp/agy-fixture/project` (a `README.md` and a `calc.py`, not a git repo).
+  Auth: two fresh Google OAuth sign-ins performed inside the sandbox (the CLI's
+  pasted authorization code, the ACP server's loopback callback), with the
+  onboarding data-sharing opt-in unticked; both tokens
+  (`antigravity-cli/antigravity-oauth-token`, `antigravity-acp/acp_token.json`)
+  were deleted before anything was copied out. Models: agy's default Gemini 3.8
+  Flash (High), `claude-sonnet-4-6` for the reasoning session, the ACP server's
+  default. Drivers: headless `agy -p ... --output-format json` (resumed with
+  `--conversation`), the TUI under tmux for `/rewind` and `/fork`, SIGTERM
+  mid-command for the interrupts; the ACP tool session through `acpx exec`, the
+  multi-turn ACP session through a minimal JSON-RPC client (`initialize`,
+  `session/new`, `session/prompt`, then `session/load` from a fresh server
+  process) because acpx 0.15.1's named sessions resolved to its codex agent
+  under `--agent`. Each WAL was folded into its database with `PRAGMA
+  wal_checkpoint(TRUNCATE)`; the files stay in WAL mode (the production shape,
+  so a read-only open materializes gitignored `-wal`/`-shm`). No other edit:
+  nothing needed anonymizing.
+- Census (13 databases, 62 `steps` rows; step type / status):
+  - `antigravity-cli/conversations/`:
+    - `109948f1` no-workspace: a headless one-shot without `--add-dir`, so no
+      workspace appears anywhere in the database (only
+      `project_id: "default-cli-project"`). 2 steps: 1 USER_INPUT, 1
+      PLANNER_RESPONSE.
+    - `bb24ae0d` text + resume: two headless turns, the second through
+      `--conversation`; the resume injects a SYSTEM_MESSAGE (the "subagents and
+      background tasks have been stopped due to server restart" notice). 5
+      steps: 2 USER_INPUT, 2 PLANNER_RESPONSE, 1 SYSTEM_MESSAGE.
+    - `3f72cf51` tools: four tool calls as GENERIC steps - `ls`, a view of a
+      missing file (status ERROR, `error_details` populated), `false` (exit 1,
+      status DONE), a view of `README.md`. 10 steps: 1 USER_INPUT, 5
+      PLANNER_RESPONSE, 3 GENERIC/DONE, 1 GENERIC/ERROR.
+    - `3570c3c6` reasoning: `claude-sonnet-4-6`; the planner response carries
+      `thinking` text and a thinking signature. 2 steps.
+    - `121e0cfc` interrupted, never resumed: SIGTERM 20 s into `sleep 45`; the
+      command step is left RUNNING (with `task_details`, a background task). 4
+      steps: 1 USER_INPUT, 2 PLANNER_RESPONSE, 1 GENERIC/RUNNING.
+    - `5d458282` interrupted, then resumed: the same interrupt, then a headless
+      resume, which rewrote the RUNNING step to CANCELED in place and injected
+      the restart SYSTEM_MESSAGE. 7 steps: 2 USER_INPUT, 3 PLANNER_RESPONSE, 1
+      SYSTEM_MESSAGE, 1 GENERIC/CANCELED.
+    - `6479151c` subagent parent: the subagent is spawned through a GENERIC
+      tool call (`Subagents` argument) and reports back as a SYSTEM_MESSAGE
+      whose sender is the child; `brain/.../subagents/11b9a01c-....json` is the
+      parent-side record. 6 steps: 1 USER_INPUT, 3 PLANNER_RESPONSE, 1
+      GENERIC/DONE, 1 SYSTEM_MESSAGE.
+    - `11b9a01c` subagent child: its own `trajectory_metadata_blob` names
+      `parent_conversation_id: 6479151c-...`, `nesting_depth: 1` and the
+      `research` agent script. 6 steps: 1 USER_INPUT, 3 PLANNER_RESPONSE, 2
+      GENERIC/DONE.
+    - `07439cf3` TUI, rewound: two turns, `/rewind` over the second (its two
+      steps deleted, `trajectory_meta` rotated to a new `trajectory_id`, one
+      `parent_references` FORK row pointing at the conversation's own previous
+      trajectory), then a new turn that reuses step indexes 2-3. 4 steps: 2
+      USER_INPUT, 2 PLANNER_RESPONSE.
+    - `3abd71a7` `/fork` of `07439cf3`, plus one turn of its own: the parent's
+      steps are copied verbatim (still carrying the parent's trajectory ids),
+      and two `parent_references` FORK rows name the parent - the inherited
+      rewind and the fork cut at the parent's step 3. 6 steps: 3 USER_INPUT, 3
+      PLANNER_RESPONSE.
+  - `antigravity-acp/conversations/` (every ACP database writes an empty
+    `trajectory_metadata_blob` and a `trajectory_meta` row whose
+    `trajectory_id` equals the conversation id; the cwd lives only in the
+    `.meta` sidecar):
+    - `7337857a` empty: created by the sign-in handshake (`session/new`, never
+      prompted) - every table present, zero steps.
+    - `85732767` two turns + reload: two prompts, then `session/load` from a new
+      server process and a third prompt. 6 steps: 3 USER_INPUT, 3
+      PLANNER_RESPONSE.
+    - `884ff681` tool: `acpx exec`; the client-side `client_view_file` tool is an
+      AGENCY_TOOL_CALL step. 4 steps: 1 USER_INPUT, 2 PLANNER_RESPONSE, 1
+      AGENCY_TOOL_CALL.
+  - Totals: 19 USER_INPUT, 30 PLANNER_RESPONSE, 9 GENERIC (6 DONE, 1 ERROR, 1
+    RUNNING, 1 CANCELED), 3 SYSTEM_MESSAGE, 1 AGENCY_TOOL_CALL = 62.
+- Left out on purpose: per-install state (`bin/`, `builtin/`, `cache/`,
+  `log/`, `crashes/`, `installation_id`, `jetski_state.pbtxt`, `implicit/*.pb`,
+  `annotations/*.pbtxt`, `presence/`, `knowledge/`, `scratch/`, both lanes'
+  `settings.json`), the opaque (encrypted) `<uuid>.pb` that `/fork` writes
+  beside the fork's `.db`, and a second empty ACP conversation that
+  `acpx sessions ensure` created (the same shape as `7337857a`).
+  `agy --model not-a-real-model` is rejected before any conversation is
+  written, so there is no failed-start database to include.
+- Sweeps: trufflehog 0 over the tree (databases included); gitleaks 0 over the
+  text files and over `strings` of every database (gitleaks skips files it
+  sniffs as `application/vnd.sqlite3`, the extracted text had the SQLite magic
+  line removed); every JSON/JSONL/`.meta` file parses and every database passes
+  `PRAGMA integrity_check`; no username, email, hostname or `/home/<name>` path.
 
 ### claude_ai_export (claude.ai data export)
 
