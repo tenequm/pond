@@ -1,5 +1,5 @@
 //! Shared read-only SQLite plumbing for DB-backed adapters (opencode, openclaw,
-//! hermes, nanoclaw).
+//! hermes, nanoclaw, agy, pi-coding-agent).
 //!
 //! Seam rule (CLAUDE.md "Seam boundaries"): this module carries only
 //! cross-implementation infrastructure with two real callers and no
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{Value, json};
 
 use super::AdapterError;
@@ -72,6 +72,32 @@ pub(crate) fn join_error(adapter: &'static str, join: tokio::task::JoinError) ->
         "blocking read task",
         std::io::Error::other(join.to_string()),
     )
+}
+
+/// Does this table exist? Probe `sqlite_master` before preparing a SELECT
+/// against an optional table, so its absence is a clean control-flow signal
+/// rather than a swallowed prepare error.
+///
+/// Shared because the harnesses pond reads reshape their schemas between
+/// releases, so "which tables are present" is load-bearing for more than one
+/// adapter: openclaw tells three storage eras apart by the table SET, and agy
+/// checks for its `steps` table before peeking a conversation's watermark
+/// (absent means empty, unreadable means opaque). It lives here for the same
+/// reason [`open_db`] and [`row_to_json`] do - one behaviour, one place,
+/// rather than each adapter carrying a copy that drifts.
+///
+/// `LIMIT 1` rather than `count(*)`: both scan `sqlite_master` (no index on
+/// `name`, so the query plans read the same), but the limit emits a counter
+/// and halts on the first match while `count(*)` always runs the scan out.
+/// This asks whether a row exists, not how many.
+pub(crate) fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        [table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
 }
 
 /// SQLite affinity of each column in a mirrored SELECT list, so a row decodes to

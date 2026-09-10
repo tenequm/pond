@@ -4483,6 +4483,11 @@ async fn run_sync_dry_run(
         source_path: Option<String>,
         sessions: usize,
         plan: Option<pond::adapter::SyncPlan>,
+        /// Why this adapter could not be counted. An adapter that cannot read
+        /// part of its source reports an error rather than a count, and the
+        /// point of a dry run is to see the whole picture - so it becomes a
+        /// row saying so, not an abort that blanks every other adapter too.
+        error: Option<String>,
     }
     let mut rows: Vec<DryRunRow> = Vec::new();
     for resolved in adapters {
@@ -4496,9 +4501,12 @@ async fn run_sync_dry_run(
         let source_path = source_path(&resolved.config);
         let opened = factory.open(resolved.config)?;
         let plan = opened.plan(oracle).await?;
-        let sessions = match &plan {
-            Some(plan) => plan.sessions,
-            None => opened.discover().await?,
+        let (sessions, error) = match &plan {
+            Some(plan) => (plan.sessions, None),
+            None => match opened.discover().await {
+                Ok(sessions) => (sessions, None),
+                Err(error) => (0, Some(error.to_string())),
+            },
         };
         rows.push(DryRunRow {
             name: resolved.name,
@@ -4506,6 +4514,7 @@ async fn run_sync_dry_run(
             source_path,
             sessions,
             plan,
+            error,
         });
     }
     if json {
@@ -4515,9 +4524,12 @@ async fn run_sync_dry_run(
                 serde_json::json!({
                     "name": row.name,
                     "path": row.source_path,
-                    "sessions": row.sessions,
+                    // null, not 0, when the source could not be read: a count
+                    // is a claim, and "unknown" is the honest one here.
+                    "sessions": row.error.is_none().then_some(row.sessions),
                     "fresh": row.plan.map(|plan| plan.fresh),
                     "pending": row.plan.map(|plan| plan.pending),
+                    "error": row.error,
                 })
             })
             .collect();
@@ -4529,23 +4541,30 @@ async fn run_sync_dry_run(
     }
     let label = pond::output::paint("plan", pond::output::dim());
     for row in &rows {
-        let detail = match &row.plan {
-            Some(plan) if plan.pending == 0 => {
-                format!(
-                    "{} sessions - up to date",
-                    format_thousands(row.sessions as u64)
-                )
+        let detail = if let Some(error) = &row.error {
+            pond::output::paint(
+                &format!("cannot read this source - {error}"),
+                pond::output::red(),
+            )
+        } else {
+            match &row.plan {
+                Some(plan) if plan.pending == 0 => {
+                    format!(
+                        "{} sessions - up to date",
+                        format_thousands(row.sessions as u64)
+                    )
+                }
+                Some(plan) => format!(
+                    "{} sessions - {} to sync, {} fresh",
+                    format_thousands(row.sessions as u64),
+                    format_thousands(plan.pending as u64),
+                    format_thousands(plan.fresh as u64),
+                ),
+                None => format!(
+                    "{} sessions (pending unknown - this adapter has no cheap freshness preview)",
+                    format_thousands(row.sessions as u64),
+                ),
             }
-            Some(plan) => format!(
-                "{} sessions - {} to sync, {} fresh",
-                format_thousands(row.sessions as u64),
-                format_thousands(plan.pending as u64),
-                format_thousands(plan.fresh as u64),
-            ),
-            None => format!(
-                "{} sessions (pending unknown - this adapter has no cheap freshness preview)",
-                format_thousands(row.sessions as u64),
-            ),
         };
         let display = adapter_label(&row.name, row.fanout.as_deref());
         output(&format!("{label}      {display:<12} {detail}"))?;
@@ -5960,6 +5979,10 @@ fn status_json(
                 "sessions": adapter.sessions,
                 "fresh": adapter.plan.map(|plan| plan.fresh),
                 "pending": adapter.plan.map(|plan| plan.pending),
+                // Same shape as `sync --dry-run --format json`: a null count
+                // says nothing about why, and the two surfaces should not
+                // explain the same failure differently.
+                "error": adapter.error,
             })
         })
         .collect();
@@ -6202,6 +6225,14 @@ struct LocalAdapterStatus {
     fanned: bool,
     sessions: Option<usize>,
     plan: Option<pond::adapter::SyncPlan>,
+    /// Why this adapter reported no count, when it said so itself. A `None`
+    /// `sessions` used to mean only one thing here - the source path could not
+    /// be opened - so that was what the renderer said. An adapter can now also
+    /// refuse to count a source it cannot classify, which is a different
+    /// problem with a different fix, and telling an operator to check their
+    /// config path when the path is fine and the software is stale is worse
+    /// than saying nothing.
+    error: Option<String>,
 }
 
 struct LocalStatus {
@@ -6268,6 +6299,10 @@ async fn local_status(
                 fanned,
                 sessions: None,
                 plan: None,
+                // The config itself would not open, which IS the case the
+                // "check [adapters.<name>] in config" line was written for -
+                // so leave it to that arm rather than inventing a message.
+                error: None,
             });
             continue;
         };
@@ -6276,9 +6311,16 @@ async fn local_status(
         } else {
             None
         };
-        let sessions = match &plan {
-            Some(plan) => Some(plan.sessions),
-            None => opened.discover().await.ok(),
+        let (sessions, error) = match &plan {
+            Some(plan) => (Some(plan.sessions), None),
+            None => match opened.discover().await {
+                Ok(sessions) => (Some(sessions), None),
+                // Keep the adapter's own words. It knows why it could not
+                // count - an unrecognized schema names the tables it found and
+                // says to upgrade - and this is the surface an operator checks
+                // first, so throwing that away and guessing helps nobody.
+                Err(error) => (None, Some(error.to_string())),
+            },
         };
         adapters.push(LocalAdapterStatus {
             name,
@@ -6286,6 +6328,7 @@ async fn local_status(
             fanned,
             sessions,
             plan,
+            error,
         });
     }
     let last_sync = syncstate::read_last_sync(store_key);
@@ -6333,6 +6376,14 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
             "          ".to_owned()
         };
         let detail = match (adapter.sessions, &adapter.plan) {
+            // The adapter said why: repeat it rather than diagnose over it.
+            (None, _) if adapter.error.is_some() => paint(
+                &format!(
+                    "cannot read this source - {}",
+                    adapter.error.as_deref().unwrap_or_default()
+                ),
+                red(),
+            ),
             (None, _) => paint(
                 &format!(
                     "source path unreadable - check [adapters.{}] in config",

@@ -17,7 +17,7 @@
 use std::path::Path;
 
 use pond::{
-    adapter::{AdapterFactory, OpenClawAdapter, OpenClawFactory, RestoreFidelity},
+    adapter::{Adapter, AdapterFactory, OpenClawAdapter, OpenClawFactory, RestoreFidelity},
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::{SessionWithMessages, Store},
     wire::{Message, PartKind, Provenance},
@@ -1195,6 +1195,89 @@ async fn db_era_deleted_archive_is_excluded_but_reported() -> anyhow::Result<()>
         "the one deleted archive is accounted for either way"
     );
     Ok(())
+}
+
+/// A schema no reader claims must be a TYPED ERROR, never a quiet zero.
+///
+/// This is the guarantee the whole DB-era change rests on. pond probed for one
+/// table name, did not find it on any 2026.8.1+ host, and reported "up to
+/// date" against a database full of sessions - `session-movement-complete`
+/// calls that a skip that outruns durability. A future OpenClaw schema must
+/// fail loudly instead of silently reproducing #224.
+///
+/// `discover()` is the surface under test on purpose: it is what `pond status`
+/// and `sync --dry-run` report, and it used to discard enumeration errors and
+/// answer `Ok(0)` - so the fix was loud on the path that ingests and silent on
+/// the two paths people use to check.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_schema_is_an_error_not_an_empty_root() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let db = db_path(root.path(), "bot");
+    std::fs::create_dir_all(db.parent().expect("agent dir"))?;
+    // Session-bearing but matching no era: `transcript_events` with neither
+    // the v1 (`sessions` + `session_entries`) nor the v2 (`session_windows` +
+    // `session_nodes`) tables beside it. A plausible future rename, and the
+    // shape 2026.8.1 itself presented to a pond that only knew v1.
+    let conn = rusqlite::Connection::open(&db)?;
+    conn.execute_batch(
+        "CREATE TABLE transcript_events (
+           session_id TEXT NOT NULL,
+           seq INTEGER NOT NULL,
+           event_json TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           PRIMARY KEY (session_id, seq)
+         ) STRICT;
+         CREATE TABLE schema_meta (
+           meta_key TEXT NOT NULL PRIMARY KEY,
+           schema_version INTEGER NOT NULL,
+           app_version TEXT
+         ) STRICT;
+         INSERT INTO schema_meta VALUES ('primary', 999, '2099.1.1');",
+    )?;
+    drop(conn);
+
+    let adapter = OpenClawAdapter::new(root.path());
+    let error = adapter
+        .discover()
+        .await
+        .expect_err("an unreadable schema must not report a session count");
+    let text = error.to_string();
+    for expected in ["transcript_events", "999", "2099.1.1"] {
+        assert!(
+            text.contains(expected),
+            "the error must name what it found so an operator can act on it; \
+             missing {expected:?} in: {text}"
+        );
+    }
+    Ok(())
+}
+
+/// The counterpart: a DB with no session tables at all is the FILE era, and
+/// its empty read is a fact rather than a failure. This is the one era that
+/// must stay quiet, so the error above cannot be achieved by making every
+/// unfamiliar database loud.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auth_only_db_stays_quiet_and_is_not_an_error() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let db = db_path(root.path(), "bot");
+    std::fs::create_dir_all(db.parent().expect("agent dir"))?;
+    let conn = rusqlite::Connection::open(&db)?;
+    conn.execute_batch(
+        "CREATE TABLE auth_state (id TEXT NOT NULL PRIMARY KEY, value TEXT) STRICT;",
+    )?;
+    drop(conn);
+
+    assert_eq!(
+        adapter_discover(root.path()).await?,
+        0,
+        "a pre-2026.7.2 agent DB carries only auth state; the file store is \
+         the session source and an empty read is correct"
+    );
+    Ok(())
+}
+
+async fn adapter_discover(root: &Path) -> anyhow::Result<usize> {
+    Ok(OpenClawAdapter::new(root).discover().await?)
 }
 
 /// The same source read twice adds nothing (spec.md#adapter-integrity-additive-sync).

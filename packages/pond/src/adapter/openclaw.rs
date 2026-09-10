@@ -142,7 +142,7 @@ use super::{
     extracted_text,
     jsonl::{parse_bounded, peek_first_line, peek_last_mapped},
     jsonl_bytes, part_id, part_ordinal, raw_record,
-    sqlite::{self, CHANNEL_CAP, ColKind, columns_sql, emit, row_to_json},
+    sqlite::{self, CHANNEL_CAP, ColKind, columns_sql, emit, has_table, row_to_json},
 };
 
 const NAME: &str = "openclaw";
@@ -267,7 +267,18 @@ impl Adapter for OpenClawAdapter {
         let adapter = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                Ok(enumerate_and_peek(&adapter, false).entries.len())
+                // An enumeration error means part of this root could not be
+                // read, so a count is a claim we cannot make. Reporting
+                // `Ok(n)` here is what let a 2026.8.1+ host show "0 sessions"
+                // in `pond status` and `sync --dry-run` while its database
+                // held eight - `session-movement-complete` calls that a skip
+                // that outruns durability. The count is honest only when
+                // nothing failed; otherwise the first error is the answer.
+                let enumerated = enumerate_and_peek(&adapter, false);
+                match enumerated.errors.into_iter().next() {
+                    Some(error) => Err(error),
+                    None => Ok(enumerated.entries.len()),
+                }
             })
             .await
             .map_err(join_error)?
@@ -1076,20 +1087,6 @@ enum DbSessions {
         rows: Vec<(String, String)>,
     },
     FileEra,
-}
-
-/// Detect a table via `sqlite_master` before preparing a SELECT against it, so
-/// its absence is a clean control-flow signal (not a swallowed prepare error).
-/// OpenClaw's schema differs across versions in which tables exist at all, so
-/// every optional-table read goes through this.
-fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
-        [table],
-        |_| Ok(()),
-    )
-    .optional()
-    .map(|row| row.is_some())
 }
 
 /// Which session layout an agent DB carries. OpenClaw has shipped three, and
@@ -3348,9 +3345,18 @@ fn session_entry_exists(
     conn: &Connection,
     session_key: &str,
 ) -> Result<Option<bool>, AdapterError> {
-    let table = if has_table(conn, "session_nodes").unwrap_or(false) {
+    // Propagated, not `unwrap_or(false)`: a busy or corrupt DB is a third
+    // case, and folding it into `None` would report "unknown schema" for a
+    // schema we simply could not read - the same swallowed-error shape this
+    // function was rewritten to remove. The caller preserves on `Err` too, so
+    // the safe direction is unchanged; only the reason it logs gets honest.
+    let probe = |table: &'static str| {
+        has_table(conn, table)
+            .map_err(|error| db_error(Path::new(table), "probe live-entry table", &error))
+    };
+    let table = if probe("session_nodes")? {
         "session_nodes"
-    } else if has_table(conn, "session_entries").unwrap_or(false) {
+    } else if probe("session_entries")? {
         "session_entries"
     } else {
         return Ok(None);
