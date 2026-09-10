@@ -82,6 +82,8 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 - Run the old-side row (the gate at the pre-change commit) BEFORE the new binary ever writes to the real store: writes mutate store state, so the old-side read baseline is unrecoverable afterwards except via s5cmd scratch copies (the lance 8->10 upgrade lost its sync-write baseline exactly this way). The gate's write metrics have no such hazard - they run on fixed synthetic scratch stores either way.
 - `POND_BIN=/path/to/pond moon run bench-gate` snapshots a prebuilt binary (e.g. the released one) through the CLI probes; the cargo-bench fields land null since those compile HEAD. A full old-side row needs the gate run from the old commit's checkout.
 - Rows are comparable only within the same `store` digest and `write_corpus` tag; the delta printer warns on store changes and flags rows with no write metrics.
+- The gate measures the paths its probes name and nothing else, so confirm a probe reads yours before citing a row as evidence - its `[sync] change-detection oracle` spent months timing a function with no production callers, leaving real sync-oracle changes unmeasured (#232). Otherwise add a probe, or measure separately and say so in the write-up.
+- One row does not bracket a change on a remote store: two runs 65 minutes apart on identical code moved `search_dated_s` +129%, `row_counts_ms` -59% and `open_store_ms` +90%, which buries a few hundred ms of real regression. Bracket a small effect with a targeted A/B over many runs (`hyperfine`, medians - S3 outliers drag means), each run on its own store path.
 
 ## Errors
 
