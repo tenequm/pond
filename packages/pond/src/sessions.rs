@@ -2682,7 +2682,11 @@ impl Store {
     ///   chain claims to describe in full, a valid map holds exactly as many
     ///   rows as the store does. pond appends and merge-updates but never
     ///   deletes, and stable row ids survive compaction, so the count is an
-    ///   equality, not a bound. One metadata read, no data pages.
+    ///   equality, not a bound. One metadata read, no data pages. **When a
+    ///   delete path lands (`pond erase`), this stops being an equality**: a
+    ///   valid map would then hold rows the store no longer has, and the check
+    ///   has to become a bound plus a rebuild-on-shrink, or it will spuriously
+    ///   discard good chains and pay a full rebuild for each.
     /// - **Identity**: the store's oldest rows must resolve, through the map, to
     ///   the messages they actually are. A row id naming a different message is
     ///   proof of a foreign chain.
