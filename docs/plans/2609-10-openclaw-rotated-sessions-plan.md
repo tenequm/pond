@@ -8,10 +8,25 @@ rotated-out generation - isolated cron runs, hook runs, isolated heartbeats, com
 predecessors, reset archives - is dropped without a count. The reporter's host ingested 13
 sessions out of ~1.8k real transcripts.
 
-Status: file era IMPLEMENTED, committed and pushed on `fix/openclaw-rotated-sessions`
-(`3b70b7b` fixtures, `63495c4` code), draft PR #228, CI green. Fixtures captured from real
-OpenClaw 2026.7.1-2; every delta in section 4 approved and built (user OK 2026-09-10).
-The DB era (section 5) is IN PROGRESS on the same branch and the same PR.
+Status (2026-09-10 21:28): BOTH ERAS IMPLEMENTED, committed and pushed on
+`fix/openclaw-rotated-sessions`. Draft PR #228, CI fully green on `5bc4f8b`
+(build-and-test, flake-check, windows-verify, release-note-lint).
+
+- `3b70b7b` file-era fixtures, `63495c4` file-era fix (OpenClaw <= 2026.7.1)
+- `087c185` merge of origin/main, which brought in #225 (agy adapter)
+- `6f0757f` DB-era reader + the silent-skip fix + three spec corrections
+- `1e5ece4` DB-era tests, cron exact keys, first polish round
+- `5bc4f8b` `discover()` propagation, dry-run/status reporting, `has_table` shared
+
+Proven end to end on the captured 2026.9.3 root: 8 sessions / 86 messages, up
+from 0. 564 tests pass; clippy `--all-targets -D warnings` and fmt clean.
+
+UNCOMMITTED: `docs/benchmarks/{results.md,bench-gate-baseline.jsonl}` and this
+plan. See section 8 - the gate row in that jsonl is CONTAMINATED and results.md
+is what explains it, so the two belong in one commit.
+
+Every delta in section 4 and every adjudicated decision in section 6 is approved
+and built (user OK 2026-09-10).
 
 Two deviations from the plan as written, both decided during implementation:
 
@@ -250,11 +265,66 @@ silent-skip in this PR; fix all ten extras in this PR.
 10. Settle `parse_archive_name` against the real
     `<id>.jsonl.deleted.<ts>.<gen>.zst` filename with a unit test, not by reading.
 
-## 7. Out of scope
+## 7. Known gaps - what "we ingest everything" does and does NOT cover
 
-- Nothing currently deferred.
+Proven: for the captured 2026.9.3 root, 9 distinct session ids exist anywhere in
+the agent DB and 8 are ingested. The 9th is the deliberately-deleted session,
+excluded as erasure intent and REPORTED ("1 deleted-archive(s) preserved"). Zero
+orphans - no `transcript_events` rows whose `session_id` has no window, no
+`session_nodes.current_session_id` pointing at a missing window. For the four
+file-era captures, a test asserts every transcript file lands.
 
-## 8. After implementation: benchmark run (user request, 2026-09-10)
+NOT proven, and the honest way to close each is another capture, not more
+reasoning:
+
+1. **DB era v1 (2026.7.2-2026.7.x) has no real capture.** The `sessions` +
+   `session_entries` branch is covered only by synthetic fixtures - the same
+   "what we believed the format was" that hid #224 in the first place.
+2. **Mixed-era (doctor-migrated) hosts have no fixture.** The `db_ids`
+   supersession that stops migrated files re-ingesting as duplicates is reasoned,
+   not demonstrated. Getting it wrong produces DUPLICATE message rows, not a
+   no-op, because the file reader synthesizes its own ordering key.
+3. **`reason='reset'` archive rows are untested against real data.** 2026.9.3
+   never writes one (reset does not rotate), so that path rests on schema
+   evidence alone.
+4. **Heartbeat is unverified for the DB era** - the capture did not run one.
+5. The capture ran the scenarios the brief asked for. A real host may hold shapes
+   never produced here: channel sessions, plugin-owned sessions, subagent spawns.
+
+Knowingly not ingested, by design:
+
+- `deleted` archives unless `ingest_deleted` (reported, not silent).
+- A DB-era deleted archive whose derived file retention already removed:
+  excluded AND invisible to `reconcile_deletions`, which enumerates FILENAMES.
+  Documented as a blind spot in the openclaw module doc rather than papered over.
+  Closing it means teaching that pass to enumerate `session_transcript_archives`.
+- Events created and destroyed between two syncs by truncating compaction -
+  unrecoverable by anyone, not just pond.
+
+Deferred refactors from the first polish pass (all real, none behavioural):
+`SESSION_WINDOW_COLUMNS` duplicating `SESSION_COLUMNS`; the decode-tail
+duplication between `fetch_archive_lines` and `read_entry_lines`; four functions
+past ~100 lines; wildcard `_ =>` arms in the era dispatch.
+
+## 8. Deferred: a clean bench-gate re-run
+
+The 2026-09-10 gate row (`5bc4f8b-dirty`, in `bench-gate-baseline.jsonl`) is
+CONTAMINATED - builds, tests and another bench ran on the same VM throughout its
+30-minute window, and the CPU-bound write/index columns moved up to +176% with no
+substrate change in the bracket. `docs/benchmarks/results.md` documents it as
+such so nobody reads it as a regression.
+
+Re-run ONE quiet gate after PR #232 merges (user's call, 2026-09-10). Not before:
+#232 replaces `oracle_warm_ms` (which times `Store::session_last_message_ids`, a
+function with no production callers) with `rowmap_cold_ms` / `rowmap_warm_ms`
+against `ensure_rowmap`, the path sync actually takes. Re-running earlier buys a
+quiet row that still carries a dead column.
+
+Prerequisites for that run: `pond schedule stop` first (see results.md 2026-08-25
+incident), nothing else running on the VM, and a fresh store path if any
+ingest timing is involved (#226).
+
+## 9. Benchmark run notes (user request, 2026-09-10)
 
 Run the full bench gate and append a jsonl record. NOT before the DB-era reader, its tests
 and the section-4/5 fixes are all done.
