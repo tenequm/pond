@@ -1972,9 +1972,17 @@ impl Store {
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
         {
-            self.rowmap.store(Some(Arc::new(set)));
-            Self::sweep_stale_rowmaps(cache_dir, &store_key, chain.base_version);
-            return Ok(());
+            if self.rowmap_matches_store(&set).await? {
+                self.rowmap.store(Some(Arc::new(set)));
+                Self::sweep_stale_rowmaps(cache_dir, &store_key, chain.base_version);
+                return Ok(());
+            }
+            tracing::warn!(
+                store = store_key,
+                version,
+                "cached rowmap describes a different store at this path; rebuilding"
+            );
+            Self::purge_rowmaps(cache_dir, &store_key);
         }
         if let Some(set) = self
             .extend_rowmap_coordinated(cache_dir, &store_key, version)
@@ -2045,6 +2053,7 @@ impl Store {
         if let Some(chain) = discover_chain(cache_dir, store_key)
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
+            && self.rowmap_matches_store(&set).await?
         {
             return Ok(Some(set));
         }
@@ -2061,6 +2070,17 @@ impl Store {
         let chain = discover_chain(cache_dir, store_key);
         let existing = match &chain {
             Some(paths) => match RowMetaSet::open(paths) {
+                // A chain from a previous store at this path is worse than no
+                // chain: extending it would layer this store's new rows onto
+                // another store's rows and call the result current.
+                Ok(set) if !self.rowmap_matches_store(&set).await? => {
+                    tracing::warn!(
+                        store = store_key,
+                        "cached rowmap describes a different store at this path; rebuilding"
+                    );
+                    Self::purge_rowmaps(cache_dir, store_key);
+                    None
+                }
                 Ok(set) => Some((paths, set)),
                 Err(error) => {
                     tracing::warn!(%error, store = store_key, "rowmap unreadable; purging and rebuilding");
@@ -2592,6 +2612,67 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// Does a cached rowmap chain describe *this* store, or a previous one that
+    /// lived at the same path?
+    ///
+    /// The cache key is a hash of the storage URL (`substrate::store_key`), and
+    /// nothing in Lance identifies a dataset across a rebuild: version numbers,
+    /// row ids and fragment ids all restart when a dataset is recreated. So a
+    /// store deleted and re-created at the same path inherits its predecessor's
+    /// chain, and every session in it gates `Fresh` against rows that no longer
+    /// exist - a sync that reports "up to date" into an empty store.
+    ///
+    /// Rather than stamp an identity into the cache (state to write, migrate and
+    /// keep honest), ask the store: read its oldest rows and check the map knows
+    /// them. That is the property that actually matters - a chain is usable iff
+    /// its row ids still resolve to the same messages - and it stays true for a
+    /// store restored from a backup, where the rows really are the same.
+    ///
+    /// The probe reads from the store rather than `take_rows`-ing the map's ids,
+    /// so a row the map holds and the store has since deleted cannot be mistaken
+    /// for a foreign dataset. Cost is one small scan per sync that finds a
+    /// chain, against the hundreds of calls a sync already makes.
+    async fn rowmap_matches_store(&self, set: &RowMetaSet) -> Result<bool> {
+        if set.is_empty() {
+            return Ok(true);
+        }
+        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        scanner.with_row_id();
+        scanner.project(&["id"])?;
+        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut known = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let rowids = uint64(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                let Some(message_id) = string(&batch, "id", row)? else {
+                    continue;
+                };
+                match set.lookup(rowids.value(row)) {
+                    // The same row id naming a different message is proof: this
+                    // chain was built from another dataset.
+                    Some((_, cached)) if cached != message_id => return Ok(false),
+                    Some(_) => known += 1,
+                    // Unknown is not proof on its own - a row appended after the
+                    // map was built is unknown too - but the store's OLDEST rows
+                    // predate any chain built from it, so a map that knows none
+                    // of them did not come from this store.
+                    None => {}
+                }
+            }
+        }
+        // Zero rows scanned lands here too: a non-empty map against a store with
+        // nothing in it is the emptied-and-rebuilt case, and describes rows that
+        // no longer exist.
+        Ok(known > 0)
+    }
+
+    /// Rows the freshness probe reads from the store. Three, because the check
+    /// is for a wholesale identity mismatch, not for drift: one row settles it
+    /// unless that row is itself deleted or newly appended.
+    const ROWMAP_PROBE_ROWS: i64 = 3;
 
     /// Row metas for the rows appended since the base segment - the input to a
     /// delta layered on a base whose high-water mark is `base_max_row_id` and

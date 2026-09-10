@@ -56,6 +56,55 @@ async fn rowmap_oracle_skips_unchanged_then_verify_re_reads() -> anyhow::Result<
     Ok(())
 }
 
+/// A store deleted and re-created at the same path must not inherit the old
+/// store's rowmap. The cache is keyed by a hash of the storage URL, and nothing
+/// in Lance survives a rebuild to tell the two apart - version numbers, row ids
+/// and fragment ids all restart - so the stale chain used to be installed as
+/// current and gate every session `Fresh` against rows that no longer existed:
+/// `pond sync` reported "up to date" into an empty store, exit 0, no warning.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_rebuilt_at_the_same_path_does_not_inherit_the_old_rowmap() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let cache = temp.path().join("cache");
+    let store_dir = temp.path().join("store");
+    let adapter = ClaudeCodeAdapter::new(FIXTURES);
+
+    // A store with history, and the rowmap that describes it.
+    let store = Store::open_local(&store_dir).await?;
+    let first = ingest_adapter(&store, &adapter, &NoopOracle, |_| {}).await?;
+    assert!(first.sessions_inserted > 0);
+    store.ensure_rowmap(&cache).await?;
+    assert!(!RowmapOracle(store.rowmap_snapshot()).is_empty());
+    // Drop the mapping before unlinking: Windows refuses to remove a mapped file.
+    drop(store);
+
+    // What a user does: wipe the store, keep the path, sync again. The cache
+    // directory is untouched, exactly as it survives in ~/.cache/pond.
+    std::fs::remove_dir_all(&store_dir)?;
+    assert!(
+        std::fs::read_dir(&cache)?
+            .flatten()
+            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "rmm")),
+        "the old store's segments must still be on disk for this to be a test"
+    );
+
+    let rebuilt = Store::open_local(&store_dir).await?;
+    rebuilt.ensure_rowmap(&cache).await?;
+    let oracle = RowmapOracle(rebuilt.rowmap_snapshot());
+    assert!(
+        oracle.is_empty(),
+        "an empty store's oracle must be empty; a stale map would gate every source fresh",
+    );
+
+    let after = ingest_adapter(&rebuilt, &adapter, &oracle, |_| {}).await?;
+    assert_eq!(
+        after.sessions_inserted, first.sessions_inserted,
+        "every session must land in the rebuilt store, not skip as fresh",
+    );
+    assert_eq!(after.skipped_fresh, 0, "nothing in an empty store is fresh");
+    Ok(())
+}
+
 /// An on-disk map left by an older pond (incompatible MAGIC) or a corrupt
 /// segment must be purged and rebuilt, not error every sync. Regression for the
 /// MAGIC bump that introduced the freshness watermark.
