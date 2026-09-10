@@ -371,6 +371,27 @@ Stemmer drift - the one behavioral change in lance 11 for pond. Lance 11 replace
 
 Consequence: a store's writers must all move to the lance-11 pond before its FTS index is rebuilt, and each store then needs `pond optimize --rebuild` exactly once; until then whole-word FTS misses the drifted forms in whichever direction the index and binary disagree. Neither of today's gate rows is affected (the gate's search probes run in `vector` mode and the equivalence check is get-based), and the s3-nbg1 store was deliberately not rebuilt because other hosts still write to it with lance-10 binaries. On this store the rebuild measured 10m13s on 08-25.
 
+## rowmap identity guard (#226)
+
+### 2026-09-10 - ws-pond-01 -> s3-nbg1, `234f5e7` vs installed 0.17.1
+
+The guard that stops a rebuilt store inheriting the previous store's rowmap adds one probe read per `ensure_rowmap`. Measured on the path that actually changed, because **the bench gate does not reach it**: `ops_bench`'s `session_last_message_ids` (`sessions.rs:1431`) is a full scan of messages and never calls `ensure_rowmap`. A gate row is evidence that nothing else moved, not evidence about this change.
+
+`pond sync --dry-run` builds the freshness map through `ensure_rowmap` (`main.rs:4476`) and writes nothing to the store, so it isolates the change. `XDG_CACHE_HOME` was redirected per arm, both arms seeded from one cold build of the operator's real chain (base `v8917`, 477 MB, plus delta `d8921`), so neither arm read or wrote `~/.cache/pond`.
+
+`hyperfine --warmup 2 --runs 12`:
+
+```
+before (0.17.1, no guard)   757.8 ms ± 218.5 ms   [455.1 … 1115.8]
+after  (identity guard)      1.202 s ±  0.306 s   [ 0.860 …  1.883]
+```
+
+**~+440 ms per `ensure_rowmap`**, one S3 probe read. The ranges barely overlap (before max 1.116 s, after min 0.860 s), so this is the probe rather than jitter. In proportion: it roughly doubles `sync --dry-run`, which is sub-second, and is ~1% of a real sync against this store, where the oracle alone is ~27 s. A sync that imports rows calls `ensure_rowmap` twice (once before the import, once to republish the chain after), so it pays this twice.
+
+**No false positive on the real store**, which was the thing worth checking: the guard kept the 477 MB chain (`v8917` + `d8921` still present in the after arm), rather than deciding a live production map was foreign and forcing a full rebuild over ~2M rows.
+
+Gate run for the "nothing else moved" half: `moon run repo:bench-gate` on the branch, `equivalence: OK`, row appended to `bench-gate-baseline.jsonl` (`5838108-dirty`). Its delta against the row 65 minutes earlier is **not readable as a code comparison** - same store, same host, and the probes swing both ways by 30-130% (`search_dated` +129%, `row_counts` -59%, `open_store` +90%) on paths this change does not touch. That spread is the honest measure of how much a single gate row can bracket a read-path change on this store: not much.
+
 ## bench-gate: first Linux row (agy adapter, #225)
 
 ### 2026-09-10 - ws-pond-01, `e3e6a26-dirty`, pond 0.17.1 (x86_64-linux)
