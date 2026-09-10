@@ -63,6 +63,10 @@ const SUPPORTED_USER_VERSION: i64 = 1;
 /// session record, read once into the Session row.
 const NON_CAPTURE_TABLES: [&str; 2] = ["gen_metadata", "executor_metadata"];
 const STEPS_TABLE: &str = "steps";
+/// Steps read per round trip while streaming a conversation. Bounds what is
+/// resident when the consumer is slower than the reader; the whole row,
+/// protobuf blobs included, is held for a page at a time.
+const STEP_PAGE: usize = 512;
 const METADATA_TABLE: &str = "trajectory_metadata_blob";
 const PARENT_REFERENCES_TABLE: &str = "parent_references";
 
@@ -521,8 +525,10 @@ fn conversation_yields(
     // The id names a restore target file in every foreign client.
     validate_path_id(NAME, "conversation id", &conversation.id, &location)?;
 
-    let steps = read_table(&conn, &conversation.db, STEPS_TABLE)?;
-    if steps.is_empty() {
+    let any_step: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM steps)", [], |row| row.get(0))
+        .map_err(|error| db_error(&conversation.db, "count steps", &error))?;
+    if !any_step {
         return skip(SkipReason::Empty);
     }
     let metadata_rows = if has(METADATA_TABLE) {
@@ -550,25 +556,21 @@ fn conversation_yields(
         .and_then(|row| row.blob("data"))
         .map(TrajectoryMeta::decode)
         .unwrap_or_default();
-    let decoded_steps: Vec<(&Row, Result<StepView<'_>, String>)> = steps
-        .iter()
-        .map(|row| (row, StepView::decode(row)))
-        .collect();
-    let anchor = metadata
-        .created_at
-        .or_else(|| {
-            decoded_steps
-                .iter()
-                .filter_map(|(_, step)| step.as_ref().ok()?.meta.created_at)
-                .min()
-        })
-        .ok_or_else(|| {
+    // The anchor has to be known before the Session event, which precedes every
+    // message. When the trajectory records its own creation time that costs
+    // nothing; otherwise it is one scan of the small `metadata` column, which
+    // is what a step's stamp is copied into (`step_payload` is only read for a
+    // row that has none).
+    let anchor = match metadata.created_at {
+        Some(created) => created,
+        None => earliest_step(&conn, &conversation.db)?.ok_or_else(|| {
             AdapterError::schema(
                 NAME,
                 &location,
                 "conversation records no creation time and no step timestamp",
             )
-        })?;
+        })?,
+    };
     let current_trajectory = carrier_tables
         .iter()
         .find(|(table, _)| table == "trajectory_meta")
@@ -604,33 +606,99 @@ fn conversation_yields(
             }
         }
     }
-    for (row, step) in &decoded_steps {
-        let item = match step {
-            Ok(step) => {
-                for event in step_events(
-                    &session_id,
-                    row,
-                    step,
-                    current_trajectory.as_deref(),
-                    anchor,
-                ) {
-                    if !send(Ok(AdapterYield::Event(event))) {
-                        return Ok(false);
-                    }
-                }
-                continue;
-            }
-            Err(reason) => Err(AdapterError::schema(
-                NAME,
-                format!("{location}#steps/{}", row.int("idx").unwrap_or(-1)),
-                reason.clone(),
-            )),
+    // Steps stream a page at a time, keyed by the `idx` primary key. A
+    // conversation is never resident whole: while the consumer is busy, this
+    // holds one page, not every row and its base64 raw record. Keyset paging
+    // rather than one long-lived statement, so no read transaction is parked
+    // on a live database that agy is still checkpointing.
+    let mut after = i64::MIN;
+    loop {
+        let page = read_step_page(&conn, &conversation.db, after)?;
+        let Some(last) = page.last() else {
+            break;
         };
-        if !send(item) {
-            return Ok(false);
+        after = last.int("idx").unwrap_or(i64::MAX);
+        for row in &page {
+            let item = match StepView::decode(row) {
+                Ok(step) => {
+                    for event in step_events(
+                        &session_id,
+                        row,
+                        &step,
+                        current_trajectory.as_deref(),
+                        anchor,
+                    ) {
+                        if !send(Ok(AdapterYield::Event(event))) {
+                            return Ok(false);
+                        }
+                    }
+                    continue;
+                }
+                Err(reason) => Err(AdapterError::schema(
+                    NAME,
+                    format!("{location}#steps/{}", row.int("idx").unwrap_or(-1)),
+                    reason,
+                )),
+            };
+            if !send(item) {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
+}
+
+/// Steps whose `idx` is greater than `after`, at most [`STEP_PAGE`] of them.
+fn read_step_page(conn: &Connection, db: &Path, after: i64) -> Result<Vec<Row>, AdapterError> {
+    let sql = format!("SELECT * FROM steps WHERE idx > ?1 ORDER BY idx LIMIT {STEP_PAGE}");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|error| db_error(db, "prepare steps page", &error))?;
+    let names = column_names(&stmt);
+    let width = names.len();
+    let rows = stmt
+        .query_map([after], |row| {
+            (0..width)
+                .map(|index| row.get_ref(index).map(Cell::from_ref))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|error| db_error(db, "query steps page", &error))?;
+    rows.map(|cells| {
+        cells.map(|cells| Row {
+            names: names.clone(),
+            cells,
+        })
+    })
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(|error| db_error(db, "read steps row", &error))
+}
+
+/// The earliest `created_at` any step records, read from the small `metadata`
+/// column; `step_payload` is materialized only for a row whose column is null.
+fn earliest_step(conn: &Connection, db: &Path) -> Result<Option<DateTime<Utc>>, AdapterError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT metadata, CASE WHEN metadata IS NULL THEN step_payload END \
+             FROM steps",
+        )
+        .map_err(|error| db_error(db, "prepare step timestamps", &error))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<Vec<u8>>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+            ))
+        })
+        .map_err(|error| db_error(db, "query step timestamps", &error))?;
+    let mut earliest: Option<DateTime<Utc>> = None;
+    for row in rows {
+        let (metadata, payload) =
+            row.map_err(|error| db_error(db, "read step timestamp", &error))?;
+        if let Some(created) = step_created_at(metadata.as_deref(), payload.as_deref()) {
+            earliest = Some(earliest.map_or(created, |current| current.min(created)));
+        }
+    }
+    Ok(earliest)
 }
 
 /// The ACP lane's `<uuid>.meta` sidecar (`{"cwd": ...}`, merged and rewritten
@@ -1566,18 +1634,22 @@ fn table_names(conn: &Connection, db: &Path) -> Result<Vec<String>, AdapterError
         .map_err(|error| db_error(db, "read table name", &error))
 }
 
+/// The statement's columns, shared by every row it produces.
+fn column_names(stmt: &rusqlite::Statement<'_>) -> std::sync::Arc<[String]> {
+    stmt.column_names()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// Every row of `table`, ordered by its first column (the primary key in every
-/// agy table).
+/// agy table). Used for the small trajectory tables; `steps` streams instead.
 fn read_table(conn: &Connection, db: &Path, table: &str) -> Result<Vec<Row>, AdapterError> {
     let sql = format!("SELECT * FROM {} ORDER BY 1", quote_ident(table));
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|error| db_error(db, &format!("prepare {table}"), &error))?;
-    let names: std::sync::Arc<[String]> = stmt
-        .column_names()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect();
+    let names = column_names(&stmt);
     let width = names.len();
     let rows = stmt
         .query_map([], |row| {
@@ -2024,6 +2096,36 @@ mod tests {
             panic!("a tool result");
         };
         assert_eq!(result.as_str(), Some("calc.py"));
+    }
+
+    /// Two harness kinds no captured conversation has ever contained. Their
+    /// payload field numbers come from the binary's descriptors alone, and the
+    /// enum value is not the payload field (90 -> 103, 98 -> 111), which is
+    /// exactly the confusion that once cost `RUN_COMMAND` its results. Hand-built
+    /// payloads pin the numbers until a real row exists.
+    #[test]
+    fn the_unobserved_harness_kinds_read_their_own_text() {
+        use pb::encode;
+        for (kind, payload_field) in [
+            (step_type::EPHEMERAL_MESSAGE, 103),
+            (step_type::CONVERSATION_HISTORY, 111),
+            (step_type::SYSTEM_MESSAGE, 114),
+        ] {
+            let mut body = Vec::new();
+            encode::bytes(1, b"the harness said this", &mut body);
+            let mut payload = Vec::new();
+            encode::uint(1, u64::try_from(kind).unwrap(), &mut payload);
+            encode::uint(4, 3, &mut payload);
+            encode::bytes(payload_field, &body, &mut payload);
+
+            let row = step_row(0, kind, 3, payload);
+            let step = StepView::decode(&row).expect("a well-formed harness step");
+            assert_eq!(
+                step_text(&step),
+                Some("the harness said this"),
+                "step type {kind} reads its content from payload field {payload_field}",
+            );
+        }
     }
 
     #[test]
