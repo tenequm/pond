@@ -4,14 +4,21 @@
 //! archive/legacy files in a tempdir, ingests through the adapter into a real
 //! `Store`, and asserts the canonical shape for every plan case (a)-(h), the
 //! native round-trip conformance (spec.md#adapter conformance), and the sync
-//! summary signals. All fixture data is synthetic - never copied from any real
-//! `~/.openclaw`.
+//! summary signals. The in-file fixture data is synthetic - never copied from
+//! any real `~/.openclaw`.
+//!
+//! The real-capture suite at the bottom is the deliberate exception: it runs
+//! against `tests/fixtures/adapter/openclaw-captures/`, five complete state
+//! roots driven out of the actual OpenClaw runtime in a throwaway `$HOME` with a
+//! stub model - four file-era (2026.7.1-2) and one DB-era (2026.9.3). Synthetic
+//! trees are what let issue #224 hide - they encoded what we believed OpenClaw
+//! writes, and that belief was wrong.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::Path;
 
 use pond::{
-    adapter::{AdapterFactory, OpenClawAdapter, OpenClawFactory, RestoreFidelity},
+    adapter::{Adapter, AdapterFactory, OpenClawAdapter, OpenClawFactory, RestoreFidelity},
     handlers::{SyncEvent, SyncStatus, ingest_adapter},
     sessions::{SessionWithMessages, Store},
     wire::{Message, PartKind, Provenance},
@@ -806,6 +813,611 @@ async fn source_rewrite_re_syncs_additively_keeping_the_superset() -> anyhow::Re
     assert!(
         ids.contains(&"m1") && ids.contains(&"m2"),
         "pond keeps the superset after a rewrite"
+    );
+    Ok(())
+}
+
+// -- Real-capture suite (issue #224) -----------------------------------------
+//
+// The cases above build synthetic trees, which is exactly what let issue #224
+// hide: the adapter matched what we believed OpenClaw writes. These fixtures
+// are complete state roots copied out of the real runtime, so they assert
+// against what it actually wrote. The four file-era roots below are
+// 2026.7.1-2; the DB-era root in its own section further down is 2026.9.3. See
+// `tests/fixtures/README.md`, section `openclaw-captures`.
+
+const CAPTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/openclaw-captures"
+);
+
+fn capture(pass: &str) -> std::path::PathBuf {
+    Path::new(CAPTURES).join(pass)
+}
+
+/// Every transcript in a captured root, by session id. A `.trajectory.jsonl`
+/// sidecar is not a transcript, and a `<ts>_<id>.jsonl` successor is named by
+/// its id, not by its whole stem.
+fn transcript_ids(pass: &str) -> Vec<String> {
+    let dir = capture(pass).join("agents").join("main").join("sessions");
+    let mut ids: Vec<String> = std::fs::read_dir(&dir)
+        .expect("captured sessions dir")
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_str()?.to_owned();
+            if name.contains(".trajectory") {
+                return None;
+            }
+            // `<id>.jsonl`, `<id>.jsonl.<reason>.<ts>`, `<ts>_<id>.jsonl`
+            let stem = name[..name.find(".jsonl")?].to_owned();
+            Some(match stem.split_once('_') {
+                Some((head, rest)) if head.ends_with('Z') => rest.to_owned(),
+                _ => stem,
+            })
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+async fn ingest_capture(pass: &str) -> (Store, TempDir, Vec<String>) {
+    let (store, dir) = ingest(&capture(pass)).await;
+    (store, dir, transcript_ids(pass))
+}
+
+/// The bug in #224: only the newest session per routing key survived, because
+/// keys came from `sessions.json` `sessionId` and that file names only the
+/// CURRENT session for each key. Every rotated-out generation must now land.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_captured_transcript_is_ingested() -> anyhow::Result<()> {
+    for pass in ["rotate-reply", "cron", "compaction", "hooks-heartbeat"] {
+        let (store, _dir, ids) = ingest_capture(pass).await;
+        assert!(!ids.is_empty(), "{pass}: fixture has transcripts");
+        for id in &ids {
+            let session = store.get_session(id).await?.unwrap_or_else(|| {
+                panic!(
+                    "{pass}: transcript {id} was dropped; every generation must be ingested \
+                     (spec.md#adapter-integrity-no-silent-drops)"
+                )
+            });
+            assert!(
+                !session.session.project.is_empty(),
+                "{pass}: {id} has an empty project (spec.md#model-project-non-empty)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Cron runs group under their JOB, not one project per run: a
+/// `sessionTarget: "main"` run stores its own
+/// `...:cron:<jobId>:run:<startedAtMs>` key, and a project per run would make
+/// cron unsearchable. The exact run key is kept alongside, so nothing is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn cron_runs_group_under_the_job_key() -> anyhow::Result<()> {
+    let (store, _dir, ids) = ingest_capture("cron").await;
+    let mut cron_projects: Vec<String> = Vec::new();
+    for id in &ids {
+        let Some(session) = store.get_session(id).await? else {
+            continue;
+        };
+        if session.session.source_agent != "openclaw/cron" {
+            continue;
+        }
+        let project = (*session.session.project).clone();
+        assert!(
+            !project.contains(":run:"),
+            "{id}: project {project} still carries the per-run suffix"
+        );
+        let openclaw = session.session.options.get("openclaw").expect("options");
+        if let Some(exact) = openclaw.get("session_key_exact").and_then(Value::as_str) {
+            assert!(
+                exact.starts_with(&format!("{project}:run:")),
+                "{id}: exact key {exact} is not a run of {project}"
+            );
+        }
+        cron_projects.push(project);
+    }
+    assert!(
+        !cron_projects.is_empty(),
+        "the cron capture must classify cron sessions; a stored key is \
+         `agent:<id>:cron:<job>`, never a bare `cron:`"
+    );
+    let runs = cron_projects.len();
+    cron_projects.sort();
+    cron_projects.dedup();
+    assert!(
+        cron_projects.len() < runs,
+        "several runs must share one job project, else grouping did not happen"
+    );
+    Ok(())
+}
+
+/// Each rung of the recovery ladder tags what resolved the key, and the tag must
+/// name a rung the adapter actually has. A transcript nothing resolves is still
+/// ingested, under its agent directory, with no invented `session_key`.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_keys_record_their_source() -> anyhow::Result<()> {
+    const RUNGS: &[&str] = &[
+        "sessions_json",
+        "usage_family",
+        "session_file",
+        "system_prompt_report",
+        "trajectory",
+        "cron_run_logs",
+        "audit_events",
+        "cron_prompt_prefix",
+        "agent_dir_fallback",
+    ];
+    let mut seen: Vec<String> = Vec::new();
+    for pass in ["rotate-reply", "cron", "compaction", "hooks-heartbeat"] {
+        let (store, _dir, ids) = ingest_capture(pass).await;
+        for id in &ids {
+            let Some(session) = store.get_session(id).await? else {
+                continue;
+            };
+            let openclaw = session.session.options.get("openclaw").expect("options");
+            let source = openclaw
+                .get("session_key_source")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{pass}/{id}: no session_key_source recorded"));
+            assert!(
+                RUNGS.contains(&source),
+                "{pass}/{id}: unknown key source {source}"
+            );
+            if source == "agent_dir_fallback" {
+                assert!(
+                    openclaw.get("session_key").is_none(),
+                    "{pass}/{id}: the fallback must not invent a session_key \
+                     (spec.md#model-no-synthesis)"
+                );
+                assert_eq!(
+                    *session.session.project, "agent:main",
+                    "{pass}/{id}: the fallback attributes to the owning agent directory"
+                );
+            } else {
+                assert_eq!(
+                    openclaw.get("session_key").and_then(Value::as_str),
+                    Some(session.session.project.as_str()),
+                    "{pass}/{id}: a resolved key is the project"
+                );
+            }
+            seen.push(source.to_owned());
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    // The captures were chosen to exercise the deeper rungs; if this shrinks, a
+    // rung silently stopped being reachable.
+    for rung in ["sessions_json", "trajectory", "cron_run_logs"] {
+        assert!(
+            seen.iter().any(|s| s == rung),
+            "no captured transcript resolved via {rung}; saw {seen:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A compaction successor and a checkpoint branch are both `<ts>_<id>.jsonl`
+/// with an absolute-path `parentSession`. The path must reduce to the parent's
+/// id, and the branch must read as a fork rather than a spawn.
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_lineage_resolves_paths_to_ids() -> anyhow::Result<()> {
+    let (store, _dir, ids) = ingest_capture("compaction").await;
+    let mut relations: Vec<String> = Vec::new();
+    for id in &ids {
+        let Some(session) = store.get_session(id).await? else {
+            continue;
+        };
+        let openclaw = session.session.options.get("openclaw").expect("options");
+        let Some(relation) = openclaw.get("relation").and_then(Value::as_str) else {
+            continue;
+        };
+        relations.push(relation.to_owned());
+        if let Some(parent) = &session.session.parent_session_id {
+            assert!(
+                !parent.contains('/') && !parent.contains(".jsonl"),
+                "{id}: parent_session_id {parent} is still a path"
+            );
+            assert!(
+                ids.iter().any(|known| known == parent),
+                "{id}: parent {parent} is not one of the captured transcripts"
+            );
+        }
+        // spec.md 4: a cut-point is incoherent without a parent to cut from.
+        assert!(
+            session.session.parent_message_id.is_none()
+                || session.session.parent_session_id.is_some(),
+            "{id}: parent_message_id without parent_session_id"
+        );
+        if relation == "fork" {
+            assert!(
+                session.session.parent_session_id.is_some(),
+                "{id}: a checkpoint branch must name the session it branched from"
+            );
+        }
+    }
+    assert!(
+        relations.iter().any(|r| r == "compaction_successor"),
+        "the compaction capture must contain a successor; saw {relations:?}"
+    );
+    assert!(
+        relations.iter().any(|r| r == "fork"),
+        "the checkpoint branch must read as a fork, not a spawn; saw {relations:?}"
+    );
+    Ok(())
+}
+
+/// Re-syncing an unchanged captured root is a no-op
+/// (spec.md#adapter-integrity-additive-sync), and it must not disagree with the
+/// labels it stored a moment ago.
+#[tokio::test(flavor = "multi_thread")]
+async fn resyncing_a_capture_is_additive() -> anyhow::Result<()> {
+    let root = capture("cron");
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = OpenClawAdapter::new(&root);
+
+    let first = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+    let second = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    assert_eq!(first.dropped_sessions, 0, "first sync dropped a session");
+    assert_eq!(second.dropped_sessions, 0, "re-sync dropped a session");
+    assert_eq!(
+        second.relabeled_sessions, 0,
+        "an unchanged source must not disagree with its own stored labels"
+    );
+    assert_eq!(
+        second.sessions_inserted, 0,
+        "a re-sync of an unchanged source inserts nothing"
+    );
+    assert_eq!(second.messages_inserted_total, 0, "no new messages");
+    Ok(())
+}
+
+// -- DB era (OpenClaw >= 2026.8.1) ------------------------------------------
+//
+// The `db-era` capture has no transcript FILES at all, so none of the helpers
+// above apply: identity comes from `session_windows`, one row per generation.
+
+/// Every `session_windows` row, i.e. every generation, as `(session_id, key)`.
+fn window_rows() -> Vec<(String, String)> {
+    let db = capture("db-era")
+        .join("agents")
+        .join("main")
+        .join("agent")
+        .join("openclaw-agent.sqlite");
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open captured agent db");
+    let mut stmt = conn
+        .prepare("SELECT session_id, session_key FROM session_windows ORDER BY session_id")
+        .expect("prepare window list");
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .expect("query windows")
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .expect("read windows")
+}
+
+/// #224 in DB clothing: pond probed for a `sessions` table, found none on any
+/// 2026.8.1+ host, and reported "up to date" against a DB full of sessions.
+/// Every generation `session_windows` names must now land.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_db_era_generation_is_ingested() -> anyhow::Result<()> {
+    let (store, _dir) = ingest(&capture("db-era")).await;
+    let windows = window_rows();
+    assert_eq!(windows.len(), 8, "the capture holds 8 generations");
+    for (session_id, _) in &windows {
+        let session = store.get_session(session_id).await?.unwrap_or_else(|| {
+            panic!(
+                "generation {session_id} was dropped; a source pond cannot read must be a \
+                 typed error, never a silent skip (spec.md#session-movement-complete)"
+            )
+        });
+        assert!(
+            !session.session.project.is_empty(),
+            "{session_id} has an empty project (spec.md#model-project-non-empty)"
+        );
+    }
+    Ok(())
+}
+
+/// Rotated-out generations are the whole point: two cron runs share one job
+/// key and two rollover generations share theirs, so 8 generations must land
+/// under 6 projects rather than collapsing to one session per key.
+#[tokio::test(flavor = "multi_thread")]
+async fn db_era_rotated_generations_group_by_key() -> anyhow::Result<()> {
+    let (store, _dir) = ingest(&capture("db-era")).await;
+    let mut by_key: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (session_id, _) in window_rows() {
+        let session = store.get_session(&session_id).await?.expect("generation");
+        *by_key
+            .entry((*session.session.project).clone())
+            .or_default() += 1;
+    }
+    assert_eq!(by_key.len(), 6, "6 distinct routing keys: {by_key:?}");
+    assert_eq!(by_key.values().sum::<usize>(), 8, "8 generations");
+    let multi = by_key.values().filter(|n| **n > 1).count();
+    assert_eq!(
+        multi, 2,
+        "two keys carry more than one generation (cron runs, rollover): {by_key:?}"
+    );
+    Ok(())
+}
+
+/// `sessions.fork` records the parent id AND the cut-point entry id, so the
+/// fork lands as a fork-with-cut-point (spec.md 4). A rollover does NOT: it
+/// starts a fresh context and carries nothing forward, so calling it lineage
+/// would assert a relationship the source never states.
+#[tokio::test(flavor = "multi_thread")]
+async fn db_era_forks_carry_a_cut_point_and_rollovers_carry_none() -> anyhow::Result<()> {
+    let (store, _dir) = ingest(&capture("db-era")).await;
+    let windows = window_rows();
+    let mut parented = 0usize;
+    for (session_id, key) in &windows {
+        let session = store.get_session(session_id).await?.expect("generation");
+        let Some(parent) = session.session.parent_session_id.as_deref() else {
+            continue;
+        };
+        parented += 1;
+        assert!(
+            key.contains(":dashboard:"),
+            "only the forked session has a parent, not {key}"
+        );
+        assert!(
+            session.session.parent_message_id.is_some(),
+            "a fork off a named entry must carry its cut-point"
+        );
+        assert!(
+            windows.iter().any(|(id, _)| id == parent),
+            "the parent id must name a real generation, not a key resolved through \
+             current_session_id (which moves on rotation)"
+        );
+    }
+    assert_eq!(parented, 1, "exactly one fork in the capture");
+    Ok(())
+}
+
+/// Copy a captured root so a test can add a row the capture does not contain.
+fn copy_tree(from: &Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A fork whose key later rolls over.
+///
+/// `session_nodes` holds ONE row per `session_key`, so `fork_source_session_id`
+/// and `fork_source_entry_id` describe the moment the KEY was created;
+/// `session_windows` holds one row per generation and the read runs per
+/// generation. Ask the per-key table once per generation and every generation
+/// claims the same cut-point - so a rollover, which starts a fresh context and
+/// carries nothing forward, ends up asserting it was cut from an entry it never
+/// touched (spec.md 4, `model-no-synthesis`).
+///
+/// The committed capture cannot catch this and neither can
+/// `db_era_forks_carry_a_cut_point_and_rollovers_carry_none`: the only forked
+/// key there has exactly one generation, and the two multi-generation keys have
+/// no fork source. The combination has to be constructed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forked_key_that_rolls_over_gives_the_rollover_no_lineage() -> anyhow::Result<()> {
+    // The capture's one forked generation, and its key.
+    const FORKED: &str = "8e3f8044-14d1-4db5-b61b-ac60abaa591c";
+    const KEY: &str = "agent:main:dashboard:01ee5473-28f2-4312-8112-2998d903624f";
+    // The rollover successor this test adds; not in the capture.
+    const ROLLED: &str = "00000000-0000-4000-8000-0000000f0175";
+
+    let scratch = TempDir::new()?;
+    let root = scratch.path().join("root");
+    copy_tree(&capture("db-era"), &root)?;
+    {
+        let conn = Connection::open(
+            root.join("agents")
+                .join("main")
+                .join("agent")
+                .join("openclaw-agent.sqlite"),
+        )?;
+        // The capture is a trimmed DB: `session_windows` declares a foreign key
+        // into `conversations`, which the capture does not carry, and SQLite
+        // resolves a parent table at prepare time even for a NULL child value.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        conn.execute(
+            "INSERT INTO session_windows \
+             (session_id, session_key, previous_session_id, reason, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'rollover', 1, 1)",
+            rusqlite::params![ROLLED, KEY, FORKED],
+        )?;
+    }
+
+    let (store, _store_dir) = ingest(&root).await;
+
+    let rolled = store
+        .get_session(ROLLED)
+        .await?
+        .expect("the rollover generation is ingested");
+    assert!(
+        rolled.session.parent_session_id.is_none(),
+        "a rollover must not inherit its key's fork parent: {:?}",
+        rolled.session.parent_session_id
+    );
+    assert!(
+        rolled.session.parent_message_id.is_none(),
+        "a rollover must not claim a cut-point it never had: {:?}",
+        rolled.session.parent_message_id
+    );
+    assert_eq!(
+        rolled
+            .session
+            .options
+            .get("openclaw")
+            .and_then(|o| o.get("relation")),
+        None,
+        "nor keep the relation tag, which would say 'fork' with nothing to point at"
+    );
+
+    // The edge is declined for the successor, not lost for the fork itself.
+    let forked = store
+        .get_session(FORKED)
+        .await?
+        .expect("the forked generation is ingested");
+    assert!(
+        forked.session.parent_session_id.is_some(),
+        "the generation the key was created as still carries the real fork edge"
+    );
+    assert!(
+        forked.session.parent_message_id.is_some(),
+        "and its cut-point"
+    );
+    Ok(())
+}
+
+/// A deleted session survives only as a `session_transcript_archives` blob.
+/// Deletion is an erasure intent, so it stays out by default - but it must be
+/// ACCOUNTED FOR, not silently dropped, which is what `reconcile_deletions`
+/// does. Before this fix the probe hit a table that no longer exists, and the
+/// swallowed error made every archive preserve with no log line at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn db_era_deleted_archive_is_excluded_but_reported() -> anyhow::Result<()> {
+    let root = capture("db-era");
+    let (store, _dir) = ingest(&root).await;
+    let adapter = OpenClawAdapter::new(&root);
+    let report = adapter.reconcile_deletions(&store).await?;
+    // WHICH bucket is the whole point: `erase.len() + preserved.len() == 1`
+    // would pass whether the archive is preserved or slated for an
+    // irreversible purge, which is the one distinction this pass exists to
+    // draw.
+    assert!(
+        report.erase.is_empty(),
+        "a deleted archive pond never ingested must not be an erase target: {:?}",
+        report.erase
+    );
+    assert_eq!(report.preserved.len(), 1, "and it must still be REPORTED");
+    // The two policies compose: `.deleted.` archives are excluded from ingest,
+    // so reconciliation finds no stored session and stops there. It never
+    // reaches the live-entry probe, which is why that probe's DB-era behaviour
+    // is asserted by `an_auth_only_db_stays_quiet_and_is_not_an_error` and the
+    // file-era cases rather than here.
+    assert_eq!(
+        report.preserved[0].reason, "not stored in pond; nothing to erase",
+        "the reason must name the actual finding, not a classification it never made"
+    );
+    Ok(())
+}
+
+/// A schema no reader claims must be a TYPED ERROR, never a quiet zero.
+///
+/// This is the guarantee the whole DB-era change rests on. pond probed for one
+/// table name, did not find it on any 2026.8.1+ host, and reported "up to
+/// date" against a database full of sessions - `session-movement-complete`
+/// calls that a skip that outruns durability. A future OpenClaw schema must
+/// fail loudly instead of silently reproducing #224.
+///
+/// `discover()` is the surface under test on purpose: it is what `pond status`
+/// and `sync --dry-run` report, and it used to discard enumeration errors and
+/// answer `Ok(0)` - so the fix was loud on the path that ingests and silent on
+/// the two paths people use to check.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecognized_schema_is_an_error_not_an_empty_root() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let db = db_path(root.path(), "bot");
+    std::fs::create_dir_all(db.parent().expect("agent dir"))?;
+    // Session-bearing but matching no era: `transcript_events` with neither
+    // the v1 (`sessions` + `session_entries`) nor the v2 (`session_windows` +
+    // `session_nodes`) tables beside it. A plausible future rename, and the
+    // shape 2026.8.1 itself presented to a pond that only knew v1.
+    let conn = rusqlite::Connection::open(&db)?;
+    conn.execute_batch(
+        "CREATE TABLE transcript_events (
+           session_id TEXT NOT NULL,
+           seq INTEGER NOT NULL,
+           event_json TEXT NOT NULL,
+           created_at INTEGER NOT NULL,
+           PRIMARY KEY (session_id, seq)
+         ) STRICT;
+         CREATE TABLE schema_meta (
+           meta_key TEXT NOT NULL PRIMARY KEY,
+           schema_version INTEGER NOT NULL,
+           app_version TEXT
+         ) STRICT;
+         INSERT INTO schema_meta VALUES ('primary', 999, '2099.1.1');",
+    )?;
+    drop(conn);
+
+    let adapter = OpenClawAdapter::new(root.path());
+    let error = adapter
+        .discover()
+        .await
+        .expect_err("an unreadable schema must not report a session count");
+    let text = error.to_string();
+    for expected in ["transcript_events", "999", "2099.1.1"] {
+        assert!(
+            text.contains(expected),
+            "the error must name what it found so an operator can act on it; \
+             missing {expected:?} in: {text}"
+        );
+    }
+    Ok(())
+}
+
+/// The counterpart: a DB with no session tables at all is the FILE era, and
+/// its empty read is a fact rather than a failure. This is the one era that
+/// must stay quiet, so the error above cannot be achieved by making every
+/// unfamiliar database loud.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auth_only_db_stays_quiet_and_is_not_an_error() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let db = db_path(root.path(), "bot");
+    std::fs::create_dir_all(db.parent().expect("agent dir"))?;
+    let conn = rusqlite::Connection::open(&db)?;
+    conn.execute_batch(
+        "CREATE TABLE auth_state (id TEXT NOT NULL PRIMARY KEY, value TEXT) STRICT;",
+    )?;
+    drop(conn);
+
+    assert_eq!(
+        adapter_discover(root.path()).await?,
+        0,
+        "a pre-2026.7.2 agent DB carries only auth state; the file store is \
+         the session source and an empty read is correct"
+    );
+    Ok(())
+}
+
+async fn adapter_discover(root: &Path) -> anyhow::Result<usize> {
+    Ok(OpenClawAdapter::new(root).discover().await?)
+}
+
+/// The same source read twice adds nothing (spec.md#adapter-integrity-additive-sync).
+#[tokio::test(flavor = "multi_thread")]
+async fn resyncing_the_db_era_capture_is_additive() -> anyhow::Result<()> {
+    let root = capture("db-era");
+    let store_dir = TempDir::new()?;
+    let store = Store::open_local(store_dir.path()).await?;
+    let adapter = OpenClawAdapter::new(&root);
+
+    let first = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+    let second = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
+
+    assert_eq!(first.dropped_sessions, 0, "first sync dropped a session");
+    assert!(
+        first.sessions_inserted > 0,
+        "the first sync stored something"
+    );
+    assert_eq!(second.sessions_inserted, 0, "a re-sync inserts nothing");
+    assert_eq!(second.messages_inserted_total, 0, "no new messages");
+    assert_eq!(
+        second.relabeled_sessions, 0,
+        "an unchanged source must not disagree with its own stored labels"
     );
     Ok(())
 }

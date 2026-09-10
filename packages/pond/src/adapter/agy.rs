@@ -41,7 +41,7 @@ use super::{
     config_path,
     extract::{Extracted, extract_self_str, extract_str, extract_value, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
-    sqlite::{self, CHANNEL_CAP, emit},
+    sqlite::{self, CHANNEL_CAP, emit, has_table},
     validate_path_id,
 };
 use crate::{
@@ -1607,15 +1607,6 @@ impl Row {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn has_table(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-        [table],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|count| count > 0)
 }
 
 /// User tables in schema order (SQLite's own `sqlite_*` tables excluded).

@@ -50,3 +50,5 @@ mod sync;
 mod transport_http;
 #[path = "integration/transport_mcp.rs"]
 mod transport_mcp;
+#[path = "integration/unreadable_source.rs"]
+mod unreadable_source;

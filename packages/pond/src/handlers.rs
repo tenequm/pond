@@ -464,6 +464,7 @@ mod ingest_handler {
             rows_matched = summary.matched as u64,
             dropped_events = summary.dropped_events as u64,
             dropped_sessions = summary.dropped_sessions as u64,
+            relabeled_sessions = summary.relabeled_sessions as u64,
             skipped_files = summary.skipped_files as u64,
             skipped_fresh = summary.skipped_fresh as u64,
             skipped_superseded = summary.skipped_superseded as u64,
@@ -614,7 +615,7 @@ mod ingest_handler {
                         if let Some(field) = err.field {
                             details.insert("field".to_owned(), serde_json::json!(field));
                         }
-                        if let Some(reason) = err.reason {
+                        if let Some(reason) = err.reason_key {
                             details.insert("reason".to_owned(), serde_json::json!(reason));
                         }
                         ErrorBody {
@@ -733,9 +734,11 @@ pub use export_handler::{ExportSummary, pond_export};
 mod restore_handler {
     //! `restore_lineage` (spec.md#adapter-lineage-complete-restore): collect the named
     //! session plus its direct subagent children for the `pond copy` restore
-    //! path. The spawn graph is one level deep; a collected
-    //! child that is itself a parent means a deeper graph, which is a typed
-    //! error - never a silently flattened restore.
+    //! path. Restore handles ONE level: a collected child that is itself a
+    //! parent means a deeper graph, which is a typed error - never a silently
+    //! flattened restore. That is a limit of this path, not a property of the
+    //! data. Sources do emit multi-level lineage (spec.md 551), so the typed
+    //! error is a case that occurs, not a defensive impossibility.
 
     use anyhow::{Context, Result};
 

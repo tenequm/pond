@@ -387,14 +387,26 @@ fn print_drop_reasons(label: &str, reasons: &std::collections::BTreeMap<&'static
 /// keeps SQLite's `-wal` / `-shm` sidecars out (`x.db-wal` has no `db`
 /// segment).
 ///
-/// A hint, not an accounting: an adapter whose sidecars share the extension of
-/// its transcripts (openclaw's `<id>.trajectory.jsonl`) counts them too.
+/// Still a hint rather than an accounting, but sidecars that share their
+/// transcripts' extension are excluded by name where we know of them:
+/// openclaw writes an `<id>.trajectory.jsonl` beside every transcript that ran
+/// a turn, and it is not a transcript - pond opens it only for the
+/// `sessionKey` it carries. Counting those would roughly double an openclaw
+/// corpus, in the one bench whose subject is how many generations get ingested.
 fn count_sources(root: &std::path::Path) -> u64 {
     const SOURCE_TYPES: [&str; 4] = ["jsonl", "json", "db", "sqlite"];
+    // Matches both `<id>.trajectory.jsonl` and its `<id>.trajectory-path.json`
+    // pointer.
+    const SIDECAR_PREFIX: &str = "trajectory";
     fn is_source(name: &str) -> bool {
-        name.split('.')
-            .skip(1)
-            .any(|segment| SOURCE_TYPES.contains(&segment))
+        let mut segments = name.split('.').skip(1).peekable();
+        if segments
+            .peek()
+            .is_some_and(|s| s.starts_with(SIDECAR_PREFIX))
+        {
+            return false;
+        }
+        segments.any(|segment| SOURCE_TYPES.contains(&segment))
     }
     fn walk(path: &std::path::Path, count: &mut u64) {
         let Ok(entries) = std::fs::read_dir(path) else {

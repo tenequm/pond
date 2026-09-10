@@ -165,6 +165,12 @@ roaring = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Verifying `session_transcript_archives.archive_sha256` before ingesting an
+# archived transcript generation. The algorithm is the source's choice, not
+# ours (pond's own content ids use blake3). Already in the tree twice via
+# aws-sigv4/rsa and datafusion-functions/opendal, so declaring it directly
+# adds no crates to the build.
+sha2 = "0.10"
 # `~` + `$VAR` expansion for user-supplied paths in config values.
 shellexpand = "3.1"
 tempfile = "3.25"
