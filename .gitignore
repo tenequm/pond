@@ -20,6 +20,9 @@ Thumbs.db
 *.swp
 
 .env*
+# .env* guards secret env files; the committed direnv entrypoint is not one.
+!.envrc
+.direnv/
 .secrets*
 tmp/
 .mcp.json
