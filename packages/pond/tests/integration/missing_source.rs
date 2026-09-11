@@ -446,7 +446,8 @@ fn a_dangling_symlink_source_is_missing() {
 
 /// Permission denied is not "missing". Both EACCES shapes - a statable root
 /// with mode 000 (`try_exists` = Ok(true)) and a child behind an untraversable
-/// parent (`try_exists` = Err) - keep the legacy per-file-skip behavior.
+/// parent (`try_exists` = Err) - keep the per-file-skip behavior, and the
+/// skips surface as `degraded_adapters` with the count and first error.
 /// Flipping the `Err(_)` arm of `missing_source_root` to "missing" would
 /// misreport permission problems as absent directories; this pins it.
 #[cfg(unix)]
@@ -489,11 +490,43 @@ fn permission_denied_is_not_source_missing() {
     assert_eq!(doc["outcome"].as_str(), Some("ok"), "{doc}");
     assert!(
         doc.get("failed_adapters").is_none(),
-        "EACCES is the legacy per-file path, never an absent source: {doc}",
+        "EACCES is the per-file path, never an absent source: {doc}",
     );
     assert!(
         !stderr(&out).contains("source missing"),
         "no surface may call a permission problem 'missing': {}",
+        stderr(&out),
+    );
+
+    let degraded = doc["degraded_adapters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("EACCES must be attributed in the summary: {doc}"));
+    for name in ["agy", "codex-cli"] {
+        let entry = degraded
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("no degraded entry for {name}: {doc}"));
+        assert!(
+            entry["errors"].as_u64().is_some_and(|n| n >= 1),
+            "the skip count is the magnitude: {entry}",
+        );
+        let first_error = entry["first_error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no first_error explaining the skips: {entry}"));
+        assert!(
+            first_error.to_lowercase().contains("denied"),
+            "the reason must carry the cause: {first_error:?}",
+        );
+    }
+    assert!(
+        !degraded
+            .iter()
+            .any(|entry| entry["name"].as_str() == Some("claude-code")),
+        "the healthy adapter is not degraded: {doc}",
+    );
+    assert!(
+        stderr(&out).contains("could not read"),
+        "the skip must survive off-TTY: {}",
         stderr(&out),
     );
 }

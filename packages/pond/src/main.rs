@@ -3852,6 +3852,9 @@ struct SyncReport {
     /// absent on this host). Named per adapter on every summary surface;
     /// the run itself still succeeds, because the other sources are reachable.
     failed_adapters: Vec<FailedAdapter>,
+    /// Adapters that ran but skipped files they could not read; without this
+    /// the count and reason exist only on the live progress line.
+    degraded_adapters: Vec<DegradedAdapter>,
 }
 
 /// One adapter skipped because its configured source root does not exist on
@@ -3893,6 +3896,42 @@ impl FailedAdapter {
             self.label,
             source_missing_detail(&self.path)
         )
+    }
+}
+
+/// One adapter that ran but skipped files it could not read
+/// (`IngestSummary::skipped_files`). Kept apart from [`FailedAdapter`]:
+/// "never ran" and "ran degraded" are different fleet responses, and folding
+/// them would trip `failed_adapters` gates on any single bad file.
+#[derive(Debug, serde::Serialize)]
+struct DegradedAdapter {
+    name: String,
+    /// Text surfaces only; JSON identifies the adapter by `name` and `path`.
+    #[serde(skip)]
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    errors: u64,
+    /// First skip reason, verbatim: its path and cause are what distinguish
+    /// an unreadable root from one corrupt file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_error: Option<String>,
+}
+
+impl DegradedAdapter {
+    /// Emitted when the adapter's pass ends and repeated beside the final
+    /// summary - the per-file reasons are dropped off-TTY.
+    fn summary_line(&self) -> String {
+        match &self.first_error {
+            Some(reason) => format!(
+                "import: {} skipped {} file(s) it could not read - first error: {reason}",
+                self.label, self.errors
+            ),
+            None => format!(
+                "import: {} skipped {} file(s) it could not read",
+                self.label, self.errors
+            ),
+        }
     }
 }
 
@@ -4038,6 +4077,7 @@ pub(crate) async fn run_sync(
         // ok path).
         add_reconciliation(&mut summary, &report)?;
         add_failed_adapters(&mut summary, &report)?;
+        add_degraded_adapters(&mut summary, &report)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     }
     outcome?;
@@ -4055,6 +4095,7 @@ pub(crate) async fn run_sync(
         });
         add_reconciliation(&mut summary, &report)?;
         add_failed_adapters(&mut summary, &report)?;
+        add_degraded_adapters(&mut summary, &report)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     } else {
         // Repeated beside the summary: the line emitted when the adapter was
@@ -4064,6 +4105,12 @@ pub(crate) async fn run_sync(
             output_err(&pond::output::paint(
                 &failed.summary_line(),
                 pond::output::red(),
+            ))?;
+        }
+        for degraded in &report.degraded_adapters {
+            output_err(&pond::output::paint(
+                &degraded.summary_line(),
+                pond::output::yellow(),
             ))?;
         }
         output(&format!(
@@ -4263,6 +4310,7 @@ async fn run_sync_pipeline(
         invocation.verify,
         flush_hud,
         &mut report.failed_adapters,
+        &mut report.degraded_adapters,
         sink,
     )
     .await?;
@@ -4401,6 +4449,21 @@ fn add_failed_adapters(summary: &mut Value, report: &SyncReport) -> anyhow::Resu
         map.insert(
             "failed_adapters".to_owned(),
             serde_json::to_value(&report.failed_adapters)?,
+        );
+    }
+    Ok(())
+}
+
+/// Attach `"degraded_adapters"` to both JSON summary documents. Additive and
+/// omitted when empty (spec.md 7.2), same posture as `failed_adapters`.
+fn add_degraded_adapters(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
+    if report.degraded_adapters.is_empty() {
+        return Ok(());
+    }
+    if let Value::Object(map) = summary {
+        map.insert(
+            "degraded_adapters".to_owned(),
+            serde_json::to_value(&report.degraded_adapters)?,
         );
     }
     Ok(())
@@ -4915,10 +4978,11 @@ async fn run_import_stage(
     path: Option<PathBuf>,
     verify: bool,
     flush_hud: &Arc<FlushHud>,
-    // Out-param rather than a return value on purpose: entries recorded before
+    // Out-params rather than return values on purpose: entries recorded before
     // a later adapter's error must survive that error, or the error-path JSON
     // summary would omit skips the stderr line already reported.
     failed: &mut Vec<FailedAdapter>,
+    degraded: &mut Vec<DegradedAdapter>,
     sink: SyncSink,
 ) -> anyhow::Result<IngestSummary> {
     // The in-serve loop keeps stdout for the transport and paints no bars:
@@ -5014,10 +5078,37 @@ async fn run_import_stage(
             failed.push(entry);
             continue;
         }
+        let name = resolved.name.clone();
+        let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
+        let path = source_path(&resolved.config);
         let summary = sync_with_progress(store, &mp, resolved, oracle, flush_hud, quiet).await?;
+        if summary.skipped_files > 0 {
+            let entry = DegradedAdapter {
+                name,
+                label,
+                path,
+                errors: summary.skipped_files as u64,
+                first_error: summary.first_skip_reason.clone(),
+            };
+            emit_degraded(sink, &entry)?;
+            degraded.push(entry);
+        }
         total.merge(&summary);
     }
     Ok(total)
+}
+
+/// Name an adapter that skipped unreadable files, the moment its pass ends.
+/// Same routing as [`emit_source_missing`].
+fn emit_degraded(sink: SyncSink, entry: &DegradedAdapter) -> anyhow::Result<()> {
+    if sink.is_serve() {
+        tracing::warn!(target: "pond::sync", adapter = %entry.name, errors = entry.errors, "{}", entry.summary_line());
+        return Ok(());
+    }
+    output_err(&pond::output::paint(
+        &entry.summary_line(),
+        pond::output::yellow(),
+    ))
 }
 
 /// Name an adapter skipped for an absent source root, the moment it is skipped.
@@ -7778,6 +7869,37 @@ mod tests {
             summary["failed_adapters"].as_array().map(Vec::len),
             Some(1),
             "a real failure must still attach: {summary}",
+        );
+    }
+
+    /// Same posture for `degraded_adapters`: omitted on a clean run - never
+    /// `[]` - and attached without the display-only `label`.
+    #[test]
+    fn an_all_healthy_summary_omits_degraded_adapters() {
+        let mut summary = json!({ "outcome": "ok" });
+        add_degraded_adapters(&mut summary, &SyncReport::default()).expect("attach");
+        assert_eq!(summary, json!({ "outcome": "ok" }));
+
+        let report = SyncReport {
+            degraded_adapters: vec![DegradedAdapter {
+                name: "codex-cli".to_owned(),
+                label: "codex-cli (~/.codex/sessions)".to_owned(),
+                path: Some("~/.codex/sessions".to_owned()),
+                errors: 3,
+                first_error: Some("permission denied".to_owned()),
+            }],
+            ..SyncReport::default()
+        };
+        add_degraded_adapters(&mut summary, &report).expect("attach");
+        assert_eq!(
+            summary["degraded_adapters"],
+            json!([{
+                "name": "codex-cli",
+                "path": "~/.codex/sessions",
+                "errors": 3,
+                "first_error": "permission denied",
+            }]),
+            "attach the machine fields, not the label: {summary}",
         );
     }
 

@@ -268,6 +268,9 @@ mod ingest_handler {
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += 1;
+                            if summary.first_skip_reason.is_none() {
+                                summary.first_skip_reason = Some(reason.clone());
+                            }
                             SyncStatus::Skipped { reason }
                         }
                     };
@@ -294,6 +297,9 @@ mod ingest_handler {
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += count;
+                            if summary.first_skip_reason.is_none() {
+                                summary.first_skip_reason = Some(reason.clone());
+                            }
                             SyncStatus::Skipped { reason }
                         }
                     };
@@ -408,6 +414,9 @@ mod ingest_handler {
                             // skip - surface it as a SessionDone with
                             // session_id=None and status=Skipped.
                             summary.skipped_files += 1;
+                            if summary.first_skip_reason.is_none() {
+                                summary.first_skip_reason = Some(error.to_string());
+                            }
                             on_event(SyncEvent::SessionDone(SessionOutcome {
                                 project: None,
                                 session_id: None,

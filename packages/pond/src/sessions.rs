@@ -3784,6 +3784,9 @@ pub struct IngestSummary {
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
+    /// First `skipped_files` reason, verbatim. One string, never a list;
+    /// the count carries the magnitude.
+    pub first_skip_reason: Option<String>,
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
     /// metadata file), or an unextractable header. Never an error or a drop;
@@ -3892,6 +3895,9 @@ impl IngestSummary {
         self.dropped_sessions += other.dropped_sessions;
         self.relabeled_sessions += other.relabeled_sessions;
         self.skipped_files += other.skipped_files;
+        if self.first_skip_reason.is_none() {
+            self.first_skip_reason = other.first_skip_reason.clone();
+        }
         self.skipped_empty += other.skipped_empty;
         self.skipped_fresh += other.skipped_fresh;
         self.skipped_superseded += other.skipped_superseded;
