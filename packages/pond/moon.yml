@@ -39,8 +39,12 @@ tasks:
   format:
     command: 'cargo fmt --check'
     inputs: ['@group(sources)', '@group(tests)', '@group(benches)']
+  # --all-targets so tests and benches are linted too, not just the lib and
+  # bin: without it this task takes the tests and benches groups as inputs but
+  # never compiles them, and the Windows leg below ends up the stricter of the
+  # two. It is also the bar CONTRIBUTING gives contributors.
   lint:
-    command: 'cargo clippy --locked -- -D warnings'
+    command: 'cargo clippy --locked --all-targets -- -D warnings'
     inputs: ['@group(sources)', '@group(tests)', '@group(benches)']
   test:
     command: 'cargo test --locked'
@@ -232,13 +236,17 @@ tasks:
       WRITE_CORPUS=null
       if [ -z "${POND_BIN:-}" ]; then
         echo "--- serve_mem_bench (io-trace) ---"
-        cargo bench --bench serve_mem_bench --features io-trace -- --storage-path "$STORE_URL" --io-trace | tee "$TMP/serve.txt"
+        # --locked on every cargo bench below, as everywhere else in this file:
+        # these resolve the graph, so without it a gate run can rewrite
+        # Cargo.lock underneath itself and report numbers for a dependency set
+        # that was never reviewed.
+        cargo bench --locked --bench serve_mem_bench --features io-trace -- --storage-path "$STORE_URL" --io-trace | tee "$TMP/serve.txt"
 
         echo "--- ops_bench ---"
         # --url is load-bearing: ops_bench resolves the operator XDG config directly
         # (it ignores POND_CONFIG_FILE), so without it the ops phases silently measure
         # whatever store the operator's config names instead of the gate store.
-        cargo bench --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
+        cargo bench --locked --bench ops_bench -- --url "$STORE_URL" | tee "$TMP/ops.txt"
 
         echo "--- write benches (scratch stores, the real store is never written) ---"
         WRITE_ARGS=(--sessions "$WRITE_SESSIONS" --messages "$WRITE_MESSAGES")
@@ -290,12 +298,12 @@ tasks:
         else
           WRITE_BACKEND='"local"'
         fi
-        cargo bench --bench write_bench -- "${WRITE_ARGS[@]}" | tee "$TMP/write-copy.txt"
+        cargo bench --locked --bench write_bench -- "${WRITE_ARGS[@]}" | tee "$TMP/write-copy.txt"
         if grep -q ': false' "$TMP/write-copy.txt"; then echo "WRITE VERIFICATION FAILED"; exit 1; fi
-        cargo bench --bench write_bench -- "${WRITE_ARGS[@]}" --append-sweep "$WRITE_SWEEP_BATCH" --sweep-commits-cap 10 | tee "$TMP/write-sweep.txt"
+        cargo bench --locked --bench write_bench -- "${WRITE_ARGS[@]}" --append-sweep "$WRITE_SWEEP_BATCH" --sweep-commits-cap 10 | tee "$TMP/write-sweep.txt"
         # --grown 2: round 0 folds under the eager policy, round 1 under the deferred
         # policy production sync uses - round 1 is the scraped fold figure.
-        cargo bench --bench write_bench -- "${WRITE_ARGS[@]}" --profile-optimize "$TMP/wprof" --grown 2 | tee "$TMP/write-prof.txt"
+        cargo bench --locked --bench write_bench -- "${WRITE_ARGS[@]}" --profile-optimize "$TMP/wprof" --grown 2 | tee "$TMP/write-prof.txt"
       fi
 
       # `null` when the bench skipped that phase (serve_mem_bench skips its vector
