@@ -8,7 +8,7 @@
 //! picks the ACP family (`session/update`) or the x.ai extension family
 //! (`_x.ai/session/update`). The sibling `summary.json` supplies identity,
 //! project, and lineage; every other sibling is documented non-capture. Format
-//! archaeology and the decision record live in `docs/knowledge/references/grok-build.md`.
+//! archaeology and the decision record live in `docs/knowledge/adapters/grok-build.md`.
 //!
 //! Identity is the session directory name (a UUID, equal to `summary.json`
 //! `info.id` by construction); message ids are position-derived
@@ -236,7 +236,7 @@ impl JsonlTree for GrokBuildAdapter {
         let lineage = self.lineage().get(&id);
         // Fork/resume children carry the link themselves; a fresh subagent
         // never does (no writer exists for it) - the parent-side meta is the
-        // only record (docs/knowledge/references/grok-build.md row 7).
+        // only record (docs/knowledge/adapters/grok-build.md row 7).
         let parent_session_id = summary
             .as_ref()
             .and_then(|summary| summary.get("parent_session_id")?.as_str())
@@ -752,7 +752,7 @@ fn serialize_session(
                 ),
             ];
             // Re-emit the parent-side lineage sidecar so a restored child is
-            // discoverable as a child again (docs/knowledge/references/grok-build.md row 7).
+            // discoverable as a child again (docs/knowledge/adapters/grok-build.md row 7).
             if let Some(meta) = source.and_then(|source| source.get("subagent_meta"))
                 && let Some(rel) = source
                     .and_then(|source| source.get("subagent_meta_path"))
@@ -899,7 +899,7 @@ fn reconstruct_rows(session_id: &str, messages: &[&MessageWithParts]) -> Vec<Val
 
 #[cfg(test)]
 mod tests {
-    //! Mapping decisions from `docs/knowledge/references/grok-build.md`, checked against
+    //! Mapping decisions from `docs/knowledge/adapters/grok-build.md`, checked against
     //! the committed sandbox capture under `tests/fixtures/adapter/grok-build/`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 

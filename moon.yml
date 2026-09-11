@@ -155,7 +155,7 @@ tasks:
       # A concept's directory is derivable from its type, which is what keeps
       # filing mechanical instead of a judgment call. Enforce the match here or
       # it silently stops being true.
-      TYPE_DIRS = {"Decision": "decisions", "Finding": "findings", "Reference": "references", "Runbook": "runbooks"}
+      TYPE_DIRS = {"Decision": "decisions", "Finding": "findings", "Adapter": "adapters", "Runbook": "runbooks"}
 
       violations = []
 

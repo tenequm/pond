@@ -19,8 +19,8 @@ below and the discussion transcript disagree, this file wins.
    per file, YAML frontmatter with `type`/`sources`/`generated`, index + log
    bookkeeping, deprecate-never-delete. The bundle holds what AGENTS.md does not:
    decisions and findings that are not standing orders.
-3. **`docs/adapters/` migrates into the bundle** as `docs/knowledge/references/`,
-   one Reference concept per source agent. Their ad-hoc "Last verified: <date>,
+3. **`docs/adapters/` migrates into the bundle** as `docs/knowledge/adapters/`,
+   one Adapter concept per source agent. Their ad-hoc "Last verified: <date>,
    against <version>" headers become `verified` events + `stale_after`.
 4. **All benchmark material consolidates under `packages/pond/benches/`** (the
    cargo bench targets cannot leave it, so the data moves to the code):
@@ -73,7 +73,7 @@ below and the discussion transcript disagree, this file wins.
 - `docs/knowledge/index.md`: `okf_version: "0.2"` frontmatter; preamble states
   what the bundle holds and refuses (plans and benchmark logs stay out; AGENTS.md
   carries laws and links here; publicity fence; type vocabulary: Decision,
-  Finding, Reference, Runbook; `adapters/` subdir convention).
+  Finding, Adapter, Runbook; `adapters/` subdir convention).
 - `docs/knowledge/log.md` (newest-first `## YYYY-MM-DD` headings).
 - First real concept written by the driver, full frontmatter and real sources -
   it is the convention every later writer imitates (invariant 2). Candidate:
@@ -82,7 +82,7 @@ below and the discussion transcript disagree, this file wins.
 ### C. Adapters migration (agy)
 
 - Move `docs/adapters/{agy,grok-build,letta-code}.md` to
-  `docs/knowledge/references/`, adding frontmatter: `type: Reference`,
+  `docs/knowledge/adapters/`, adding frontmatter: `type: Adapter`,
   `description`, `tags`, `sources` (upstream repos, descriptors as honest scope
   descriptors, issue links), `verified` from the "Last verified" lines,
   `stale_after` pegged to the next plausible upstream release. Bodies unchanged.

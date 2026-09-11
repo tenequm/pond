@@ -1,5 +1,5 @@
 ---
-type: Reference
+type: Adapter
 title: letta-code
 description: Upstream format archaeology and mapping decision record for the letta-code adapter.
 tags: [adapter, letta-code]

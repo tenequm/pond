@@ -7,14 +7,16 @@ the entry - the prose is the history, the link is a working reference.
 
 ## 2026-09-11
 
-- Filed every concept by type (`decisions/`, `findings/`, `references/`,
+- Filed every concept by type (`decisions/`, `findings/`, `adapters/`,
   `runbooks/`), replacing both the original flat layout and a short-lived
   subject-area one. The bundle doubled in a day and flat stopped being
   navigable, but subject directories turned filing into a judgment call that
   would need new categories as pond grows. Type directories are derivable from
   frontmatter, closed, and now enforced by `repo:check-knowledge`. Subject
-  grouping moved to the index, which is the entry point anyway. `adapters/`
-  became `references/`.
+  grouping moved to the index, which is the entry point anyway. The type is
+  named `Adapter`, not the generic `Reference` the format's example
+  vocabulary suggests, so that the directory keeps the name that means
+  something to a reader looking for adapter format archaeology.
 - Added [Per-sync watermarks must never come from Dataset::versions() on a remote store](findings/s3-sync-change-detection-oracle.md),
   [Absent rows must append, never merge-insert, on a remote store](findings/s3-append-vs-merge-write-path.md),
   [cleanup_old_versions belongs off the per-sync hot path](findings/s3-sync-cleanup-amortization.md),
@@ -30,9 +32,9 @@ the entry - the prose is the history, the link is a working reference.
   (Decision), backfilled from landed plans in `docs/plans/`.
 - Bundle created. First concept: [token-usage-accounting](runbooks/token-usage-accounting.md)
   (Runbook), migrated from `docs/other/2608-27-token-usage-accounting.md`.
-- Added [adapters/agy](references/agy.md) (Reference), migrated from `docs/adapters/`.
-- Added [adapters/grok-build](references/grok-build.md) (Reference), migrated from `docs/adapters/`.
-- Added [adapters/letta-code](references/letta-code.md) (Reference), migrated from `docs/adapters/`.
+- Added [agy](adapters/agy.md) (Adapter), migrated from `docs/adapters/`.
+- Added [grok-build](adapters/grok-build.md) (Adapter), migrated from `docs/adapters/`.
+- Added [letta-code](adapters/letta-code.md) (Adapter), migrated from `docs/adapters/`.
 - Added [Fable 5 vs Fable 5.1: the queries behind the per-prompt comparison](findings/fable-5-vs-5-1-usage-queries.md)
   (Finding), migrated from `docs/other/2609-02-fable-5-vs-5-1-usage-queries.md`.
 - Added [pond retrieval tools redesign - research and reasoning (2026-06-19)](findings/retrieval-tools-redesign-research.md)

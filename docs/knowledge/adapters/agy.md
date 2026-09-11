@@ -1,5 +1,5 @@
 ---
-type: Reference
+type: Adapter
 title: agy
 description: Upstream format archaeology and mapping decision record for the agy adapter.
 tags: [adapter, agy]

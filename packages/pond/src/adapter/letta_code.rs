@@ -8,7 +8,7 @@
 //! `{kind: tool_call, name?, argsText?, resultText?, resultOk?}`, each with a
 //! per-turn `captured_at` stamp and optional `source_line_id` /
 //! `source_message_id`. Format archaeology and the decision record live in
-//! `docs/knowledge/references/letta-code.md`.
+//! `docs/knowledge/adapters/letta-code.md`.
 //!
 //! Identity is the path: the session id is `<agent-dir>+<conversation-dir>`
 //! (letta sanitizes both to `[A-Za-z0-9._-]`, so the directory names ARE the
@@ -657,7 +657,7 @@ fn fold_result(row: &mut Value, result: ReconstructedResult) {
 
 #[cfg(test)]
 mod tests {
-    //! Mapping decisions from `docs/knowledge/references/letta-code.md`, checked against
+    //! Mapping decisions from `docs/knowledge/adapters/letta-code.md`, checked against
     //! the committed sandbox capture under `tests/fixtures/adapter/letta-code/`.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 

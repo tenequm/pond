@@ -1,5 +1,5 @@
 ---
-type: Reference
+type: Adapter
 title: grok-build
 description: Upstream format archaeology and mapping decision record for the grok-build adapter.
 tags: [adapter, grok-build]

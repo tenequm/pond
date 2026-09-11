@@ -5,7 +5,7 @@ okf_version: "0.2"
 # Pond knowledge base
 
 Durable project knowledge for pond: decisions with rationale, findings with
-evidence, references to upstream formats, runbooks for recurring analysis.
+evidence, adapter format records, runbooks for recurring analysis.
 An entry belongs here only when it is true and useful in a fresh clone, to a
 reader who never used the session that produced it.
 
@@ -23,12 +23,12 @@ What this bundle refuses:
 
 Conventions:
 
-- Type vocabulary: `Decision`, `Finding`, `Reference`, `Runbook`.
+- Type vocabulary: `Decision`, `Finding`, `Adapter`, `Runbook`.
 - One concept per file, YAML frontmatter with at least a non-empty `type`;
   full frontmatter (`description`, `sources`, `generated`, `stale_after`
   where content rots) is the standard set by the first concept.
 - Concepts are filed **by type**, one directory per entry in the vocabulary:
-  `decisions/`, `findings/`, `references/`, `runbooks/`. The directory is
+  `decisions/`, `findings/`, `adapters/`, `runbooks/`. The directory is
   therefore derivable from the `type:` field rather than being a judgment
   call, the set never grows as pond does, and `repo:check-knowledge` enforces
   the match - a concept whose `type` and directory disagree fails the build.
@@ -151,14 +151,14 @@ Recurring analysis over pond's own data.
   Fable 5.1 generated 31% more output tokens per prompt with 15% fewer tool
   calls while reducing per-prompt API cost by 31% over 22,022 measured calls.
 
-## Adapter references
+## Adapters
 
 Upstream format archaeology and mapping decision records, one per source
 agent. The add-adapter playbook writes one of these per new adapter:
 
-- [agy](references/agy.md) - Upstream format archaeology and mapping decision
+- [agy](adapters/agy.md) - Upstream format archaeology and mapping decision
   record for the agy adapter.
-- [grok-build](references/grok-build.md) - Upstream format archaeology and
+- [grok-build](adapters/grok-build.md) - Upstream format archaeology and
   mapping decision record for the grok-build adapter.
-- [letta-code](references/letta-code.md) - Upstream format archaeology and
+- [letta-code](adapters/letta-code.md) - Upstream format archaeology and
   mapping decision record for the letta-code adapter.

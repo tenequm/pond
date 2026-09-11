@@ -19,7 +19,7 @@
      playbook step the reviewer checks rather than trusts:
 
 ## Adapter checklist
-- [ ] `docs/knowledge/references/<name>.md`: 11-row decision table with evidence per row, a field-history section, and a `Last verified` line
+- [ ] `docs/knowledge/adapters/<name>.md`: 11-row decision table with evidence per row, a field-history section, and a `Last verified` line
 - [ ] Fixture self-captured under a sandbox home (agent version stated); per-file row census in `tests/fixtures/README.md`
 - [ ] JSONL sources go through `jsonl.rs` (`parse_bounded`, tail peek); the peek read-budget test is present
 - [ ] `probe_default` reads only the injected `Env`; `assert_probe_default` test
