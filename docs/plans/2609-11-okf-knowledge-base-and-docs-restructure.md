@@ -106,11 +106,11 @@ below and the discussion transcript disagree, this file wins.
   append-on-every-run jsonl would invalidate format/lint/test caches. Fix by
   splitting, not negating: a new `benches` fileGroup holding code only
   (`benches/**/*.rs`; root: `packages/pond/benches/**/*.rs`), attached to the
-  tasks that actually read bench sources (`format` formats them, `lint-msvc`
-  compiles them via `--all-targets`, `test`/`lint` keep them under the repo's
-  stated completeness rule); `tests` shrinks back to `tests/**/*`. The data
-  under `benches/docs/` belongs to NO group, so bench-gate appends never touch
-  a task fingerprint.
+  tasks that actually read bench sources (`format` formats them, `lint` and
+  `lint-msvc` compile them via `--all-targets`, `test` keeps them under the
+  repo's stated completeness rule); `tests` shrinks back to `tests/**/*`. The
+  data under `benches/docs/` belongs to NO group, so bench-gate appends never
+  touch a task fingerprint.
 - **Packaging guard:** `benches/` ships in the crates.io package by default;
   add `exclude` entries for `benches/docs/` in `packages/pond/Cargo.toml`, then
   prove it with `moon run pond:check-package` and the new `pond:check-publish`.
@@ -149,11 +149,11 @@ below and the discussion transcript disagree, this file wins.
 
 ### F. Loose docs + research distillation (agy)
 
-- `docs/other/token-usage-accounting.md` -> Runbook concept (the dedup rule is
-  the finding). `docs/other/fable-5-vs-5-1-usage-queries.md` -> Finding with
-  `stale_after`. `docs/check-later/` retrieval-redesign research -> concept with
-  honest superseded status, or folded into the search-scope decision's history;
-  both source dirs end empty and are removed.
+- `docs/other/2608-27-token-usage-accounting.md` -> Runbook concept (the dedup
+  rule is the finding). `docs/other/2609-02-fable-5-vs-5-1-usage-queries.md` ->
+  Finding with `stale_after`. `docs/check-later/` retrieval-redesign research ->
+  concept with honest superseded status, or folded into the search-scope
+  decision's history; both source dirs end empty and are removed.
 - `docs/researches/` reports stay in place as cited sources; each is distilled
   into a Finding concept (claim + what invalidates it + sources). No bulk moves.
 

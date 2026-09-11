@@ -5011,7 +5011,7 @@ pub(crate) fn pond_index_intents_with_vector_threshold(
             column: "vector",
             // Probes count `embedding_model`, the narrow co-set sibling of
             // `vector` (spec.md#session-embed-from-canonical): same answer,
-            // none of the wide-column data-page reads (CLAUDE.md "count_rows
+            // none of the wide-column data-page reads (AGENTS.md "count_rows
             // predicates").
             trigger: IndexTrigger::OnNonNullCount {
                 column: "embedding_model",

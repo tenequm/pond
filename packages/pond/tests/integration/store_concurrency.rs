@@ -3,7 +3,7 @@
 //! concurrent writers without surfacing a spurious `Conflict`.
 //!
 //! The real `TempDir` here is deliberate and must not be "fixed" to
-//! `shared-memory://` under the CLAUDE.md two-Store rule. Lance picks its
+//! `shared-memory://` under the AGENTS.md two-Store rule. Lance picks its
 //! commit handler by scheme and platform: a `file://` store on Windows routes
 //! to `RenameCommitHandler` (hard-link plus delete, NTFS-only), while
 //! `shared-memory://` and every remote scheme keep `ConditionalPutCommitHandler`
