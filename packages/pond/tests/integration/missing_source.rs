@@ -601,7 +601,7 @@ fn dropped_events_are_attributed_to_their_adapter() {
     let root = claude_code_root(&temp, &Healthy::OneFixtureSession);
     // A second session file the walk lists but the read cannot open: the
     // adapter gets far enough to charge the loss to a session, not to the file.
-    let project = root.join("projects").join("denied-project");
+    let project = root.join("denied-project");
     std::fs::create_dir_all(&project).expect("project dir");
     let denied = project.join("denied.jsonl");
     std::fs::write(&denied, "{\"type\":\"user\"}\n").expect("write");
@@ -633,7 +633,7 @@ fn dropped_events_are_attributed_to_their_adapter() {
     let lost = entry["unreadable_events"].as_u64().unwrap_or(0)
         + entry["skipped_files"].as_u64().unwrap_or(0);
     assert!(lost >= 1, "the count is the magnitude: {entry}");
-    let reason = entry["first_drop_reason"]
+    let reason = entry["first_unreadable_reason"]
         .as_str()
         .or_else(|| entry["first_skip_reason"].as_str())
         .unwrap_or_else(|| panic!("a count with no cause is the silence we removed: {entry}"));

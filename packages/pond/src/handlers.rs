@@ -408,8 +408,8 @@ mod ingest_handler {
                             }
                             summary.dropped_events += 1;
                             summary.unreadable_events += 1;
-                            if summary.first_drop_reason.is_none() {
-                                summary.first_drop_reason = Some(error.to_string());
+                            if summary.first_unreadable_reason.is_none() {
+                                summary.first_unreadable_reason = Some(error.to_string());
                             }
                         }
                         None => {

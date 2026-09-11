@@ -3930,7 +3930,7 @@ struct DegradedAdapter {
     /// whole-file count above never sees.
     unreadable_events: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    first_drop_reason: Option<String>,
+    first_unreadable_reason: Option<String>,
     /// Whole sessions the validator rejected (an empty `source_agent`, a parent
     /// that never arrived): a larger loss than any event count, and silent
     /// until now. `drop_reasons` on the summary document carries the kinds.
@@ -3938,8 +3938,9 @@ struct DegradedAdapter {
 }
 
 impl DegradedAdapter {
-    /// The yellow line naming what this adapter lost. `None` when nothing
-    /// actionable was lost, which is what keeps a routine dedupe pass quiet.
+    /// The yellow line naming what this adapter lost, and the authority on
+    /// whether it lost anything actionable at all - `None` keeps a routine
+    /// dedupe pass out of both the warning and the JSON array.
     fn summary_line(&self) -> Option<String> {
         let mut what = Vec::new();
         if self.skipped_files > 0 {
@@ -3965,7 +3966,7 @@ impl DegradedAdapter {
         let first = if self.skipped_files > 0 {
             self.first_skip_reason.as_deref()
         } else {
-            self.first_drop_reason.as_deref()
+            self.first_unreadable_reason.as_deref()
         };
         Some(match first {
             Some(reason) => format!(
@@ -3998,8 +3999,10 @@ impl SyncSink {
 }
 
 /// The whole `pond sync` verb: per-host lock, model preload, import, index
-/// fold, summary, and the last-sync breadcrumb - written on success AND
-/// failure, so `pond status` can surface a silently failing scheduled sync.
+/// fold, summary, and the last-sync breadcrumb - written once the run owns a
+/// store, on success AND failure, so `pond status` can surface a silently
+/// failing scheduled sync. Setup failures (storage resolve, creds, lock, a
+/// narrowed absent source) return before the breadcrumb exists.
 pub(crate) async fn run_sync(
     loaded: &Config,
     config_file: &Path,
@@ -4134,13 +4137,7 @@ pub(crate) async fn run_sync(
             "messages_inserted": report.messages_inserted,
             "duration_secs": duration.as_secs_f64(),
         });
-        // Reconciliation runs after import, so a mid-pipeline failure may still
-        // have detected deletions; surface them when present (same store as the
-        // ok path).
-        add_reconciliation(&mut summary, &report)?;
-        add_when_non_empty(&mut summary, "failed_adapters", &report.failed_adapters)?;
-        add_when_non_empty(&mut summary, "degraded_adapters", &report.degraded_adapters)?;
-        add_drop_reasons(&mut summary, &report)?;
+        attach_adapter_verdicts(&mut summary, &report)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     }
     outcome?;
@@ -4156,10 +4153,7 @@ pub(crate) async fn run_sync(
             },
             "duration_secs": duration.as_secs_f64(),
         });
-        add_reconciliation(&mut summary, &report)?;
-        add_when_non_empty(&mut summary, "failed_adapters", &report.failed_adapters)?;
-        add_when_non_empty(&mut summary, "degraded_adapters", &report.degraded_adapters)?;
-        add_drop_reasons(&mut summary, &report)?;
+        attach_adapter_verdicts(&mut summary, &report)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     } else {
         // Repeated beside the summary: the line emitted when the adapter was
@@ -4371,9 +4365,10 @@ async fn run_sync_pipeline(
         sink,
     )
     .await;
-    // Counts land on the report before the error propagates: earlier adapters'
-    // rows are already committed, and the error-path summary and last-sync
-    // record must not claim zero for a store that grew.
+    // Counts land on the report before the error propagates, so an adapter
+    // that finished keeps its rows on the error document. An adapter failing
+    // mid-flush still loses its own committed batches: `ingest_adapter` hands
+    // back no summary on error.
     report.sessions_inserted = import_summary.sessions_inserted as u64;
     report.messages_inserted = import_summary.messages_inserted_searchable as u64;
     report.drop_reasons = import_summary.drop_reasons.clone();
@@ -4499,10 +4494,17 @@ fn add_reconciliation(summary: &mut Value, report: &SyncReport) -> anyhow::Resul
     Ok(())
 }
 
-/// Attach a per-adapter verdict array (`failed_adapters`, `degraded_adapters`)
-/// to a `--format json` summary document, on both the ok and error documents.
-/// Additive and omitted when empty (spec.md 7.2), so an all-healthy run's
-/// summary is byte-identical to the pre-field document.
+/// Every additive field the ok and error summary documents share, attached in
+/// one place so the two cannot drift apart. Reconciliation belongs here too: it
+/// runs after import, so a mid-pipeline failure may still have detected
+/// deletions worth surfacing.
+fn attach_adapter_verdicts(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
+    add_reconciliation(summary, report)?;
+    add_when_non_empty(summary, "failed_adapters", &report.failed_adapters)?;
+    add_when_non_empty(summary, "degraded_adapters", &report.degraded_adapters)?;
+    add_drop_reasons(summary, report)
+}
+
 /// Attach the run's `drop_reasons` histogram. Separate from
 /// `degraded_adapters` on purpose: it records what the validator discarded,
 /// including the routine duplicates, and asserts nothing about health.
@@ -4519,6 +4521,10 @@ fn add_drop_reasons(summary: &mut Value, report: &SyncReport) -> anyhow::Result<
     Ok(())
 }
 
+/// Attach a per-adapter verdict array (`failed_adapters`, `degraded_adapters`)
+/// to a `--format json` summary document, on both the ok and error documents.
+/// Additive and omitted when empty (spec.md 7.2), so an all-healthy run's
+/// summary is byte-identical to the pre-field document.
 fn add_when_non_empty<T: serde::Serialize>(
     summary: &mut Value,
     key: &str,
@@ -5167,46 +5173,42 @@ async fn run_import_stage(
         // Merge before emitting: these rows are already committed, so a failed
         // stderr write must not drop them from the run's counts.
         total.merge(&summary);
-        // Routine validator drops are deliberately absent from this gate: the
-        // dedupe floor firing is expected, and warning on it every sync trains
-        // operators to ignore the line that matters.
-        if summary.skipped_files > 0
-            || summary.unreadable_events > 0
-            || summary.dropped_sessions > 0
-        {
-            degraded.push(DegradedAdapter {
-                name,
-                label,
-                path,
-                skipped_files: summary.skipped_files as u64,
-                first_skip_reason: summary.first_skip_reason.clone(),
-                unreadable_events: summary.unreadable_events as u64,
-                first_drop_reason: summary.first_drop_reason.clone(),
-                dropped_sessions: summary.dropped_sessions as u64,
-            });
-            if let Some(entry) = degraded.last() {
-                emit_degraded(sink, entry, Some(&mp))?;
+        let entry = DegradedAdapter {
+            name,
+            label,
+            path,
+            skipped_files: summary.skipped_files as u64,
+            first_skip_reason: summary.first_skip_reason.clone(),
+            unreadable_events: summary.unreadable_events as u64,
+            first_unreadable_reason: summary.first_unreadable_reason.clone(),
+            dropped_sessions: summary.dropped_sessions as u64,
+        };
+        // One authority for "this adapter lost something actionable": the line
+        // an operator would read. A routine dedupe pass yields none, which is
+        // what keeps it out of the warning and out of the JSON array alike.
+        if let Some(line) = entry.summary_line() {
+            degraded.push(entry);
+            if let Some(pushed) = degraded.last() {
+                emit_degraded(sink, pushed, &line, Some(&mp))?;
             }
         }
     }
     Ok(())
 }
 
-/// Name an adapter that skipped unreadable files, the moment its pass ends.
-/// Same routing as [`emit_source_missing`].
+/// Name what an adapter lost - unread files, undecodable events, rejected
+/// sessions - the moment its pass ends. Same routing as [`emit_source_missing`].
 fn emit_degraded(
     sink: SyncSink,
     entry: &DegradedAdapter,
+    line: &str,
     mp: Option<&indicatif::MultiProgress>,
 ) -> anyhow::Result<()> {
-    let Some(line) = entry.summary_line() else {
-        return Ok(());
-    };
     if sink.is_serve() {
         tracing::warn!(target: "pond::sync", adapter = %entry.name, skipped_files = entry.skipped_files, unreadable_events = entry.unreadable_events, dropped_sessions = entry.dropped_sessions, "{line}");
         return Ok(());
     }
-    paint_err_above(mp, &pond::output::paint(&line, pond::output::yellow()))
+    paint_err_above(mp, &pond::output::paint(line, pond::output::yellow()))
 }
 
 /// Name an adapter skipped for an absent source root, the moment it is skipped.
@@ -5218,7 +5220,7 @@ fn emit_source_missing(
     mp: Option<&indicatif::MultiProgress>,
 ) -> anyhow::Result<()> {
     if sink.is_serve() {
-        tracing::warn!(target: "pond::sync", adapter = %failed.name, path = %failed.path, "{}", failed.error);
+        tracing::warn!(target: "pond::sync", adapter = %failed.name, path = %failed.path, "{}", failed.summary_line());
         return Ok(());
     }
     paint_err_above(
@@ -5279,7 +5281,7 @@ fn source_root(config: &Value) -> Option<PathBuf> {
 fn missing_source_root(config: &Value) -> Option<String> {
     let root = source_root(config)?;
     match root.try_exists() {
-        Ok(false) => Some(contract_display(&root.to_string_lossy())),
+        Ok(false) => Some(config::contract_home(&root).display().to_string()),
         Ok(true) | Err(_) => None,
     }
 }
@@ -6766,7 +6768,9 @@ async fn local_status(
                 // "check [adapters.<name>] in config" line was written for -
                 // so leave it to that arm rather than inventing a message.
                 error: None,
-                reason,
+                // Not `reason`: a blob that will not open is a config fault,
+                // and naming the wrong kind costs more than naming none.
+                reason: None,
             });
             continue;
         };
@@ -8005,7 +8009,7 @@ mod tests {
                 skipped_files: 3,
                 first_skip_reason: Some("permission denied".to_owned()),
                 unreadable_events: 2,
-                first_drop_reason: Some("bad line".to_owned()),
+                first_unreadable_reason: Some("bad line".to_owned()),
                 dropped_sessions: 1,
             }],
             ..SyncReport::default()
@@ -8020,7 +8024,7 @@ mod tests {
                 "skipped_files": 3,
                 "first_skip_reason": "permission denied",
                 "unreadable_events": 2,
-                "first_drop_reason": "bad line",
+                "first_unreadable_reason": "bad line",
                 "dropped_sessions": 1,
             }]),
             "attach the machine fields, not the label: {summary}",

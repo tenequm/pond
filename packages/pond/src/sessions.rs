@@ -3791,9 +3791,10 @@ pub struct IngestSummary {
     /// as opposed to the validator's categorized drops: this is the subset an
     /// operator can actually act on, and the only one worth a warning.
     pub unreadable_events: usize,
-    /// First `unreadable_events` reason, verbatim. The validator's drops carry
-    /// a `drop_reasons` key instead; a read failure has none.
-    pub first_drop_reason: Option<String>,
+    /// First `unreadable_events` reason, verbatim. Deliberately not named for
+    /// the validator's drops: those carry a `drop_reasons` key instead, and a
+    /// read failure has none.
+    pub first_unreadable_reason: Option<String>,
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
     /// metadata file), or an unextractable header. Never an error or a drop;
@@ -3900,8 +3901,8 @@ impl IngestSummary {
         self.parts_matched += other.parts_matched;
         self.dropped_events += other.dropped_events;
         self.unreadable_events += other.unreadable_events;
-        if self.first_drop_reason.is_none() {
-            self.first_drop_reason = other.first_drop_reason.clone();
+        if self.first_unreadable_reason.is_none() {
+            self.first_unreadable_reason = other.first_unreadable_reason.clone();
         }
         self.dropped_sessions += other.dropped_sessions;
         self.relabeled_sessions += other.relabeled_sessions;
