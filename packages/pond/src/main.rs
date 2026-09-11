@@ -3857,6 +3857,10 @@ struct SyncReport {
     degraded_adapters: Vec<DegradedAdapter>,
 }
 
+/// Stable kind for an absent source root, shared by `failed_adapters` and the
+/// dry-run row so one condition reads the same on both surfaces.
+const FAILURE_REASON_SOURCE_MISSING: &str = "source_missing";
+
 /// One adapter skipped because its configured source root does not exist on
 /// this host. Carried out of the import stage so the summary renderers can name
 /// it - the immediate red line scrolls away behind a long import.
@@ -3871,8 +3875,7 @@ struct FailedAdapter {
     path: String,
     error: String,
     /// Stable machine-readable kind, so fleet tooling branches on this and
-    /// never parses the human `error` string. One value today; a future
-    /// adapter-level failure class gets its own.
+    /// never parses the human `error` string.
     reason: &'static str,
 }
 
@@ -3884,7 +3887,7 @@ impl FailedAdapter {
             label,
             path,
             error,
-            reason: "source_missing",
+            reason: FAILURE_REASON_SOURCE_MISSING,
         }
     }
 
@@ -3918,21 +3921,46 @@ struct DegradedAdapter {
     /// an unreadable root from one corrupt file.
     #[serde(skip_serializing_if = "Option::is_none")]
     first_skip_reason: Option<String>,
+    /// Events lost from sessions the adapter did open, which the whole-file
+    /// counts above never see.
+    dropped_events: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_drop_reason: Option<String>,
+    /// `IngestSummary::drop_reasons`, whose keys are the stable
+    /// `DROP_REASON_*` tokens; a mid-session decode failure has none, which is
+    /// what `first_drop_reason` is for.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    drop_reasons: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl DegradedAdapter {
     /// Emitted when the adapter's pass ends and repeated beside the final
     /// summary - the per-file reasons are dropped off-TTY.
     fn summary_line(&self) -> String {
-        match &self.first_skip_reason {
+        let mut what = Vec::new();
+        if self.skipped_files > 0 {
+            what.push(format!(
+                "skipped {} file(s) it could not read",
+                self.skipped_files
+            ));
+        }
+        if self.dropped_events > 0 {
+            what.push(format!(
+                "dropped {} event(s) it could not import",
+                self.dropped_events
+            ));
+        }
+        let first = self
+            .first_skip_reason
+            .as_deref()
+            .or(self.first_drop_reason.as_deref());
+        match first {
             Some(reason) => format!(
-                "import: {} skipped {} file(s) it could not read - first error: {reason}",
-                self.label, self.skipped_files
+                "import: {} {} - first error: {reason}",
+                self.label,
+                what.join(" and ")
             ),
-            None => format!(
-                "import: {} skipped {} file(s) it could not read",
-                self.label, self.skipped_files
-            ),
+            None => format!("import: {} {}", self.label, what.join(" and ")),
         }
     }
 }
@@ -4643,6 +4671,14 @@ async fn run_sync_dry_run(
                 RowError::Other(error) => error.clone(),
             }
         }
+        /// The row's stable machine-readable kind, matching `failed_adapters`
+        /// in the real-sync summary so one condition reads the same on both.
+        fn reason(&self) -> &'static str {
+            match self {
+                RowError::SourceMissing(_) => FAILURE_REASON_SOURCE_MISSING,
+                RowError::Other(_) => "unreadable_source",
+            }
+        }
         /// The (red) detail column of the text row.
         fn detail(&self) -> String {
             match self {
@@ -4740,6 +4776,7 @@ async fn run_sync_dry_run(
                     "fresh": row.plan.map(|plan| plan.fresh),
                     "pending": row.plan.map(|plan| plan.pending),
                     "error": row.error.as_ref().map(RowError::message),
+                    "reason": row.error.as_ref().map(RowError::reason),
                 })
             })
             .collect();
@@ -5098,13 +5135,16 @@ async fn run_import_stage(
         // Merge before emitting: these rows are already committed, so a failed
         // stderr write must not drop them from the run's counts.
         total.merge(&summary);
-        if summary.skipped_files > 0 {
+        if summary.skipped_files > 0 || summary.dropped_events > 0 {
             degraded.push(DegradedAdapter {
                 name,
                 label,
                 path,
                 skipped_files: summary.skipped_files as u64,
                 first_skip_reason: summary.first_skip_reason.clone(),
+                dropped_events: summary.dropped_events as u64,
+                first_drop_reason: summary.first_drop_reason.clone(),
+                drop_reasons: summary.drop_reasons.clone(),
             });
             if let Some(entry) = degraded.last() {
                 emit_degraded(sink, entry, Some(&mp))?;
@@ -5122,7 +5162,7 @@ fn emit_degraded(
     mp: Option<&indicatif::MultiProgress>,
 ) -> anyhow::Result<()> {
     if sink.is_serve() {
-        tracing::warn!(target: "pond::sync", adapter = %entry.name, skipped_files = entry.skipped_files, "{}", entry.summary_line());
+        tracing::warn!(target: "pond::sync", adapter = %entry.name, skipped_files = entry.skipped_files, dropped_events = entry.dropped_events, "{}", entry.summary_line());
         return Ok(());
     }
     paint_err_above(
@@ -7918,6 +7958,9 @@ mod tests {
                 path: Some("~/.codex/sessions".to_owned()),
                 skipped_files: 3,
                 first_skip_reason: Some("permission denied".to_owned()),
+                dropped_events: 2,
+                first_drop_reason: Some("bad line".to_owned()),
+                drop_reasons: [("duplicate_message_id", 2)].into_iter().collect(),
             }],
             ..SyncReport::default()
         };
@@ -7930,6 +7973,9 @@ mod tests {
                 "path": "~/.codex/sessions",
                 "skipped_files": 3,
                 "first_skip_reason": "permission denied",
+                "dropped_events": 2,
+                "first_drop_reason": "bad line",
+                "drop_reasons": { "duplicate_message_id": 2 },
             }]),
             "attach the machine fields, not the label: {summary}",
         );

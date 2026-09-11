@@ -362,6 +362,10 @@ mod ingest_handler {
                                 slot.first_drop_reason =
                                     outcome.error.as_ref().map(|err| err.message.clone());
                             }
+                            if summary.first_drop_reason.is_none() {
+                                summary.first_drop_reason =
+                                    outcome.error.as_ref().map(|err| err.message.clone());
+                            }
                         }
                     }
                     summary.add_outcomes(&push_outcomes);
@@ -407,6 +411,9 @@ mod ingest_handler {
                                 slot.first_drop_reason = Some(error.to_string());
                             }
                             summary.dropped_events += 1;
+                            if summary.first_drop_reason.is_none() {
+                                summary.first_drop_reason = Some(error.to_string());
+                            }
                         }
                         None => {
                             // Pre-Session decode failure: no in-flight

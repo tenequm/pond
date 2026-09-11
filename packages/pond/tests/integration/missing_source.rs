@@ -590,6 +590,82 @@ fn failed_adapters_survive_onto_the_error_document() {
     assert_eq!(entry["reason"].as_str(), Some("source_missing"), "{entry}");
 }
 
+/// A file the adapter opens but cannot finish reading loses events, not the
+/// whole file: that count lived only on the progress line, where the reason is
+/// dropped off-TTY. It belongs on the same per-adapter verdict as the skips.
+#[cfg(unix)]
+#[test]
+fn dropped_events_are_attributed_to_their_adapter() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().expect("temp");
+    let root = claude_code_root(&temp, &Healthy::OneFixtureSession);
+    // A second session file the walk lists but the read cannot open: the
+    // adapter gets far enough to charge the loss to a session, not to the file.
+    let project = root.join("projects").join("denied-project");
+    std::fs::create_dir_all(&project).expect("project dir");
+    let denied = project.join("denied.jsonl");
+    std::fs::write(&denied, "{\"type\":\"user\"}\n").expect("write");
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read(&denied).is_ok() {
+        // Running as root: the mode bits deny nothing, so there is no drop.
+        return;
+    }
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-code]\nenabled = true\npath = {:?}\n",
+            root.display().to_string(),
+        ),
+    );
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644)).expect("restore");
+    assert_exit_ok(&out, "a sync whose source holds one unreadable file");
+    let doc = json(&args, &out);
+    let entry = doc["degraded_adapters"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .unwrap_or_else(|| panic!("the loss must be attributed to the adapter: {doc}"));
+    assert_eq!(entry["name"].as_str(), Some("claude-code"), "{entry}");
+    let lost = entry["dropped_events"].as_u64().unwrap_or(0)
+        + entry["skipped_files"].as_u64().unwrap_or(0);
+    assert!(lost >= 1, "the count is the magnitude: {entry}");
+    let reason = entry["first_drop_reason"]
+        .as_str()
+        .or_else(|| entry["first_skip_reason"].as_str())
+        .unwrap_or_else(|| panic!("a count with no cause is the silence we removed: {entry}"));
+    assert!(
+        reason.to_lowercase().contains("denied"),
+        "the reason must name the cause: {reason:?}",
+    );
+    assert!(
+        stderr(&out).contains("first error:"),
+        "and it must survive off-TTY: {}",
+        stderr(&out),
+    );
+}
+
+/// One condition, one machine-readable kind, whichever surface reports it:
+/// the dry-run row carries the same `reason` token as `failed_adapters`.
+#[test]
+fn the_dry_run_row_carries_the_same_reason_token() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::OneFixtureSession);
+    let args = ["sync", "--dry-run", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "a whole-config dry run");
+    let doc = json(&args, &out);
+    assert_eq!(
+        adapter_row(&doc, "codex-cli")["reason"].as_str(),
+        Some("source_missing"),
+        "the dry run must name the kind, not only the prose: {doc}",
+    );
+    assert!(
+        adapter_row(&doc, "claude-code")["reason"].is_null(),
+        "a healthy row has no failure kind: {doc}",
+    );
+}
+
 /// The narrowed bail costs nothing: a typo'd `pond sync <adapter>` must fail
 /// before the store is created and before the sync flock is taken, so a wrong
 /// invocation leaves the host exactly as it found it.

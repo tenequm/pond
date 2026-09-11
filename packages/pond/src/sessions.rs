@@ -3787,6 +3787,9 @@ pub struct IngestSummary {
     /// First `skipped_files` reason, verbatim. One string, never a list;
     /// the count carries the magnitude.
     pub first_skip_reason: Option<String>,
+    /// First `dropped_events` reason, verbatim. `drop_reasons` categorizes the
+    /// validator's drops, but a mid-session decode failure has no reason key.
+    pub first_drop_reason: Option<String>,
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
     /// metadata file), or an unextractable header. Never an error or a drop;
@@ -3892,6 +3895,9 @@ impl IngestSummary {
         self.messages_matched_searchable += other.messages_matched_searchable;
         self.parts_matched += other.parts_matched;
         self.dropped_events += other.dropped_events;
+        if self.first_drop_reason.is_none() {
+            self.first_drop_reason = other.first_drop_reason.clone();
+        }
         self.dropped_sessions += other.dropped_sessions;
         self.relabeled_sessions += other.relabeled_sessions;
         self.skipped_files += other.skipped_files;
