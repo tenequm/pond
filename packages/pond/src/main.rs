@@ -4367,8 +4367,8 @@ async fn run_sync_pipeline(
     .await;
     // Counts land on the report before the error propagates, so an adapter
     // that finished keeps its rows on the error document. An adapter failing
-    // mid-flush still loses its own committed batches: `ingest_adapter` hands
-    // back no summary on error.
+    // mid-flush still loses its own committed batches (#240): `ingest_adapter`
+    // hands back no summary on error.
     report.sessions_inserted = import_summary.sessions_inserted as u64;
     report.messages_inserted = import_summary.messages_inserted_searchable as u64;
     report.drop_reasons = import_summary.drop_reasons.clone();
