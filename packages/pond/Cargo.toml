@@ -23,6 +23,7 @@ categories = ["command-line-utilities", "database", "artificial-intelligence"]
 # broke `cargo install` for v0.10.0-v0.13.0; check-package guards this in CI).
 exclude = [
     "tests/",
+    "benches/docs/",
     "**/.DS_Store",
 ]
 

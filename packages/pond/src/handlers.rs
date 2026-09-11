@@ -1116,7 +1116,7 @@ mod search_handler {
     /// tightly (~0.78-0.86), so the typical relevance gap between the right
     /// answer and a near-miss is only ~0.02-0.05. The boost must stay below
     /// that band or it swamps relevance and tanks recall - measured on
-    /// ops/search-benchmarks/queries-en.tsv, magnitude 0.1 collapsed
+    /// packages/pond/benches/docs/search-benchmarks/queries-en.tsv, magnitude 0.1 collapsed
     /// Success@3 from 0.33 (no boost) to 0.10; 0.02 keeps it tie-breaking.
     const RECENCY_BOOST_MAGNITUDE: f64 = 0.02;
     const RECENCY_BOOST_SCALE_DAYS: f64 = 30.0;

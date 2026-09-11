@@ -64,7 +64,7 @@ jobs:
       # bootstrap.
       - run: >
           moon run
-          repo:check-changelog
+          repo:check-changelog repo:check-knowledge
           pond:check-package pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
@@ -764,7 +764,20 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-      - run: ops/scripts/publish-npm.sh packages/openclaw-pond packages/pi-pond
+      # GitHub-hosted runner, so the pond-ci bootstrap (a /ci-cache PVC affair)
+      # does not apply; fetch the pinned moon the same way it does, reading
+      # the version from the same .prototools pin.
+      #
+      # GitHub's default run shell carries errexit but not pipefail, so without
+      # an explicit bash shell a failing curl is masked and caught only by tar
+      # choking on the truncated stream.
+      - shell: bash
+        run: |
+          MOON_VERSION=$(awk -F'"' '/^moon = /{print $2; exit}' .prototools)
+          test -n "$MOON_VERSION"
+          curl -fsSL "https://github.com/moonrepo/moon/releases/download/v${MOON_VERSION}/moon_cli-x86_64-unknown-linux-gnu.tar.xz" \
+            | tar -xJ --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
+          ./moon run repo:publish-npm
 
   # Not `on: release`: release-plz publishes the release, and publish-release
   # uploads the binaries to it several steps later, so a release-triggered run

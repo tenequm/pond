@@ -20,6 +20,9 @@ Thumbs.db
 *.swp
 
 .env*
+# .env* guards secret env files; the committed direnv entrypoint is not one.
+!.envrc
+.direnv/
 .secrets*
 tmp/
 .mcp.json
@@ -46,6 +49,8 @@ skills-lock.json
 # tree and make `cargo publish` refuse to release.
 /dist/
 /minisign*
+# moon binary unpacked into repo root by the npm-publish workflow step
+/moon
 
 # Benchmark fixtures/results and any query set derived from the operator's
 # corpus capture full conversation content (including API keys, wallet
@@ -53,13 +58,13 @@ skills-lock.json
 # paraphrased query set is also derivative - even after paraphrasing the
 # topics and project names leak. Regenerate locally via `bench.py`. Never
 # commit these.
-/ops/search-benchmarks/fixtures/
-/ops/search-benchmarks/results/
-/ops/search-benchmarks/queries-paraphrased*.tsv
-/ops/search-benchmarks/queries-real-use*.tsv
-/ops/search-benchmarks/queries-false-negatives*.tsv
-/ops/search-benchmarks/arms*.json
-/ops/search-benchmarks/__pycache__/
+/packages/pond/benches/docs/search-benchmarks/fixtures/
+/packages/pond/benches/docs/search-benchmarks/results/
+/packages/pond/benches/docs/search-benchmarks/queries-paraphrased*.tsv
+/packages/pond/benches/docs/search-benchmarks/queries-real-use*.tsv
+/packages/pond/benches/docs/search-benchmarks/queries-false-negatives*.tsv
+/packages/pond/benches/docs/search-benchmarks/arms*.json
+/packages/pond/benches/docs/search-benchmarks/__pycache__/
 
 # Corpus snapshot enumerates the operator's projects by name; aggregate
 # stats appear inline in the benchmark report. Regenerate via `pond status`.

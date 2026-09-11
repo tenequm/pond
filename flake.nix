@@ -46,6 +46,18 @@
       #               satisfy the build; neither is load-bearing for output.
       #   pkg-config  the pkg-config crate is in the tree via libsqlite3-sys.
       #
+      # The repo's own task toolchain is pinned here too, so `direnv allow`
+      # (or `nix develop`) is a complete dev setup:
+      #
+      #   moon        exact-pinned from the .prototools value via
+      #               ops/moon-cli.nix (not nixpkgs, which trails
+      #               releases); shadows any host-installed moon and always
+      #               satisfies the workspace versionConstraint.
+      #   gitleaks    repo:secret-scan, the pre-commit gate's first leg.
+      #   python3 + pyyaml
+      #               repo:check-knowledge runs its full YAML validation
+      #               instead of the degraded no-pyyaml fallback.
+      #
       # The Rust toolchain is deliberately NOT pinned here: rust-toolchain.toml
       # already pins it and rustup honors that on both a dev machine and CI. A
       # second pin in this flake would be a second source of truth that drifts.
@@ -55,6 +67,9 @@
             cmake
             protobuf
             pkg-config
+            gitleaks
+            (python3.withPackages (ps: [ ps.pyyaml ]))
+            (pkgs.callPackage ./ops/moon-cli.nix { })
           ];
         };
       });

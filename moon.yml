@@ -25,26 +25,375 @@ fileGroups:
     # the old ones. kache's own keys already include the flags, so adding this
     # costs one moon run and no cold cache.
     - '.cargo/config.toml'
-  tests:
-    - 'packages/pond/tests/**/*'
-    - 'packages/pond/benches/**/*'
 
 tasks:
+  # Gate the top CHANGELOG.md section's `###` headers to the canonical emoji
+  # taxonomy from .github/release-plz.toml, and require release-note prose on
+  # user-visible entries. The release body is that section verbatim
+  # (release-plz git_release_body default), and it fans out to the GitHub
+  # release + homebrew-tap + pond-nix, so a hand-edit that drops the emoji
+  # headers silently de-styles all three.
   check-changelog:
-    command: 'bash ops/scripts/check-changelog-headers.sh'
-    toolchains: 'system'
-    inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
+    script: |
+      set -euo pipefail
 
-  # Pre-release validation against the live remote store: gate benches + CLI
-  # probes + map-vs-scan equivalence, appending to
-  # docs/benchmarks/bench-gate-baseline.jsonl and printing the delta vs the
-  # previous run. ~30 min of S3 wall-clock; never cached, always live.
-  bench-gate:
-    command: 'bash ops/scripts/bench-gate.sh'
-    toolchains: 'system'
+      file=CHANGELOG.md
+
+      # Judge what is about to be committed, not the working tree: AGENTS.md
+      # documents `release-plz update` as a local changelog preview, and that
+      # unstaged rewrite would otherwise arm the prose gate below on a commit
+      # touching nothing near the changelog. Falls back to the file on disk
+      # outside a git checkout, or when the path is not in the index.
+      content=$(git show :"$file" 2>/dev/null || true)
+      [ -n "$content" ] || content=$(cat "$file" 2>/dev/null || true)
+
+      allowed=(
+        "🛠 Breaking Changes"
+        "🎉 New Features"
+        "🐛 Bug Fixes"
+        "🚀 Performance"
+        "🚜 Refactor"
+        "📚 Documentation"
+        "🧹 Chores"
+        "🔧 Other"
+      )
+
+      section=$(awk '/^## \[/{n++} n==1{print} n==2{exit}' <<< "$content")
+      [ -n "$section" ] || { echo "check-changelog: no '## [version]' section in $file" >&2; exit 1; }
+
+      bad=0
+      while IFS= read -r line; do
+        [[ "$line" == "### "* ]] || continue
+        header=$(printf '%s' "$line" | sed -E 's/^### +//; s/<!--[^>]*-->//; s/^ *//; s/ *$//')
+        ok=0
+        for a in "${allowed[@]}"; do [ "$header" = "$a" ] && { ok=1; break; }; done
+        if [ "$ok" -eq 0 ]; then
+          echo "check-changelog: non-canonical header: ### $header" >&2
+          bad=1
+        fi
+      done <<< "$section"
+
+      if [ "$bad" -ne 0 ]; then
+        echo >&2
+        echo "Allowed headers (keep release-plz's generated emoji form, add prose under them):" >&2
+        printf '  ### %s\n' "${allowed[@]}" >&2
+        exit 1
+      fi
+
+      # Backstop for the release-note flow: a user-visible entry with no prose
+      # under it means the note is missing at the source - the PR description
+      # had no `## Release note` section either, since a squash that merely
+      # lost its body is repaired at generation time from the PR (see AGENTS.md
+      # "Changelog authoring"). Fix it by adding the section to that PR's
+      # description, which the next release PR refresh picks up; the release PR
+      # can also be hand-patched before it ships.
+      #
+      # Only checked when this change actually writes the top entry - i.e. the
+      # release PR. An entry already on `main` is shipped history the flow
+      # cannot fix, and enforcing prose there would block every later commit on
+      # someone else's miss.
+      # No pipe here: awk exits at the second version heading, and a CHANGELOG
+      # past the 64KB pipe buffer would SIGPIPE git show, which pipefail turns
+      # into exit 141.
+      main_changelog=$(git show origin/main:"$file" 2>/dev/null || true)
+      base_section=$(awk '/^## \[/{n++} n==1{print} n==2{exit}' <<< "$main_changelog")
+      # An unresolvable origin/main (a fresh clone before its first fetch, a
+      # remote under another name, a shallow checkout) leaves the base empty,
+      # and the gate then cannot tell a new entry from shipped history;
+      # skipping is correct because the prose gate must never fire on an entry
+      # this flow cannot fix. CI always has a base, since it checks out at
+      # fetch-depth: 0.
+      if [ -z "$base_section" ] || [ "$section" = "$base_section" ]; then
+        exit 0
+      fi
+
+      bare=$(awk '
+        /^### / { visible = ($0 ~ /(New Features|Bug Fixes|Performance|Breaking Changes)/); next }
+        /^- / { if (visible) { entry = $0; if ((getline nxt) <= 0 || nxt !~ /^  /) print entry } }
+      ' <<< "$section")
+
+      if [ -n "$bare" ]; then
+        echo "check-changelog: user-visible entries with no release-note prose:" >&2
+        printf '  %s\n' "$bare" >&2
+        echo >&2
+        echo "Write the prose in the squash-commit body at merge time (PR's '## Release note')." >&2
+        echo "For an already-merged commit, hand-patch this entry on the release PR." >&2
+        exit 1
+      fi
+    inputs: ['CHANGELOG.md']
+    options:
+      # The oracle is `git show origin/main:CHANGELOG.md` against the staged
+      # copy, and no input glob represents either, so a cached pass keyed on the
+      # worktree file would survive a base that moved underneath it. The input
+      # stays because that path is still what makes this task affected.
+      cache: false
+
+  # Validate the Open Knowledge Format (OKF) bundle under docs/knowledge/:
+  # every concept file has valid frontmatter with a non-empty scalar type, each
+  # concept sits in the directory its type names, relative markdown links
+  # resolve to existing files, index.md and the concept files on disk stay in
+  # sync, and log.md is present.
+  #
+  # Link checking covers only links INSIDE the bundle. Paths that name a concept
+  # from elsewhere in the repo (docs/spec.md, the add-adapter playbook, adapter
+  # doc comments) are invisible here, so renaming a concept means sweeping the
+  # repo for them by hand - a bundle rename passed every gate while leaving 19
+  # dangling references exactly once.
+  check-knowledge:
+    script: |
+      set -euo pipefail
+
+      if ! command -v python3 >/dev/null 2>&1; then
+        echo "check-knowledge: python3 not found; SKIPPING - CI is the hard gate" >&2
+        exit 0
+      fi
+
+      python3 - <<'PY'
+      import os
+      import re
+      import sys
+
+      try:
+          import yaml
+          HAVE_YAML = True
+      except ImportError:
+          HAVE_YAML = False
+          sys.stderr.write("check-knowledge: warning: yaml module not found, full YAML validation skipped\n")
+
+      bundle_dir = os.path.join("docs", "knowledge")
+      index_file = os.path.join(bundle_dir, "index.md")
+      log_file = os.path.join(bundle_dir, "log.md")
+
+      # A concept's directory is derivable from its type, which is what keeps
+      # filing mechanical instead of a judgment call. Enforce the match here or
+      # it silently stops being true.
+      TYPE_DIRS = {"Decision": "decisions", "Finding": "findings", "Adapter": "adapters", "Runbook": "runbooks"}
+
+      violations = []
+
+      if not os.path.isdir(bundle_dir):
+          sys.stderr.write(f"check-knowledge: {bundle_dir}: bundle directory does not exist\n")
+          sys.exit(1)
+
+      # 1. log.md must exist.
+      if not os.path.isfile(log_file):
+          violations.append(f"check-knowledge: {log_file}: file does not exist")
+
+      # 2. index.md must exist.
+      if not os.path.isfile(index_file):
+          violations.append(f"check-knowledge: {index_file}: file does not exist")
+
+      # Collect all *.md files under docs/knowledge/ recursively
+      all_md_files = []
+      for root, _, files in os.walk(bundle_dir):
+          for f in files:
+              if f.endswith(".md"):
+                  all_md_files.append(os.path.normpath(os.path.join(root, f)))
+
+      norm_index = os.path.normpath(index_file)
+      norm_log = os.path.normpath(log_file)
+
+      concept_files = [f for f in all_md_files if f != norm_index and f != norm_log]
+      concept_set = set(concept_files)
+
+      # 3. Validate frontmatter of concept files
+      for file_path in concept_files:
+          try:
+              with open(file_path, "r", encoding="utf-8") as f:
+                  content = f.read()
+          except Exception as e:
+              violations.append(f"check-knowledge: {file_path}: cannot read file: {e}")
+              continue
+
+          lines = content.splitlines()
+          if not lines or lines[0].strip() != "---":
+              violations.append(f"check-knowledge: {file_path}: missing opening frontmatter delimiter (---)")
+              continue
+
+          closing_idx = -1
+          for idx in range(1, len(lines)):
+              if lines[idx].strip() == "---":
+                  closing_idx = idx
+                  break
+
+          if closing_idx == -1:
+              violations.append(f"check-knowledge: {file_path}: missing closing frontmatter delimiter (---)")
+              continue
+
+          fm_text = "\n".join(lines[1:closing_idx])
+
+          if HAVE_YAML:
+              try:
+                  data = yaml.safe_load(fm_text)
+              except Exception as e:
+                  violations.append(f"check-knowledge: {file_path}: invalid YAML frontmatter: {e}")
+                  continue
+
+              if not isinstance(data, dict):
+                  violations.append(f"check-knowledge: {file_path}: frontmatter is not a mapping")
+                  continue
+
+              type_val = data.get("type")
+              if type_val is None:
+                  violations.append(f"check-knowledge: {file_path}: missing 'type' in frontmatter")
+              elif isinstance(type_val, (dict, list)):
+                  violations.append(f"check-knowledge: {file_path}: 'type' must be a non-empty scalar value")
+              elif isinstance(type_val, str) and not type_val.strip():
+                  violations.append(f"check-knowledge: {file_path}: 'type' must be a non-empty scalar value")
+          else:
+              # Fallback structural check
+              type_found = False
+              type_val = None
+              for fm_line in lines[1:closing_idx]:
+                  m = re.match(r"^type\s*:\s*(.*?)(?:\s+#.*)?$", fm_line)
+                  if m:
+                      type_found = True
+                      val = m.group(1).strip()
+                      if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                          val = val[1:-1].strip()
+                      type_val = val
+                      break
+
+              if not type_found:
+                  violations.append(f"check-knowledge: {file_path}: missing 'type' in frontmatter")
+              elif not type_val or type_val.startswith(("[", "{")):
+                  violations.append(f"check-knowledge: {file_path}: 'type' must be a non-empty scalar value")
+
+          if isinstance(type_val, str) and type_val.strip():
+              want = TYPE_DIRS.get(type_val.strip())
+              got = os.path.basename(os.path.dirname(file_path))
+              if want is None:
+                  violations.append(f"check-knowledge: {file_path}: unknown type '{type_val.strip()}'; vocabulary is {', '.join(sorted(TYPE_DIRS))}")
+              elif got != want:
+                  violations.append(f"check-knowledge: {file_path}: type '{type_val.strip()}' belongs in {want}/, not {got}/")
+
+      # 4. Check relative markdown links in concept files, index.md, and log.md
+      link_pattern = re.compile(r'\[(?:\\\]|[^\]])*\]\(([^)]+)\)')
+
+      def extract_links(content):
+          targets = []
+          for m in link_pattern.finditer(content):
+              raw = m.group(1).strip()
+              t = raw.split()[0] if raw else ""
+              if t.startswith("<") and t.endswith(">"):
+                  t = t[1:-1]
+              targets.append((raw, t))
+          return targets
+
+      index_concept_links = set()
+
+      for file_path in all_md_files:
+          try:
+              with open(file_path, "r", encoding="utf-8") as f:
+                  content = f.read()
+          except Exception as e:
+              violations.append(f"check-knowledge: {file_path}: cannot read file: {e}")
+              continue
+
+          for raw_target, target in extract_links(content):
+              if not target:
+                  continue
+              if target.startswith(("http://", "https://", "#", "mailto:")):
+                  continue
+
+              target_no_frag = target.split("#", 1)[0]
+              if not target_no_frag:
+                  continue
+
+              if target_no_frag.startswith("/"):
+                  resolved = os.path.normpath(os.path.join(bundle_dir, target_no_frag.lstrip("/")))
+              else:
+                  resolved = os.path.normpath(os.path.join(os.path.dirname(file_path), target_no_frag))
+
+              if not os.path.isfile(resolved):
+                  violations.append(f"check-knowledge: {file_path}: broken link '{raw_target}' (resolved to '{resolved}')")
+
+              if file_path == norm_index:
+                  if resolved != norm_index and resolved != norm_log:
+                      index_concept_links.add(resolved)
+
+      # 5. index.md must link every concept file on disk, and every concept link in index.md must exist on disk
+      if os.path.isfile(index_file):
+          unindexed = concept_set - index_concept_links
+          for f in sorted(unindexed):
+              violations.append(f"check-knowledge: {index_file}: concept file not listed in index: {f}")
+
+          nonexistent = index_concept_links - concept_set
+          for f in sorted(nonexistent):
+              violations.append(f"check-knowledge: {index_file}: concept link target does not exist on disk: {f}")
+
+      if violations:
+          for v in violations:
+              sys.stderr.write(f"{v}\n")
+          sys.exit(1)
+      PY
+    inputs: ['docs/knowledge/**/*']
+    options:
+      # The validator resolves links that leave the bundle (six concepts link
+      # into docs/researches/), so a target can be deleted or renamed without
+      # changing this task's fingerprint, and a cached pass would then survive
+      # the break it exists to catch - on the pre-commit hook and in CI alike.
+      cache: false
+
+  # Scan staged changes for secrets before they enter history - the only cheap
+  # moment to stop them, since a committed secret lives in git history forever
+  # even after deletion. Runs from the pre-commit hook (.moon/workspace.yml
+  # vcs.hooks) as the sole automated gate; there is no CI backstop. Rules +
+  # verified-false-positive allowlist: .github/gitleaks.toml.
+  secret-scan:
+    script: |
+      set -euo pipefail
+
+      if ! command -v gitleaks >/dev/null 2>&1; then
+        echo "secret-scan: gitleaks not installed; SKIPPING the secret scan." >&2
+        echo "  install: brew install gitleaks" >&2
+        exit 0
+      fi
+
+      if ! gitleaks git --staged --no-banner --redact -v --config .github/gitleaks.toml; then
+        echo >&2
+        echo "secret-scan: gitleaks flagged a staged secret (above)." >&2
+        echo "  real secret?    unstage it, rotate the credential, then re-stage" >&2
+        echo "  false positive? add a narrow allowlist block to .github/gitleaks.toml" >&2
+        exit 1
+      fi
+    # cache: false alone still makes moon hash the whole project; the empty
+    # list states that no file inputs apply.
+    inputs: []
+    options:
+      # Reads the git index, which no input glob can represent.
+      cache: false
+
+  # Publish the npm plugin packages that ride a pond release. Idempotent: a
+  # package publishes only when its package.json version is absent from the
+  # registry, so bump-less releases and job re-runs are no-ops. Auth is npm
+  # trusted publishing (OIDC): the npm CLI exchanges the GitHub Actions
+  # id-token itself - no npm token exists anywhere.
+  publish-npm:
+    script: |
+      set -euo pipefail
+      for dir in packages/openclaw-pond packages/pi-pond; do
+        name=$(node -p "require('./$dir/package.json').name")
+        version=$(node -p "require('./$dir/package.json').version")
+        if [ -n "$(npm view "$name@$version" version 2>/dev/null || true)" ]; then
+          echo "$name@$version already published - skipping"
+          continue
+        fi
+        echo "publishing $name@$version"
+        (cd "$dir" && npm ci && npm publish --access public)
+      done
+    inputs: []
     options:
       cache: false
       outputStyle: stream
+      # The task type makes it selectable by moon check and moon ci, so without
+      # this a local `moon check --all` runs `npm publish`. `only` keeps the
+      # explicit `moon run repo:publish-npm` that the release workflow issues
+      # working while `moon check` stops selecting this one task - it does not
+      # make the sweep itself safe, so every other side-effecting task needs its
+      # own opt-out (`type: 'run'` on the dist and bench-gate tasks).
+      # `inputs: []` states that nothing file-based makes it affected.
+      runInCI: 'only'
 
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
   # cross-compiled. It is a separate task for the same reason `test-msvc` is
@@ -56,7 +405,15 @@ tasks:
   # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
   # persistent CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the
   # workspace target dir and dist/ lands at the root where publish-release reads it.
+  #
+  # Both dist tasks are pinned `type: 'run'`: only ci.yml names them, and the
+  # inferred `build` type would let a local `moon check --all` push to the S3
+  # rustc cache and rm -rf dist/ + completions/ at the repo root. The paired
+  # `runInCI: true` is then mandatory, not decoration - a run-typed task
+  # defaults to runInCI false, and moon 2.5.4 answers `moon run` on such a task
+  # with "No tasks found" once CI is set, i.e. exactly where these two run.
   build-dist:
+    type: 'run'
     script: |
       set -euo pipefail
       export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
@@ -104,7 +461,7 @@ tasks:
       # zig records LC_BUILD_VERSION sdk >= 26, which makes macOS 26 dyld
       # reject its duplicate libobjc load command; rewrite the recorded sdk to
       # 15.0 and ad-hoc re-sign (the byte-patch invalidates the signature).
-      python3 ops/scripts/patch-macos-sdk.py target/dist/pond-aarch64-apple-darwin
+      python3 .github/scripts/patch-macos-sdk.py target/dist/pond-aarch64-apple-darwin
       # Developer ID + hardened runtime when the cert is present (release CI),
       # ad-hoc otherwise so local and fork builds still get a loadable arm64
       # binary. Gatekeeper denies unnotarized Developer ID outright, so the
@@ -152,9 +509,9 @@ tasks:
       # this copy never reaches a release.
       ( cd dist && sha256sum pond-* > checksums.txt )
       ls -lh dist/
-    # No @group(tests): tests and benches are not linked into the shipped
-    # binary, so a test-only change cannot alter dist/ and should not pay a
-    # three-target cross-compile.
+    # No test or bench inputs: they are not linked into the shipped binary, so
+    # a test-only change cannot alter dist/ and should not pay a three-target
+    # cross-compile.
     #
     # Caveat worth knowing before narrowing these further: the script bakes
     # `git rev-parse HEAD` into the binary via POND_BUILD_COMMIT, and no
@@ -165,7 +522,7 @@ tasks:
     # cache is for, and there HEAD is unchanged.
     inputs:
       - '@group(sources)'
-      - 'ops/scripts/patch-macos-sdk.py'
+      - '.github/scripts/patch-macos-sdk.py'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'
@@ -173,6 +530,7 @@ tasks:
       - 'dist/checksums.txt'
     options:
       cache: true
+      runInCI: true
       outputStyle: stream
 
   # The shipped msvc zip, built natively on a Windows runner. A moon task rather
@@ -190,6 +548,7 @@ tasks:
   # and what keeps a hit from shipping a stale commit string is that a release
   # commit always bumps the version in packages/pond/Cargo.toml, which IS an input.
   build-dist-msvc:
+    type: 'run'
     script: |
       $ErrorActionPreference = 'Stop'
       $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
@@ -222,5 +581,6 @@ tasks:
       - 'dist/pond-x86_64-pc-windows-msvc.zip'
     options:
       cache: true
+      runInCI: true
       outputStyle: stream
       windowsShell: 'pwsh'

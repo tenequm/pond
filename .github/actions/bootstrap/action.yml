@@ -13,7 +13,10 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        MOON_VERSION=2.5.1
+        # Derived from the .prototools pin at the repo root - the single
+        # place a moon bump is typed.
+        MOON_VERSION=$(awk -F'"' '/^moon = /{print $2; exit}' "$GITHUB_WORKSPACE/.prototools")
+        test -n "$MOON_VERSION"
         PROTOC_VERSION=35.1
         # Bumped in lockstep with the kache-action `version:` in
         # windows-bootstrap and the k-tag in the .github/kache/*.toml prefixes,
@@ -21,8 +24,9 @@ runs:
         # 0.14.2, 27 at 0.15.0) and costs one cold run per leg.
         KACHE_VERSION=0.15.0
         UV_VERSION=0.11.33
+        PYYAML_VERSION=6.0.2
 
-        mkdir -p /ci-cache/bin /ci-cache/tmp
+        mkdir -p /ci-cache/bin /ci-cache/tmp /ci-cache/python
         echo "/ci-cache/bin" >> "$GITHUB_PATH"
         echo "/ci-cache/cargo/bin" >> "$GITHUB_PATH"
         # node and npm are NOT installed here - moon provisions them through
@@ -48,6 +52,7 @@ runs:
           echo "npm_config_cache=/ci-cache/npm"
           echo "UV_CACHE_DIR=/ci-cache/uv"
           echo "KACHE_CONFIG=$KACHE_CONFIG"
+          echo "PYTHONPATH=/ci-cache/python"
         } >> "$GITHUB_ENV"
 
         # dist-build is the only caller that declares a remote, and the CLI
@@ -66,6 +71,7 @@ runs:
         export CARGO_HOME=/ci-cache/cargo RUSTUP_HOME=/ci-cache/rustup
         export PROTO_HOME=/ci-cache/proto
         export PATH="/ci-cache/bin:/ci-cache/cargo/bin:$PATH"
+        export PYTHONPATH=/ci-cache/python
 
         # /ci-cache is one RWO PVC shared by every runner pod on the node, so two
         # concurrent jobs bootstrap into the SAME paths. Serialize: without this,
@@ -118,6 +124,16 @@ runs:
                uv-x86_64-unknown-linux-gnu/uv ;;
         esac
 
+        # repo:check-knowledge validates concept frontmatter with PyYAML and
+        # silently degrades to a weaker regex pass when the import fails, so
+        # without this the job that calls itself the hard gate is the degraded
+        # one. Installed with uv rather than pip, which the runner's python3
+        # does not necessarily ship, into a target dir on PYTHONPATH so this
+        # never depends on a writable system site-packages.
+        if [ "$(python3 -c 'import yaml; print(yaml.__version__)' 2>/dev/null)" != "$PYYAML_VERSION" ]; then
+          uv pip install --target /ci-cache/python "PyYAML==$PYYAML_VERSION"
+        fi
+
         if [ "$(/ci-cache/bin/protoc --version 2>/dev/null)" != "libprotoc $PROTOC_VERSION" ]; then
           tmp=$(mktemp -d /ci-cache/tmp/protoc.XXXXXX)
           curl -fsSL -o "$tmp/protoc.zip" \
@@ -149,3 +165,4 @@ runs:
         moon --version
         protoc --version
         kache --version
+        python3 -c 'import yaml; print("pyyaml", yaml.__version__)'

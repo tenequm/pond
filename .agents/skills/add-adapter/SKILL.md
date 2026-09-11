@@ -18,7 +18,9 @@ Ground rules that override any instinct to improvise:
 
 ## Phase A - spec the adapter
 
-Output: `docs/adapters/<source_agent>.md` (named by the brand string, e.g. `grok-build.md`; the directory is created with the first spec doc) plus the committed fixture.
+Output: `docs/knowledge/adapters/<source_agent>.md`, named by the brand string (e.g. `grok-build.md`), plus the committed fixture.
+
+The spec doc is an OKF concept of type `Adapter`, so it carries YAML frontmatter (type: Adapter, description, tags, sources, generated, verified, stale_after) and its addition must update `docs/knowledge/index.md` and `docs/knowledge/log.md` in the same change, per that bundle's conventions. The directory follows from the type rather than being a choice - `adapters/` because the concept is an `Adapter` - and `repo:check-knowledge` fails the build if the two disagree, so a spec doc filed anywhere else will not merge.
 
 Preflight, before anything else: the agent binary installed at the version the spec doc will cite, a provider key in the environment (or the credential file step 2 describes), and `tmux` when the TUI is the only writer. Discovering one of these missing on the day implementation starts is the most expensive kind of blocker.
 
@@ -26,7 +28,7 @@ A key is not always enough. An agent may gate every run on account sign-in rathe
 
 ### 1. Read the writer, not the reader
 
-Clone the upstream agent locally and locate the code that WRITES the session files - serializers, transcript stores, migration code - not code that reads them back. The writer is the authority on what can appear in a file; readers routinely tolerate less than writers emit. Note the agent version or commit you read: it becomes the `Last verified` line of the spec doc.
+Clone the upstream agent locally and locate the code that WRITES the session files - serializers, transcript stores, migration code - not code that reads them back. The writer is the authority on what can appear in a file; readers routinely tolerate less than writers emit. Note the agent version or commit you read: it becomes the `Verified against` line of the spec doc.
 
 Verify every claimed shape empirically against a real capture (step 2). A field the source never actually emits does not get a mapping.
 
@@ -67,15 +69,15 @@ Adapter-specific concerns beyond the table go into extra prose sections of the s
 
 ### 4. Write the spec doc
 
-`docs/adapters/<source_agent>.md`, structured as:
+`docs/knowledge/adapters/<source_agent>.md`, structured as:
 
-- Title, then one line: `Last verified: <date>, against <agent> <version or commit>.`
+- Title, then one line naming what the doc was checked against: `Verified against: <agent> <version or commit>.` The **date** of that check is deliberately NOT repeated in the body - it lives once, in the frontmatter `verified` event (`verified:` with one `- { by: <actor>, at: <ISO 8601 instant> }` entry per confirmation), which is the OKF-native home for it. One date in two places drifts; one date in one place cannot.
 - Upstream pointers: the repo, the writer files read in step 1, any third-party references consulted (marked as non-authoritative).
 - The 11-row decision table, filled, with evidence per row.
 - Field history from step 1: the commit and date each row kind and field first appeared.
 - Extra format notes (envelope variants, migrations, legacy shapes) as prose.
 
-Scope split (spec 6.9): the spec doc owns format archaeology and the decision record - facts about the upstream, which do not rot when pond's code changes. The adapter code stays authoritative for extraction behavior. Maintenance is best-effort: drift is passively detected (unknown kinds still ingest losslessly; malformed input surfaces as typed errors), and the doc's `Last verified` line is updated when the adapter is next touched, not on a schedule.
+Scope split (spec 6.9): the spec doc owns format archaeology and the decision record - facts about the upstream, which do not rot when pond's code changes. The adapter code stays authoritative for extraction behavior. Maintenance is best-effort: drift is passively detected (unknown kinds still ingest losslessly; malformed input surfaces as typed errors), and the doc's frontmatter `verified` event plus its `Verified against` line are updated when the adapter is next touched, not on a schedule.
 
 ## Phase B - implement from spec
 
@@ -119,8 +121,8 @@ Two layers, split by seam (single-module mapping behavior in unit tests; cross-m
 
 ### 6. Docs
 
-- Commit the spec doc from Phase A under `docs/adapters/`.
-- Add the adapter's row to the README supported-harnesses table, including its `Last verified` date.
+- Commit the spec doc from Phase A under `docs/knowledge/adapters/`.
+- Add the adapter's row to the README supported-harnesses table, taking the date from the spec doc's frontmatter `verified` event.
 - Add the fixture section to `packages/pond/tests/fixtures/README.md`.
 
 ### 7. Validate

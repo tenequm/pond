@@ -1,9 +1,23 @@
+---
+type: Finding
+title: "Fable 5 vs Fable 5.1: the queries behind the per-prompt comparison"
+description: Fable 5.1 generated 31% more output tokens per prompt with 15% fewer tool calls while reducing per-prompt API cost by 31% over 22,022 measured calls.
+tags: [usage, cost, fable, sql, benchmarks]
+status: stable
+generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+stale_after: "2027-01-01T00:00:00Z"
+sources:
+  - id: store-queries-20260902
+    resource: operator pond store queries run 2026-09-02 across 22,022 API calls
+    title: Operator pond store queries run on 2026-09-02
+---
+
 # Fable 5 vs Fable 5.1: the queries behind the per-prompt comparison
 
 The queries used for the 2026-09-02 comparison of Claude Fable 5 and Fable 5.1
 over 22,022 API calls from one pond store plus one throwaway store built from
 a second Claude config dir. Method and pricing follow
-[2608-27-token-usage-accounting.md](2608-27-token-usage-accounting.md): one
+[token-usage-accounting.md](../runbooks/token-usage-accounting.md): one
 row per provider message id, `MAX` per usage field, then aggregate. The same
 shape works on raw `~/.claude/projects/**/*.jsonl` with any JSON tool.
 
