@@ -4,32 +4,40 @@ title: agy
 description: Upstream format archaeology and mapping decision record for the agy adapter.
 tags: [adapter, agy]
 status: stable
-generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:54Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 verified:
   - { by: "claude-code", at: "2026-09-10T00:00:00Z" }
 stale_after: "2026-12-11T00:00:00Z"
 sources:
   - id: fixtures
     resource: committed fixture capture under packages/pond/tests/fixtures/ (see the doc body for the exact capture)
+    title: The committed agy conformance fixture
   - id: upstream
     resource: Antigravity CLI and ACP server local session stores, inspected at agy 1.2.0 and release blaze-2026.08.18-1
+    title: The agy CLI and ACP server session stores, as inspected on a real install
   - id: upstream-repo
     resource: https://github.com/google-antigravity/antigravity-cli
+    title: google-antigravity/antigravity-cli - changelog and issue tracker only; the CLI itself is closed source
   - id: upstream-issue-423
     resource: https://github.com/google-antigravity/antigravity-cli/issues/423
+    title: "antigravity-cli issue #423, cited here for the store schema version agy 1.0.9 writes"
   - id: txcript
     resource: https://docs.rs/crate/txcript/latest/source/docs/formats/antigravity.md
+    title: txcript's antigravity format notes (third-party, non-authoritative)
   - id: casr
     resource: https://docs.rs/cross_agent_session_resumer/latest/src/casr/providers/antigravity.rs.html
+    title: cross_agent_session_resumer's antigravity provider source (third-party, non-authoritative)
   - id: opendray
     resource: https://github.com/Opendray/opendray/blob/main/internal/session/antigravity_db.go
+    title: Opendray's antigravity_db.go reader (third-party, non-authoritative)
   - id: agentsview
     resource: https://github.com/kenn-io/agentsview/commit/2e11aa7a687afb61839ffa29b572bdf6362b29f8
+    title: agentsview commit 2e11aa7, covering the encrypted pre-SQLite .pb era (third-party, non-authoritative)
 ---
 
 # agy
 
-Last verified: 2026-09-10, against agy 1.2.0 (the `agy` CLI) and the Antigravity ACP server build `release blaze-2026.08.18-1` (`agy_acp_server.par`), on Linux.
+Verified against: agy 1.2.0 (the `agy` CLI) and the Antigravity ACP server build `release blaze-2026.08.18-1` (`agy_acp_server.par`), on Linux. The date of that check is the frontmatter `verified` event.
 
 Format archaeology and the decision record for the `agy` adapter (issue [#201](https://github.com/tenequm/pond/issues/201)). The adapter code in `packages/pond/src/adapter/agy.rs` stays authoritative for extraction behavior; this document records facts about the upstream format and the choices made against them.
 

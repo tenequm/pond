@@ -1,13 +1,13 @@
 ---
 type: Finding
 title: Value-oriented agent session retrieval and evaluation methodology
-description: Existing memory benchmarks measure synthetic QA vacuum metrics rather than coding task completion, highlighting the need for an issue-resolution ablation using raw lossless session archives.
+description: Existing memory benchmarks measure synthetic QA vacuum metrics rather than coding task completion; the measurement that connects retrieval to value is an issue-resolution ablation over raw lossless session archives.
 tags: [evaluation, benchmarks, memory, retrieval, swe-bench]
 status: stable
-generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: session-eval-research
-    resource: docs/researches/agent-session-retrieval-and-evaluation.md
+    resource: ../../researches/agent-session-retrieval-and-evaluation.md
     title: Agent-session retrieval and value-oriented evaluation (2026-05-22)
 ---
 
@@ -21,7 +21,7 @@ sources:
 - Retrieval granularity literature (EMNLP 2024 Dense X Retrieval) confirms atomic message units outperform passage chunks, validating message-level indexing.[^session-eval-research]
 - Attention degradation ("Lost in the Middle") implies that precision at ranks 1-3 is far more valuable to an agent than recall at rank 20.[^session-eval-research]
 - Lossless raw session archives uniquely enable end-to-end task-completion benchmarks that summarization-based architectures (Mem0, Zep) cannot reconstruct.[^session-eval-research]
-- A proposed SWE-bench Verified value ablation measures issue resolution rates, step counts, and token costs with and without prior session retrieval.[^session-eval-research]
+- The evaluation instrument that actually measures retrieval value is an issue-resolution ablation over SWE-bench Verified: issue resolution rate, step count and token cost, each measured with and without prior session retrieval. Those three are what tie retrieval to task completion; conversational QA accuracy does not.[^session-eval-research]
 - Honest benchmark reporting requires disclosing retrieval-only recall metrics (R@k) rather than presenting retrieval numbers as conversational QA accuracy.[^session-eval-research]
 
 ## Invalidation

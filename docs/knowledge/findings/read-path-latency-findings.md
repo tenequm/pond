@@ -4,10 +4,10 @@ title: Read path latency analysis and bottleneck attribution
 description: 77% of MCP tool calls exceeded 5s due to unindexed message ID resolution full-scans and rowmap bypasses in the get path issuing over 10,000 S3 GET requests per query.
 tags: [latency, performance, s3, mcp, read-path]
 status: stable
-generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: read-path-latency
-    resource: docs/researches/2608-12-read-path-where-time-goes.md
+    resource: ../../researches/2608-12-read-path-where-time-goes.md
     title: "Read path: where the time actually goes (measured, 2026-08-12)"
 ---
 

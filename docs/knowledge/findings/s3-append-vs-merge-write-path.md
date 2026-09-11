@@ -4,7 +4,7 @@ title: Absent rows must append, never merge-insert, on a remote store
 description: Appending absent sessions took 13.8 min and 1 commit per table; routing the same rows through merge-insert took 75.7 min and 354 commits - 5.47x slower, because merge over S3 is commit-latency-bound.
 tags: [s3, write-path, performance, lance, object-store]
 status: stable
-generated: { by: "claude-code/opus-5", at: "2026-09-11T13:28:09Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: sync-copy-plan
     resource: ../../plans/2606-17-sync-copy-durability-and-perf.md
@@ -37,8 +37,8 @@ thing to minimize.
 Absent rows cannot collide, so they MUST append. Any write-path unification
 keeps a single shared write seam - that is what stops bespoke write paths
 reappearing - but the seam MUST expose append-for-absent as a first-class mode
-rather than collapsing everything into `merge_insert`. `write_bench --only
-append|merge` is the regression guard.
+rather than collapsing everything into `merge_insert`.[^sync-copy-plan]
+`write_bench --only append|merge` is the regression guard.
 
 The spec carries the rule (`spec.md#session-durable-copy`); this concept
 carries why. Same root cause as [the request-rate

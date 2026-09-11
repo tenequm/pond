@@ -4,7 +4,7 @@ title: Embeddings are opt-in and FTS is the default search arm
 description: Semantic search became a local config switch defaulting off, vector mode is refused rather than silently downgraded when disabled, and no process constructs an embedder until asked.
 tags: [embeddings, search, config, decision]
 status: stable
-generated: { by: "claude-code/opus-5", at: "2026-09-11T13:28:09Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: opt-in-plan
     resource: ../../plans/2608-21-embeddings-opt-in-plan.md
@@ -18,7 +18,7 @@ sources:
 
 Spec 8.7 had said "Embedding is opt-in by configuration" while the code carried
 no such switch. This closed the gap rather than adding a new
-capability.[^opt-in-plan]
+capability.[^issue164][^opt-in-plan]
 
 ## The shape of the decision
 

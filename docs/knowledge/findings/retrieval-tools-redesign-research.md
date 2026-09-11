@@ -4,20 +4,34 @@ title: "pond retrieval tools redesign - research and reasoning (2026-06-19)"
 description: Field tests and failure traces motivated replacing auto-hybrid search with separate vector and FTS modes, adding recency boosting and pagination, and bounding tool outputs to 10k characters.
 tags: [retrieval, mcp, tools, search, design]
 status: deprecated
-generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: research-20260619
     resource: research conducted 2026-06-19 against the then-current pond CLI
     title: Pond retrieval tools redesign research (2026-06-19)
 ---
 
-*Superseded: the shipped pond_search / pond_get_session / pond_get_message / pond_sql surface is the outcome; kept for the evidence behind it.*
+*Deprecated. Successor: the shipped `pond_search` / `pond_get_session` /
+`pond_get_message` / `pond_sql` surface, contracted in
+[docs/spec.md](../../spec.md) sections 7.7 (MCP surface) and 8 (search and
+embeddings). Inside this bundle, the arm-selection rule that replaced hybrid
+fusion lives in
+[Embeddings are opt-in and FTS is the default search arm](../decisions/embeddings-are-opt-in.md),
+and the fusion tuning this doc argues against is kept in
+[Hybrid search score normalization and memory footprint tuning](embeddings-tuning-findings.md)
+(also deprecated). This concept is kept only for the evidence behind the move.*
 
 # pond retrieval tools redesign - research and reasoning (2026-06-19)
 
-Status: research capture for later review. This records the *why* behind a redesign of pond's three MCP tools, derived from a real failure transcript plus the [pond retrieval ergonomics field test](https://github.com/tenequm/pond/blob/50ced73d8433bb0c477a39515f90c6b59d4ba4c7/docs/researches/pond-retrieval-ergonomics-fieldtest-2026-06-16.md) ([PR #59](https://github.com/tenequm/pond/pull/59)).
+Status: research capture from 2026-06-19. This records the *why* behind a
+redesign of pond's three MCP tools, derived from a real failure transcript plus
+the [pond retrieval ergonomics field test](https://github.com/tenequm/pond/blob/50ced73d8433bb0c477a39515f90c6b59d4ba4c7/docs/researches/pond-retrieval-ergonomics-fieldtest-2026-06-16.md) ([PR #59](https://github.com/tenequm/pond/pull/59)).
 
-This is the reasoning, not the locked spec. The locked param surface lives in `docs/plans/2606-19-tools-redesign-and-hydration-perf.md`; where this doc and that plan disagree, the plan wins. Divergences are called out explicitly at the end.
+This was the reasoning, not the locked spec. The param surface it fed lived in
+`docs/plans/2606-19-tools-redesign-and-hydration-perf.md`; where this doc and
+that plan disagreed, the plan won. Divergences are called out explicitly at the
+end. Both are now behind `docs/spec.md`, which is the contract for what
+actually shipped.
 
 ## The problem
 
@@ -70,7 +84,9 @@ boost = 0.2 * exp(-age / 1week) in claude-kb: now=0.200, 1wk=0.074, 1mo=0.003, 6
 
 ## The hybrid critique (the central argument)
 
-What the current hybrid does (`src/handlers.rs`): always runs both arms, fuses `0.3 * norm_fts + 1.0 * norm_vec` (then / 1.3 into [0,1]); `norm_*` is min-max within the query's pool; mode is server-decided; weights `0.3:1` are benchmark-tuned (2026-06-10 sweep, S@3 67/111 paraphrase, 10/12 false-negative regression); no recency anywhere.
+What the hybrid did as of 2026-06-19 (`packages/pond/src/handlers.rs`): always ran both arms, fusing `0.3 * norm_fts + 1.0 * norm_vec` (then / 1.3 into [0,1]); `norm_*` was min-max within the query's pool; mode was server-decided; weights `0.3:1` were benchmark-tuned (2026-06-10 sweep, S@3 67/111 paraphrase, 10/12 false-negative regression); no recency anywhere.
+
+The `0.3:1` ratio here and the `0.135:1` ratio in [the embeddings tuning findings](embeddings-tuning-findings.md) are not a contradiction, they are two successive values of the same constant: `FTS_FUSION_WEIGHT` was 0.135 from 2026-05-26 (commit `a7b3949`), was retuned to 0.3 on 2026-06-10 (commit `f85df03`, the sweep cited above), and was deleted with the whole fusion path on 2026-06-20 (commit `dc2f3b5`). This doc quotes the value that was live when it was written. Neither value exists in the code today.
 
 The verdict: it is competent engineering optimized for the wrong objective, and its core mechanism blocks what we need.
 
@@ -90,7 +106,7 @@ For the dominant recall workload this should improve tokens, tool-call count, an
 
 ## Divergences from the locked plan (resolve before implementing)
 
-The locked plan `docs/plans/2606-19-tools-redesign-and-hydration-perf.md` and memory `project_pond_hybrid_recall_and_takerows_hydration` differ from this thread's conclusions on two points:
+The locked plan `docs/plans/2606-19-tools-redesign-and-hydration-perf.md` differed from this thread's conclusions on two points:
 
 1. pond_get stays ONE tool with prefixed params (`session_id`/`session_limit`/`session_from`/`session_after_message_id`/`session_before_message_id`; `message_id`/`message_context_before=3`/`message_context_after=3`), so names self-document under the names-only constraint. The `pond_get_message` / `pond_get_session` split discussed here is DEFERRED.
 2. `fts` is default-sorted by relevance (agents expect relevance from "search"), with `sort_by=relevance|recency` available on both modes. This thread had instead concluded `fts` = recency-sorted, no score, and `sort_by` dropped. The plan's version is the locked one.

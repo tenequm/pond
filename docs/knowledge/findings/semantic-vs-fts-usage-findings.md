@@ -4,13 +4,13 @@ title: Semantic vs BM25 retrieval efficacy and cost evaluation
 description: In a 1,126-call production trace, BM25 resolved 61% of queries versus 37% for vector search, showing semantic retrieval uniquely helped only 6-7% of calls while adding substantial memory and ingest costs.
 tags: [search, vector, fts, bm25, eval, cost]
 status: stable
-generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: semantic-fts-eval
-    resource: docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md
+    resource: ../../researches/2608-21-semantic-vs-fts-usage-eval/README.md
     title: "Does semantic search earn its keep? A usage-trace evaluation of vector vs BM25 retrieval over an agent-session archive"
   - id: cost-side-eval
-    resource: docs/researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md
+    resource: ../../researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md
     title: "Cost side: what removing embeddings would change (estimate, 2026-08-21)"
 ---
 

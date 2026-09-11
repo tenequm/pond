@@ -4,7 +4,7 @@ title: What a bench-gate row does and does not prove
 description: A gate row measures only the paths its probes name, one row cannot bracket a small effect on a remote store, and a read baseline is unrecoverable once the new binary has written.
 tags: [benchmarking, performance, s3, methodology]
 status: stable
-generated: { by: "claude-code/opus-5", at: "2026-09-11T13:28:09Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: issue232
     resource: https://github.com/tenequm/pond/issues/232
@@ -36,7 +36,7 @@ separately and say so in the write-up.
 ## One row does not bracket a small effect
 
 Two runs 65 minutes apart on identical code moved `search_dated_s` by +129%,
-`row_counts_ms` by -59%, and `open_store_ms` by +90%. Remote-store noise of
+`row_counts_ms` by -59%, and `open_store_ms` by +90%.[^results] Remote-store noise of
 that size buries a few hundred milliseconds of real regression. Bracket a small
 effect with a targeted A/B over many runs (`hyperfine`, medians - S3 outliers
 drag means), each run on its own store path.

@@ -38,11 +38,26 @@ Conventions:
   sections below cluster concepts that share a cause even when their types
   differ; filing is by type so it stays mechanical. Enter through this index.
 - Links between concepts are relative to the linking file, so they stay
-  clickable on GitHub. `repo:check-knowledge` fails the build on one that does
-  not resolve, so a move is safe to make and impossible to half-finish.
+  clickable on GitHub. The same convention covers a `sources[].resource` that
+  names a file in this repo: write it relative to the concept, never relative
+  to the repo root. `repo:check-knowledge` does not look at `resource:` at all,
+  which is exactly why the convention has to be written down rather than left
+  to the gate. A source no link reaches stays an honest prose scope descriptor.
+- What `repo:check-knowledge` actually guarantees: it resolves every relative
+  Markdown link written INSIDE this bundle - including the ones that point out
+  of it, into `docs/` or `packages/` - and fails the build on any that does not
+  resolve. What it does NOT do is find links pointing INTO the bundle from the
+  rest of the repo. `docs/spec.md`, the add-adapter playbook and adapter doc
+  comments all name concepts by path, and the validator is blind to every one
+  of them. So a move is only half-checked, and it is the unchecked half that
+  bites: a bundle rename once passed every gate while leaving 19 dangling
+  references across exactly those files. After renaming or moving a concept,
+  sweep the repo by hand for the old path (`rg -n '<old-path>'` outside
+  `docs/knowledge/`) and fix what the gate cannot see.
 - Every add, move, or removal updates this index and appends a dated entry to
-  `log.md` in the same change. Concepts are deprecated
-  (`status: deprecated` + successor link), never deleted.
+  `log.md` in the same change. Concepts are deprecated (`status: deprecated`
+  plus a link to the successor, in the concept itself and in its index line
+  here), never deleted.
 
 ## Storage and the object-store substrate
 
@@ -89,9 +104,12 @@ synthetic QA.
   for vector search, showing semantic retrieval uniquely helped only 6-7% of
   calls while adding substantial memory and ingest costs.
 - [Hybrid search score normalization and memory footprint tuning](findings/embeddings-tuning-findings.md) -
-  Score-normalized fusion with a 0.135:1 FTS-to-vector weight ratio improved
-  paraphrase Success@3 to 64.9%, while macOS memory profiling showed
-  phys_footprint is the only valid metric.
+  Score-normalized fusion with a 0.135:1 FTS-to-vector weight ratio raised
+  paraphrase Success@3 to 64.9%, and macOS memory profiling showed
+  phys_footprint is the only valid metric. **Deprecated**: cross-arm fusion and
+  its weight constants were removed on 2026-06-20 and search runs one arm per
+  request. Successor:
+  [Embeddings are opt-in and FTS is the default search arm](decisions/embeddings-are-opt-in.md).
 - [Bilingual FTS tokenizer evaluation and word tokenizer adoption](findings/tokenizer-experiment-findings.md) -
   Character 3-5 n-grams initially preserved Ukrainian inflection without
   English regression, but word tokenization with English stemming was
@@ -99,13 +117,15 @@ synthetic QA.
   gains.
 - [Value-oriented agent session retrieval and evaluation methodology](findings/session-retrieval-evaluation-findings.md) -
   Existing memory benchmarks measure synthetic QA vacuum metrics rather than
-  coding task completion, highlighting the need for an issue-resolution
-  ablation using raw lossless session archives.
+  coding task completion; the measurement that connects retrieval to value is
+  an issue-resolution ablation over raw lossless session archives.
 - [pond retrieval tools redesign - research and reasoning (2026-06-19)](findings/retrieval-tools-redesign-research.md) -
   Field tests and failure traces motivated replacing auto-hybrid search with
   separate vector and FTS modes, adding recency boosting and pagination, and
-  bounding tool outputs to 10k characters. Deprecated: the shipped tool
-  surface is the outcome.
+  bounding tool outputs to 10k characters. **Deprecated**: the shipped tool
+  surface is the outcome, contracted in `docs/spec.md` sections 7.7 and 8;
+  inside this bundle the successor is
+  [Embeddings are opt-in and FTS is the default search arm](decisions/embeddings-are-opt-in.md).
 
 ## Engineering process and platform
 

@@ -7,6 +7,61 @@ the entry - the prose is the history, the link is a working reference.
 
 ## 2026-09-11
 
+- Deprecated [Hybrid search score normalization and memory footprint tuning](findings/embeddings-tuning-findings.md).
+  It was `status: stable` while documenting `FTS_FUSION_WEIGHT`,
+  `VECTOR_FUSION_WEIGHT`, `RECENCY_MAX_BOOST` and cross-arm fusion, none of
+  which exist: the fusion path was deleted on 2026-06-20 and `pond_search` now
+  runs one arm per request. The measurements are real, so they stay, moved into
+  past tense under a successor link to
+  [Embeddings are opt-in and FTS is the default search arm](decisions/embeddings-are-opt-in.md).
+  The same pass reconciled its 5-minute idle eviction against the 60s the two
+  sibling concepts quote - 5 minutes was the constant when the memory figures
+  were measured (2026-05-27), 60s has been the constant since 2026-06-20 - and
+  restated the deferred cross-encoder reranker as the cost constraint that was
+  measured rather than as an intention.
+- Gave [pond retrieval tools redesign](findings/retrieval-tools-redesign-research.md)
+  the successor link its own `status: deprecated` requires, in the concept and
+  in the index line; prose naming a successor is not a link. Also fixed a
+  `src/handlers.rs` path that predates the crate move to `packages/pond/`,
+  reconciled its `0.3:1` fusion weight against the `0.135:1` in the tuning
+  concept (two successive values of one constant, both now deleted), and
+  removed a citation to a personal agent-memory key no reader of this repo
+  could resolve - the publicity fence covers references as well as secrets.
+- Cited three footnote definitions that were defined but never referenced, so
+  they rendered as stray footnotes attributing nothing: `[^results]` in
+  [bench-gate evidence standards](findings/bench-gate-evidence-standards.md),
+  `[^issue164]` in [embeddings are opt-in](decisions/embeddings-are-opt-in.md),
+  `[^sync-copy-plan]` in [s3 append vs merge](findings/s3-append-vs-merge-write-path.md).
+  Each now sits on the claim it actually supports; none was dropped, because
+  each had one.
+- Durability-fence pass on two concepts that stated in-flight or live upstream
+  work as durable findings.
+  [Session retrieval evaluation](findings/session-retrieval-evaluation-findings.md)
+  now states the evaluation instrument the research settles on instead of a
+  proposed ablation.
+  [OpenClaw integration](findings/openclaw-integration-findings.md) keeps its
+  upstream observation but dates it to the 2026-07-17 snapshot and carries a
+  `stale_after`, which is the fence's own remedy for knowledge that decays on
+  an upstream release rather than on pond's next commit.
+- Corrected this index's claim that `repo:check-knowledge` makes a move
+  "impossible to half-finish". It checks only links written inside the bundle;
+  references pointing into the bundle from `docs/spec.md`, the add-adapter
+  playbook and adapter doc comments are invisible to it, which is how a rename
+  once left 19 dangling references behind a green gate. The preamble now says
+  what the gate covers, what it does not, and to sweep the repo by hand after a
+  move. The same preamble settles a convention the validator cannot enforce: a
+  `sources[].resource` naming a repo file is written relative to the concept,
+  like every other link. Eight resources that were repo-root-relative were
+  converted.
+- Split the adapter concepts' duplicated verification fact. The date now lives
+  only in the frontmatter `verified` event and the body line keeps only what
+  the doc was checked against, in [agy](adapters/agy.md),
+  [grok-build](adapters/grok-build.md) and
+  [letta-code](adapters/letta-code.md); the add-adapter playbook was updated to
+  require `verified` in the frontmatter and to stop asking for a second copy of
+  the date in the body. The adapters' `sources[]` entries also gained the
+  `title` every other concept supplies.
+
 - Filed every concept by type (`decisions/`, `findings/`, `adapters/`,
   `runbooks/`), replacing both the original flat layout and a short-lived
   subject-area one. The bundle doubled in a day and flat stopped being

@@ -4,13 +4,13 @@ title: Bilingual FTS tokenizer evaluation and word tokenizer adoption
 description: Character 3-5 n-grams initially preserved Ukrainian inflection without English regression, but word tokenization with English stemming was ultimately adopted for 28x smaller index size and 2x English retrieval gains.
 tags: [tokenizer, fts, bm25, multilingual, tantivy]
 status: stable
-generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
 sources:
   - id: tokenizer-report
-    resource: docs/researches/tokenizer-experiment-report.md
+    resource: ../../researches/tokenizer-experiment-report.md
     title: FTS tokenizer selection for a bilingual agent-session corpus (2026-05-22, updated 2026-06-18)
   - id: tokenizer-plan
-    resource: docs/researches/tokenizer-experiment-plan.md
+    resource: ../../researches/tokenizer-experiment-plan.md
     title: "Tokenizer experiment plan: bilingual FTS for pond"
 ---
 
