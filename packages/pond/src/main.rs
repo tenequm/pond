@@ -7756,6 +7756,31 @@ mod tests {
         assert!(err.contains("this host has no such directory"), "{err}");
     }
 
+    /// An all-healthy summary omits `failed_adapters` entirely - never `[]` -
+    /// so it stays byte-identical to the pre-field document (spec.md 7.2) and
+    /// strict consumers model the field as optional.
+    #[test]
+    fn an_all_healthy_summary_omits_failed_adapters() {
+        let mut summary = json!({ "outcome": "ok" });
+        add_failed_adapters(&mut summary, &SyncReport::default()).expect("attach");
+        assert_eq!(summary, json!({ "outcome": "ok" }));
+
+        let report = SyncReport {
+            failed_adapters: vec![FailedAdapter::new(
+                "codex-cli".to_owned(),
+                "codex-cli".to_owned(),
+                "~/.codex/sessions".to_owned(),
+            )],
+            ..SyncReport::default()
+        };
+        add_failed_adapters(&mut summary, &report).expect("attach");
+        assert_eq!(
+            summary["failed_adapters"].as_array().map(Vec::len),
+            Some(1),
+            "a real failure must still attach: {summary}",
+        );
+    }
+
     // Long-help snapshots for the root and every visible subcommand. The
     // help text IS the agent-facing API surface (the docs promise that
     // `pond <cmd> --help` carries examples), so a wording change must show

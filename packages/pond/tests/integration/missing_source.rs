@@ -412,6 +412,165 @@ fn multi_path_narrowing_fails_before_any_write() {
     );
 }
 
+/// `try_exists()` follows symlinks, so a dangling link is an absent source:
+/// the verdict names the configured path, not the target it pointed at.
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_source_is_missing() {
+    let temp = TempDir::new().expect("temp");
+    let root = claude_code_root(&temp, &Healthy::EmptyDir);
+    let dangling = temp.path().join("dangling");
+    std::os::unix::fs::symlink(temp.path().join("nonexistent-target"), &dangling).expect("symlink");
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-code]\nenabled = true\npath = {:?}\n\n\
+             [adapters.codex-cli]\nenabled = true\npath = {:?}\n",
+            root.display().to_string(),
+            dangling.display().to_string(),
+        ),
+    );
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "a sync whose source is a dangling symlink");
+    let doc = json(&args, &out);
+    let entry = &doc["failed_adapters"][0];
+    assert_eq!(entry["name"].as_str(), Some("codex-cli"), "{doc}");
+    assert_eq!(entry["reason"].as_str(), Some("source_missing"), "{doc}");
+    assert_eq!(
+        entry["path"].as_str(),
+        Some(dangling.display().to_string().as_str()),
+        "the failure names the configured path, not the link target: {entry}",
+    );
+}
+
+/// Permission denied is not "missing". Both EACCES shapes - a statable root
+/// with mode 000 (`try_exists` = Ok(true)) and a child behind an untraversable
+/// parent (`try_exists` = Err) - keep the legacy per-file-skip behavior.
+/// Flipping the `Err(_)` arm of `missing_source_root` to "missing" would
+/// misreport permission problems as absent directories; this pins it.
+#[cfg(unix)]
+#[test]
+fn permission_denied_is_not_source_missing() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().expect("temp");
+    let root = claude_code_root(&temp, &Healthy::EmptyDir);
+    let locked = temp.path().join("locked");
+    let parent = temp.path().join("parent");
+    let child = parent.join("child");
+    std::fs::create_dir_all(&locked).expect("locked");
+    std::fs::create_dir_all(&child).expect("child");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read_dir(&locked).is_ok() {
+        // Root is not denied by mode bits; there is nothing to test.
+        restore_dir_mode(&locked);
+        restore_dir_mode(&parent);
+        return;
+    }
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-code]\nenabled = true\npath = {:?}\n\n\
+             [adapters.codex-cli]\nenabled = true\npath = {:?}\n\n\
+             [adapters.agy]\nenabled = true\npath = {:?}\n",
+            root.display().to_string(),
+            locked.display().to_string(),
+            child.display().to_string(),
+        ),
+    );
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    // Restore before asserting so TempDir cleanup works even on failure.
+    restore_dir_mode(&locked);
+    restore_dir_mode(&parent);
+    assert_exit_ok(&out, "a sync over unreadable sources");
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("ok"), "{doc}");
+    assert!(
+        doc.get("failed_adapters").is_none(),
+        "EACCES is the legacy per-file path, never an absent source: {doc}",
+    );
+    assert!(
+        !stderr(&out).contains("source missing"),
+        "no surface may call a permission problem 'missing': {}",
+        stderr(&out),
+    );
+}
+
+#[cfg(unix)]
+fn restore_dir_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("restore mode");
+}
+
+/// The error document still names the adapters that failed before the abort:
+/// an absent source recorded early must survive a later adapter's hard error
+/// into the `outcome: "error"` summary (the out-param threading in
+/// `run_import_stage`). `agy` sorts before `claude-code`, so its skip is
+/// recorded before the read-only store kills the run.
+#[cfg(unix)]
+#[test]
+fn failed_adapters_survive_onto_the_error_document() {
+    let temp = TempDir::new().expect("temp");
+    let root = claude_code_root(&temp, &Healthy::EmptyDir);
+    let missing = temp.path().join("absent").join("agy").join("sessions");
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.agy]\nenabled = true\npath = {:?}\n\n\
+             [adapters.claude-code]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+            root.display().to_string(),
+        ),
+    );
+    // First sync builds the store; the fixture session arrives after, so the
+    // second sync has a write to fail on.
+    assert_exit_ok(&run(&temp, &["sync"]), "the store-seeding sync");
+    claude_code_root(&temp, &Healthy::OneFixtureSession);
+    let store = temp.path().join("store");
+    chmod_dirs(&store, 0o555);
+    if std::fs::write(store.join("probe"), b"x").is_ok() {
+        // Read-only bits do not deny this user (root); nothing to test.
+        let _ = std::fs::remove_file(store.join("probe"));
+        chmod_dirs(&store, 0o755);
+        return;
+    }
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    chmod_dirs(&store, 0o755);
+    assert!(
+        !out.status.success(),
+        "a store that cannot be written must fail the run\nstdout: {}\nstderr: {}",
+        stdout(&out),
+        stderr(&out),
+    );
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("error"), "{doc}");
+    assert!(doc["error"].is_string(), "{doc}");
+    let entry = &doc["failed_adapters"][0];
+    assert_eq!(
+        entry["name"].as_str(),
+        Some("agy"),
+        "the skip recorded before the abort must survive it: {doc}",
+    );
+    assert_eq!(entry["reason"].as_str(), Some("source_missing"), "{entry}");
+}
+
+/// Every directory under `root` gets `mode`; files keep theirs (denying dir
+/// writes is what makes the store read-only).
+#[cfg(unix)]
+fn chmod_dirs(root: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode)).expect("chmod dir");
+    for entry in std::fs::read_dir(root).expect("read_dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            chmod_dirs(&path, mode);
+        }
+    }
+}
+
 /// The adjacent detail, pinned so the fix above cannot swallow it: a malformed
 /// config blob is not fleet state, and keeps failing the whole resolve even
 /// when a sibling adapter is perfectly healthy (spec 7.8).
