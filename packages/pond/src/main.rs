@@ -3978,13 +3978,16 @@ pub(crate) async fn run_sync(
     // A typo'd `pond sync <adapter>`/`--path` must fail before waiting on the
     // sync flock, creating a fresh store, or cold-loading the embedder; the
     // import stage re-runs the same pure-config scan as its TOCTOU guard.
+    // A resolve error falls through on purpose: it is not this check's to
+    // report, and the import stage's own resolve keeps it on the error
+    // document that already carries the run's counters.
     if invocation.adapter.is_some()
-        && let Err(error) = resolve_sync_adapters(
+        && let Ok(adapters) = resolve_sync_adapters(
             loaded,
             invocation.adapter.as_deref(),
             invocation.path.clone(),
         )
-        .and_then(|adapters| bail_when_explicit_source_missing(&adapters, true))
+        && let Err(error) = bail_when_explicit_source_missing(&adapters, true)
     {
         if json {
             emit_json_error(&error)?;
@@ -5092,6 +5095,9 @@ async fn run_import_stage(
         let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
         let path = source_path(&resolved.config);
         let summary = sync_with_progress(store, &mp, resolved, oracle, flush_hud, quiet).await?;
+        // Merge before emitting: these rows are already committed, so a failed
+        // stderr write must not drop them from the run's counts.
+        total.merge(&summary);
         if summary.skipped_files > 0 {
             degraded.push(DegradedAdapter {
                 name,
@@ -5104,7 +5110,6 @@ async fn run_import_stage(
                 emit_degraded(sink, entry, Some(&mp))?;
             }
         }
-        total.merge(&summary);
     }
     Ok(())
 }

@@ -590,6 +590,60 @@ fn failed_adapters_survive_onto_the_error_document() {
     assert_eq!(entry["reason"].as_str(), Some("source_missing"), "{entry}");
 }
 
+/// The narrowed bail costs nothing: a typo'd `pond sync <adapter>` must fail
+/// before the store is created and before the sync flock is taken, so a wrong
+/// invocation leaves the host exactly as it found it.
+#[test]
+fn narrowing_at_an_absent_source_creates_no_store_and_takes_no_lock() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::OneFixtureSession);
+    let out = run(&temp, &["sync", "codex-cli"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a named absent source is a wrong invocation\nstderr: {}",
+        stderr(&out),
+    );
+    assert!(
+        !temp.path().join("store").exists(),
+        "the bail must precede `open_store`, which would create the destination",
+    );
+    let locks: Vec<_> = std::fs::read_dir(temp.path().join("state").join("pond"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("sync-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        locks.is_empty(),
+        "the bail must precede the sync flock, so a typo never queues behind a real sync: {locks:?}",
+    );
+}
+
+/// The narrowed bail is only the source-missing check's to make: every other
+/// resolve failure keeps the error document that carries the run's counters,
+/// so a consumer reading `sessions_inserted` never finds the key simply gone.
+#[test]
+fn a_resolve_error_keeps_the_counted_error_document() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::OneFixtureSession);
+    for adapter in ["definitely-not-an-adapter", "agy"] {
+        let args = ["sync", adapter, "--format", "json"];
+        let out = run(&temp, &args);
+        assert_eq!(out.status.code(), Some(1), "{adapter}: {}", stderr(&out));
+        let doc = json(&args, &out);
+        assert_eq!(doc["outcome"].as_str(), Some("error"), "{doc}");
+        for key in ["sessions_inserted", "messages_inserted", "duration_secs"] {
+            assert!(
+                doc.get(key).is_some(),
+                "{adapter}: a resolve error must keep {key} on the document: {doc}",
+            );
+        }
+    }
+}
+
 /// Every directory under `root` gets `mode`; files keep theirs (denying dir
 /// writes is what makes the store read-only).
 #[cfg(unix)]
