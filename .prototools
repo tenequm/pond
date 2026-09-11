@@ -1,5 +1,6 @@
-# The repo-owned moon pin (proto-managed installs resolve it; CI's bootstrap
-# pins the same version in .github/actions/bootstrap/action.yml). Bump both
-# together. A workspace versionConstraint in .moon/workspace.yml is deferred
-# until operator environments are on >= 2.5.4.
+# The repo-owned moon pin - the single place a moon bump is typed. Everything
+# else derives from it: proto-managed installs resolve it directly, the nix
+# devShell reads it through ops/nix/moon-cli.nix (bump the hashes there with
+# it), CI's bootstrap action and the npm-publish job grep it, and
+# .moon/workspace.yml's versionConstraint sets the floor it must satisfy.
 moon = "2.5.4"
