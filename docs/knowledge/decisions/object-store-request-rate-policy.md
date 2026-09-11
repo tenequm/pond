@@ -22,8 +22,8 @@ narrow it.
 
 The throttling and 503s pond saw on Hetzner were a *symptom of issuing too many
 requests* - the [versions() manifest
-storm](s3-sync-change-detection-oracle.md), full-column rescans, and
-[per-batch merge commits](s3-append-vs-merge-write-path.md) - not evidence that
+storm](../findings/s3-sync-change-detection-oracle.md), full-column rescans, and
+[per-batch merge commits](../findings/s3-append-vs-merge-write-path.md) - not evidence that
 the ceiling was too low.
 
 Lance compounds the misreading by labelling the resulting transport timeouts

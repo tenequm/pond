@@ -17,7 +17,7 @@ sources:
 The queries used for the 2026-09-02 comparison of Claude Fable 5 and Fable 5.1
 over 22,022 API calls from one pond store plus one throwaway store built from
 a second Claude config dir. Method and pricing follow
-[token-usage-accounting.md](token-usage-accounting.md): one
+[token-usage-accounting.md](../runbooks/token-usage-accounting.md): one
 row per provider message id, `MAX` per usage field, then aggregate. The same
 shape works on raw `~/.claude/projects/**/*.jsonl` with any JSON tool.
 

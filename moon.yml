@@ -145,6 +145,11 @@ tasks:
       index_file = os.path.join(bundle_dir, "index.md")
       log_file = os.path.join(bundle_dir, "log.md")
 
+      # A concept's directory is derivable from its type, which is what keeps
+      # filing mechanical instead of a judgment call. Enforce the match here or
+      # it silently stops being true.
+      TYPE_DIRS = {"Decision": "decisions", "Finding": "findings", "Reference": "references", "Runbook": "runbooks"}
+
       violations = []
 
       if not os.path.isdir(bundle_dir):
@@ -234,6 +239,14 @@ tasks:
                   violations.append(f"check-knowledge: {file_path}: missing 'type' in frontmatter")
               elif not type_val or type_val.startswith(("[", "{")):
                   violations.append(f"check-knowledge: {file_path}: 'type' must be a non-empty scalar value")
+
+          if isinstance(type_val, str) and type_val.strip():
+              want = TYPE_DIRS.get(type_val.strip())
+              got = os.path.basename(os.path.dirname(file_path))
+              if want is None:
+                  violations.append(f"check-knowledge: {file_path}: unknown type '{type_val.strip()}'; vocabulary is {', '.join(sorted(TYPE_DIRS))}")
+              elif got != want:
+                  violations.append(f"check-knowledge: {file_path}: type '{type_val.strip()}' belongs in {want}/, not {got}/")
 
       # 4. Check relative markdown links in concept files, index.md, and log.md
       link_pattern = re.compile(r'\[(?:\\\]|[^\]])*\]\(([^)]+)\)')

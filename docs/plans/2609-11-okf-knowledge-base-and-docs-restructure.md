@@ -224,6 +224,9 @@ overrides decision 1 on the second one:
   concept carries the measurement and the incident. Five object-store rules,
   the bench-gate evidence standards and the release-plz v0.12.0 story moved.
 
-The bundle was also refiled from flat into subject-area directories
-(`storage/`, `search/`, `engineering/`, `integrations/`, `usage/`, beside the
-existing `adapters/`) in the same change, since it roughly doubled in size.
+The bundle was also refiled from flat into per-type directories (`decisions/`,
+`findings/`, `references/`, `runbooks/`) in the same change, since it roughly
+doubled in size. Filing by type rather than by subject keeps the directory
+derivable from the `type:` field instead of a judgment call, keeps the set
+closed as pond grows, and is enforced by `repo:check-knowledge`; subject
+grouping lives in the index, which is the read entry point anyway.

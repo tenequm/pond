@@ -42,7 +42,7 @@ append|merge` is the regression guard.
 
 The spec carries the rule (`spec.md#session-durable-copy`); this concept
 carries why. Same root cause as [the request-rate
-policy](object-store-request-rate-policy.md) and [the sync
+policy](../decisions/object-store-request-rate-policy.md) and [the sync
 oracle](s3-sync-change-detection-oracle.md): issue fewer round trips.
 
 ## Invalidation

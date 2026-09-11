@@ -42,7 +42,7 @@ capability.[^opt-in-plan]
 ## Why off is the right default
 
 The evidence is in [the semantic versus BM25
-evaluation](semantic-vs-fts-usage-findings.md): in a 1,126-call production
+evaluation](../findings/semantic-vs-fts-usage-findings.md): in a 1,126-call production
 trace, BM25 resolved 61% of queries against 37% for vector search, and semantic
 retrieval uniquely helped only 6-7% of calls while adding substantial memory
 and ingest cost. Paying a model load and an embed stage by default to serve

@@ -33,7 +33,7 @@ derives from is the single biggest lever on how long a sync takes.
 
 Never derive a per-sync watermark from `versions()` on a remote store. This is
 the same root cause as [never tuning the object store's request-rate
-limiter](object-store-request-rate-policy.md): on an object store, latency is
+limiter](../decisions/object-store-request-rate-policy.md): on an object store, latency is
 round-trip-bound, so the fix is always to issue fewer requests.
 
 Source-side change detection (mtime stat versus JSONL last-record tail-peek) is
