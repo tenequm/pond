@@ -132,11 +132,11 @@ fn conversational_word(session: &SessionWithMessages) -> Option<String> {
 }
 
 /// A fixture ingest is clean or the suite is not measuring the adapter: a
-/// dropped event, a rejected session, or a storage error still leaves the
-/// session count and the searchable scope intact.
+/// dropped event or a rejected session still leaves the session count and the
+/// searchable scope intact.
 fn ensure_clean_ingest(brand: &str, summary: &IngestSummary) -> anyhow::Result<()> {
     anyhow::ensure!(
-        summary.dropped_events == 0 && summary.dropped_sessions == 0 && summary.storage_errors == 0,
+        summary.dropped_events == 0 && summary.dropped_sessions == 0,
         "{brand}: fixture ingest was not clean: {summary:?}",
     );
     Ok(())

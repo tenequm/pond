@@ -1294,22 +1294,36 @@ async fn run() -> anyhow::Result<()> {
             let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
             if !store.initialized().await? {
-                let (has_adapters, adapters_error) = match loaded.resolve_adapters(None) {
-                    Ok(adapters) => (!adapters.is_empty(), None),
-                    Err(error) => (true, Some(format!("{error:#}"))),
+                // The local rows cost no store read, and an all-absent sync
+                // now leaves the store uninitialized - so this branch has to
+                // carry them, or the host this PR is about loses the only
+                // surface that names its missing sources.
+                let local =
+                    local_status(&loaded, &store, &store_key, crate::schedule::status_snapshot()).await;
+                let has_adapters = match loaded.resolve_adapters(None) {
+                    Ok(resolved) => !resolved.is_empty(),
+                    // A config that will not resolve is not "no adapters":
+                    // the error line is the fix to name, not `pond init`.
+                    Err(_) => true,
                 };
+                let all_sources_missing = !local.adapters.is_empty()
+                    && local
+                        .adapters
+                        .iter()
+                        .all(|adapter| adapter.reason == Some(FAILURE_REASON_SOURCE_MISSING));
                 match format {
                     OutputFormat::Json => {
-                        output(&status_json_empty(&resolved, adapters_error.as_deref())?)?;
+                        output(&status_json_empty(&resolved, &local)?)?;
                     }
                     OutputFormat::Text => {
                         render_empty_status(
                             "pond status",
                             &resolved,
                             has_adapters,
-                            adapters_error.as_deref(),
+                            local.adapters_error.as_deref(),
+                            all_sources_missing,
                         )?;
-                        output(&crate::schedule::status_line())?;
+                        render_local_status(&local, false)?;
                         if hosts {
                             output_err(&pond::output::paint(
                                 "(--hosts has nothing to report until the first sync populates the store)",
@@ -1403,7 +1417,7 @@ async fn run() -> anyhow::Result<()> {
                     OutputFormat::Text => {
                         render_status_header("pond status", &resolved, &sizes, &totals)?;
                         render_status_checks(&checks)?;
-                        render_local_status(&local)?;
+                        render_local_status(&local, true)?;
                         if let Some(host_activity) = &host_activity {
                             render_host_activity(host_activity)?;
                         }
@@ -3840,14 +3854,138 @@ impl SyncInvocation {
 /// one place to read from.
 #[derive(Default)]
 struct SyncReport {
-    sessions_inserted: u64,
-    messages_inserted: u64,
+    ingest: IngestSummary,
     indexes_folded: bool,
     stored_sessions: Option<u64>,
     stored_messages: Option<u64>,
     /// openclaw deletion-reconciliation outcome (decision 7), when the
     /// openclaw adapter was in scope. Detection-only until `pond erase` exists.
     reconciliation: Option<adapter::ReconciliationReport>,
+    /// Adapters the run could not read at all (their configured source root is
+    /// absent on this host). Named per adapter on every summary surface;
+    /// the run itself still succeeds, because the other sources are reachable.
+    failed_adapters: Vec<FailedAdapter>,
+    /// Adapters that lost data an operator can act on; without this the count
+    /// and reason exist only on the live progress line.
+    degraded_adapters: Vec<DegradedAdapter>,
+}
+
+/// Stable kind for an absent source root, shared by `failed_adapters`, dry-run
+/// rows, and status rows so one condition reads the same on every surface.
+const FAILURE_REASON_SOURCE_MISSING: &str = "source_missing";
+
+/// One adapter skipped because its configured source root does not exist on
+/// this host. Carried out of the import stage so the summary renderers can name
+/// it - the immediate red line scrolls away behind a long import.
+#[derive(Debug, serde::Serialize)]
+struct FailedAdapter {
+    name: String,
+    /// Display name for the text surfaces only (`name (path)` for a fanned-out
+    /// multi-path entry); the JSON document identifies the adapter by `name`
+    /// and `path`, which already distinguish those passes.
+    #[serde(skip)]
+    label: String,
+    path: String,
+    error: String,
+    /// Stable machine-readable kind, so fleet tooling branches on this and
+    /// never parses the human `error` string.
+    reason: &'static str,
+}
+
+impl FailedAdapter {
+    fn new(name: String, label: String, path: String) -> Self {
+        let error = source_missing_message(&path);
+        Self {
+            name,
+            label,
+            path,
+            error,
+            reason: FAILURE_REASON_SOURCE_MISSING,
+        }
+    }
+
+    /// The red line every text surface prints for this failure - emitted when
+    /// the adapter is skipped and repeated beside the final summary.
+    fn summary_line(&self) -> String {
+        format!(
+            "import: {} {}",
+            self.label,
+            source_missing_detail(&self.path)
+        )
+    }
+}
+
+/// One adapter that ran but lost data an operator can act on - files it could
+/// not read, events it could not decode, sessions the validator rejected
+/// wholesale. Deliberately NOT the validator's routine per-event drops: the
+/// dedupe floor firing is expected behavior (spec `adapter-integrity-dedup`),
+/// and an adapter is not "degraded" for discarding a redundant record.
+#[derive(Debug, serde::Serialize)]
+struct DegradedAdapter {
+    name: String,
+    /// Text surfaces only; JSON identifies the adapter by `name` and `path`.
+    #[serde(skip)]
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// Named after `IngestSummary::skipped_files`, not the bar's `N err` tail,
+    /// which also counts validator-rejected sessions.
+    skipped_files: u64,
+    /// First skip reason, verbatim: its path and cause are what distinguish
+    /// an unreadable root from one corrupt file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_skip_reason: Option<String>,
+    /// Events lost mid-session to a read or decode failure, which the
+    /// whole-file count above never sees.
+    unreadable_events: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_unreadable_reason: Option<String>,
+    /// Whole sessions the validator rejected (an empty `source_agent`, a parent
+    /// that never arrived): a larger loss whose kinds the summary document
+    /// carries in `drop_reasons`.
+    dropped_sessions: u64,
+}
+
+impl DegradedAdapter {
+    /// The yellow line naming what this adapter lost, and the authority on
+    /// whether it lost anything actionable at all - `None` keeps a routine
+    /// dedupe pass out of both the warning and the JSON array.
+    fn summary_line(&self) -> Option<String> {
+        let mut what = Vec::new();
+        if self.skipped_files > 0 {
+            what.push(format!("could not read {} file(s)", self.skipped_files));
+        }
+        if self.unreadable_events > 0 {
+            what.push(format!(
+                "lost {} event(s) it could not decode",
+                self.unreadable_events
+            ));
+        }
+        if self.dropped_sessions > 0 {
+            what.push(format!(
+                "lost {} session(s) to failed validation",
+                self.dropped_sessions
+            ));
+        }
+        if what.is_empty() {
+            return None;
+        }
+        // Read failures carry reasons; validator-rejected sessions carry only
+        // stable keys, in the summary document's `drop_reasons` histogram.
+        let first = if self.skipped_files > 0 {
+            self.first_skip_reason.as_deref()
+        } else {
+            self.first_unreadable_reason.as_deref()
+        };
+        Some(match first {
+            Some(reason) => format!(
+                "import: {} {} - first error: {reason}",
+                self.label,
+                what.join(", ")
+            ),
+            None => format!("import: {} {}", self.label, what.join(", ")),
+        })
+    }
 }
 
 /// Where a sync run's progress + summary go. The CLI verb owns the terminal
@@ -3870,8 +4008,12 @@ impl SyncSink {
 }
 
 /// The whole `pond sync` verb: per-host lock, model preload, import, index
-/// fold, summary, and the last-sync breadcrumb - written on success AND
-/// failure, so `pond status` can surface a silently failing scheduled sync.
+/// fold, summary, and the last-sync breadcrumb - written after the run acquires
+/// its lock, on success AND failure, so `pond status` can surface a silently
+/// failing scheduled sync. Storage resolution, credential, lock, no-wait busy,
+/// and narrowed absent-source exits happen before the breadcrumb exists. The
+/// all-absent exit is the one that writes it without running a stage, and it
+/// too sits under the lock, so it cannot overwrite a concurrent run's record.
 pub(crate) async fn run_sync(
     loaded: &Config,
     config_file: &Path,
@@ -3888,6 +4030,24 @@ pub(crate) async fn run_sync(
         return outcome;
     }
     let cmd_started = std::time::Instant::now();
+    // A narrowed invocation whose configured source is absent must fail before
+    // the sync flock, store creation, or embedder load; import re-checks for TOCTOU.
+    // A resolve error falls through on purpose: it is not this check's to
+    // report, and the import stage's own resolve keeps it on the error
+    // document that already carries the run's counters.
+    if invocation.adapter.is_some()
+        && let Ok(adapters) = resolve_sync_adapters(
+            loaded,
+            invocation.adapter.as_deref(),
+            invocation.path.clone(),
+        )
+        && let Err(error) = bail_when_explicit_source_missing(&adapters, true)
+    {
+        if json {
+            emit_json_error(&error)?;
+        }
+        return Err(error);
+    }
     // Pre-stage failures (storage resolve, creds, lock) happen before the
     // last-sync record exists, but the `--format json` contract - one summary
     // document on stdout for EVERY outcome - already holds here.
@@ -3950,6 +4110,70 @@ pub(crate) async fn run_sync(
         }
     };
 
+    // Every enabled source absent is the shared-fleet-config case, and there is
+    // nothing for the run to do: skip the store open and the embedder cold-load
+    // and report each adapter. Held to after the flock so the breadcrumb cannot
+    // overwrite a concurrent real sync's record and --no-wait still skips.
+    // `adapter_count > 0` keeps the no-enabled-adapters help below reachable;
+    // resolve errors fall through deliberately, to report as config errors.
+    if invocation.adapter.is_none()
+        && let Ok(adapters) = resolve_sync_adapters(loaded, None, invocation.path.clone())
+    {
+        let adapter_count = adapters.len();
+        let absent: Vec<_> = adapters
+            .into_iter()
+            .filter_map(|resolved| {
+                missing_source_root(&resolved.config).map(|missing| (resolved, missing))
+            })
+            .collect();
+        if adapter_count > 0 && absent.len() == adapter_count {
+            let mut report = SyncReport::default();
+            for (resolved, missing) in absent {
+                let failed = FailedAdapter::new(
+                    resolved.name.clone(),
+                    adapter_label(&resolved.name, resolved.fanout_path.as_deref()),
+                    missing,
+                );
+                emit_source_missing(SyncSink::Cli { json }, &failed, None)?;
+                report.failed_adapters.push(failed);
+            }
+            let duration = cmd_started.elapsed();
+            syncstate::write_last_sync(
+                &store_key,
+                &syncstate::LastSyncRecord {
+                    finished_at: Utc::now(),
+                    duration_secs: duration.as_secs_f64(),
+                    sessions_inserted: 0,
+                    messages_inserted: 0,
+                    outcome: syncstate::SyncOutcome::Ok,
+                    error: None,
+                },
+            );
+            if json {
+                let mut summary = serde_json::json!({
+                    "outcome": "ok",
+                    "sessions_inserted": 0,
+                    "messages_inserted": 0,
+                    "indexes_folded": false,
+                    // Null, not zero and not absent: this run never opened the
+                    // store, so it cannot report the lake's totals - the same
+                    // shape an uncounted adapter row uses.
+                    "stored": { "sessions": null, "messages": null },
+                    "duration_secs": duration.as_secs_f64(),
+                });
+                attach_adapter_verdicts(&mut summary, &report)?;
+                output(&serde_json::to_string_pretty(&summary)?)?;
+            } else {
+                output(&format!(
+                    "{} sync complete in {}",
+                    pond::output::paint("done -", pond::output::dim()),
+                    elapsed_hms(duration),
+                ))?;
+            }
+            return Ok(());
+        }
+    }
+
     let mut report = SyncReport::default();
     let outcome = run_sync_stages(
         loaded,
@@ -3966,8 +4190,8 @@ pub(crate) async fn run_sync(
         &syncstate::LastSyncRecord {
             finished_at: Utc::now(),
             duration_secs: duration.as_secs_f64(),
-            sessions_inserted: report.sessions_inserted,
-            messages_inserted: report.messages_inserted,
+            sessions_inserted: report.ingest.sessions_inserted as u64,
+            messages_inserted: report.ingest.messages_inserted_searchable as u64,
             outcome: if outcome.is_ok() {
                 syncstate::SyncOutcome::Ok
             } else {
@@ -3983,22 +4207,19 @@ pub(crate) async fn run_sync(
         let mut summary = serde_json::json!({
             "outcome": "error",
             "error": format!("{error:#}"),
-            "sessions_inserted": report.sessions_inserted,
-            "messages_inserted": report.messages_inserted,
+            "sessions_inserted": report.ingest.sessions_inserted,
+            "messages_inserted": report.ingest.messages_inserted_searchable,
             "duration_secs": duration.as_secs_f64(),
         });
-        // Reconciliation runs after import, so a mid-pipeline failure may still
-        // have detected deletions; surface them when present (same store as the
-        // ok path).
-        add_reconciliation(&mut summary, &report)?;
+        attach_adapter_verdicts(&mut summary, &report)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     }
     outcome?;
     if json {
         let mut summary = serde_json::json!({
             "outcome": "ok",
-            "sessions_inserted": report.sessions_inserted,
-            "messages_inserted": report.messages_inserted,
+            "sessions_inserted": report.ingest.sessions_inserted,
+            "messages_inserted": report.ingest.messages_inserted_searchable,
             "indexes_folded": report.indexes_folded,
             "stored": {
                 "sessions": report.stored_sessions,
@@ -4006,9 +4227,15 @@ pub(crate) async fn run_sync(
             },
             "duration_secs": duration.as_secs_f64(),
         });
-        add_reconciliation(&mut summary, &report)?;
+        attach_adapter_verdicts(&mut summary, &report)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     } else {
+        // Repeated beside the summary: the line emitted when the adapter was
+        // skipped can be thousands of sessions back in the log, and the run's
+        // last words must not read as an unqualified success.
+        for failed in &report.failed_adapters {
+            emit_source_missing(SyncSink::Cli { json: false }, failed, None)?;
+        }
         output(&format!(
             "{} sync complete in {}",
             pond::output::paint("done -", pond::output::dim()),
@@ -4090,8 +4317,8 @@ async fn in_serve_sync_once(
         &syncstate::LastSyncRecord {
             finished_at: Utc::now(),
             duration_secs: duration.as_secs_f64(),
-            sessions_inserted: report.sessions_inserted,
-            messages_inserted: report.messages_inserted,
+            sessions_inserted: report.ingest.sessions_inserted as u64,
+            messages_inserted: report.ingest.messages_inserted_searchable as u64,
             outcome: if outcome.is_ok() {
                 syncstate::SyncOutcome::Ok
             } else {
@@ -4103,8 +4330,8 @@ async fn in_serve_sync_once(
     if outcome.is_ok() {
         tracing::info!(
             target: "pond::sync",
-            sessions = report.sessions_inserted,
-            messages = report.messages_inserted,
+            sessions = report.ingest.sessions_inserted,
+            messages = report.ingest.messages_inserted_searchable,
             secs = duration.as_secs_f64(),
             "in-serve sync complete",
         );
@@ -4197,20 +4424,22 @@ async fn run_sync_pipeline(
     flush_hud: &Arc<FlushHud>,
 ) -> anyhow::Result<()> {
     let import_started = std::time::Instant::now();
-    let import_summary = run_import_stage(
+    let import_result = run_import_stage(
         store,
         loaded,
         config_file,
-        invocation.adapter.clone(),
-        invocation.path.clone(),
-        invocation.verify,
+        invocation,
         flush_hud,
+        report,
         sink,
     )
-    .await?;
-    report.sessions_inserted = import_summary.sessions_inserted as u64;
-    report.messages_inserted = import_summary.messages_inserted_searchable as u64;
-    let any_new_rows = import_summary.inserted > 0;
+    .await;
+    // Counts land on the report before the error propagates, so an adapter
+    // that finished keeps its rows on the error document. An adapter failing
+    // mid-flush still loses its own committed batches (#240): `ingest_adapter`
+    // hands back no summary on error.
+    import_result?;
+    let any_new_rows = report.ingest.inserted > 0;
     // "searchable": the delta counts user/assistant conversational rows only,
     // while the stored total below counts every role - unlabeled, the 10x gap
     // between them reads as dropped data.
@@ -4220,8 +4449,8 @@ async fn run_sync_pipeline(
         "import",
         &format!(
             "+{} sessions, +{} searchable messages",
-            format_thousands(import_summary.sessions_inserted as u64),
-            format_thousands(import_summary.messages_inserted_searchable as u64),
+            format_thousands(report.ingest.sessions_inserted as u64),
+            format_thousands(report.ingest.messages_inserted_searchable as u64),
         ),
     )?;
 
@@ -4229,7 +4458,19 @@ async fn run_sync_pipeline(
     // a non-openclaw sync pays nothing. Detection-only - it names the erase
     // set and preserves for the summary; the byte-purge waits on `pond erase`.
     // A multi-path entry reconciles every dir, merged into one report.
-    let roots = openclaw_in_scope(loaded, invocation)?;
+    let openclaw_read_failed = report
+        .failed_adapters
+        .iter()
+        .any(|entry| entry.name == "openclaw")
+        || report
+            .degraded_adapters
+            .iter()
+            .any(|entry| entry.name == "openclaw");
+    let roots = if openclaw_read_failed {
+        Vec::new()
+    } else {
+        openclaw_in_scope(loaded, invocation)?
+    };
     let mut reports = Vec::with_capacity(roots.len());
     for config in roots {
         let adapter = adapter::OpenClawAdapter::from_config(config)?;
@@ -4327,6 +4568,64 @@ fn add_reconciliation(summary: &mut Value, report: &SyncReport) -> anyhow::Resul
         && let Value::Object(map) = summary
     {
         map.insert("reconciliation".to_owned(), serde_json::to_value(recon)?);
+    }
+    Ok(())
+}
+
+/// Every additive field the ok and error summary documents share, attached in
+/// one place so the two cannot drift apart. Reconciliation belongs here too: it
+/// runs after import, so a mid-pipeline failure may still have detected
+/// deletions worth surfacing.
+fn attach_adapter_verdicts(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
+    add_reconciliation(summary, report)?;
+    add_when_non_empty(summary, "failed_adapters", &report.failed_adapters)?;
+    add_when_non_empty(summary, "degraded_adapters", &report.degraded_adapters)?;
+    add_skipped_unimportable(summary, report);
+    add_drop_reasons(summary, report)
+}
+
+/// Attach the drop histogram accumulated before the current outcome. Separate from
+/// `degraded_adapters` on purpose: it records what the validator discarded,
+/// including the routine duplicates, and asserts nothing about health.
+fn add_drop_reasons(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
+    if report.ingest.drop_reasons.is_empty() {
+        return Ok(());
+    }
+    if let Value::Object(map) = summary {
+        map.insert(
+            "drop_reasons".to_owned(),
+            serde_json::to_value(&report.ingest.drop_reasons)?,
+        );
+    }
+    Ok(())
+}
+
+fn add_skipped_unimportable(summary: &mut Value, report: &SyncReport) {
+    if report.ingest.skipped_unimportable == 0 {
+        return;
+    }
+    if let Value::Object(map) = summary {
+        map.insert(
+            "skipped_unimportable".to_owned(),
+            report.ingest.skipped_unimportable.into(),
+        );
+    }
+}
+
+/// Attach a per-adapter verdict array (`failed_adapters`, `degraded_adapters`)
+/// to a `--format json` summary document, on both the ok and error documents.
+/// These two arrays are additive and omitted when empty (spec.md 7.8), leaving
+/// an all-healthy run's summary unchanged.
+fn add_when_non_empty<T: serde::Serialize>(
+    summary: &mut Value,
+    key: &str,
+    entries: &[T],
+) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if let Value::Object(map) = summary {
+        map.insert(key.to_owned(), serde_json::to_value(entries)?);
     }
     Ok(())
 }
@@ -4446,11 +4745,13 @@ async fn run_sync_dry_run(
     invocation: &SyncInvocation,
 ) -> anyhow::Result<()> {
     let json = matches!(invocation.format, OutputFormat::Json);
+    let explicit = invocation.adapter.is_some();
     let adapters = resolve_sync_adapters(
         loaded,
         invocation.adapter.as_deref(),
         invocation.path.clone(),
     )?;
+    bail_when_explicit_source_missing(&adapters, explicit)?;
     if adapters.is_empty() {
         output_err(&format!(
             "{} no enabled adapters - run `pond adapters discover` (or `pond init`) to enable some, or add `[adapters.<name>]` blocks to {}",
@@ -4477,17 +4778,51 @@ async fn run_sync_dry_run(
         rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
         &rowmap_oracle
     };
+    /// Why this adapter could not be counted. An adapter that cannot read
+    /// part of its source reports an error rather than a count, and the
+    /// point of a dry run is to see the whole picture - so it becomes a
+    /// row saying so, not an abort that blanks every other adapter too.
+    enum RowError {
+        /// The configured source root is absent on this host: its own pinned
+        /// wording, shared with the real-sync surfaces.
+        SourceMissing(String),
+        /// Anything else that stopped this adapter being counted.
+        Other(String),
+    }
+    impl RowError {
+        /// What the JSON row's `"error"` carries.
+        fn message(&self) -> String {
+            match self {
+                RowError::SourceMissing(path) => source_missing_message(path),
+                RowError::Other(error) => error.clone(),
+            }
+        }
+        /// The row's stable machine-readable kind, matching `failed_adapters`
+        /// in the real-sync summary so one condition reads the same on both.
+        /// `None` for the catch-all: `Other` covers unrelated conditions (an
+        /// unknown openclaw schema among them), and minting one "stable" token
+        /// over that class would tell fleet tooling a wrong diagnosis.
+        fn reason(&self) -> Option<&'static str> {
+            match self {
+                RowError::SourceMissing(_) => Some(FAILURE_REASON_SOURCE_MISSING),
+                RowError::Other(_) => None,
+            }
+        }
+        /// The (red) detail column of the text row.
+        fn detail(&self) -> String {
+            match self {
+                RowError::SourceMissing(path) => source_missing_detail(path),
+                RowError::Other(error) => format!("cannot read this source - {error}"),
+            }
+        }
+    }
     struct DryRunRow {
         name: String,
         fanout: Option<String>,
         source_path: Option<String>,
         sessions: usize,
         plan: Option<pond::adapter::SyncPlan>,
-        /// Why this adapter could not be counted. An adapter that cannot read
-        /// part of its source reports an error rather than a count, and the
-        /// point of a dry run is to see the whole picture - so it becomes a
-        /// row saying so, not an abort that blanks every other adapter too.
-        error: Option<String>,
+        error: Option<RowError>,
     }
     let mut rows: Vec<DryRunRow> = Vec::new();
     for resolved in adapters {
@@ -4499,13 +4834,46 @@ async fn run_sync_dry_run(
             )
         })?;
         let source_path = source_path(&resolved.config);
+        // Same pre-flight and same verdict as the real sync, so the preview
+        // tells the operator what the run would actually do - short-circuited
+        // before `open`, which some adapters answer with their own io error.
+        if let Some(missing) = missing_source_root(&resolved.config) {
+            // Unreachable unless the root vanished after the pre-scan above -
+            // an explicitly named source stays a hard error even then.
+            bail_when_explicit_entry_source_missing(&resolved, explicit)?;
+            rows.push(DryRunRow {
+                name: resolved.name,
+                fanout: resolved.fanout_path,
+                source_path,
+                sessions: 0,
+                plan: None,
+                error: Some(RowError::SourceMissing(missing)),
+            });
+            continue;
+        }
         let opened = factory.open(resolved.config)?;
-        let plan = opened.plan(oracle).await?;
+        // A failed plan is this adapter's verdict, not the run's: `?` here used
+        // to blank every other adapter's row too, which is the one thing a dry
+        // run exists to show.
+        let plan = match opened.plan(oracle).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                rows.push(DryRunRow {
+                    name: resolved.name,
+                    fanout: resolved.fanout_path,
+                    source_path,
+                    sessions: 0,
+                    plan: None,
+                    error: Some(RowError::Other(error.to_string())),
+                });
+                continue;
+            }
+        };
         let (sessions, error) = match &plan {
             Some(plan) => (plan.sessions, None),
             None => match opened.discover().await {
                 Ok(sessions) => (sessions, None),
-                Err(error) => (0, Some(error.to_string())),
+                Err(error) => (0, Some(RowError::Other(error.to_string()))),
             },
         };
         rows.push(DryRunRow {
@@ -4529,7 +4897,8 @@ async fn run_sync_dry_run(
                     "sessions": row.error.is_none().then_some(row.sessions),
                     "fresh": row.plan.map(|plan| plan.fresh),
                     "pending": row.plan.map(|plan| plan.pending),
-                    "error": row.error,
+                    "error": row.error.as_ref().map(RowError::message),
+                    "reason": row.error.as_ref().and_then(RowError::reason),
                 })
             })
             .collect();
@@ -4542,10 +4911,7 @@ async fn run_sync_dry_run(
     let label = pond::output::paint("plan", pond::output::dim());
     for row in &rows {
         let detail = if let Some(error) = &row.error {
-            pond::output::paint(
-                &format!("cannot read this source - {error}"),
-                pond::output::red(),
-            )
+            pond::output::paint(&error.detail(), pond::output::red())
         } else {
             match &row.plan {
                 Some(plan) if plan.pending == 0 => {
@@ -4771,21 +5137,27 @@ fn brief_duration(duration: Duration) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_import_stage(
     store: &Store,
     loaded: &Config,
     config_file: &Path,
-    adapter: Option<String>,
-    path: Option<PathBuf>,
-    verify: bool,
+    invocation: &SyncInvocation,
     flush_hud: &Arc<FlushHud>,
+    report: &mut SyncReport,
     sink: SyncSink,
-) -> anyhow::Result<IngestSummary> {
+) -> anyhow::Result<()> {
     // The in-serve loop keeps stdout for the transport and paints no bars:
     // hide every progress surface and suppress the off-TTY heartbeat lines.
     let quiet = sink.is_serve();
-    let adapters = resolve_sync_adapters(loaded, adapter.as_deref(), path)?;
+    // Naming an adapter (with or without `--path`) makes its source absence a
+    // wrong invocation rather than fleet state.
+    let explicit = invocation.adapter.is_some();
+    let adapters = resolve_sync_adapters(
+        loaded,
+        invocation.adapter.as_deref(),
+        invocation.path.clone(),
+    )?;
+    bail_when_explicit_source_missing(&adapters, explicit)?;
     if adapters.is_empty() {
         let disabled = loaded.disabled_adapter_names();
         let label = pond::output::paint("import:", pond::output::dim());
@@ -4803,7 +5175,7 @@ async fn run_import_stage(
                 config_file.display(),
             ))?;
         }
-        return Ok(IngestSummary::default());
+        return Ok(());
     }
     // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
     // watermark, so every source body is re-decoded and re-ingested through the
@@ -4812,7 +5184,7 @@ async fn run_import_stage(
     // watermark that mtime can never re-read past (spec.md#session-movement-complete).
     let noop = pond::adapter::NoopOracle;
     let rowmap_oracle;
-    let oracle: &dyn pond::adapter::SkipOracle = if verify {
+    let oracle: &dyn pond::adapter::SkipOracle = if invocation.verify {
         output_err(&pond::output::paint(
             "import: --verify: re-reading every source body, bypassing the freshness skip",
             pond::output::yellow(),
@@ -4830,7 +5202,15 @@ async fn run_import_stage(
     // Set expectations up front on the one run that is genuinely long: a first
     // sync reads (and, with embedding enabled, embeds) the full history.
     // `--verify` (also an empty oracle) already announced itself above.
-    if !verify && oracle.is_empty() {
+    // The all-absent conjunct now only bites in-serve: a CLI whole-config sync
+    // short-circuits before this stage, so `serve --with-sync` is the one
+    // caller left that can reach here with every source absent.
+    if !invocation.verify
+        && oracle.is_empty()
+        && !adapters
+            .iter()
+            .all(|resolved| missing_source_root(&resolved.config).is_some())
+    {
         let notice = if pond::embed::embeddings_enabled() {
             "plan: first sync from this host - every source is read and embedded in full, which can take a while on a large history. Ctrl-C is safe: the next sync resumes where this one stopped."
         } else {
@@ -4849,12 +5229,98 @@ async fn run_import_stage(
     } else {
         indicatif::ProgressDrawTarget::stderr_with_hz(8)
     });
-    let mut total = IngestSummary::default();
     for resolved in adapters {
+        // Pre-flight, rather than classifying the adapter's first stream error:
+        // the event stream cannot tell "the whole source is gone" from "one
+        // unreadable file" without an adapter-API change, and the run must not
+        // sign off an unread source as `up to date`.
+        if let Some(missing) = missing_source_root(&resolved.config) {
+            let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
+            // Unreachable unless the root vanished after the pre-scan above -
+            // an explicitly named source stays a hard error even then.
+            bail_when_explicit_entry_source_missing(&resolved, explicit)?;
+            // Record before emitting: the entry must reach the JSON summary
+            // even when the stderr write fails.
+            report
+                .failed_adapters
+                .push(FailedAdapter::new(resolved.name, label, missing));
+            if let Some(entry) = report.failed_adapters.last() {
+                emit_source_missing(sink, entry, Some(&mp))?;
+            }
+            continue;
+        }
+        // The source may still vanish after this re-check. The adapter then
+        // truthfully reports the resulting read loss as degradation.
+        let name = resolved.name.clone();
+        let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
+        let path = source_path(&resolved.config);
         let summary = sync_with_progress(store, &mp, resolved, oracle, flush_hud, quiet).await?;
-        total.merge(&summary);
+        // Merge before emitting: these rows are already committed, so a failed
+        // stderr write must not drop them from the run's counts.
+        report.ingest.merge(&summary);
+        let entry = DegradedAdapter {
+            name,
+            label,
+            path,
+            skipped_files: summary.skipped_files as u64,
+            first_skip_reason: summary.first_skip_reason.clone(),
+            unreadable_events: summary.unreadable_events as u64,
+            first_unreadable_reason: summary.first_unreadable_reason.clone(),
+            dropped_sessions: summary.dropped_sessions as u64,
+        };
+        // One authority for "this adapter lost something actionable": the line
+        // an operator would read. A routine dedupe pass yields none, which is
+        // what keeps it out of the warning and out of the JSON array alike.
+        if let Some(line) = entry.summary_line() {
+            report.degraded_adapters.push(entry);
+            if let Some(pushed) = report.degraded_adapters.last() {
+                emit_degraded(sink, pushed, &line, Some(&mp))?;
+            }
+        }
     }
-    Ok(total)
+    Ok(())
+}
+
+/// Name what an adapter lost - unread files, undecodable events, rejected
+/// sessions - the moment its pass ends. Same routing as [`emit_source_missing`].
+fn emit_degraded(
+    sink: SyncSink,
+    entry: &DegradedAdapter,
+    line: &str,
+    mp: Option<&indicatif::MultiProgress>,
+) -> anyhow::Result<()> {
+    if sink.is_serve() {
+        tracing::warn!(target: "pond::sync", adapter = %entry.name, skipped_files = entry.skipped_files, unreadable_events = entry.unreadable_events, dropped_sessions = entry.dropped_sessions, "{line}");
+        return Ok(());
+    }
+    paint_err_above(mp, &pond::output::paint(line, pond::output::yellow()))
+}
+
+/// Name an adapter skipped for an absent source root, the moment it is skipped.
+/// Never `mp.println`: those lines are dropped off-TTY, which is exactly where
+/// a fleet reads its sync - the cron log.
+fn emit_source_missing(
+    sink: SyncSink,
+    failed: &FailedAdapter,
+    mp: Option<&indicatif::MultiProgress>,
+) -> anyhow::Result<()> {
+    if sink.is_serve() {
+        tracing::warn!(target: "pond::sync", adapter = %failed.name, path = %failed.path, "{}", failed.summary_line());
+        return Ok(());
+    }
+    paint_err_above(
+        mp,
+        &pond::output::paint(&failed.summary_line(), pond::output::red()),
+    )
+}
+
+/// A raw stderr write under a live `MultiProgress` gets overdrawn by the next
+/// redraw on a TTY; suspending pauses the draw for the write (a no-op off-TTY).
+fn paint_err_above(mp: Option<&indicatif::MultiProgress>, line: &str) -> anyhow::Result<()> {
+    match mp {
+        Some(mp) => mp.suspend(|| output_err(line)),
+        None => output_err(line),
+    }
 }
 
 /// `name (path)` for an entry fanned out of a multi-path `[adapters.<name>]`
@@ -4879,6 +5345,89 @@ fn source_path(config: &Value) -> Option<String> {
 
 fn contract_display(path: &str) -> String {
     config::contract_home(Path::new(path)).display().to_string()
+}
+
+/// A config blob's source dir as this host would open it: home-expanded by the
+/// same `adapter::expand_home` the adapters call, so the pre-flight check below
+/// and the adapter cannot disagree on what `~/...` means. `None` for a blob
+/// with no `path` - that shape is the adapter's to refuse (`factory.open`), and
+/// it stays a whole-run config error.
+fn source_root(config: &Value) -> Option<PathBuf> {
+    let path = config.get("path").and_then(Value::as_str)?;
+    Some(adapter::expand_home(PathBuf::from(path)))
+}
+
+/// The home-contracted source dir of an adapter whose configured root does not
+/// exist on this host, `None` when it does (or when the question cannot be
+/// answered) - a shared fleet config legitimately enables adapters a host
+/// lacks, so the caller names the adapter and carries on (spec 7.8). Only a
+/// definite "not there" counts: an unreadable root (`try_exists` error) keeps
+/// the per-file-skip behavior.
+fn missing_source_root(config: &Value) -> Option<String> {
+    let root = source_root(config)?;
+    match root.try_exists() {
+        Ok(false) => Some(config::contract_home(&root).display().to_string()),
+        Ok(true) | Err(_) => None,
+    }
+}
+
+/// Pinned wording for an absent source root, as the JSON surfaces carry it.
+fn source_missing_message(path: &str) -> String {
+    format!("source missing: {path}")
+}
+
+/// [`source_missing_message`] with the human tail every text surface adds - the
+/// verdict is a failure, but the run went on without this adapter.
+fn source_missing_detail(path: &str) -> String {
+    format!("{} - skipped this run", source_missing_message(path))
+}
+
+/// The explicit-narrowing pre-scan: `pond sync <adapter>` names its sources
+/// deliberately, so ANY absent root among the resolved passes fails the run -
+/// `run_sync` checks before the lock and store setup, the stages re-check as a
+/// TOCTOU guard. Scanned across all passes because a multi-path entry fans out
+/// in arbitrary order and the first pass must not ingest when the second's
+/// root is absent; a no-op for whole-config runs, whose absent roots are
+/// per-adapter verdicts.
+fn bail_when_explicit_source_missing(
+    adapters: &[pond::config::ResolvedAdapter],
+    explicit: bool,
+) -> anyhow::Result<()> {
+    if !explicit {
+        return Ok(());
+    }
+    for resolved in adapters {
+        bail_when_explicit_entry_source_missing(resolved, true)?;
+    }
+    Ok(())
+}
+
+fn bail_when_explicit_entry_source_missing(
+    resolved: &pond::config::ResolvedAdapter,
+    explicit: bool,
+) -> anyhow::Result<()> {
+    if explicit && let Some(missing) = missing_source_root(&resolved.config) {
+        let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
+        return Err(explicit_source_missing_error(
+            &resolved.name,
+            &label,
+            &missing,
+        ));
+    }
+    Ok(())
+}
+
+/// The whole-run error kept for an explicitly narrowed sync (`pond sync
+/// <adapter>` / `--path`): the operator named this source, so its absence is a
+/// wrong invocation rather than fleet state, and the `--path`-typo protection
+/// depends on it staying fatal.
+fn explicit_source_missing_error(name: &str, label: &str, path: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{label}: {} - this host has no such directory. Check the path \
+         (`[adapters.{name}]` in config.toml, or `--path`), or run `pond sync` \
+         without naming an adapter to sync the sources this host does have.",
+        source_missing_message(path),
+    )
 }
 
 /// Cheap (LIMIT-1) model-swap guard for the sync path, which embeds inline and
@@ -5297,6 +5846,9 @@ fn resolve_sync_adapters(
         }
         // `--path` is a filesystem-shaped override. Adapters that need
         // a richer config blob can't use this path; they must edit config.toml.
+        let path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("--path must be valid UTF-8"))?;
         return Ok(vec![pond::config::ResolvedAdapter {
             name: name.to_owned(),
             config: json!({ "path": path }),
@@ -5461,6 +6013,11 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Unimportable { reason } => {
+                    status_label = "unimportable";
+                    dropped_count = 0;
+                    optional_reason = Some(reason.clone());
+                }
             }
             messages += outcome.messages as u64;
             // Only surface the non-`ok`/`fresh` cases as scroll-back lines;
@@ -5469,7 +6026,11 @@ async fn sync_with_progress(
             // full per-session detail at `-v` verbosity.
             if !matches!(
                 outcome.status,
-                SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty | SyncStatus::Superseded
+                SyncStatus::Ok
+                    | SyncStatus::Fresh
+                    | SyncStatus::Empty
+                    | SyncStatus::Superseded
+                    | SyncStatus::Unimportable { .. }
             ) {
                 let _ = mp.println(format_sync_line(
                     label,
@@ -5500,7 +6061,10 @@ async fn sync_with_progress(
                     "session done"
                 ),
             }
-            if !matches!(outcome.status, SyncStatus::Empty | SyncStatus::Superseded) {
+            if !matches!(
+                outcome.status,
+                SyncStatus::Empty | SyncStatus::Superseded | SyncStatus::Unimportable { .. }
+            ) {
                 // Empty already shrunk `len`; ticking `pos` would over-count.
                 // Superseded was never in `len` (excluded from discover's
                 // total), so ticking `pos` would over-count it too.
@@ -5525,7 +6089,7 @@ async fn sync_with_progress(
                 }
                 // Superseded copies are excluded from discover()'s total, so
                 // they were never in `len`: neither shrink it nor tick `pos`.
-                SyncStatus::Superseded => {}
+                SyncStatus::Superseded | SyncStatus::Unimportable { .. } => {}
                 _ => bar_ref.inc(count as u64),
             }
             let tail = format_bar_message(messages, drops, errors, started.elapsed());
@@ -5628,6 +6192,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
         SyncStatus::Fresh => ("fresh", green()),
         SyncStatus::Empty => ("empty", dim()),
         SyncStatus::Superseded => ("superseded", dim()),
+        SyncStatus::Unimportable { .. } => ("unimportable", dim()),
     };
     let tag = paint(raw_tag, tag_style);
     if matches!(outcome.status, SyncStatus::Fresh) {
@@ -5910,13 +6475,37 @@ fn index_status_label(status: &IndexStatus, fold_threshold: u64) -> &'static str
     }
 }
 
-/// `pond status --format json` for a configured-but-never-synced store: just
-/// the storage destination, no corpus/indexes/embedding (spec parity with the
-/// text path's "no data yet" line).
-fn status_json_empty(
-    resolved: &ResolvedStorage,
-    adapters_error: Option<&str>,
-) -> anyhow::Result<String> {
+/// The per-adapter rows, shared by the initialized and never-synced documents
+/// so a host whose every source is missing reports them the same either way.
+fn local_adapters_json(local: &LocalStatus) -> Vec<serde_json::Value> {
+    local
+        .adapters
+        .iter()
+        .map(|adapter| {
+            serde_json::json!({
+                "name": adapter.name,
+                "path": adapter.path,
+                "sessions": adapter.sessions,
+                "fresh": adapter.plan.map(|plan| plan.fresh),
+                "pending": adapter.plan.map(|plan| plan.pending),
+                // Same shape as `sync --dry-run --format json`: a null count
+                // says nothing about why, and the two surfaces should not
+                // explain the same failure differently.
+                "error": adapter.error,
+                "reason": adapter.reason,
+            })
+        })
+        .collect()
+}
+
+/// `pond status --format json` for a configured-but-never-synced store: no
+/// corpus/indexes/embedding, but the local rows and the last-sync record still
+/// ride along. A whole-config sync whose every source is absent now creates no
+/// store, so this is the document that host gets - and dropping the adapter
+/// rows here would hide exactly the failure it needs to report. Note the host
+/// is not permanently storeless: `open_store` creates the destination, so the
+/// first `pond status` after such a sync materializes it.
+fn status_json_empty(resolved: &ResolvedStorage, local: &LocalStatus) -> anyhow::Result<String> {
     let doc = serde_json::json!({
         "pond_version": VERSION.as_str(),
         "embeddings_enabled": pond::embed::embeddings_enabled(),
@@ -5924,13 +6513,29 @@ fn status_json_empty(
             "url": resolved.display(),
             "binding": resolved.binding.describe(),
         },
-        // Explicit nulls so a consumer keying on `.local`/`.hosts` sees the
-        // fields exist and `initialized: false` explains their absence. The
-        // adapters error rides at top level for the same reason: `local` is
-        // null here, so it has nowhere else to go.
-        "local": serde_json::Value::Null,
+        "local": {
+            "host": local.hostname,
+            "adapters": local_adapters_json(local),
+            "adapters_error": local.adapters_error,
+            "pending_known": local.pending_known,
+            "last_sync": local
+                .last_sync
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .context("serialize last-sync record")?,
+            "next_scheduled_run_secs": local.next_run_secs,
+        },
+        // Explicit null so a consumer keying on `.hosts` sees the field exists
+        // and `initialized: false` explains its absence.
         "hosts": serde_json::Value::Null,
-        "adapters_error": adapters_error,
+        "adapters_error": local.adapters_error,
+        "schedule": {
+            "active": local.schedule.active,
+            "backend": local.schedule.backend,
+            "every": local.schedule.every.map(|every| every.label()),
+            "problem": local.schedule.problem,
+        },
         "initialized": false,
     });
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
@@ -5969,23 +6574,7 @@ fn status_json(
             "backlog": e.backlog,
         })
     });
-    let local_adapters: Vec<serde_json::Value> = local
-        .adapters
-        .iter()
-        .map(|adapter| {
-            serde_json::json!({
-                "name": adapter.name,
-                "path": adapter.path,
-                "sessions": adapter.sessions,
-                "fresh": adapter.plan.map(|plan| plan.fresh),
-                "pending": adapter.plan.map(|plan| plan.pending),
-                // Same shape as `sync --dry-run --format json`: a null count
-                // says nothing about why, and the two surfaces should not
-                // explain the same failure differently.
-                "error": adapter.error,
-            })
-        })
-        .collect();
+    let local_adapters = local_adapters_json(local);
     let hosts_doc = hosts.map(|hosts| {
         hosts
             .iter()
@@ -6064,17 +6653,21 @@ fn render_empty_status(
     resolved: &ResolvedStorage,
     has_adapters: bool,
     adapters_error: Option<&str>,
+    all_sources_missing: bool,
 ) -> anyhow::Result<()> {
     use pond::output::{dim, paint};
     render_status_storage_line(title, resolved)?;
     // With no adapters enabled, `pond sync` dead-ends ("no adapters
     // configured") - point the first-run user at the command that works.
     // A malformed [adapters] section is neither case: naming the config error
-    // beats "run `pond sync`", which would just fail the same way.
-    let fix = match (adapters_error, has_adapters) {
-        (Some(error), _) => return render_empty_adapters_error(error),
-        (None, true) => "run `pond sync` to import sessions",
-        (None, false) => "run `pond init` to set up adapters and import sessions",
+    // beats "run `pond sync`", which would just fail the same way. Nor is a
+    // host whose every source is absent: `pond sync` there exits 0 and imports
+    // nothing, so telling the operator to run it sends them in a circle.
+    let fix = match (adapters_error, has_adapters, all_sources_missing) {
+        (Some(error), _, _) => return render_empty_adapters_error(error),
+        (None, true, true) => "no enabled source exists on this host, see below",
+        (None, true, false) => "run `pond sync` to import sessions",
+        (None, false, _) => "run `pond init` to set up adapters and import sessions",
     };
     output(&format!(
         "{}    no data yet - {fix}",
@@ -6233,6 +6826,10 @@ struct LocalAdapterStatus {
     /// config path when the path is fine and the software is stale is worse
     /// than saying nothing.
     error: Option<String>,
+    /// The same stable kind `sync --dry-run --format json` reports, so one
+    /// condition never reads as two different failures. `None` whenever the
+    /// cause is not one we can name.
+    reason: Option<&'static str>,
 }
 
 struct LocalStatus {
@@ -6289,12 +6886,24 @@ async fn local_status(
         Err(error) => (Vec::new(), Some(format!("{error:#}"))),
     };
     for entry in resolved {
-        let Some(factory) = adapter::by_name(&entry.name) else {
-            continue;
-        };
         let name = entry.name;
         let path = source_path(&entry.config);
         let fanned = entry.fanout_path.is_some();
+        if let Some(missing) = missing_source_root(&entry.config) {
+            adapters.push(LocalAdapterStatus {
+                name,
+                path,
+                fanned,
+                sessions: None,
+                plan: None,
+                error: Some(source_missing_message(&missing)),
+                reason: Some(FAILURE_REASON_SOURCE_MISSING),
+            });
+            continue;
+        }
+        let Some(factory) = adapter::by_name(&name) else {
+            continue;
+        };
         let Ok(opened) = factory.open(entry.config) else {
             adapters.push(LocalAdapterStatus {
                 name,
@@ -6306,6 +6915,9 @@ async fn local_status(
                 // "check [adapters.<name>] in config" line was written for -
                 // so leave it to that arm rather than inventing a message.
                 error: None,
+                // Not `reason`: a blob that will not open is a config fault,
+                // and naming the wrong kind costs more than naming none.
+                reason: None,
             });
             continue;
         };
@@ -6332,6 +6944,7 @@ async fn local_status(
             sessions,
             plan,
             error,
+            reason: None,
         });
     }
     let last_sync = syncstate::read_last_sync(store_key);
@@ -6352,7 +6965,9 @@ async fn local_status(
     }
 }
 
-fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
+/// `show_adapters_error` is false on the never-synced path, where the "no data
+/// yet" line above has already named the same config error.
+fn render_local_status(local: &LocalStatus, show_adapters_error: bool) -> anyhow::Result<()> {
     use pond::output::{dim, green, paint, red};
 
     output("")?;
@@ -6420,14 +7035,22 @@ fn render_local_status(local: &LocalStatus) -> anyhow::Result<()> {
             name_width = name_width,
         ))?;
     }
-    if let Some(error) = &local.adapters_error {
+    if let Some(error) = &local.adapters_error
+        && show_adapters_error
+    {
         output(&format!(
             "{}     {}",
             paint("local", dim()),
             paint(&format!("adapters config error - {error}"), red()),
         ))?;
     }
-    if !local.adapters.is_empty() && !local.pending_known {
+    // Not when every source is missing: that host's first `pond sync` has
+    // nothing to read, so the counts this promises will never appear.
+    let any_readable_source = local
+        .adapters
+        .iter()
+        .any(|adapter| adapter.reason != Some(FAILURE_REASON_SOURCE_MISSING));
+    if !local.adapters.is_empty() && !local.pending_known && any_readable_source {
         output_err(&paint(
             "(pending-sync counts appear after the first `pond sync` on this host)",
             dim(),
@@ -6871,8 +7494,17 @@ mod tests {
             .unwrap()
             .resolve(&std::collections::BTreeMap::new())
             .unwrap();
+        let local = LocalStatus {
+            hostname: None,
+            adapters: Vec::new(),
+            adapters_error: None,
+            pending_known: false,
+            last_sync: None,
+            schedule: crate::schedule::ScheduleSnapshot::default(),
+            next_run_secs: None,
+        };
         let doc: serde_json::Value =
-            serde_json::from_str(&status_json_empty(&resolved, None).unwrap()).unwrap();
+            serde_json::from_str(&status_json_empty(&resolved, &local).unwrap()).unwrap();
         assert_eq!(doc["embeddings_enabled"], serde_json::json!(false));
     }
 
@@ -7413,6 +8045,167 @@ mod tests {
             err.to_string().contains("pond adapters enable claude-code"),
             "disabled error should name the enable verb: {err}"
         );
+    }
+
+    /// The sync pre-flight: only a root that is definitely not there becomes a
+    /// per-adapter failure. A present root and a blob with no `path` at all
+    /// (the adapter's own config error, still fatal) must both pass through.
+    #[test]
+    fn missing_source_root_names_only_a_definitely_absent_dir() {
+        let present = tempfile::TempDir::new().expect("temp dir");
+        assert_eq!(
+            missing_source_root(&json!({ "path": present.path() })),
+            None,
+            "an existing source root is not a failure",
+        );
+
+        let absent = present.path().join("no-such-source");
+        let missing = missing_source_root(&json!({ "path": absent }))
+            .expect("an absent source root is a failure");
+        assert!(
+            missing.ends_with("no-such-source"),
+            "the verdict must name the configured path: {missing}",
+        );
+
+        assert_eq!(
+            missing_source_root(&json!({})),
+            None,
+            "a pathless blob is `factory.open`'s to refuse, not a skip",
+        );
+    }
+
+    /// `~/...` has to resolve exactly as the adapters resolve it
+    /// (`adapter::expand_home`); if the pre-flight and the adapter disagree
+    /// about what the configured source is, the pre-flight skips a readable
+    /// source (or passes an absent one through).
+    #[test]
+    fn source_root_expands_a_leading_tilde_like_the_adapters_do() {
+        let home = config::home_dir().expect("test host has a home dir");
+        assert_eq!(
+            source_root(&json!({ "path": "~/pond-source" })),
+            Some(home.join("pond-source")),
+        );
+        // The home dir exists, so an expanded `~` is never reported missing -
+        // an unexpanded one would be, resolved against the cwd.
+        assert_eq!(missing_source_root(&json!({ "path": "~" })), None);
+    }
+
+    /// The two absent-root wordings are one string in two shapes, and both the
+    /// text rows and the JSON `failed_adapters` entries read from them.
+    #[test]
+    fn source_missing_wording_is_shared_by_every_surface() {
+        assert_eq!(
+            source_missing_message("~/.codex/sessions"),
+            "source missing: ~/.codex/sessions",
+        );
+        assert_eq!(
+            source_missing_detail("~/.codex/sessions"),
+            "source missing: ~/.codex/sessions - skipped this run",
+        );
+
+        let failed = FailedAdapter::new(
+            "codex-cli".to_owned(),
+            "codex-cli".to_owned(),
+            "~/.codex/sessions".to_owned(),
+        );
+        assert_eq!(
+            failed.summary_line(),
+            "import: codex-cli source missing: ~/.codex/sessions - skipped this run",
+        );
+        assert_eq!(
+            serde_json::to_value(&failed).expect("serializes"),
+            json!({
+                "name": "codex-cli",
+                "path": "~/.codex/sessions",
+                "error": "source missing: ~/.codex/sessions",
+                "reason": "source_missing",
+            }),
+            "the JSON entry carries name/path/error/reason and never the display label",
+        );
+
+        // Explicit narrowing keeps the hard error: it names the adapter, the
+        // path, and that this host has no such directory.
+        let err = explicit_source_missing_error("codex-cli", "codex-cli", "~/.codex/sessions");
+        let err = err.to_string();
+        assert!(err.contains("codex-cli"), "{err}");
+        assert!(err.contains("~/.codex/sessions"), "{err}");
+        assert!(err.contains("this host has no such directory"), "{err}");
+    }
+
+    /// An all-healthy summary omits `failed_adapters` entirely (spec.md 7.8),
+    /// leaving that field additive and optional for strict consumers.
+    #[test]
+    fn an_all_healthy_summary_omits_failed_adapters() {
+        let mut summary = json!({ "outcome": "ok" });
+        add_when_non_empty::<FailedAdapter>(&mut summary, "failed_adapters", &[]).expect("attach");
+        assert_eq!(summary, json!({ "outcome": "ok" }));
+
+        let report = SyncReport {
+            failed_adapters: vec![FailedAdapter::new(
+                "codex-cli".to_owned(),
+                "codex-cli".to_owned(),
+                "~/.codex/sessions".to_owned(),
+            )],
+            ..SyncReport::default()
+        };
+        add_when_non_empty(&mut summary, "failed_adapters", &report.failed_adapters)
+            .expect("attach");
+        assert_eq!(
+            summary["failed_adapters"].as_array().map(Vec::len),
+            Some(1),
+            "a real failure must still attach: {summary}",
+        );
+    }
+
+    /// Same posture for `degraded_adapters`: omitted on a clean run - never
+    /// `[]` - and attached without the display-only `label`.
+    #[test]
+    fn an_all_healthy_summary_omits_degraded_adapters() {
+        let mut summary = json!({ "outcome": "ok" });
+        add_when_non_empty::<DegradedAdapter>(&mut summary, "degraded_adapters", &[])
+            .expect("attach");
+        assert_eq!(summary, json!({ "outcome": "ok" }));
+
+        let report = SyncReport {
+            degraded_adapters: vec![DegradedAdapter {
+                name: "codex-cli".to_owned(),
+                label: "codex-cli (~/.codex/sessions)".to_owned(),
+                path: Some("~/.codex/sessions".to_owned()),
+                skipped_files: 3,
+                first_skip_reason: Some("permission denied".to_owned()),
+                unreadable_events: 2,
+                first_unreadable_reason: Some("bad line".to_owned()),
+                dropped_sessions: 1,
+            }],
+            ..SyncReport::default()
+        };
+        add_when_non_empty(&mut summary, "degraded_adapters", &report.degraded_adapters)
+            .expect("attach");
+        assert_eq!(
+            summary["degraded_adapters"],
+            json!([{
+                "name": "codex-cli",
+                "path": "~/.codex/sessions",
+                "skipped_files": 3,
+                "first_skip_reason": "permission denied",
+                "unreadable_events": 2,
+                "first_unreadable_reason": "bad line",
+                "dropped_sessions": 1,
+            }]),
+            "attach the machine fields, not the label: {summary}",
+        );
+    }
+
+    #[test]
+    fn skipped_unimportable_is_a_benign_optional_json_count() {
+        let mut clean = json!({ "outcome": "ok" });
+        add_skipped_unimportable(&mut clean, &SyncReport::default());
+        assert!(clean.get("skipped_unimportable").is_none());
+
+        let mut report = SyncReport::default();
+        report.ingest.skipped_unimportable = 3;
+        add_skipped_unimportable(&mut clean, &report);
+        assert_eq!(clean["skipped_unimportable"].as_u64(), Some(3));
     }
 
     // Long-help snapshots for the root and every visible subcommand. The

@@ -359,6 +359,9 @@ pub enum SkipReason {
     /// another session under a borrowed id. The payload is the user-facing
     /// reason naming the file and the fix.
     Unsupported(String),
+    /// Source metadata names a contractually unavailable transcript, counted
+    /// and visible at debug verbosity without a health warning.
+    Unimportable(String),
     /// Session present in more than one source form; this copy is superseded by
     /// an authoritative copy the same run ingests (e.g. opencode's legacy tree
     /// copy of a DB-resident session). Content identity is not verified -
@@ -609,12 +612,12 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
     Ok(expand_home(cfg.path))
 }
 
-/// Expand a leading `~` against the user's home directory, or return the path
-/// untouched when the env has no home (CI, post-install hooks, sandboxes).
-/// Shared because an adapter whose config carries more than one path cannot use
-/// [`config_path`]. Home resolution is portable ([`crate::config::home_dir`]:
-/// `USERPROFILE` on Windows, `HOME` on Unix).
-pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
+/// Expand a leading `~` against the user's home directory (portably, via
+/// [`crate::config::home_dir`]), or return the path untouched when the env has
+/// no home (CI, post-install hooks, sandboxes). Shared because multi-path
+/// adapter configs cannot use [`config_path`], and the CLI pre-flight must
+/// resolve paths exactly as adapters do.
+pub fn expand_home(path: PathBuf) -> PathBuf {
     match crate::config::home_dir() {
         Some(home) => crate::config::expand_home_under(&path, &home),
         None => path,

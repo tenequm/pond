@@ -47,8 +47,8 @@
 //! -> `options.nanoclaw`; opencode's own session/message ids stay canonical. Codex
 //! keeps its history server-side with no on-disk transcript, so sessions whose
 //! resolved provider (`v2.db sessions.agent_provider`, else the group's
-//! `container_configs.provider`, else `claude`) is `codex` surface as a visible
-//! `Unsupported` skip, enumerated from `v2.db` metadata.
+//! `container_configs.provider`, else `claude`) is `codex` surface as a counted
+//! `Unimportable` skip, enumerated from `v2.db` metadata.
 //!
 //! Documented non-ingest (per-adapter contract): the pre-compaction Markdown
 //! summaries under `groups/<folder>/conversations/*.md`; the `messages_in` /
@@ -189,7 +189,7 @@ impl Adapter for NanoclawAdapter {
                 yield Ok(AdapterYield::Skipped {
                     session_id: Some(skip.session_id),
                     project: Some(skip.agent_group_id),
-                    reason: SkipReason::Unsupported(CODEX_SKIP_REASON.to_owned()),
+                    reason: SkipReason::Unimportable(CODEX_SKIP_REASON.to_owned()),
                 });
             }
 

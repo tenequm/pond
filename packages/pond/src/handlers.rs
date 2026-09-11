@@ -142,6 +142,10 @@ mod ingest_handler {
         /// source's documented migration contract). Counted in
         /// `skipped_superseded`, never folded into `Empty`.
         Superseded,
+        /// Transcript is unavailable by the adapter's documented contract.
+        Unimportable {
+            reason: String,
+        },
     }
 
     #[derive(Debug, Default)]
@@ -268,7 +272,15 @@ mod ingest_handler {
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += 1;
+                            if summary.first_skip_reason.is_none() {
+                                summary.first_skip_reason = Some(reason.clone());
+                            }
                             SyncStatus::Skipped { reason }
+                        }
+                        SkipReason::Unimportable(reason) => {
+                            summary.skipped_unimportable += 1;
+                            tracing::debug!(%reason, "skipping source excluded by adapter contract");
+                            SyncStatus::Unimportable { reason }
                         }
                     };
                     on_event(SyncEvent::SessionDone(SessionOutcome {
@@ -294,7 +306,15 @@ mod ingest_handler {
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += count;
+                            if summary.first_skip_reason.is_none() {
+                                summary.first_skip_reason = Some(reason.clone());
+                            }
                             SyncStatus::Skipped { reason }
+                        }
+                        SkipReason::Unimportable(reason) => {
+                            summary.skipped_unimportable += count;
+                            tracing::debug!(%reason, count, "skipping sources excluded by adapter contract");
+                            SyncStatus::Unimportable { reason }
                         }
                     };
                     on_event(SyncEvent::SkippedBulk { status, count });
@@ -344,8 +364,8 @@ mod ingest_handler {
                     // / dup-id violations) attribute to the in-flight
                     // session's drop count. Session-level errors (e.g. empty
                     // source_agent) come back here too; we don't currently
-                    // distinguish them - they're rare and end up in
-                    // `summary.dropped_events`.
+                    // distinguish them - they're rare and `add_outcomes`
+                    // routes them to `summary.dropped_sessions`.
                     for outcome in &push_outcomes {
                         if matches!(outcome.status, OutcomeStatus::Error)
                             && outcome.kind != "session"
@@ -401,6 +421,10 @@ mod ingest_handler {
                                 slot.first_drop_reason = Some(error.to_string());
                             }
                             summary.dropped_events += 1;
+                            summary.unreadable_events += 1;
+                            if summary.first_unreadable_reason.is_none() {
+                                summary.first_unreadable_reason = Some(error.to_string());
+                            }
                         }
                         None => {
                             // Pre-Session decode failure: no in-flight
@@ -408,6 +432,9 @@ mod ingest_handler {
                             // skip - surface it as a SessionDone with
                             // session_id=None and status=Skipped.
                             summary.skipped_files += 1;
+                            if summary.first_skip_reason.is_none() {
+                                summary.first_skip_reason = Some(error.to_string());
+                            }
                             on_event(SyncEvent::SessionDone(SessionOutcome {
                                 project: None,
                                 session_id: None,
