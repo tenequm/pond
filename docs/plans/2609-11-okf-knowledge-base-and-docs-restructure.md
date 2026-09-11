@@ -1,7 +1,7 @@
 # OKF knowledge base, benches consolidation, moonification (2026-09-11)
 
 Status: plan locked in discussion 2026-09-11; branch `docs/use-okf-for-knowledge-base`
-in a treehouse worktree. Driver: Claude Code session; bulk transformation fanned out
+in a treehouse worktree (draft PR [#238](https://github.com/tenequm/pond/pull/238)). Driver: Claude Code session; bulk transformation fanned out
 to agy subagents (see Execution). This file is the locked scope; where a workstream
 below and the discussion transcript disagree, this file wins.
 
