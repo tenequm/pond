@@ -33,6 +33,6 @@ These findings would be invalidated if the archive corpus shifts from English do
 
 ## Source
 
-Full research reports: [docs/researches/tokenizer-experiment-report.md](../researches/tokenizer-experiment-report.md) and [docs/researches/tokenizer-experiment-plan.md](../researches/tokenizer-experiment-plan.md).
+Full research reports: [docs/researches/tokenizer-experiment-report.md](../../researches/tokenizer-experiment-report.md) and [docs/researches/tokenizer-experiment-plan.md](../../researches/tokenizer-experiment-plan.md).
 
 [^tokenizer-report]: `docs/researches/tokenizer-experiment-report.md`

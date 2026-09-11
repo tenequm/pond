@@ -33,7 +33,7 @@ These findings would be invalidated if agent query workloads shift from identifi
 
 ## Source
 
-Full research reports: [docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md](../researches/2608-21-semantic-vs-fts-usage-eval/README.md) and [docs/researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md](../researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md).
+Full research reports: [docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md](../../researches/2608-21-semantic-vs-fts-usage-eval/README.md) and [docs/researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md](../../researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md).
 
 [^semantic-fts-eval]: `docs/researches/2608-21-semantic-vs-fts-usage-eval/README.md`
 [^cost-side-eval]: `docs/researches/2608-21-semantic-vs-fts-usage-eval/cost-side.md`

@@ -30,6 +30,6 @@ These findings would be invalidated if get operations are updated to resolve mes
 
 ## Source
 
-Full research report: [docs/researches/2608-12-read-path-where-time-goes.md](../researches/2608-12-read-path-where-time-goes.md).
+Full research report: [docs/researches/2608-12-read-path-where-time-goes.md](../../researches/2608-12-read-path-where-time-goes.md).
 
 [^read-path-latency]: `docs/researches/2608-12-read-path-where-time-goes.md`

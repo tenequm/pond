@@ -30,6 +30,6 @@ These findings would be invalidated if OpenClaw replaces its per-agent SQLite st
 
 ## Source
 
-Full research report: [docs/researches/2607-17-openclaw-integration-research.md](../researches/2607-17-openclaw-integration-research.md).
+Full research report: [docs/researches/2607-17-openclaw-integration-research.md](../../researches/2607-17-openclaw-integration-research.md).
 
 [^openclaw-research]: `docs/researches/2607-17-openclaw-integration-research.md`

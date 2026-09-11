@@ -209,6 +209,21 @@ below and the discussion transcript disagree, this file wins.
 
 ## Out of scope / follow-ups
 
-- Plans backfill (Decision concepts from landed plans) - optional workstream.
-- Moving AGENTS.md narrative histories (e.g. the release-plz v0.12.0 story)
-  into concepts - optional polish, explicitly NOT part of this PR (decision 1).
+Both follow-ups below were pulled INTO this PR on operator instruction, which
+overrides decision 1 on the second one:
+
+- Plans backfill - done for the landed plans carrying a durable decision not
+  already recorded elsewhere: embeddings opt-in, the Windows msvc port, and the
+  CI compiler-cache architecture. The rest needed no concept, either because
+  their outcome is the code (most implementation plans), because an existing
+  concept already covers them (the tools redesign, OpenClaw), or because they
+  are still state rather than knowledge (designs not yet implemented, such as
+  scoped access and the pond_get three-mode redesign).
+- AGENTS.md narrative histories moved into concepts, which is what the bundle's
+  own instructions fence asks for: AGENTS.md keeps the one-line law, the
+  concept carries the measurement and the incident. Five object-store rules,
+  the bench-gate evidence standards and the release-plz v0.12.0 story moved.
+
+The bundle was also refiled from flat into subject-area directories
+(`storage/`, `search/`, `engineering/`, `integrations/`, `usage/`, beside the
+existing `adapters/`) in the same change, since it roughly doubled in size.

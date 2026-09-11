@@ -30,6 +30,6 @@ These findings would be invalidated if score distributions between Lance vector 
 
 ## Source
 
-Full research report: [docs/researches/embeddings.md](../researches/embeddings.md).
+Full research report: [docs/researches/embeddings.md](../../researches/embeddings.md).
 
 [^embeddings-tuning]: `docs/researches/embeddings.md`

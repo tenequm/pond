@@ -30,6 +30,6 @@ These findings would be invalidated if synthetic conversational QA benchmarks ar
 
 ## Source
 
-Full research report: [docs/researches/agent-session-retrieval-and-evaluation.md](../researches/agent-session-retrieval-and-evaluation.md).
+Full research report: [docs/researches/agent-session-retrieval-and-evaluation.md](../../researches/agent-session-retrieval-and-evaluation.md).
 
 [^session-eval-research]: `docs/researches/agent-session-retrieval-and-evaluation.md`
