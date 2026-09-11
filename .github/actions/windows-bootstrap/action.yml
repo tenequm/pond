@@ -76,7 +76,7 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $m = Select-String -Path "$env:GITHUB_WORKSPACE\.prototools" -Pattern '^moon = "(.+)"' | Select-Object -First 1
+        $m = Select-String -Path "$env:GITHUB_WORKSPACE\.prototools" -Pattern '^moon = "([^"]+)"' | Select-Object -First 1
         if (-not $m) { throw "no moon pin found in .prototools" }
         $v = $m.Matches[0].Groups[1].Value
         Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip

@@ -65,8 +65,10 @@ tasks:
     inputs: ['@group(sources)', '@group(tests)', '@group(benches)']
   # Cheap packaging gate: `cargo package --list` must contain every file the
   # code embeds via include_str!/include_bytes! (a full verify build is skipped
-  # at publish time - publish_no_verify in .github/release-plz.toml). The script
-  # cd's to this crate root itself, so it is cwd-independent.
+  # at publish time - publish_no_verify in .github/release-plz.toml). Correct
+  # only because moon runs a project task from its project root: the `grep -rn
+  # ... src` below finds nothing from anywhere else, so `bad` stays 0 and the
+  # gate passes vacuously rather than failing.
   #
   # Takes the full sources group, not just src/ + SKILL.md: `cargo package
   # --list` resolves the graph, so it reads the manifests and the lockfile too.
@@ -116,6 +118,7 @@ tasks:
       outputStyle: stream
 
   bench-gate:
+    type: 'run'
     script: |
       # Release bench gate: the pre-release validation of what pond actually
       # delivers, runnable as one command (`moon run pond:bench-gate`) against
@@ -123,7 +126,10 @@ tasks:
       # probes, checks map-vs-scan output equivalence (hard pass/fail), appends
       # one JSON line per run to packages/pond/benches/docs/bench-gate-baseline.jsonl,
       # and prints the delta vs the previous run. ~30 min of S3 wall-clock;
-      # never cached, always live.
+      # never cached, always live. The `type: 'run'` pin is load-bearing: moon
+      # otherwise infers `test`, and `moon check` selects build- and test-typed
+      # tasks, so a plain local sweep would spend that half hour writing to the
+      # operator's real object store.
       #
       # Gate targets (run here, every release):
       #   serve_mem_bench  - read-serving components + per-query S3 iops (io-trace)

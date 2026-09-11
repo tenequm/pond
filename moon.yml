@@ -25,8 +25,6 @@ fileGroups:
     # the old ones. kache's own keys already include the flags, so adding this
     # costs one moon run and no cold cache.
     - '.cargo/config.toml'
-  tests:
-    - 'packages/pond/tests/**/*'
 
 tasks:
   # Gate the top CHANGELOG.md section's `###` headers to the canonical emoji
@@ -41,6 +39,14 @@ tasks:
 
       file=CHANGELOG.md
 
+      # Judge what is about to be committed, not the working tree: AGENTS.md
+      # documents `release-plz update` as a local changelog preview, and that
+      # unstaged rewrite would otherwise arm the prose gate below on a commit
+      # touching nothing near the changelog. Falls back to the file on disk
+      # outside a git checkout, or when the path is not in the index.
+      content=$(git show :"$file" 2>/dev/null || true)
+      [ -n "$content" ] || content=$(cat "$file" 2>/dev/null || true)
+
       allowed=(
         "🛠 Breaking Changes"
         "🎉 New Features"
@@ -52,7 +58,7 @@ tasks:
         "🔧 Other"
       )
 
-      section=$(awk '/^## \[/{n++} n==1{print} n==2{exit}' "$file")
+      section=$(awk '/^## \[/{n++} n==1{print} n==2{exit}' <<< "$content")
       [ -n "$section" ] || { echo "check-changelog: no '## [version]' section in $file" >&2; exit 1; }
 
       bad=0
@@ -115,6 +121,12 @@ tasks:
         exit 1
       fi
     inputs: ['CHANGELOG.md']
+    options:
+      # The oracle is `git show origin/main:CHANGELOG.md` against the staged
+      # copy, and no input glob represents either, so a cached pass keyed on the
+      # worktree file would survive a base that moved underneath it. The input
+      # stays because that path is still what makes this task affected.
+      cache: false
 
   # Validate the Open Knowledge Format (OKF) bundle under docs/knowledge/:
   # every concept file has valid frontmatter with a non-empty scalar type, each
@@ -377,8 +389,10 @@ tasks:
       # The task type makes it selectable by moon check and moon ci, so without
       # this a local `moon check --all` runs `npm publish`. `only` keeps the
       # explicit `moon run repo:publish-npm` that the release workflow issues
-      # working, while removing it from every local sweep. `inputs: []` states
-      # that nothing file-based makes it affected.
+      # working while `moon check` stops selecting this one task - it does not
+      # make the sweep itself safe, so every other side-effecting task needs its
+      # own opt-out (`type: 'run'` on the dist and bench-gate tasks).
+      # `inputs: []` states that nothing file-based makes it affected.
       runInCI: 'only'
 
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
@@ -391,7 +405,15 @@ tasks:
   # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
   # persistent CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the
   # workspace target dir and dist/ lands at the root where publish-release reads it.
+  #
+  # Both dist tasks are pinned `type: 'run'`: only ci.yml names them, and the
+  # inferred `build` type would let a local `moon check --all` push to the S3
+  # rustc cache and rm -rf dist/ + completions/ at the repo root. The paired
+  # `runInCI: true` is then mandatory, not decoration - a run-typed task
+  # defaults to runInCI false, and moon 2.5.4 answers `moon run` on such a task
+  # with "No tasks found" once CI is set, i.e. exactly where these two run.
   build-dist:
+    type: 'run'
     script: |
       set -euo pipefail
       export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
@@ -487,9 +509,9 @@ tasks:
       # this copy never reaches a release.
       ( cd dist && sha256sum pond-* > checksums.txt )
       ls -lh dist/
-    # No @group(tests): tests and benches are not linked into the shipped
-    # binary, so a test-only change cannot alter dist/ and should not pay a
-    # three-target cross-compile.
+    # No test or bench inputs: they are not linked into the shipped binary, so
+    # a test-only change cannot alter dist/ and should not pay a three-target
+    # cross-compile.
     #
     # Caveat worth knowing before narrowing these further: the script bakes
     # `git rev-parse HEAD` into the binary via POND_BUILD_COMMIT, and no
@@ -508,6 +530,7 @@ tasks:
       - 'dist/checksums.txt'
     options:
       cache: true
+      runInCI: true
       outputStyle: stream
 
   # The shipped msvc zip, built natively on a Windows runner. A moon task rather
@@ -525,6 +548,7 @@ tasks:
   # and what keeps a hit from shipping a stale commit string is that a release
   # commit always bumps the version in packages/pond/Cargo.toml, which IS an input.
   build-dist-msvc:
+    type: 'run'
     script: |
       $ErrorActionPreference = 'Stop'
       $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
@@ -557,5 +581,6 @@ tasks:
       - 'dist/pond-x86_64-pc-windows-msvc.zip'
     options:
       cache: true
+      runInCI: true
       outputStyle: stream
       windowsShell: 'pwsh'
