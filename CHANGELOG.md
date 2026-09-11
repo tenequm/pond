@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.17.2](https://github.com/tenequm/pond/compare/v0.17.1...v0.17.2) - 2026-09-11
+
+### <!-- 1 -->🎉 New Features
+- **adapter:** agy (Antigravity CLI + ACP server) ([#225](https://github.com/tenequm/pond/pull/225)) ([5838108](https://github.com/tenequm/pond/commit/5838108cca80587ddad1f0b1baefc84c13f49261))
+  pond now ingests Antigravity CLI (`agy`) sessions, including those its ACP server writes. Both lanes under `~/.gemini` are picked up automatically; run `pond adapters enable agy` if you synced before this release. Restore into agy is not supported, so resume these sessions in another client.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **openclaw:** keep session facts in the stored entry, drop host config ([#235](https://github.com/tenequm/pond/pull/235)) ([2f14880](https://github.com/tenequm/pond/commit/2f1488096f1ba23e5be410e904fc8da2cde131f6))
+  pond no longer copies OpenClaw's `systemPromptReport` and
+  `skillsSnapshot` into each stored session. Both describe the host rather
+  than the session and carry no conversational content, and together they
+  were 87-94% of the stored entry. Model, token, cost, timestamp and
+  lineage fields are unchanged.
+- **openclaw:** ingest every rotated-out session, not just the newest ([#228](https://github.com/tenequm/pond/pull/228)) ([3845ffe](https://github.com/tenequm/pond/commit/3845ffe4fb7cc88393578233d77de0526a6947e5))
+  pond now ingests every OpenClaw session generation rather than the
+  newest per routing key, and reads the 2026.8.1+ SQLite session store it
+  previously skipped in silence. Past cron runs, hook runs, heartbeats and
+  pre-compaction transcripts were dropped. Re-sync to pick up that
+  history.
+- **sync:** stop a rebuilt store inheriting the old store's rowmap ([#232](https://github.com/tenequm/pond/pull/232)) ([df9bb1a](https://github.com/tenequm/pond/commit/df9bb1a76b2bd190fc1b2bd975899437a8ca1c18))
+  A store deleted and rebuilt at the same path no longer inherits the old store's freshness cache, which made `pond sync` report every source up to date and import nothing. If a sync ever silently stored nothing after you moved or restored a store, it will now re-import normally.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.17.1...v0.17.2
+
 ## [0.17.1](https://github.com/tenequm/pond/compare/v0.17.0...v0.17.1) - 2026-09-09
 
 ### <!-- 2 -->🐛 Bug Fixes
