@@ -3787,8 +3787,12 @@ pub struct IngestSummary {
     /// First `skipped_files` reason, verbatim. One string, never a list;
     /// the count carries the magnitude.
     pub first_skip_reason: Option<String>,
-    /// First `dropped_events` reason, verbatim. `drop_reasons` categorizes the
-    /// validator's drops, but a mid-session decode failure has no reason key.
+    /// Events lost because the source could not be read or decoded mid-session,
+    /// as opposed to the validator's categorized drops: this is the subset an
+    /// operator can actually act on, and the only one worth a warning.
+    pub unreadable_events: usize,
+    /// First `unreadable_events` reason, verbatim. The validator's drops carry
+    /// a `drop_reasons` key instead; a read failure has none.
     pub first_drop_reason: Option<String>,
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
@@ -3895,6 +3899,7 @@ impl IngestSummary {
         self.messages_matched_searchable += other.messages_matched_searchable;
         self.parts_matched += other.parts_matched;
         self.dropped_events += other.dropped_events;
+        self.unreadable_events += other.unreadable_events;
         if self.first_drop_reason.is_none() {
             self.first_drop_reason = other.first_drop_reason.clone();
         }

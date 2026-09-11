@@ -350,8 +350,8 @@ mod ingest_handler {
                     // / dup-id violations) attribute to the in-flight
                     // session's drop count. Session-level errors (e.g. empty
                     // source_agent) come back here too; we don't currently
-                    // distinguish them - they're rare and end up in
-                    // `summary.dropped_events`.
+                    // distinguish them - they're rare and `add_outcomes`
+                    // routes them to `summary.dropped_sessions`.
                     for outcome in &push_outcomes {
                         if matches!(outcome.status, OutcomeStatus::Error)
                             && outcome.kind != "session"
@@ -360,10 +360,6 @@ mod ingest_handler {
                             slot.dropped_events += 1;
                             if slot.first_drop_reason.is_none() {
                                 slot.first_drop_reason =
-                                    outcome.error.as_ref().map(|err| err.message.clone());
-                            }
-                            if summary.first_drop_reason.is_none() {
-                                summary.first_drop_reason =
                                     outcome.error.as_ref().map(|err| err.message.clone());
                             }
                         }
@@ -411,6 +407,7 @@ mod ingest_handler {
                                 slot.first_drop_reason = Some(error.to_string());
                             }
                             summary.dropped_events += 1;
+                            summary.unreadable_events += 1;
                             if summary.first_drop_reason.is_none() {
                                 summary.first_drop_reason = Some(error.to_string());
                             }

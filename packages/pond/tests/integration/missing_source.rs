@@ -627,7 +627,10 @@ fn dropped_events_are_attributed_to_their_adapter() {
         .and_then(|entries| entries.first())
         .unwrap_or_else(|| panic!("the loss must be attributed to the adapter: {doc}"));
     assert_eq!(entry["name"].as_str(), Some("claude-code"), "{entry}");
-    let lost = entry["dropped_events"].as_u64().unwrap_or(0)
+    // Either population is a correct answer - which one depends on whether a
+    // session was in flight when the read failed - but the loss must be counted
+    // as unreadable, never as a routine validator drop.
+    let lost = entry["unreadable_events"].as_u64().unwrap_or(0)
         + entry["skipped_files"].as_u64().unwrap_or(0);
     assert!(lost >= 1, "the count is the magnitude: {entry}");
     let reason = entry["first_drop_reason"]
@@ -642,6 +645,46 @@ fn dropped_events_are_attributed_to_their_adapter() {
         stderr(&out).contains("first error:"),
         "and it must survive off-TTY: {}",
         stderr(&out),
+    );
+}
+
+/// The validator's dedupe floor firing is expected behavior (spec
+/// `adapter-integrity-dedup`), so a sync that ingested everything it was asked
+/// to must not warn about it - the counts belong in the record, not in an
+/// alarm. `claude-desktop-app`'s own fixtures drop ~26 duplicate/mismatch
+/// events while inserting every session.
+#[test]
+fn a_routine_validator_drop_is_recorded_but_never_warns() {
+    let temp = TempDir::new().expect("temp");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/adapter/claude_desktop_app");
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-desktop-app]\nenabled = true\npath = {:?}\n",
+            src.display().to_string(),
+        ),
+    );
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "a sync of the desktop-app fixtures");
+    let doc = json(&args, &out);
+    assert!(
+        doc["drop_reasons"].is_object(),
+        "the drops still belong in the record: {doc}",
+    );
+    assert!(
+        doc.get("degraded_adapters").is_none(),
+        "a dedupe floor is not a degraded adapter: {doc}",
+    );
+    let noise: Vec<_> = stderr(&out)
+        .lines()
+        .filter(|line| line.starts_with("import: "))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        noise.is_empty(),
+        "a successful sync must not warn about expected drops: {noise:?}",
     );
 }
 
