@@ -669,9 +669,18 @@ fn a_routine_validator_drop_is_recorded_but_never_warns() {
     let out = run(&temp, &args);
     assert_exit_ok(&out, "a sync of the desktop-app fixtures");
     let doc = json(&args, &out);
+    // The silence is only correct while every session still lands: a run that
+    // dropped all four would be a real loss this test must not vouch for.
+    assert_eq!(
+        doc["sessions_inserted"].as_u64(),
+        Some(4),
+        "every fixture session must survive the dedupe floor: {doc}",
+    );
     assert!(
-        doc["drop_reasons"].is_object(),
-        "the drops still belong in the record: {doc}",
+        doc["drop_reasons"][pond::sessions::DROP_REASON_DUPLICATE_MESSAGE_ID]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the dedupe floor must be what fired, and it belongs in the record: {doc}",
     );
     assert!(
         doc.get("degraded_adapters").is_none(),
