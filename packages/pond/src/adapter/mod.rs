@@ -609,11 +609,9 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
     Ok(expand_home(cfg.path))
 }
 
-/// Expand a leading `~` against the user's home directory, or return the path
-/// untouched when the env has no home (CI, post-install hooks, sandboxes).
-/// Shared because an adapter whose config carries more than one path cannot use
-/// [`config_path`]. Home resolution is portable ([`crate::config::home_dir`]:
-/// `USERPROFILE` on Windows, `HOME` on Unix). `pub` because the CLI's sync
+/// Expand a leading `~` against the user's home directory (portably, via
+/// [`crate::config::home_dir`]), or return the path untouched when the env has
+/// no home (CI, post-install hooks, sandboxes). `pub` because the CLI's sync
 /// pre-flight resolves a configured source path through this exact function,
 /// so the existence check and the adapter can never disagree about a path.
 pub fn expand_home(path: PathBuf) -> PathBuf {

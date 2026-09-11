@@ -3911,25 +3911,27 @@ struct DegradedAdapter {
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    errors: u64,
+    /// Named after `IngestSummary::skipped_files`, not the bar's `N err` tail,
+    /// which also counts validator-rejected sessions.
+    skipped_files: u64,
     /// First skip reason, verbatim: its path and cause are what distinguish
     /// an unreadable root from one corrupt file.
     #[serde(skip_serializing_if = "Option::is_none")]
-    first_error: Option<String>,
+    first_skip_reason: Option<String>,
 }
 
 impl DegradedAdapter {
     /// Emitted when the adapter's pass ends and repeated beside the final
     /// summary - the per-file reasons are dropped off-TTY.
     fn summary_line(&self) -> String {
-        match &self.first_error {
+        match &self.first_skip_reason {
             Some(reason) => format!(
                 "import: {} skipped {} file(s) it could not read - first error: {reason}",
-                self.label, self.errors
+                self.label, self.skipped_files
             ),
             None => format!(
                 "import: {} skipped {} file(s) it could not read",
-                self.label, self.errors
+                self.label, self.skipped_files
             ),
         }
     }
@@ -3973,6 +3975,22 @@ pub(crate) async fn run_sync(
         return outcome;
     }
     let cmd_started = std::time::Instant::now();
+    // A typo'd `pond sync <adapter>`/`--path` must fail before waiting on the
+    // sync flock, creating a fresh store, or cold-loading the embedder; the
+    // import stage re-runs the same pure-config scan as its TOCTOU guard.
+    if invocation.adapter.is_some()
+        && let Err(error) = resolve_sync_adapters(
+            loaded,
+            invocation.adapter.as_deref(),
+            invocation.path.clone(),
+        )
+        .and_then(|adapters| bail_when_explicit_source_missing(&adapters, true))
+    {
+        if json {
+            emit_json_error(&error)?;
+        }
+        return Err(error);
+    }
     // Pre-stage failures (storage resolve, creds, lock) happen before the
     // last-sync record exists, but the `--format json` contract - one summary
     // document on stdout for EVERY outcome - already holds here.
@@ -4076,8 +4094,8 @@ pub(crate) async fn run_sync(
         // have detected deletions; surface them when present (same store as the
         // ok path).
         add_reconciliation(&mut summary, &report)?;
-        add_failed_adapters(&mut summary, &report)?;
-        add_degraded_adapters(&mut summary, &report)?;
+        add_when_non_empty(&mut summary, "failed_adapters", &report.failed_adapters)?;
+        add_when_non_empty(&mut summary, "degraded_adapters", &report.degraded_adapters)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     }
     outcome?;
@@ -4094,24 +4112,18 @@ pub(crate) async fn run_sync(
             "duration_secs": duration.as_secs_f64(),
         });
         add_reconciliation(&mut summary, &report)?;
-        add_failed_adapters(&mut summary, &report)?;
-        add_degraded_adapters(&mut summary, &report)?;
+        add_when_non_empty(&mut summary, "failed_adapters", &report.failed_adapters)?;
+        add_when_non_empty(&mut summary, "degraded_adapters", &report.degraded_adapters)?;
         output(&serde_json::to_string_pretty(&summary)?)?;
     } else {
         // Repeated beside the summary: the line emitted when the adapter was
         // skipped can be thousands of sessions back in the log, and the run's
         // last words must not read as an unqualified success.
         for failed in &report.failed_adapters {
-            output_err(&pond::output::paint(
-                &failed.summary_line(),
-                pond::output::red(),
-            ))?;
+            emit_source_missing(SyncSink::Cli { json: false }, failed, None)?;
         }
         for degraded in &report.degraded_adapters {
-            output_err(&pond::output::paint(
-                &degraded.summary_line(),
-                pond::output::yellow(),
-            ))?;
+            emit_degraded(SyncSink::Cli { json: false }, degraded, None)?;
         }
         output(&format!(
             "{} sync complete in {}",
@@ -4301,7 +4313,8 @@ async fn run_sync_pipeline(
     flush_hud: &Arc<FlushHud>,
 ) -> anyhow::Result<()> {
     let import_started = std::time::Instant::now();
-    let import_summary = run_import_stage(
+    let mut import_summary = IngestSummary::default();
+    let import_result = run_import_stage(
         store,
         loaded,
         config_file,
@@ -4311,11 +4324,16 @@ async fn run_sync_pipeline(
         flush_hud,
         &mut report.failed_adapters,
         &mut report.degraded_adapters,
+        &mut import_summary,
         sink,
     )
-    .await?;
+    .await;
+    // Counts land on the report before the error propagates: earlier adapters'
+    // rows are already committed, and the error-path summary and last-sync
+    // record must not claim zero for a store that grew.
     report.sessions_inserted = import_summary.sessions_inserted as u64;
     report.messages_inserted = import_summary.messages_inserted_searchable as u64;
+    import_result?;
     let any_new_rows = import_summary.inserted > 0;
     // "searchable": the delta counts user/assistant conversational rows only,
     // while the stored total below counts every role - unlabeled, the 10x gap
@@ -4437,34 +4455,20 @@ fn add_reconciliation(summary: &mut Value, report: &SyncReport) -> anyhow::Resul
     Ok(())
 }
 
-/// Attach the adapters whose source root was absent to a `--format json`
-/// summary document under `"failed_adapters"` (`{name, path, error}` each),
-/// on both the ok and error documents. Additive and omitted when empty
-/// (spec.md 7.2), so an all-healthy run's summary is byte-identical to before.
-fn add_failed_adapters(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
-    if report.failed_adapters.is_empty() {
+/// Attach a per-adapter verdict array (`failed_adapters`, `degraded_adapters`)
+/// to a `--format json` summary document, on both the ok and error documents.
+/// Additive and omitted when empty (spec.md 7.2), so an all-healthy run's
+/// summary is byte-identical to the pre-field document.
+fn add_when_non_empty<T: serde::Serialize>(
+    summary: &mut Value,
+    key: &str,
+    entries: &[T],
+) -> anyhow::Result<()> {
+    if entries.is_empty() {
         return Ok(());
     }
     if let Value::Object(map) = summary {
-        map.insert(
-            "failed_adapters".to_owned(),
-            serde_json::to_value(&report.failed_adapters)?,
-        );
-    }
-    Ok(())
-}
-
-/// Attach `"degraded_adapters"` to both JSON summary documents. Additive and
-/// omitted when empty (spec.md 7.2), same posture as `failed_adapters`.
-fn add_degraded_adapters(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
-    if report.degraded_adapters.is_empty() {
-        return Ok(());
-    }
-    if let Value::Object(map) = summary {
-        map.insert(
-            "degraded_adapters".to_owned(),
-            serde_json::to_value(&report.degraded_adapters)?,
-        );
+        map.insert(key.to_owned(), serde_json::to_value(entries)?);
     }
     Ok(())
 }
@@ -4584,12 +4588,13 @@ async fn run_sync_dry_run(
     invocation: &SyncInvocation,
 ) -> anyhow::Result<()> {
     let json = matches!(invocation.format, OutputFormat::Json);
+    let explicit = invocation.adapter.is_some();
     let adapters = resolve_sync_adapters(
         loaded,
         invocation.adapter.as_deref(),
         invocation.path.clone(),
     )?;
-    bail_when_explicit_source_missing(&adapters, invocation.adapter.is_some())?;
+    bail_when_explicit_source_missing(&adapters, explicit)?;
     if adapters.is_empty() {
         output_err(&format!(
             "{} no enabled adapters - run `pond adapters discover` (or `pond init`) to enable some, or add `[adapters.<name>]` blocks to {}",
@@ -4651,7 +4656,6 @@ async fn run_sync_dry_run(
         plan: Option<pond::adapter::SyncPlan>,
         error: Option<RowError>,
     }
-    let explicit = invocation.adapter.is_some();
     let mut rows: Vec<DryRunRow> = Vec::new();
     for resolved in adapters {
         let factory = adapter::by_name(&resolved.name).ok_or_else(|| {
@@ -4666,6 +4670,8 @@ async fn run_sync_dry_run(
         // tells the operator what the run would actually do - short-circuited
         // before `open`, which some adapters answer with their own io error.
         if let Some(missing) = missing_source_root(&resolved.config) {
+            // Unreachable unless the root vanished after the pre-scan above -
+            // an explicitly named source stays a hard error even then.
             if explicit {
                 let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
                 return Err(explicit_source_missing_error(
@@ -4978,13 +4984,15 @@ async fn run_import_stage(
     path: Option<PathBuf>,
     verify: bool,
     flush_hud: &Arc<FlushHud>,
-    // Out-params rather than return values on purpose: entries recorded before
-    // a later adapter's error must survive that error, or the error-path JSON
-    // summary would omit skips the stderr line already reported.
+    // Out-params rather than return values on purpose: entries and counts
+    // recorded before a later adapter's error must survive that error, or the
+    // error-path JSON would omit skips (and rows already committed to the
+    // store) that the stderr lines already reported.
     failed: &mut Vec<FailedAdapter>,
     degraded: &mut Vec<DegradedAdapter>,
+    total: &mut IngestSummary,
     sink: SyncSink,
-) -> anyhow::Result<IngestSummary> {
+) -> anyhow::Result<()> {
     // The in-serve loop keeps stdout for the transport and paints no bars:
     // hide every progress surface and suppress the off-TTY heartbeat lines.
     let quiet = sink.is_serve();
@@ -5010,7 +5018,7 @@ async fn run_import_stage(
                 config_file.display(),
             ))?;
         }
-        return Ok(IngestSummary::default());
+        return Ok(());
     }
     // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
     // watermark, so every source body is re-decoded and re-ingested through the
@@ -5056,7 +5064,6 @@ async fn run_import_stage(
     } else {
         indicatif::ProgressDrawTarget::stderr_with_hz(8)
     });
-    let mut total = IngestSummary::default();
     for resolved in adapters {
         // Pre-flight, rather than classifying the adapter's first stream error:
         // the event stream cannot tell "the whole source is gone" from "one
@@ -5073,9 +5080,12 @@ async fn run_import_stage(
                     &missing,
                 ));
             }
-            let entry = FailedAdapter::new(resolved.name, label, missing);
-            emit_source_missing(sink, &entry)?;
-            failed.push(entry);
+            // Record before emitting: the entry must reach the JSON summary
+            // even when the stderr write fails.
+            failed.push(FailedAdapter::new(resolved.name, label, missing));
+            if let Some(entry) = failed.last() {
+                emit_source_missing(sink, entry, Some(&mp))?;
+            }
             continue;
         }
         let name = resolved.name.clone();
@@ -5083,46 +5093,64 @@ async fn run_import_stage(
         let path = source_path(&resolved.config);
         let summary = sync_with_progress(store, &mp, resolved, oracle, flush_hud, quiet).await?;
         if summary.skipped_files > 0 {
-            let entry = DegradedAdapter {
+            degraded.push(DegradedAdapter {
                 name,
                 label,
                 path,
-                errors: summary.skipped_files as u64,
-                first_error: summary.first_skip_reason.clone(),
-            };
-            emit_degraded(sink, &entry)?;
-            degraded.push(entry);
+                skipped_files: summary.skipped_files as u64,
+                first_skip_reason: summary.first_skip_reason.clone(),
+            });
+            if let Some(entry) = degraded.last() {
+                emit_degraded(sink, entry, Some(&mp))?;
+            }
         }
         total.merge(&summary);
     }
-    Ok(total)
+    Ok(())
 }
 
 /// Name an adapter that skipped unreadable files, the moment its pass ends.
 /// Same routing as [`emit_source_missing`].
-fn emit_degraded(sink: SyncSink, entry: &DegradedAdapter) -> anyhow::Result<()> {
+fn emit_degraded(
+    sink: SyncSink,
+    entry: &DegradedAdapter,
+    mp: Option<&indicatif::MultiProgress>,
+) -> anyhow::Result<()> {
     if sink.is_serve() {
-        tracing::warn!(target: "pond::sync", adapter = %entry.name, errors = entry.errors, "{}", entry.summary_line());
+        tracing::warn!(target: "pond::sync", adapter = %entry.name, skipped_files = entry.skipped_files, "{}", entry.summary_line());
         return Ok(());
     }
-    output_err(&pond::output::paint(
-        &entry.summary_line(),
-        pond::output::yellow(),
-    ))
+    paint_err_above(
+        mp,
+        &pond::output::paint(&entry.summary_line(), pond::output::yellow()),
+    )
 }
 
 /// Name an adapter skipped for an absent source root, the moment it is skipped.
-/// `output_err`, not the `MultiProgress` scroll-back: `println` lines are
-/// dropped off-TTY, which is exactly where a fleet reads its sync - the cron log.
-fn emit_source_missing(sink: SyncSink, failed: &FailedAdapter) -> anyhow::Result<()> {
+/// Never `mp.println`: those lines are dropped off-TTY, which is exactly where
+/// a fleet reads its sync - the cron log.
+fn emit_source_missing(
+    sink: SyncSink,
+    failed: &FailedAdapter,
+    mp: Option<&indicatif::MultiProgress>,
+) -> anyhow::Result<()> {
     if sink.is_serve() {
         tracing::warn!(target: "pond::sync", adapter = %failed.name, path = %failed.path, "{}", failed.error);
         return Ok(());
     }
-    output_err(&pond::output::paint(
-        &failed.summary_line(),
-        pond::output::red(),
-    ))
+    paint_err_above(
+        mp,
+        &pond::output::paint(&failed.summary_line(), pond::output::red()),
+    )
+}
+
+/// A raw stderr write under a live `MultiProgress` gets overdrawn by the next
+/// redraw on a TTY; suspending pauses the draw for the write (a no-op off-TTY).
+fn paint_err_above(mp: Option<&indicatif::MultiProgress>, line: &str) -> anyhow::Result<()> {
+    match mp {
+        Some(mp) => mp.suspend(|| output_err(line)),
+        None => output_err(line),
+    }
 }
 
 /// `name (path)` for an entry fanned out of a multi-path `[adapters.<name>]`
@@ -5161,13 +5189,10 @@ fn source_root(config: &Value) -> Option<PathBuf> {
 
 /// The home-contracted source dir of an adapter whose configured root does not
 /// exist on this host, `None` when it does (or when the question cannot be
-/// answered). A shared fleet `config.toml` enables adapters for tools a given
-/// host may not have installed, and that is fleet state, not an error in this
-/// run - so the caller names the adapter and carries on (spec 7.8).
-///
-/// Only a definite "not there" counts: a root that exists but is unreadable
-/// (permission denied, which `try_exists` reports as an error) keeps today's
-/// behavior - the adapter runs and reports per-file skips.
+/// answered) - a shared fleet config legitimately enables adapters a host
+/// lacks, so the caller names the adapter and carries on (spec 7.8). Only a
+/// definite "not there" counts: an unreadable root (`try_exists` error) keeps
+/// the per-file-skip behavior.
 fn missing_source_root(config: &Value) -> Option<String> {
     let root = source_root(config)?;
     match root.try_exists() {
@@ -5188,13 +5213,12 @@ fn source_missing_detail(path: &str) -> String {
 }
 
 /// The explicit-narrowing pre-scan: `pond sync <adapter>` names its sources
-/// deliberately, so ANY absent root among the resolved passes fails the run
-/// before the first adapter does any work. Checked up front rather than only
-/// inside the per-adapter loop because a multi-path entry fans out into
-/// several passes ordered arbitrarily - the first pass must not ingest and
-/// leave store writes behind a non-zero exit when the second pass's root is
-/// absent. A no-op for whole-config runs, whose absent roots are per-adapter
-/// verdicts.
+/// deliberately, so ANY absent root among the resolved passes fails the run -
+/// `run_sync` checks before the lock and store setup, the stages re-check as a
+/// TOCTOU guard. Scanned across all passes because a multi-path entry fans out
+/// in arbitrary order and the first pass must not ingest when the second's
+/// root is absent; a no-op for whole-config runs, whose absent roots are
+/// per-adapter verdicts.
 fn bail_when_explicit_source_missing(
     adapters: &[pond::config::ResolvedAdapter],
     explicit: bool,
@@ -7853,7 +7877,7 @@ mod tests {
     #[test]
     fn an_all_healthy_summary_omits_failed_adapters() {
         let mut summary = json!({ "outcome": "ok" });
-        add_failed_adapters(&mut summary, &SyncReport::default()).expect("attach");
+        add_when_non_empty::<FailedAdapter>(&mut summary, "failed_adapters", &[]).expect("attach");
         assert_eq!(summary, json!({ "outcome": "ok" }));
 
         let report = SyncReport {
@@ -7864,7 +7888,8 @@ mod tests {
             )],
             ..SyncReport::default()
         };
-        add_failed_adapters(&mut summary, &report).expect("attach");
+        add_when_non_empty(&mut summary, "failed_adapters", &report.failed_adapters)
+            .expect("attach");
         assert_eq!(
             summary["failed_adapters"].as_array().map(Vec::len),
             Some(1),
@@ -7877,7 +7902,8 @@ mod tests {
     #[test]
     fn an_all_healthy_summary_omits_degraded_adapters() {
         let mut summary = json!({ "outcome": "ok" });
-        add_degraded_adapters(&mut summary, &SyncReport::default()).expect("attach");
+        add_when_non_empty::<DegradedAdapter>(&mut summary, "degraded_adapters", &[])
+            .expect("attach");
         assert_eq!(summary, json!({ "outcome": "ok" }));
 
         let report = SyncReport {
@@ -7885,19 +7911,20 @@ mod tests {
                 name: "codex-cli".to_owned(),
                 label: "codex-cli (~/.codex/sessions)".to_owned(),
                 path: Some("~/.codex/sessions".to_owned()),
-                errors: 3,
-                first_error: Some("permission denied".to_owned()),
+                skipped_files: 3,
+                first_skip_reason: Some("permission denied".to_owned()),
             }],
             ..SyncReport::default()
         };
-        add_degraded_adapters(&mut summary, &report).expect("attach");
+        add_when_non_empty(&mut summary, "degraded_adapters", &report.degraded_adapters)
+            .expect("attach");
         assert_eq!(
             summary["degraded_adapters"],
             json!([{
                 "name": "codex-cli",
                 "path": "~/.codex/sessions",
-                "errors": 3,
-                "first_error": "permission denied",
+                "skipped_files": 3,
+                "first_skip_reason": "permission denied",
             }]),
             "attach the machine fields, not the label: {summary}",
         );

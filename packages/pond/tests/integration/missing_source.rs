@@ -507,15 +507,15 @@ fn permission_denied_is_not_source_missing() {
             .find(|entry| entry["name"].as_str() == Some(name))
             .unwrap_or_else(|| panic!("no degraded entry for {name}: {doc}"));
         assert!(
-            entry["errors"].as_u64().is_some_and(|n| n >= 1),
+            entry["skipped_files"].as_u64().is_some_and(|n| n >= 1),
             "the skip count is the magnitude: {entry}",
         );
-        let first_error = entry["first_error"]
+        let first_skip_reason = entry["first_skip_reason"]
             .as_str()
-            .unwrap_or_else(|| panic!("no first_error explaining the skips: {entry}"));
+            .unwrap_or_else(|| panic!("no first_skip_reason explaining the skips: {entry}"));
         assert!(
-            first_error.to_lowercase().contains("denied"),
-            "the reason must carry the cause: {first_error:?}",
+            first_skip_reason.to_lowercase().contains("denied"),
+            "the reason must carry the cause: {first_skip_reason:?}",
         );
     }
     assert!(
