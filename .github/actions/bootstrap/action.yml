@@ -13,7 +13,8 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        MOON_VERSION=2.5.1
+        # Kept in lockstep with the .prototools pin at the repo root.
+        MOON_VERSION=2.5.4
         PROTOC_VERSION=35.1
         # Bumped in lockstep with the kache-action `version:` in
         # windows-bootstrap and the k-tag in the .github/kache/*.toml prefixes,

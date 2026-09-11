@@ -64,7 +64,7 @@ jobs:
       # bootstrap.
       - run: >
           moon run
-          repo:check-changelog
+          repo:check-changelog repo:check-knowledge
           pond:check-package pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
@@ -764,7 +764,13 @@ jobs:
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
-      - run: ops/scripts/publish-npm.sh packages/openclaw-pond packages/pi-pond
+      # GitHub-hosted runner, so the pond-ci bootstrap (a /ci-cache PVC affair)
+      # does not apply; fetch the pinned moon the same way it does. Version in
+      # lockstep with .prototools and the bootstrap action.
+      - run: |
+          curl -fsSL "https://github.com/moonrepo/moon/releases/download/v2.5.4/moon_cli-x86_64-unknown-linux-gnu.tar.xz" \
+            | tar -xJ --strip-components=1 moon_cli-x86_64-unknown-linux-gnu/moon
+          ./moon run repo:publish-npm
 
   # Not `on: release`: release-plz publishes the release, and publish-release
   # uploads the binaries to it several steps later, so a release-triggered run

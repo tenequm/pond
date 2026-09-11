@@ -1,3 +1,22 @@
+---
+type: Reference
+title: letta-code
+description: Upstream format archaeology and mapping decision record for the letta-code adapter.
+tags: [adapter, letta-code]
+status: stable
+generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:54Z" }
+verified:
+  - { by: "claude-code", at: "2026-08-24T00:00:00Z" }
+stale_after: "2026-12-11T00:00:00Z"
+sources:
+  - id: fixtures
+    resource: committed fixture capture under packages/pond/tests/fixtures/ (see the doc body for the exact capture)
+  - id: upstream
+    resource: letta-code reflection transcript JSONL store, inspected at letta-code v0.30.30
+  - id: upstream-repo
+    resource: https://github.com/letta-ai/letta-code
+---
+
 # letta-code
 
 Last verified: 2026-08-24, against letta-code v0.30.30 (b2745ce), npm `@letta-ai/letta-code`.

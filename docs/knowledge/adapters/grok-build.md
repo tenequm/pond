@@ -1,3 +1,22 @@
+---
+type: Reference
+title: grok-build
+description: Upstream format archaeology and mapping decision record for the grok-build adapter.
+tags: [adapter, grok-build]
+status: stable
+generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:54Z" }
+verified:
+  - { by: "claude-code", at: "2026-08-24T00:00:00Z" }
+stale_after: "2026-12-11T00:00:00Z"
+sources:
+  - id: fixtures
+    resource: committed fixture capture under packages/pond/tests/fixtures/ (see the doc body for the exact capture)
+  - id: upstream
+    resource: grok-build updates.jsonl session log and summary.json sidecars, inspected at grok-build 1.0.5
+  - id: upstream-repo
+    resource: https://github.com/xai-org/grok-build
+---
+
 # grok-build
 
 Last verified: 2026-08-24, against grok-build 1.0.5 (binary `5115b46bc909`, the latest release per `grok update`); source read at the xai-org/grok-build public snapshot v1.0.6 (`SOURCE_REV 7d67deacbeb1c1093fdb4f9bcbfab2630e18a6aa`, single squashed "Synced from monorepo" commit dated 2026-08-19).

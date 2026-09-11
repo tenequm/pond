@@ -136,7 +136,7 @@ fn resolve_adapter(name: &str) -> Result<&'static dyn pond::adapter::AdapterFact
 /// not the last one.
 ///
 /// `getrusage` rather than `/proc/self/status`, which does not exist on macOS -
-/// the environment most of `docs/benchmarks/results.md` was recorded in.
+/// the environment most of `packages/pond/benches/docs/results.md` was recorded in.
 /// Windows would need `GetProcessMemoryInfo` and a `windows-sys` dependency for
 /// one line of a hand-run bench, so it omits the line instead.
 #[cfg(unix)]

@@ -1,3 +1,18 @@
+---
+type: Finding
+title: "pond retrieval tools redesign - research and reasoning (2026-06-19)"
+description: Field tests and failure traces motivated replacing auto-hybrid search with separate vector and FTS modes, adding recency boosting and pagination, and bounding tool outputs to 10k characters.
+tags: [retrieval, mcp, tools, search, design]
+status: deprecated
+generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:53Z" }
+sources:
+  - id: research-20260619
+    resource: research conducted 2026-06-19 against the then-current pond CLI
+    title: Pond retrieval tools redesign research (2026-06-19)
+---
+
+*Superseded: the shipped pond_search / pond_get_session / pond_get_message / pond_sql surface is the outcome; kept for the evidence behind it.*
+
 # pond retrieval tools redesign - research and reasoning (2026-06-19)
 
 Status: research capture for later review. This records the *why* behind a redesign of pond's three MCP tools, derived from a real failure transcript plus the [pond retrieval ergonomics field test](https://github.com/tenequm/pond/blob/50ced73d8433bb0c477a39515f90c6b59d4ba4c7/docs/researches/pond-retrieval-ergonomics-fieldtest-2026-06-16.md) ([PR #59](https://github.com/tenequm/pond/pull/59)).

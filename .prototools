@@ -1,0 +1,5 @@
+# The repo-owned moon pin (proto-managed installs resolve it; CI's bootstrap
+# pins the same version in .github/actions/bootstrap/action.yml). Bump both
+# together. A workspace versionConstraint in .moon/workspace.yml is deferred
+# until operator environments are on >= 2.5.4.
+moon = "2.5.4"

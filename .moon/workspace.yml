@@ -12,10 +12,14 @@ projects:
 vcs:
   defaultBranch: 'main'
   # sync: true wires core.hooksPath -> .moon/hooks on every moon run, so the
-  # secret-scan gate configures itself on any fresh clone (no manual setup).
+  # pre-commit gate configures itself on any fresh clone (no manual setup).
+  # The gate is moon tasks directly - one moon session, portable to the .ps1
+  # hooks moon generates on Windows. check-changelog and check-knowledge
+  # declare inputs, so an untouched input is an instant cache replay;
+  # secret-scan reads the git index and never caches.
   hooks:
     pre-commit:
-      - './.github/hooks/pre-commit'
+      - 'moon run repo:secret-scan repo:check-changelog repo:check-knowledge'
   sync: true
 
 # .claude/ and .agents/ hold local Claude Code settings and skill symlinks that

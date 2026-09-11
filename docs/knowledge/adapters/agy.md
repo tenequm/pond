@@ -1,3 +1,32 @@
+---
+type: Reference
+title: agy
+description: Upstream format archaeology and mapping decision record for the agy adapter.
+tags: [adapter, agy]
+status: stable
+generated: { by: "acpx/gemini-3.7-flash-medium", at: "2026-09-11T11:01:54Z" }
+verified:
+  - { by: "claude-code", at: "2026-09-10T00:00:00Z" }
+stale_after: "2026-12-11T00:00:00Z"
+sources:
+  - id: fixtures
+    resource: committed fixture capture under packages/pond/tests/fixtures/ (see the doc body for the exact capture)
+  - id: upstream
+    resource: Antigravity CLI and ACP server local session stores, inspected at agy 1.2.0 and release blaze-2026.08.18-1
+  - id: upstream-repo
+    resource: https://github.com/google-antigravity/antigravity-cli
+  - id: upstream-issue-423
+    resource: https://github.com/google-antigravity/antigravity-cli/issues/423
+  - id: txcript
+    resource: https://docs.rs/crate/txcript/latest/source/docs/formats/antigravity.md
+  - id: casr
+    resource: https://docs.rs/cross_agent_session_resumer/latest/src/casr/providers/antigravity.rs.html
+  - id: opendray
+    resource: https://github.com/Opendray/opendray/blob/main/internal/session/antigravity_db.go
+  - id: agentsview
+    resource: https://github.com/kenn-io/agentsview/commit/2e11aa7a687afb61839ffa29b572bdf6362b29f8
+---
+
 # agy
 
 Last verified: 2026-09-10, against agy 1.2.0 (the `agy` CLI) and the Antigravity ACP server build `release blaze-2026.08.18-1` (`agy_acp_server.par`), on Linux.
