@@ -1,6 +1,6 @@
 # Sync: an absent source dir fails its adapter, not the run
 
-Resolves [#236](https://github.com/tenequm/pond/issues/236). Branch: `fix/236-per-adapter-missing-source`.
+Resolves [#236](https://github.com/tenequm/pond/issues/236). Branch: `fix/236-per-adapter-missing-source`. Draft PR: [#237](https://github.com/tenequm/pond/pull/237).
 
 ## How to use this doc
 
