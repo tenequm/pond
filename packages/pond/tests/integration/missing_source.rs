@@ -278,6 +278,11 @@ fn real_sync_json_ingests_the_healthy_adapter_and_names_the_failed_one() {
         error.contains("source missing") && error.contains(&missing.display().to_string()),
         "the failure must be self-describing to a log scraper: {error:?}",
     );
+    assert_eq!(
+        entry["reason"].as_str(),
+        Some("source_missing"),
+        "fleet tooling branches on the stable kind, not the human string: {entry}",
+    );
 }
 
 /// Off-TTY is where fleets read sync output, and it is where the old reason
@@ -348,6 +353,63 @@ fn explicit_narrowing_keeps_the_hard_error() {
             "{args:?} narrowed to one adapter; the others are not this run's business: {stderr}",
         );
     }
+}
+
+/// A multi-path entry named explicitly fails BEFORE its first fanned pass does
+/// any work: `pond sync <adapter>` with `path = [readable, absent]` must not
+/// ingest the readable dir and then error on the absent one, leaving store
+/// writes behind a non-zero exit. The pre-scan runs over every resolved pass
+/// up front, in real sync and dry run alike.
+#[test]
+fn multi_path_narrowing_fails_before_any_write() {
+    let temp = TempDir::new().expect("temp");
+    let root = claude_code_root(&temp, &Healthy::OneFixtureSession);
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-code]\nenabled = true\npath = [{:?}, {:?}]\n",
+            root.display().to_string(),
+            missing.display().to_string(),
+        ),
+    );
+    for args in [
+        vec!["sync", "claude-code"],
+        vec!["sync", "claude-code", "--dry-run"],
+    ] {
+        let out = run(&temp, &args);
+        assert!(
+            !out.status.success(),
+            "{args:?} named an adapter with an absent pass, so the run must fail\nstdout: {}\nstderr: {}",
+            stdout(&out),
+            stderr(&out),
+        );
+        assert!(
+            stderr(&out).contains(&missing.display().to_string()),
+            "{args:?} must name the absent path: {}",
+            stderr(&out),
+        );
+    }
+    // The proof the bail preceded the first pass: the readable dir's session is
+    // still pending, so nothing was ingested before the error.
+    let args = ["sync", "--dry-run", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(
+        &out,
+        "the whole-config dry run after the failed narrow sync",
+    );
+    let doc = json(&args, &out);
+    let readable = doc["adapters"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no adapters array: {doc}"))
+        .iter()
+        .find(|row| row["path"].as_str() == Some(root.display().to_string().as_str()))
+        .unwrap_or_else(|| panic!("no row for the readable pass: {doc}"));
+    assert_eq!(
+        readable["pending"].as_u64(),
+        Some(1),
+        "the narrowed run must not have ingested anything before failing: {readable}",
+    );
 }
 
 /// The adjacent detail, pinned so the fix above cannot swallow it: a malformed

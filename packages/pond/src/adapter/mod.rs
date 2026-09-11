@@ -613,8 +613,10 @@ pub(crate) fn config_path(adapter: &'static str, config: Value) -> Result<PathBu
 /// untouched when the env has no home (CI, post-install hooks, sandboxes).
 /// Shared because an adapter whose config carries more than one path cannot use
 /// [`config_path`]. Home resolution is portable ([`crate::config::home_dir`]:
-/// `USERPROFILE` on Windows, `HOME` on Unix).
-pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
+/// `USERPROFILE` on Windows, `HOME` on Unix). `pub` because the CLI's sync
+/// pre-flight resolves a configured source path through this exact function,
+/// so the existence check and the adapter can never disagree about a path.
+pub fn expand_home(path: PathBuf) -> PathBuf {
     match crate::config::home_dir() {
         Some(home) => crate::config::expand_home_under(&path, &home),
         None => path,

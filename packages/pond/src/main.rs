@@ -3867,6 +3867,10 @@ struct FailedAdapter {
     label: String,
     path: String,
     error: String,
+    /// Stable machine-readable kind, so fleet tooling branches on this and
+    /// never parses the human `error` string. One value today; a future
+    /// adapter-level failure class gets its own.
+    reason: &'static str,
 }
 
 impl FailedAdapter {
@@ -3877,6 +3881,7 @@ impl FailedAdapter {
             label,
             path,
             error,
+            reason: "source_missing",
         }
     }
 
@@ -4249,7 +4254,7 @@ async fn run_sync_pipeline(
     flush_hud: &Arc<FlushHud>,
 ) -> anyhow::Result<()> {
     let import_started = std::time::Instant::now();
-    let (import_summary, failed_adapters) = run_import_stage(
+    let import_summary = run_import_stage(
         store,
         loaded,
         config_file,
@@ -4257,10 +4262,10 @@ async fn run_sync_pipeline(
         invocation.path.clone(),
         invocation.verify,
         flush_hud,
+        &mut report.failed_adapters,
         sink,
     )
     .await?;
-    report.failed_adapters = failed_adapters;
     report.sessions_inserted = import_summary.sessions_inserted as u64;
     report.messages_inserted = import_summary.messages_inserted_searchable as u64;
     let any_new_rows = import_summary.inserted > 0;
@@ -4521,6 +4526,7 @@ async fn run_sync_dry_run(
         invocation.adapter.as_deref(),
         invocation.path.clone(),
     )?;
+    bail_when_explicit_source_missing(&adapters, invocation.adapter.is_some())?;
     if adapters.is_empty() {
         output_err(&format!(
             "{} no enabled adapters - run `pond adapters discover` (or `pond init`) to enable some, or add `[adapters.<name>]` blocks to {}",
@@ -4909,16 +4915,20 @@ async fn run_import_stage(
     path: Option<PathBuf>,
     verify: bool,
     flush_hud: &Arc<FlushHud>,
+    // Out-param rather than a return value on purpose: entries recorded before
+    // a later adapter's error must survive that error, or the error-path JSON
+    // summary would omit skips the stderr line already reported.
+    failed: &mut Vec<FailedAdapter>,
     sink: SyncSink,
-) -> anyhow::Result<(IngestSummary, Vec<FailedAdapter>)> {
+) -> anyhow::Result<IngestSummary> {
     // The in-serve loop keeps stdout for the transport and paints no bars:
     // hide every progress surface and suppress the off-TTY heartbeat lines.
     let quiet = sink.is_serve();
     // Naming an adapter (with or without `--path`) makes its source absence a
-    // wrong invocation rather than fleet state; captured before `adapter` is
-    // consumed by the resolve below.
+    // wrong invocation rather than fleet state.
     let explicit = adapter.is_some();
     let adapters = resolve_sync_adapters(loaded, adapter.as_deref(), path)?;
+    bail_when_explicit_source_missing(&adapters, explicit)?;
     if adapters.is_empty() {
         let disabled = loaded.disabled_adapter_names();
         let label = pond::output::paint("import:", pond::output::dim());
@@ -4936,7 +4946,7 @@ async fn run_import_stage(
                 config_file.display(),
             ))?;
         }
-        return Ok((IngestSummary::default(), Vec::new()));
+        return Ok(IngestSummary::default());
     }
     // `--verify` bypasses the freshness skip: a `NoopOracle` returns no
     // watermark, so every source body is re-decoded and re-ingested through the
@@ -4983,14 +4993,15 @@ async fn run_import_stage(
         indicatif::ProgressDrawTarget::stderr_with_hz(8)
     });
     let mut total = IngestSummary::default();
-    let mut failed: Vec<FailedAdapter> = Vec::new();
     for resolved in adapters {
-        let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
         // Pre-flight, rather than classifying the adapter's first stream error:
         // the event stream cannot tell "the whole source is gone" from "one
         // unreadable file" without an adapter-API change, and the run must not
         // sign off an unread source as `up to date`.
         if let Some(missing) = missing_source_root(&resolved.config) {
+            let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
+            // Unreachable unless the root vanished after the pre-scan above -
+            // an explicitly named source stays a hard error even then.
             if explicit {
                 return Err(explicit_source_missing_error(
                     &resolved.name,
@@ -5006,7 +5017,7 @@ async fn run_import_stage(
         let summary = sync_with_progress(store, &mp, resolved, oracle, flush_hud, quiet).await?;
         total.merge(&summary);
     }
-    Ok((total, failed))
+    Ok(total)
 }
 
 /// Name an adapter skipped for an absent source root, the moment it is skipped.
@@ -5047,18 +5058,14 @@ fn contract_display(path: &str) -> String {
     config::contract_home(Path::new(path)).display().to_string()
 }
 
-/// A config blob's source dir as this host would open it: home-expanded exactly
-/// the way the adapters do (`adapter::expand_home`), so the pre-flight check
-/// below and the adapter agree on what `~/...` means. `None` for a blob with no
-/// `path` - that shape is the adapter's to refuse (`factory.open`), and it stays
-/// a whole-run config error.
+/// A config blob's source dir as this host would open it: home-expanded by the
+/// same `adapter::expand_home` the adapters call, so the pre-flight check below
+/// and the adapter cannot disagree on what `~/...` means. `None` for a blob
+/// with no `path` - that shape is the adapter's to refuse (`factory.open`), and
+/// it stays a whole-run config error.
 fn source_root(config: &Value) -> Option<PathBuf> {
     let path = config.get("path").and_then(Value::as_str)?;
-    let path = PathBuf::from(path);
-    match config::home_dir() {
-        Some(home) => Some(config::expand_home_under(&path, &home)),
-        None => Some(path),
-    }
+    Some(adapter::expand_home(PathBuf::from(path)))
 }
 
 /// The home-contracted source dir of an adapter whose configured root does not
@@ -5087,6 +5094,34 @@ fn source_missing_message(path: &str) -> String {
 /// verdict is a failure, but the run went on without this adapter.
 fn source_missing_detail(path: &str) -> String {
     format!("{} - skipped this run", source_missing_message(path))
+}
+
+/// The explicit-narrowing pre-scan: `pond sync <adapter>` names its sources
+/// deliberately, so ANY absent root among the resolved passes fails the run
+/// before the first adapter does any work. Checked up front rather than only
+/// inside the per-adapter loop because a multi-path entry fans out into
+/// several passes ordered arbitrarily - the first pass must not ingest and
+/// leave store writes behind a non-zero exit when the second pass's root is
+/// absent. A no-op for whole-config runs, whose absent roots are per-adapter
+/// verdicts.
+fn bail_when_explicit_source_missing(
+    adapters: &[pond::config::ResolvedAdapter],
+    explicit: bool,
+) -> anyhow::Result<()> {
+    if !explicit {
+        return Ok(());
+    }
+    for resolved in adapters {
+        if let Some(missing) = missing_source_root(&resolved.config) {
+            let label = adapter_label(&resolved.name, resolved.fanout_path.as_deref());
+            return Err(explicit_source_missing_error(
+                &resolved.name,
+                &label,
+                &missing,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The whole-run error kept for an explicitly narrowed sync (`pond sync
@@ -7707,8 +7742,9 @@ mod tests {
                 "name": "codex-cli",
                 "path": "~/.codex/sessions",
                 "error": "source missing: ~/.codex/sessions",
+                "reason": "source_missing",
             }),
-            "the JSON entry carries name/path/error and never the display label",
+            "the JSON entry carries name/path/error/reason and never the display label",
         );
 
         // Explicit narrowing keeps the hard error: it names the adapter, the
