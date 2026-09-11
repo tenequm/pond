@@ -142,6 +142,10 @@ mod ingest_handler {
         /// source's documented migration contract). Counted in
         /// `skipped_superseded`, never folded into `Empty`.
         Superseded,
+        /// Transcript is unavailable by the adapter's documented contract.
+        Unimportable {
+            reason: String,
+        },
     }
 
     #[derive(Debug, Default)]
@@ -273,6 +277,11 @@ mod ingest_handler {
                             }
                             SyncStatus::Skipped { reason }
                         }
+                        SkipReason::Unimportable(reason) => {
+                            summary.skipped_unimportable += 1;
+                            tracing::debug!(%reason, "skipping source excluded by adapter contract");
+                            SyncStatus::Unimportable { reason }
+                        }
                     };
                     on_event(SyncEvent::SessionDone(SessionOutcome {
                         project,
@@ -301,6 +310,11 @@ mod ingest_handler {
                                 summary.first_skip_reason = Some(reason.clone());
                             }
                             SyncStatus::Skipped { reason }
+                        }
+                        SkipReason::Unimportable(reason) => {
+                            summary.skipped_unimportable += count;
+                            tracing::debug!(%reason, count, "skipping sources excluded by adapter contract");
+                            SyncStatus::Unimportable { reason }
                         }
                     };
                     on_event(SyncEvent::SkippedBulk { status, count });

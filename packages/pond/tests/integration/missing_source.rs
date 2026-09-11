@@ -28,10 +28,8 @@ use tempfile::TempDir;
 const CLAUDE_CODE_FIXTURE: &str =
     "tests/fixtures/adapter/claude_code/projects/-Users-user-Projects-myproject-a";
 
-/// What the healthy adapter's source holds. The dry-run cases want a bare
-/// existing dir - `0 sessions` is the honest count there, and it is precisely
-/// the count its absent sibling must NOT report. The real-sync case needs a
-/// session to land, or "the other adapter still ran" is unprovable.
+/// What the healthy adapter's source holds. Most rendering and early-exit
+/// cases need only an existing directory; ingestion assertions use one session.
 enum Healthy {
     EmptyDir,
     OneFixtureSession,
@@ -124,6 +122,48 @@ fn run(temp: &TempDir, args: &[&str]) -> std::process::Output {
         .env("NO_COLOR", "1")
         .output()
         .expect("run pond")
+}
+
+fn state_files(temp: &TempDir) -> Vec<String> {
+    // `syncstate::pond_state_dir` omits the `pond` segment on Windows, where
+    // `XDG_STATE_HOME` is already pond's own. A wrong path here reads as empty,
+    // which would make every absence assertion pass vacuously - what keeps them
+    // honest is the positive assertion in
+    // `all_absent_whole_sync_skips_the_store_but_takes_the_lock`, which goes red
+    // the moment this reads the wrong dir.
+    let root = temp.path().join("state");
+    let dir = if cfg!(windows) {
+        root
+    } else {
+        root.join("pond")
+    };
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect(),
+        // A run that wrote nothing never creates the dir; the panic arm below
+        // is for a dir that exists and still will not read.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read state dir {}: {error}", dir.display()),
+    }
+}
+
+/// The per-host last-sync breadcrumb, parsed. Panics when absent: every path
+/// that claims to record one must actually write it.
+fn last_sync_record(temp: &TempDir) -> Value {
+    let root = temp.path().join("state");
+    let dir = if cfg!(windows) {
+        root
+    } else {
+        root.join("pond")
+    };
+    let name = state_files(temp)
+        .into_iter()
+        .find(|name| name.starts_with("last-sync-"))
+        .unwrap_or_else(|| panic!("no last-sync record in {}", dir.display()));
+    let raw = std::fs::read(dir.join(name)).expect("read last-sync record");
+    serde_json::from_slice(&raw).expect("last-sync record is JSON")
 }
 
 fn stdout(out: &std::process::Output) -> String {
@@ -355,6 +395,200 @@ fn explicit_narrowing_keeps_the_hard_error() {
     }
 }
 
+#[test]
+fn narrowed_missing_source_json_is_a_compact_prestage_error() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::EmptyDir);
+    let args = ["sync", "codex-cli", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("error"), "{doc}");
+    assert!(doc["error"].as_str().is_some(), "{doc}");
+    for key in ["sessions_inserted", "messages_inserted", "duration_secs"] {
+        assert!(doc.get(key).is_none(), "pre-stage errors omit {key}: {doc}");
+    }
+}
+
+#[test]
+fn all_absent_whole_sync_skips_the_store_but_takes_the_lock() {
+    let temp = TempDir::new().expect("temp");
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.codex-cli]\nenabled = true\npath = {:?}\n\n\
+             [adapters.openclaw]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+            missing.display().to_string(),
+        ),
+    );
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "an all-absent whole sync");
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("ok"), "{doc}");
+    assert_eq!(doc["failed_adapters"].as_array().map(Vec::len), Some(2));
+    assert_eq!(doc["indexes_folded"].as_bool(), Some(false), "{doc}");
+    assert_eq!(doc["sessions_inserted"].as_u64(), Some(0), "{doc}");
+    assert_eq!(doc["messages_inserted"].as_u64(), Some(0), "{doc}");
+    // `stored` is the store's total, which this run never opened the store to
+    // read. Inventing a zero there reports a populated lake as empty; dropping
+    // the key breaks every consumer that reads it on an ok document. Indexing a
+    // missing key yields Null, so the presence check has to come first.
+    assert!(
+        doc["stored"].is_object(),
+        "an ok document always carries `stored`; a null count is not an absent key: {doc}"
+    );
+    assert!(doc["stored"]["sessions"].is_null(), "{doc}");
+    assert!(doc["stored"]["messages"].is_null(), "{doc}");
+    assert!(!temp.path().join("store").exists(), "store was created");
+    // The flock IS taken: the run writes a last-sync record, and a lockless
+    // write could overwrite a concurrent real sync's. Skipping the store open
+    // and the embedder is the whole saving.
+    assert!(
+        state_files(&temp)
+            .iter()
+            .any(|name| name.starts_with("sync-") && name.ends_with(".lock")),
+        "{:?}",
+        state_files(&temp)
+    );
+    let record = last_sync_record(&temp);
+    assert_eq!(record["outcome"].as_str(), Some("ok"), "{record}");
+    assert_eq!(record["sessions_inserted"].as_u64(), Some(0), "{record}");
+    for name in ["codex-cli", "openclaw"] {
+        assert!(stderr(&out).contains(name), "{}", stderr(&out));
+    }
+    // One attribution per adapter, not one per emission site - and asserted on
+    // the TEXT run, since the JSON arm never reaches the second emission site.
+    // This is the cron log, where the same line twice reads as two hosts' worth
+    // of trouble.
+    let text = run(&temp, &["sync"]);
+    assert_exit_ok(&text, "an all-absent whole sync in text mode");
+    assert_eq!(
+        stderr(&text).matches("source missing:").count(),
+        2,
+        "{}",
+        stderr(&text)
+    );
+}
+
+/// `stored` is the lake's total, not this run's delta, so the all-absent path
+/// must not answer it from a store it never opened.
+#[test]
+fn an_all_absent_sync_does_not_report_an_existing_store_as_empty() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::OneFixtureSession);
+    let args = ["sync", "--format", "json"];
+    let seeded = json(&args, &run(&temp, &args));
+    assert_eq!(seeded["stored"]["sessions"].as_u64(), Some(1), "{seeded}");
+
+    // Same store, but now every source is gone - the fleet-config case.
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-code]\nenabled = true\npath = {:?}\n\n             [adapters.codex-cli]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+            missing.display().to_string(),
+        ),
+    );
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "an all-absent sync over a populated store");
+    let doc = json(&args, &out);
+    assert!(doc["stored"].is_object(), "{doc}");
+    assert!(
+        doc["stored"]["sessions"].is_null(),
+        "a run that never opened the store must not claim its row counts: {doc}"
+    );
+}
+
+/// The surface issue #236 was filed about: a host whose every source is absent
+/// must still be diagnosable after the sync output scrolls away. The all-absent
+/// sync creates no store, so `pond status` renders this from config alone.
+#[test]
+fn status_names_absent_sources_on_a_host_that_never_stored_anything() {
+    let temp = TempDir::new().expect("temp");
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.codex-cli]\nenabled = true\npath = {:?}\n\n             [adapters.openclaw]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+            missing.display().to_string(),
+        ),
+    );
+    assert_exit_ok(&run(&temp, &["sync"]), "the all-absent sync");
+    assert!(!temp.path().join("store").exists(), "store was created");
+
+    let args = ["status", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "status on an all-absent host");
+    let doc = json(&args, &out);
+    assert_eq!(doc["initialized"].as_bool(), Some(false), "{doc}");
+    for name in ["codex-cli", "openclaw"] {
+        let row = adapter_row(&doc["local"], name);
+        assert_eq!(row["reason"].as_str(), Some("source_missing"), "{doc}");
+        assert!(row["sessions"].is_null(), "{doc}");
+    }
+    assert_eq!(
+        doc["local"]["last_sync"]["outcome"].as_str(),
+        Some("ok"),
+        "the breadcrumb the sync just wrote must be readable: {doc}"
+    );
+    let text = stdout(&run(&temp, &["status"]));
+    assert!(text.contains("source missing:"), "{text}");
+    assert!(
+        !text.contains("run `pond sync` to import sessions"),
+        "the operator just ran it and it imported nothing: {text}"
+    );
+}
+
+#[test]
+fn verify_keeps_mixed_host_missing_source_semantics() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::OneFixtureSession);
+    let args = ["sync", "--verify", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "a verified mixed-host sync");
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("ok"), "{doc}");
+    assert_eq!(doc["failed_adapters"][0]["reason"], "source_missing");
+    // The fixture exists to prove the healthy adapter still ingests beside the
+    // failed one; asserting only the failure would pass on a run that imported
+    // nothing at all.
+    assert_eq!(doc["sessions_inserted"].as_u64(), Some(1), "{doc}");
+    assert!(stderr(&out).contains("--verify"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("codex-cli"), "{}", stderr(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_path_is_a_named_error_not_a_panic() {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::EmptyDir);
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let out = Command::new(env!("CARGO_BIN_EXE_pond"))
+        .args(["sync", "claude-code", "--path"])
+        .arg(std::ffi::OsString::from_vec(b"/tmp/pond-\xff".to_vec()))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run pond");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--path must be valid UTF-8"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("panicked"), "{}", stderr(&out));
+}
+
 /// A multi-path entry named explicitly fails BEFORE its first fanned pass does
 /// any work: `pond sync <adapter>` with `path = [readable, absent]` must not
 /// ingest the readable dir and then error on the absent one, leaving store
@@ -474,10 +708,12 @@ fn permission_denied_is_not_source_missing() {
         &format!(
             "[adapters.claude-code]\nenabled = true\npath = {:?}\n\n\
              [adapters.codex-cli]\nenabled = true\npath = {:?}\n\n\
-             [adapters.agy]\nenabled = true\npath = {:?}\n",
+             [adapters.agy]\nenabled = true\npath = {:?}\n\n\
+             [adapters.openclaw]\nenabled = true\npath = {:?}\n",
             root.display().to_string(),
             locked.display().to_string(),
             child.display().to_string(),
+            locked.display().to_string(),
         ),
     );
     let args = ["sync", "--format", "json"];
@@ -501,7 +737,7 @@ fn permission_denied_is_not_source_missing() {
     let degraded = doc["degraded_adapters"]
         .as_array()
         .unwrap_or_else(|| panic!("EACCES must be attributed in the summary: {doc}"));
-    for name in ["agy", "codex-cli"] {
+    for name in ["agy", "codex-cli", "openclaw"] {
         let entry = degraded
             .iter()
             .find(|entry| entry["name"].as_str() == Some(name))
@@ -656,8 +892,8 @@ fn dropped_events_are_attributed_to_their_adapter() {
 #[test]
 fn a_routine_validator_drop_is_recorded_but_never_warns() {
     let temp = TempDir::new().expect("temp");
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/adapter/claude_desktop_app");
+    let src =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/adapter/claude_desktop_app");
     write_config(
         &temp,
         &format!(
@@ -702,7 +938,7 @@ fn a_routine_validator_drop_is_recorded_but_never_warns() {
 #[test]
 fn the_dry_run_row_carries_the_same_reason_token() {
     let temp = TempDir::new().expect("temp");
-    fleet_config(&temp, Healthy::OneFixtureSession);
+    fleet_config(&temp, Healthy::EmptyDir);
     let args = ["sync", "--dry-run", "--format", "json"];
     let out = run(&temp, &args);
     assert_exit_ok(&out, "a whole-config dry run");
@@ -718,13 +954,57 @@ fn the_dry_run_row_carries_the_same_reason_token() {
     );
 }
 
+/// Status short-circuits discovery so every adapter reports one absent-root shape.
+#[test]
+fn status_reports_absent_sources_consistently() {
+    let temp = TempDir::new().expect("temp");
+    fleet_config(&temp, Healthy::OneFixtureSession);
+    assert_exit_ok(&run(&temp, &["sync"]), "the store-seeding sync");
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.openclaw]\nenabled = true\npath = {:?}\n\n\
+             [adapters.codex-cli]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+            missing.display().to_string(),
+        ),
+    );
+    let args = ["status", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "status over absent sources");
+    let doc = json(&args, &out);
+    for name in ["codex-cli", "openclaw"] {
+        let row = adapter_row(&doc["local"], name);
+        assert!(row["sessions"].is_null(), "{name}: {row}");
+        assert!(row["plan"].is_null(), "{name}: {row}");
+        assert_eq!(row["reason"].as_str(), Some("source_missing"), "{row}");
+        assert_eq!(
+            row["error"].as_str(),
+            Some(format!("source missing: {}", missing.display()).as_str()),
+            "{row}",
+        );
+    }
+
+    let text = run(&temp, &["status"]);
+    assert_exit_ok(&text, "text status over absent sources");
+    let output = stdout(&text);
+    for line in output
+        .lines()
+        .filter(|line| line.contains("codex-cli") || line.contains("openclaw"))
+    {
+        assert!(!line.contains("up to date"), "{line}");
+        assert!(!line.contains("0 sessions"), "{line}");
+    }
+}
+
 /// The narrowed bail costs nothing: a typo'd `pond sync <adapter>` must fail
 /// before the store is created and before the sync flock is taken, so a wrong
 /// invocation leaves the host exactly as it found it.
 #[test]
 fn narrowing_at_an_absent_source_creates_no_store_and_takes_no_lock() {
     let temp = TempDir::new().expect("temp");
-    fleet_config(&temp, Healthy::OneFixtureSession);
+    fleet_config(&temp, Healthy::EmptyDir);
     let out = run(&temp, &["sync", "codex-cli"]);
     assert_eq!(
         out.status.code(),
@@ -736,14 +1016,10 @@ fn narrowing_at_an_absent_source_creates_no_store_and_takes_no_lock() {
         !temp.path().join("store").exists(),
         "the bail must precede `open_store`, which would create the destination",
     );
-    let locks: Vec<_> = std::fs::read_dir(temp.path().join("state").join("pond"))
-        .map(|dir| {
-            dir.filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("sync-"))
-                .collect()
-        })
-        .unwrap_or_default();
+    let locks: Vec<_> = state_files(&temp)
+        .into_iter()
+        .filter(|name| name.starts_with("sync-"))
+        .collect();
     assert!(
         locks.is_empty(),
         "the bail must precede the sync flock, so a typo never queues behind a real sync: {locks:?}",
@@ -756,7 +1032,7 @@ fn narrowing_at_an_absent_source_creates_no_store_and_takes_no_lock() {
 #[test]
 fn a_resolve_error_keeps_the_counted_error_document() {
     let temp = TempDir::new().expect("temp");
-    fleet_config(&temp, Healthy::OneFixtureSession);
+    fleet_config(&temp, Healthy::EmptyDir);
     for adapter in ["definitely-not-an-adapter", "agy"] {
         let args = ["sync", adapter, "--format", "json"];
         let out = run(&temp, &args);
@@ -819,4 +1095,189 @@ fn a_config_blob_with_no_path_still_fails_the_whole_run() {
             "{args:?} must name the missing key, or the fix is a guess: {stderr}",
         );
     }
+}
+
+#[test]
+fn a_config_blob_with_an_empty_path_fails_with_a_fix() {
+    let temp = TempDir::new().expect("temp");
+    let root = claude_code_root(&temp, &Healthy::EmptyDir);
+    // Every spelling of "empty", including inside an array: a fanned pass with
+    // an empty element reported `source missing:` with no path to act on.
+    for spelling in [
+        "\"\"".to_owned(),
+        "[\"\"]".to_owned(),
+        format!("[\"\", {:?}]", root.display().to_string()),
+    ] {
+        write_config(
+            &temp,
+            &format!(
+                "[adapters.claude-code]\nenabled = true\npath = {:?}\n\n\
+                 [adapters.codex-cli]\nenabled = true\npath = {}\n",
+                root.display().to_string(),
+                spelling,
+            ),
+        );
+        for args in [vec!["sync"], vec!["sync", "--dry-run"]] {
+            let out = run(&temp, &args);
+            assert!(
+                !out.status.success(),
+                "{args:?} must reject path = {spelling}",
+            );
+            let error = stderr(&out);
+            assert!(error.contains("[adapters.codex-cli]"), "{args:?}: {error}");
+            assert!(error.contains("empty `path`"), "{args:?}: {error}");
+            assert!(
+                error.contains("set it to a directory") && error.contains("pond adapters disable"),
+                "{args:?} must name the fixes: {error}",
+            );
+        }
+    }
+}
+
+/// `--no-wait` is what the scheduled run passes so ticks never queue, and spec
+/// 7.8 promises it the `skipped` document. An all-absent run must not answer
+/// `ok` just because it had nothing to import.
+#[test]
+fn an_all_absent_sync_still_reports_skipped_when_the_store_is_busy() {
+    let temp = TempDir::new().expect("temp");
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.codex-cli]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+        ),
+    );
+    // One run to create the lock file, whose name carries the store key.
+    assert_exit_ok(&run(&temp, &["sync"]), "the seeding all-absent sync");
+    let root = temp.path().join("state");
+    let dir = if cfg!(windows) {
+        root
+    } else {
+        root.join("pond")
+    };
+    let lock_name = state_files(&temp)
+        .into_iter()
+        .find(|name| name.starts_with("sync-") && name.ends_with(".lock"))
+        .expect("the all-absent run takes the flock");
+
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(lock_name))
+        .expect("open the lock file");
+    held.try_lock().expect("hold the flock for this test");
+
+    let args = ["sync", "--no-wait", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "a --no-wait sync against a busy store");
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("skipped"), "{doc}");
+    drop(held);
+}
+
+/// openclaw's deletion-reconciliation pass runs after ingest and resolves every
+/// ambiguity to PRESERVE. A `sessions` path it cannot enumerate is ambiguity,
+/// not a run failure - aborting there would throw away a healthy adapter's
+/// committed work, which is the shape issue #236 exists to remove.
+#[test]
+fn an_unenumerable_openclaw_sessions_path_does_not_fail_the_run() {
+    let temp = TempDir::new().expect("temp");
+    let claude = claude_code_root(&temp, &Healthy::OneFixtureSession);
+    // `list_agents` manufactures an AgentDir per dir under `agents/` without
+    // probing `sessions/`, so a `sessions` that is a regular file reaches the
+    // scan as a non-directory.
+    let agent = temp.path().join("oc").join("agents").join("a1");
+    std::fs::create_dir_all(&agent).expect("agent dir");
+    std::fs::write(agent.join("sessions"), b"not a directory").expect("sessions file");
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.claude-code]\nenabled = true\npath = {:?}\n\n             [adapters.openclaw]\nenabled = true\npath = {:?}\n",
+            claude.display().to_string(),
+            temp.path().join("oc").display().to_string(),
+        ),
+    );
+
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(
+        &out,
+        "a sync whose openclaw archive scan cannot read one agent",
+    );
+    let doc = json(&args, &out);
+    assert_eq!(doc["outcome"].as_str(), Some("ok"), "{doc}");
+    assert_eq!(
+        doc["sessions_inserted"].as_u64(),
+        Some(1),
+        "the healthy adapter's committed session must survive: {doc}"
+    );
+}
+
+/// `skipped_unimportable` is attached to the real summary document, not just
+/// formatted correctly in isolation: the unit test drives the helper directly,
+/// so deleting the one call site that reaches the document leaves it green.
+#[test]
+fn contract_excluded_sessions_surface_as_a_benign_json_count() {
+    let temp = TempDir::new().expect("temp");
+    let root = temp.path().join("nanoclaw");
+    let v2_db = root.join("data").join("v2.db");
+    std::fs::create_dir_all(v2_db.parent().expect("data dir")).expect("data dir");
+    let conn = rusqlite::Connection::open(&v2_db).expect("open v2.db");
+    conn.execute_batch(
+        "CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL, agent_provider TEXT, created_at TEXT NOT NULL);
+         CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL, instance TEXT NOT NULL, name TEXT, is_group INTEGER DEFAULT 0, created_at TEXT NOT NULL);
+         CREATE TABLE container_configs (agent_group_id TEXT PRIMARY KEY, provider TEXT, model TEXT, assistant_name TEXT, updated_at TEXT NOT NULL);
+         CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT, status TEXT, created_at TEXT NOT NULL);
+         INSERT INTO agent_groups VALUES ('ag-codex', 'Codex Group', 'codex', 'codex', '2026-04-01T00:00:00Z');
+         INSERT INTO container_configs VALUES ('ag-codex', 'codex', 'gpt-5', 'Cod', '2026-04-01T00:00:00Z');
+         INSERT INTO sessions VALUES ('sess-codex-a', 'ag-codex', 'mg', 'thread', 'codex', 'active', '2026-04-27T00:00:00Z');
+         INSERT INTO sessions VALUES ('sess-codex-b', 'ag-codex', 'mg', 'thread', 'codex', 'active', '2026-04-27T00:00:00Z');",
+    )
+    .expect("seed v2.db");
+    drop(conn);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.nanoclaw]\nenabled = true\npath = {:?}\n",
+            root.display().to_string(),
+        ),
+    );
+
+    let args = ["sync", "--format", "json"];
+    let out = run(&temp, &args);
+    assert_exit_ok(&out, "a sync whose only sessions are contract-excluded");
+    let doc = json(&args, &out);
+    assert_eq!(doc["skipped_unimportable"].as_u64(), Some(2), "{doc}");
+    // A documented non-ingest is not a health claim: it must not reach the
+    // degraded array, and it must not print a warning.
+    assert!(doc.get("degraded_adapters").is_none(), "{doc}");
+    assert!(!stderr(&out).contains("could not read"), "{}", stderr(&out));
+}
+
+/// Pins the observable behavior, not the guard: since the all-absent CLI sync
+/// short-circuits before the import stage, the notice is unreachable here by
+/// construction. The guard itself now has only one live caller
+/// (`serve --with-sync`), noted at its site in `main.rs`.
+#[test]
+fn an_all_absent_host_does_not_repeat_the_first_sync_notice() {
+    let temp = TempDir::new().expect("temp");
+    let missing = absent_source(&temp);
+    write_config(
+        &temp,
+        &format!(
+            "[adapters.codex-cli]\nenabled = true\npath = {:?}\n\n\
+             [adapters.openclaw]\nenabled = true\npath = {:?}\n",
+            missing.display().to_string(),
+            missing.display().to_string(),
+        ),
+    );
+    assert_exit_ok(&run(&temp, &["sync"]), "the first all-absent sync");
+    let second = run(&temp, &["sync"]);
+    assert_exit_ok(&second, "the second all-absent sync");
+    assert!(
+        !stderr(&second).contains("first sync from this host"),
+        "an all-absent host never starts reading history: {}",
+        stderr(&second),
+    );
 }

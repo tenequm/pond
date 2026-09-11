@@ -96,6 +96,7 @@ pub(crate) enum ScheduleCmd {
 
 /// One scheduler probe's answer, shared by the `pond status` text line and
 /// the JSON document (which needs the fields structured, not pre-rendered).
+#[derive(Default)]
 pub(crate) struct ScheduleSnapshot {
     pub line: String,
     pub active: bool,
@@ -164,10 +165,6 @@ fn render_state(state: &State) -> String {
 /// used by both platform modules and the shared `logs()` function.
 pub(crate) fn log_path() -> PathBuf {
     crate::syncstate::pond_state_dir().join("sync.log")
-}
-
-pub(crate) fn status_line() -> String {
-    status_snapshot().line
 }
 
 pub(crate) fn status_snapshot() -> ScheduleSnapshot {
