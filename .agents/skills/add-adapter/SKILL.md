@@ -18,9 +18,9 @@ Ground rules that override any instinct to improvise:
 
 ## Phase A - spec the adapter
 
-Output: `docs/knowledge/references/<source_agent>.md` (named by the brand string, e.g. `grok-build.md`; the directory is created with the first spec doc) plus the committed fixture.
+Output: `docs/knowledge/references/<source_agent>.md`, named by the brand string (e.g. `grok-build.md`), plus the committed fixture.
 
-The spec doc is now an OKF Reference concept - it carries YAML frontmatter (type: Reference, description, tags, sources, generated, stale_after) and its addition must update `docs/knowledge/index.md` and `docs/knowledge/log.md` per that bundle's conventions.
+The spec doc is an OKF Reference concept, so it carries YAML frontmatter (type: Reference, description, tags, sources, generated, stale_after) and its addition must update `docs/knowledge/index.md` and `docs/knowledge/log.md` in the same change, per that bundle's conventions. The directory follows from the type rather than being a choice - `references/` because the concept is a `Reference` - and `repo:check-knowledge` fails the build if the two disagree, so a spec doc filed anywhere else will not merge.
 
 Preflight, before anything else: the agent binary installed at the version the spec doc will cite, a provider key in the environment (or the credential file step 2 describes), and `tmux` when the TUI is the only writer. Discovering one of these missing on the day implementation starts is the most expensive kind of blocker.
 

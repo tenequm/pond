@@ -161,9 +161,14 @@ below and the discussion transcript disagree, this file wins.
 
 - `repo:check-knowledge` inline script (python3 heredoc): for every
   `docs/knowledge/**` concept - frontmatter parses as YAML, `type` non-empty,
-  bundle-relative links resolve, index.md lists exactly the concept files on
-  disk, log.md exists. Graceful skip-with-warning if python3/yaml is missing
-  (mirroring the gitleaks precedent); CI is the hard gate.
+  the concept sits in the directory its type names, bundle-relative links
+  resolve, index.md lists exactly the concept files on disk, log.md exists.
+  Graceful skip-with-warning if python3/yaml is missing (mirroring the gitleaks
+  precedent); CI is the hard gate, and the CI bootstrap installs PyYAML so that
+  is true rather than aspirational.
+- Known scope limit: link checking covers only links inside the bundle. A path
+  naming a concept from elsewhere in the repo is invisible to this gate, so a
+  rename has to sweep the repo by hand.
 - Wire into the `ci.yml:66` task list (`repo:check-knowledge` joins
   `repo:check-changelog ...`) and the hook line from workstream E.
 

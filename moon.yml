@@ -117,9 +117,16 @@ tasks:
     inputs: ['CHANGELOG.md']
 
   # Validate the Open Knowledge Format (OKF) bundle under docs/knowledge/:
-  # every concept file has valid frontmatter with a non-empty scalar type,
-  # relative markdown links resolve to existing files, index.md and the
-  # concept files on disk stay in sync, and log.md is present.
+  # every concept file has valid frontmatter with a non-empty scalar type, each
+  # concept sits in the directory its type names, relative markdown links
+  # resolve to existing files, index.md and the concept files on disk stay in
+  # sync, and log.md is present.
+  #
+  # Link checking covers only links INSIDE the bundle. Paths that name a concept
+  # from elsewhere in the repo (docs/spec.md, the add-adapter playbook, adapter
+  # doc comments) are invisible here, so renaming a concept means sweeping the
+  # repo for them by hand - a bundle rename passed every gate while leaving 19
+  # dangling references exactly once.
   check-knowledge:
     script: |
       set -euo pipefail
