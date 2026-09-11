@@ -1697,7 +1697,7 @@ fn build_session(
         openclaw.insert("cwd".to_owned(), cwd.clone());
     }
     if let Some(entry) = entry {
-        openclaw.insert("session_entry".to_owned(), entry.clone());
+        openclaw.insert("session_entry".to_owned(), session_entry_projection(entry));
     }
     if let Some(token) = generation {
         openclaw.insert("transcript_generation".to_owned(), json!(token));
@@ -1756,6 +1756,55 @@ struct Lineage {
     /// a parent session id (spec.md 4).
     parent_message_id: Option<String>,
     relation: Option<&'static str>,
+}
+
+/// Entry fields that describe the HOST rather than the session, and so are not
+/// projected into `options.openclaw.session_entry`.
+///
+/// Together they are 87% of a file-era entry (11.2 KB of 12.7 KB) and 91-94%
+/// of a DB-era one (21-24 KB of 23-25.5 KB), measured across the five captures.
+/// Neither is a fact about the session, and pond's model (sessions, messages,
+/// parts) has nowhere to put a fact about a host, so the only way to keep them
+/// is once per session forever. They go for different reasons:
+///
+/// - `skillsSnapshot` (858 B file-era, 8.9 KB DB-era) is the list of skills
+///   installed on the MACHINE. Byte-identical across every key in both eras'
+///   captures, so it is pure duplication.
+/// - `systemPromptReport` (11.2-15.1 KB) does vary per session, so it is not
+///   duplication - it is telemetry. Every leaf is a COUNT or a HASH of content
+///   held elsewhere: `systemPrompt` is `{chars, hash, projectContextChars}`,
+///   `tools` is per-tool `{name, summaryChars, summaryHash, schemaChars}`,
+///   `currentTurn` is `{promptChars, runtimeContextChars}`. No message, no tool
+///   call, no tool result - OpenClaw's own prompt-budget accounting.
+///
+/// `model-lossless-projection` is not an argument for keeping either: it
+/// protects the SESSION's content, and neither field carries any. The entry is
+/// also per-key and mutable, read at ingest, so a generation rotated out months
+/// ago would be stamped with the configuration as of the sync rather than as of
+/// the session - the same per-key-onto-every-generation error
+/// `is_root_generation` exists to prevent for lineage.
+///
+/// Everything else stays. The remaining ~700 B is genuinely per-session and is
+/// what `pond_sql` wants: `model`, `modelProvider`, token counts,
+/// `estimatedCostUsd`, the timestamps - and every lineage field
+/// (`parentSessionKey`, `usageFamilySessionIds`, `compactionCheckpoints`,
+/// `heartbeatIsolatedBaseSessionKey`), which is why this is a deny list rather
+/// than an allow list: an unrecognized field is kept, not dropped.
+const ENTRY_HOST_CONFIG_FIELDS: &[&str] = &["systemPromptReport", "skillsSnapshot"];
+
+/// Project a `sessions.json` / `session_nodes` entry for storage, dropping the
+/// host-configuration fields. A non-object entry (`json_or_string` yields a
+/// string for unparseable `entry_json`) passes through untouched.
+fn session_entry_projection(entry: &Value) -> Value {
+    let Some(object) = entry.as_object() else {
+        return entry.clone();
+    };
+    object
+        .iter()
+        .filter(|(key, _)| !ENTRY_HOST_CONFIG_FIELDS.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 /// `sessions.json` `label` marking a session branched off a compaction

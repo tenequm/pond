@@ -889,6 +889,70 @@ async fn every_captured_transcript_is_ingested() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The stored entry keeps what is true of the SESSION and drops what is true
+/// of the HOST.
+///
+/// `skillsSnapshot` is the machine's installed skills, byte-identical across
+/// every key; `systemPromptReport` is OpenClaw's prompt-budget telemetry, whose
+/// every leaf is a count or a hash of content held elsewhere. Together they are
+/// 87% of a file-era entry and 91-94% of a DB-era one, and neither carries a
+/// message, a tool call or a tool result. What remains has to stay useful,
+/// which is the second half of this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_stored_entry_drops_host_config_and_keeps_session_facts() -> anyhow::Result<()> {
+    let (store, _dir, ids) = ingest_capture("hooks-heartbeat").await;
+    let mut checked = 0usize;
+    for id in &ids {
+        let Some(session) = store.get_session(id).await? else {
+            continue;
+        };
+        let Some(entry) = session
+            .session
+            .options
+            .get("openclaw")
+            .and_then(|o| o.get("session_entry"))
+        else {
+            continue;
+        };
+        checked += 1;
+        for dropped in ["systemPromptReport", "skillsSnapshot"] {
+            assert!(
+                entry.get(dropped).is_none(),
+                "{id}: {dropped} describes the host, not this session, and is \
+                 identical on every session of the machine"
+            );
+        }
+        // The projection must not gut the entry: these are the per-session
+        // facts `pond_sql` exists to answer questions about.
+        assert!(
+            entry.get("sessionId").and_then(Value::as_str).is_some(),
+            "{id}: sessionId must survive"
+        );
+        assert!(
+            entry.get("updatedAt").is_some(),
+            "{id}: timestamps must survive"
+        );
+        assert!(
+            entry.get("sessionFile").is_some(),
+            "{id}: sessionFile must survive"
+        );
+        // A deny list, not an allow list: only two fields go. Anything else the
+        // capture happens to carry - token counts, cost, lineage keys, fields
+        // OpenClaw adds later - must still be there.
+        let kept = entry.as_object().map(serde_json::Map::len).unwrap_or(0);
+        assert!(
+            kept >= 5,
+            "{id}: entry projected down to {kept} fields; only \
+             systemPromptReport and skillsSnapshot should have been dropped"
+        );
+    }
+    assert!(
+        checked > 0,
+        "no session carried an entry; the assertions above proved nothing"
+    );
+    Ok(())
+}
+
 /// Cron runs group under their JOB, not one project per run: a
 /// `sessionTarget: "main"` run stores its own
 /// `...:cron:<jobId>:run:<startedAtMs>` key, and a project per run would make
