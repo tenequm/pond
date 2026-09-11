@@ -50,7 +50,7 @@
       # (or `nix develop`) is a complete dev setup:
       #
       #   moon        exact-pinned from the .prototools value via
-      #               ops/nix/moon-cli.nix (not nixpkgs, which trails
+      #               ops/moon-cli.nix (not nixpkgs, which trails
       #               releases); shadows any host-installed moon and always
       #               satisfies the workspace versionConstraint.
       #   gitleaks    repo:secret-scan, the pre-commit gate's first leg.
@@ -69,7 +69,7 @@
             pkg-config
             gitleaks
             (python3.withPackages (ps: [ ps.pyyaml ]))
-            (pkgs.callPackage ./ops/nix/moon-cli.nix { })
+            (pkgs.callPackage ./ops/moon-cli.nix { })
           ];
         };
       });

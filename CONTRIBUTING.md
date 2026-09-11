@@ -22,6 +22,12 @@ pond's changelog is generated from squash-commit messages, so what you write on 
 - CI comments only when something is wrong, listing every problem at once, and clears the comment once the description passes.
 - If a note turns out wrong after merge, edit the PR description - the changelog is regenerated from it on the next release-PR refresh.
 
+## Toolchain and pre-commit
+
+Repo tasks run through moon; the pinned version lives in [`.prototools`](.prototools) and [`.moon/workspace.yml`](.moon/workspace.yml) enforces it as a floor, so an older moon refuses to run rather than disagreeing with CI silently. Committing runs that moon-managed pre-commit hook, so moon has to be on PATH to commit at all.
+
+Two ways to get it: `nix develop`, or `direnv allow` to have the committed [`.envrc`](.envrc) enter that shell for you on every `cd`. Either gives you the pinned moon plus gitleaks and a Python with PyYAML - everything the hook and the gates want. Otherwise install moon yourself at the version [`.prototools`](.prototools) names.
+
 ## Everything else
 
 Run the same three commands before pushing. CI re-runs them on Linux, and natively on Windows for same-repo branches (a fork PR gets the Windows leg when a maintainer pushes the branch, or on merge).

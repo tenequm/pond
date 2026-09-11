@@ -27,12 +27,6 @@ fileGroups:
     - '.cargo/config.toml'
   tests:
     - 'packages/pond/tests/**/*'
-  # Bench CODE only, never the whole dir: packages/pond/benches/docs/ holds
-  # append-on-every-run measurement logs (the bench-gate baseline jsonl), and a
-  # `benches/**/*` glob would invalidate every consumer's cache on each gate
-  # run. Bench data deliberately belongs to NO group.
-  benches:
-    - 'packages/pond/benches/**/*.rs'
 
 tasks:
   # Gate the top CHANGELOG.md section's `###` headers to the canonical emoji
@@ -97,7 +91,13 @@ tasks:
       # into exit 141.
       main_changelog=$(git show origin/main:"$file" 2>/dev/null || true)
       base_section=$(awk '/^## \[/{n++} n==1{print} n==2{exit}' <<< "$main_changelog")
-      if [ -n "$base_section" ] && [ "$section" = "$base_section" ]; then
+      # An unresolvable origin/main (a fresh clone before its first fetch, a
+      # remote under another name, a shallow checkout) leaves the base empty,
+      # and the gate then cannot tell a new entry from shipped history;
+      # skipping is correct because the prose gate must never fire on an entry
+      # this flow cannot fix. CI always has a base, since it checks out at
+      # fetch-depth: 0.
+      if [ -z "$base_section" ] || [ "$section" = "$base_section" ]; then
         exit 0
       fi
 
@@ -148,16 +148,14 @@ tasks:
       violations = []
 
       if not os.path.isdir(bundle_dir):
-          violations.append(f"check-knowledge: {bundle_dir}: bundle directory does not exist")
-          for v in violations:
-              sys.stderr.write(f"{v}\n")
+          sys.stderr.write(f"check-knowledge: {bundle_dir}: bundle directory does not exist\n")
           sys.exit(1)
 
-      # 4. log.md must exist.
+      # 1. log.md must exist.
       if not os.path.isfile(log_file):
           violations.append(f"check-knowledge: {log_file}: file does not exist")
 
-      # 3. index.md must exist.
+      # 2. index.md must exist.
       if not os.path.isfile(index_file):
           violations.append(f"check-knowledge: {index_file}: file does not exist")
 
@@ -174,7 +172,7 @@ tasks:
       concept_files = [f for f in all_md_files if f != norm_index and f != norm_log]
       concept_set = set(concept_files)
 
-      # 1. Validate frontmatter of concept files
+      # 3. Validate frontmatter of concept files
       for file_path in concept_files:
           try:
               with open(file_path, "r", encoding="utf-8") as f:
@@ -237,7 +235,7 @@ tasks:
               elif not type_val or type_val.startswith(("[", "{")):
                   violations.append(f"check-knowledge: {file_path}: 'type' must be a non-empty scalar value")
 
-      # 2. Check relative markdown links in concept files, index.md, and log.md
+      # 4. Check relative markdown links in concept files, index.md, and log.md
       link_pattern = re.compile(r'\[(?:\\\]|[^\]])*\]\(([^)]+)\)')
 
       def extract_links(content):
@@ -250,11 +248,9 @@ tasks:
               targets.append((raw, t))
           return targets
 
-      files_to_check_links = [f for f in all_md_files if os.path.isfile(f)]
-
       index_concept_links = set()
 
-      for file_path in files_to_check_links:
+      for file_path in all_md_files:
           try:
               with open(file_path, "r", encoding="utf-8") as f:
                   content = f.read()
@@ -284,7 +280,7 @@ tasks:
                   if resolved != norm_index and resolved != norm_log:
                       index_concept_links.add(resolved)
 
-      # 3. index.md must link every concept file on disk, and every concept link in index.md must exist on disk
+      # 5. index.md must link every concept file on disk, and every concept link in index.md must exist on disk
       if os.path.isfile(index_file):
           unindexed = concept_set - index_concept_links
           for f in sorted(unindexed):
@@ -300,6 +296,12 @@ tasks:
           sys.exit(1)
       PY
     inputs: ['docs/knowledge/**/*']
+    options:
+      # The validator resolves links that leave the bundle (six concepts link
+      # into docs/researches/), so a target can be deleted or renamed without
+      # changing this task's fingerprint, and a cached pass would then survive
+      # the break it exists to catch - on the pre-commit hook and in CI alike.
+      cache: false
 
   # Scan staged changes for secrets before they enter history - the only cheap
   # moment to stop them, since a committed secret lives in git history forever
@@ -323,6 +325,9 @@ tasks:
         echo "  false positive? add a narrow allowlist block to .github/gitleaks.toml" >&2
         exit 1
       fi
+    # cache: false alone still makes moon hash the whole project; the empty
+    # list states that no file inputs apply.
+    inputs: []
     options:
       # Reads the git index, which no input glob can represent.
       cache: false
@@ -345,9 +350,16 @@ tasks:
         echo "publishing $name@$version"
         (cd "$dir" && npm ci && npm publish --access public)
       done
+    inputs: []
     options:
       cache: false
       outputStyle: stream
+      # The task type makes it selectable by moon check and moon ci, so without
+      # this a local `moon check --all` runs `npm publish`. `only` keeps the
+      # explicit `moon run repo:publish-npm` that the release workflow issues
+      # working, while removing it from every local sweep. `inputs: []` states
+      # that nothing file-based makes it affected.
+      runInCI: 'only'
 
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
   # cross-compiled. It is a separate task for the same reason `test-msvc` is

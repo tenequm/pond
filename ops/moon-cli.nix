@@ -5,7 +5,7 @@ let
   # place a moon bump is typed. Only the hashes below are per-version data;
   # a bump whose hashes were not updated fails loudly at fetch, never
   # silently. New hashes come from the release's *.tar.xz.sha256 assets.
-  version = (builtins.fromTOML (builtins.readFile ../../.prototools)).moon;
+  version = (builtins.fromTOML (builtins.readFile ../.prototools)).moon;
   # musl on Linux: the static build runs on NixOS without ELF patching.
   # Darwin Mach-O needs no patching either, so no autoPatchelfHook anywhere.
   targetMap = {
@@ -23,7 +23,7 @@ let
   };
   shaMap =
     shaMaps.${version} or (throw
-      "ops/nix/moon-cli.nix has no hashes for moon ${version}; add an entry from the v${version} release's .sha256 assets");
+      "ops/moon-cli.nix has no hashes for moon ${version}; add an entry from the v${version} release's .sha256 assets");
 in
 stdenvNoCC.mkDerivation {
   pname = "moon";

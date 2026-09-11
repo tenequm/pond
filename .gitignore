@@ -49,6 +49,8 @@ skills-lock.json
 # tree and make `cargo publish` refuse to release.
 /dist/
 /minisign*
+# moon binary unpacked into repo root by the npm-publish workflow step
+/moon
 
 # Benchmark fixtures/results and any query set derived from the operator's
 # corpus capture full conversation content (including API keys, wallet

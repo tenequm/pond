@@ -40,9 +40,10 @@ below and the discussion transcript disagree, this file wins.
 6. **moon version becomes repo-owned.** Latest upstream is v2.5.4 (2026-09-03);
    this box runs 2.5.1 (Home Manager nix store), CI's pin lives in the pond-ci
    runner image, and nothing in-tree names a version. Add `.prototools` with
-   `moon = "2.5.4"`; add `versionConstraint: '>=2.5.4'` to `.moon/workspace.yml`
-   only after the runner image and the operator's Home Manager deploy are on
-   2.5.4 (sequencing, or CI hard-fails on the old image).
+   `moon = "2.5.4"`; `versionConstraint: '>=2.5.4'` in `.moon/workspace.yml`
+   waited for the runner image and the operator's Home Manager deploy to reach
+   2.5.4 (sequencing, or CI hard-fails on the old image); both were bumped and
+   the constraint shipped in this change.
 7. **Bundle invariants get mechanized as a moon task** (`repo:check-knowledge`),
    wired into the moon-managed pre-commit hook and CI. The OKF skill prescribes
    the checks, not the mechanism ("the checks, not the commands, are the
@@ -140,8 +141,9 @@ below and the discussion transcript disagree, this file wins.
   program invoked BY the `build-dist` task - the correct relationship already;
   relocate alongside (`.github/scripts/` or leave; update the task's path and
   `inputs`). `ops/scripts/` is then deleted.
-- `.prototools` with `moon = "2.5.4"` lands now; the `versionConstraint` line
-  waits for decision 6's sequencing.
+- `.prototools` with `moon = "2.5.4"` and the `versionConstraint` line both
+  landed; the version is now derived from `.prototools` by the Linux bootstrap,
+  the Windows bootstrap and the npm-publish job rather than retyped.
 - Accepted cost: inline scripts lose shellcheck/highlighting; gained: the script
   text is part of the task hash.
 
@@ -198,7 +200,9 @@ below and the discussion transcript disagree, this file wins.
 - OKF invariant 7 on the bundle: frontmatter parses, types non-empty, links
   resolve, index matches directory (i.e. `repo:check-knowledge` itself).
 - Path sweep: `rg -n 'ops/scripts|docs/benchmarks|docs/adapters'` finds only
-  deliberate survivors (CHANGELOG history, this plans dir).
+  deliberate survivors (CHANGELOG history, this plans dir,
+  `packages/pond/benches/docs/results.md` as historical record of past benchmark
+  runs).
 - Driver reviews every agent diff before commit; one PR,
   `docs(knowledge): adopt OKF bundle and consolidate benches + moon tasks`
   (or split D+E into a second PR if review size demands).
@@ -206,8 +210,5 @@ below and the discussion transcript disagree, this file wins.
 ## Out of scope / follow-ups
 
 - Plans backfill (Decision concepts from landed plans) - optional workstream.
-- `versionConstraint: '>=2.5.4'` lands after the pond-ci runner image and the
-  operator's Home Manager (moon 2.5.1 -> 2.5.4) are bumped, both outside this
-  repo.
 - Moving AGENTS.md narrative histories (e.g. the release-plz v0.12.0 story)
   into concepts - optional polish, explicitly NOT part of this PR (decision 1).

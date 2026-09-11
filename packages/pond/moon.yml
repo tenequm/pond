@@ -101,17 +101,16 @@ tasks:
   # The full verify build that release-time publishing skips (publish_no_verify
   # in .github/release-plz.toml): package the crate and compile the result.
   # On-demand, not in the CI task list - run it when packaging or manifest
-  # excludes change.
+  # excludes change. `type: 'run'` keeps it out of `moon check` and `moon ci`
+  # sweeps while an explicit `moon run pond:check-publish` still works locally.
   check-publish:
+    type: 'run'
     command: 'cargo publish --dry-run --locked --allow-dirty'
+    inputs: []
     options:
       cache: false
       outputStyle: stream
 
-  # Pre-release validation against the live remote store: gate benches + CLI
-  # probes + map-vs-scan equivalence, appending to
-  # benches/docs/bench-gate-baseline.jsonl and printing the delta vs the
-  # previous run. ~30 min of S3 wall-clock; never cached, always live.
   bench-gate:
     script: |
       # Release bench gate: the pre-release validation of what pond actually
@@ -119,7 +118,8 @@ tasks:
       # the configured remote store. Runs the regression-gate benches + CLI
       # probes, checks map-vs-scan output equivalence (hard pass/fail), appends
       # one JSON line per run to packages/pond/benches/docs/bench-gate-baseline.jsonl,
-      # and prints the delta vs the previous run.
+      # and prints the delta vs the previous run. ~30 min of S3 wall-clock;
+      # never cached, always live.
       #
       # Gate targets (run here, every release):
       #   serve_mem_bench  - read-serving components + per-query S3 iops (io-trace)
@@ -353,6 +353,7 @@ tasks:
       if not any(k.startswith("write_") and k not in TAGS and cur[k] is not None for k in cur):
           print("NOTE: no write_* metrics in this row - storage-path changes need a write-side A/B (AGENTS.md#benchmarking-storage-path-changes)")
       EOF
+    inputs: []
     options:
       cache: false
       outputStyle: stream
