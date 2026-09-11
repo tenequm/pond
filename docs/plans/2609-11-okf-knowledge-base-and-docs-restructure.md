@@ -19,7 +19,7 @@ below and the discussion transcript disagree, this file wins.
    per file, YAML frontmatter with `type`/`sources`/`generated`, index + log
    bookkeeping, deprecate-never-delete. The bundle holds what AGENTS.md does not:
    decisions and findings that are not standing orders.
-3. **`docs/adapters/` migrates into the bundle** as `docs/knowledge/adapters/`,
+3. **`docs/adapters/` migrates into the bundle** as `docs/knowledge/references/`,
    one Reference concept per source agent. Their ad-hoc "Last verified: <date>,
    against <version>" headers become `verified` events + `stale_after`.
 4. **All benchmark material consolidates under `packages/pond/benches/`** (the
@@ -82,7 +82,7 @@ below and the discussion transcript disagree, this file wins.
 ### C. Adapters migration (agy)
 
 - Move `docs/adapters/{agy,grok-build,letta-code}.md` to
-  `docs/knowledge/adapters/`, adding frontmatter: `type: Reference`,
+  `docs/knowledge/references/`, adding frontmatter: `type: Reference`,
   `description`, `tags`, `sources` (upstream repos, descriptors as honest scope
   descriptors, issue links), `verified` from the "Last verified" lines,
   `stale_after` pegged to the next plausible upstream release. Bodies unchanged.

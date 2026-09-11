@@ -320,7 +320,7 @@ sample tree.
   form exceeds 255 bytes. The adapter ingests `updates.jsonl` (the envelope
   stream grok itself calls authoritative) plus `summary.json` for identity /
   project / lineage; every other sibling is documented non-capture
-  (`docs/knowledge/adapters/grok-build.md` row 8).
+  (`docs/knowledge/references/grok-build.md` row 8).
 - Samples: captured 2026-08-24 by sandbox self-capture - grok-build 1.0.5
   (binary `5115b46bc909`) under throwaway homes at neutral base paths
   (`/tmp/grok-fixture` on macOS, `C:\gf` on Windows 11 Pro x64), model

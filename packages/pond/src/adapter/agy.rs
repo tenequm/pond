@@ -8,7 +8,7 @@
 //! blob; `steps.step_payload` is a `gemini_coder.Step`, the conversation's unit
 //! of record. The schema was recovered from the descriptors embedded in the agy
 //! binary; format archaeology and the decision record live in
-//! `docs/knowledge/adapters/agy.md`.
+//! `docs/knowledge/references/agy.md`.
 //!
 //! The database is a mutable store, not an append-only log (measured): an
 //! interrupted step stays `RUNNING` until the next resume rewrites it to
@@ -56,7 +56,7 @@ const CONVERSATIONS_DIR: &str = "conversations";
 /// higher value is a schema move this build predates: a visible, counted skip.
 const SUPPORTED_USER_VERSION: i64 = 1;
 
-/// Tables pond does not ingest (docs/knowledge/adapters/agy.md row 8): per-generation
+/// Tables pond does not ingest (docs/knowledge/references/agy.md row 8): per-generation
 /// telemetry and executor configuration snapshots. They carry no conversation,
 /// agy reserializes them on every save with nondeterministic map order, and
 /// `/rewind` deletes them. `trajectory_metadata_blob` is not listed: it is the
@@ -95,7 +95,7 @@ mod step_type {
 /// Kind steps that execute a tool at the top level rather than inside a
 /// `GENERIC` result: the step's own payload field, then paths to the text the
 /// model was shown, best first. Both are written by the harness the ACP server
-/// spawns (`docs/knowledge/adapters/agy.md` row 5).
+/// spawns (`docs/knowledge/references/agy.md` row 5).
 const KIND_TOOL_RESULTS: [(i64, u64, &[&[u64]]); 2] = [
     // `CortexStepRunCommand`: `combined_output` (21) is a `RunCommandOutput`
     // whose `full` (1) is the text, `truncated` (2) the shortened form agy
@@ -396,7 +396,7 @@ fn collect_heads(root: &Path, peek: bool) -> Result<Heads, AdapterError> {
 /// fresh. Reads only the small `metadata` column. A settle that rewrites a step
 /// in place without appending one does not move it; the next appended step (a
 /// resume always appends one) or `pond sync --verify` picks the settle up
-/// (docs/knowledge/adapters/agy.md row 10).
+/// (docs/knowledge/references/agy.md row 10).
 fn peek_watermark(db: &Path) -> SourceWatermark {
     match std::fs::metadata(db) {
         Ok(meta) if meta.len() == 0 => return SourceWatermark::Empty,
@@ -1217,7 +1217,7 @@ fn user_parts(ids: &PartIds<'_>, step: &StepView<'_>) -> Option<Vec<Part>> {
 
 /// `CortexStepPlannerResponse`: thinking, then the response text, then each
 /// tool call the model declared. The executing tool step carries the same
-/// call id, which is the pairing (docs/knowledge/adapters/agy.md row 5).
+/// call id, which is the pairing (docs/knowledge/references/agy.md row 5).
 fn planner_parts(ids: &PartIds<'_>, step: &StepView<'_>) -> Option<Vec<Part>> {
     let response = pb::message(step.payload, 20)?;
     let mut parts = Vec::new();
@@ -1673,7 +1673,7 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
 
 /// A tolerant protobuf wire-format reader: agy's schema is closed-source, so
 /// the adapter reads fields by number (numbers recovered from the descriptors
-/// in the agy binary, docs/knowledge/adapters/agy.md) and never needs the whole schema.
+/// in the agy binary, docs/knowledge/references/agy.md) and never needs the whole schema.
 /// Accessors return `None` for an absent or undecodable field; the whole
 /// payload is validated once per step and always survives in the raw record.
 mod pb {
