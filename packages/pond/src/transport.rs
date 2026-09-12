@@ -348,10 +348,11 @@ pub mod mcp {
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
-            CallToolResult, ContentBlock, ErrorCode as JsonRpcErrorCode, Implementation,
-            ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
-            ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-            ResourceContents, ServerCapabilities, ServerInfo,
+            CacheScope, CallToolResult, ContentBlock, ErrorCode as JsonRpcErrorCode,
+            Implementation, ListResourcesResult, ListToolsResult, MetaObject,
+            PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+            ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+            ServerCapabilities, ServerInfo,
         },
         schemars,
         service::RequestContext,
@@ -1266,13 +1267,18 @@ Examples (4 patterns the agent should recognize):
         async fn list_resources(
             &self,
             _request: Option<PaginatedRequestParams>,
-            _context: RequestContext<RoleServer>,
+            context: RequestContext<RoleServer>,
         ) -> Result<ListResourcesResult, ErrorData> {
-            Ok(ListResourcesResult::with_all_items(vec![
+            let result = ListResourcesResult::with_all_items(vec![
                 Resource::new("schema://pond", "pond search schema"),
                 Resource::new("schema://pond-sql", "pond SQL table schema"),
                 Resource::new("stats://pond", "pond corpus stats"),
-            ]))
+            ]);
+            Ok(if wants_cache_hints(&context) {
+                result.with_ttl_ms(0).with_cache_scope(CacheScope::Public)
+            } else {
+                result
+            })
         }
 
         async fn read_resource(
@@ -1403,15 +1409,32 @@ Examples (4 patterns the agent should recognize):
 
         async fn list_tools(
             &self,
-            request: Option<PaginatedRequestParams>,
+            _request: Option<PaginatedRequestParams>,
             context: RequestContext<RoleServer>,
         ) -> Result<ListToolsResult, ErrorData> {
-            let _ = (request, context);
             let mut result = ListToolsResult::with_all_items(self.tool_router.list_all());
             annotate_tool_limits(&mut result);
             annotate_search_mode_with(&mut result, crate::embed::embeddings_enabled());
-            Ok(result)
+            Ok(if wants_cache_hints(&context) {
+                result.with_ttl_ms(0).with_cache_scope(CacheScope::Public)
+            } else {
+                result
+            })
         }
+    }
+
+    /// SEP-2549 makes `ttlMs` and `cacheScope` required on list results once
+    /// the client negotiates 2026-07-28, and a strict client (Claude Code)
+    /// rejects the whole response without them - dropping every tool while the
+    /// connection still looks healthy. rmcp stamps them in the handler macros
+    /// (rust-sdk#1120), but pond overrides `list_tools` and `list_resources`,
+    /// so the override has to stamp them itself. Callers pair this with
+    /// `ttl_ms = 0` (immediately stale): the tool surface varies with instance
+    /// config, so a cached list would advertise the wrong one.
+    fn wants_cache_hints(context: &RequestContext<RoleServer>) -> bool {
+        context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
     }
 
     /// `pond_search` description with the whole `mode=` sentence removed - what
@@ -1653,6 +1676,92 @@ Examples (4 patterns the agent should recognize):
                 );
                 client.cancel().await?;
                 server_task.await??;
+                anyhow::Ok(())
+            })
+            .await?
+        }
+
+        /// Spin pond's MCP server over an in-memory duplex and return what a
+        /// client sees on the two list surfaces, negotiating either the
+        /// 2026-07-28 discovery handshake or the classic one.
+        async fn list_results(
+            modern: bool,
+        ) -> anyhow::Result<(ListToolsResult, ListResourcesResult)> {
+            use rmcp::{ClientLifecycleMode, ClientServiceExt, model::ProtocolVersion};
+
+            let temp = tempfile::TempDir::new()?;
+            let server = PondMcp::new(AppState {
+                store: Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
+                embedder: Arc::new(crate::embed::LazyEmbedder::candle()),
+                search: crate::config::SearchConfig::default(),
+            });
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                server.serve(server_io).await?.waiting().await?;
+                anyhow::Ok(())
+            });
+            let client = if modern {
+                ().serve_with_lifecycle(
+                    client_io,
+                    ClientLifecycleMode::Discover {
+                        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    },
+                )
+                .await?
+            } else {
+                ().serve(client_io).await?
+            };
+            let tools = client.list_tools(None).await?;
+            let resources = client.list_resources(None).await?;
+            client.cancel().await?;
+            server_task.await??;
+            Ok((tools, resources))
+        }
+
+        /// SEP-2549 makes `ttlMs` and `cacheScope` required on list results at
+        /// 2026-07-28, and a strict client rejects the whole response without
+        /// them - Claude Code showed this as a connected pond MCP server
+        /// carrying zero tools and zero resources. `list_all_tools` in the
+        /// discovery test above cannot catch it: rmcp's own client parses the
+        /// fields as optional, so only asserting the envelope fails.
+        #[tokio::test]
+        async fn modern_list_results_carry_the_required_cache_hints() -> anyhow::Result<()> {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let (tools, resources) = list_results(true).await?;
+                assert_eq!(
+                    (
+                        tools.ttl_ms,
+                        tools.cache_scope,
+                        resources.ttl_ms,
+                        resources.cache_scope,
+                    ),
+                    (
+                        Some(0),
+                        Some(CacheScope::Public),
+                        Some(0),
+                        Some(CacheScope::Public),
+                    )
+                );
+                anyhow::Ok(())
+            })
+            .await?
+        }
+
+        /// A classic client keeps the pre-SEP wire shape: the hints are absent,
+        /// not null.
+        #[tokio::test]
+        async fn legacy_list_results_omit_the_cache_hints() -> anyhow::Result<()> {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let (tools, resources) = list_results(false).await?;
+                assert_eq!(
+                    (
+                        tools.ttl_ms,
+                        tools.cache_scope,
+                        resources.ttl_ms,
+                        resources.cache_scope,
+                    ),
+                    (None, None, None, None)
+                );
                 anyhow::Ok(())
             })
             .await?
