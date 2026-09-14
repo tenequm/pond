@@ -51,7 +51,7 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         # Keep in lockstep with PROTOC_VERSION in .github/actions/bootstrap.
-        $v = '35.1'
+        $v = '36.1'
         Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
         Expand-Archive protoc.zip -DestinationPath C:\protoc
         "C:\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -73,7 +73,7 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $v = '2.5.1'
+        $v = '2.5.4'
         Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
         Expand-Archive moon.zip -DestinationPath C:\moon
         $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
@@ -179,7 +179,7 @@ runs:
     #
     # Its post step is `success() || failure()`, so a red run still saves, which
     # matters because Windows iteration means a test failing after a long compile.
-    - uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main @ 2026-06-19
+    - uses: kunobi-ninja/kache-action@d71ab254aa8c20bdfa2dc38856611f5e78678cc6 # main @ 2026-09-14
       with:
         s3-bucket: ttq
         s3-endpoint: https://nbg1.your-objectstorage.com
@@ -197,13 +197,13 @@ runs:
         # Bumped in lockstep with the Linux KACHE_VERSION and the k-tag in the
         # prefixes, never alone. 0.15.0 strips the remote env from daemons it
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
-        # what the bump buys is key schema 27, whose schema 25 predecessor
-        # could under-key (module-body swaps, include_dir renames).
-        version: v0.15.0
+        # what the bump buys is key schema 31; schema 25 could under-key
+        # module-body swaps and include_dir renames.
+        version: v0.21.0
         manifest-key: ${{ inputs.manifest-key }}
-        # Below kache's 50GiB default because the runner disk is shared with
-        # target/ and CARGO_HOME, but the cap MUST stay above the remote prefix
-        # size: `sync --pull --all` materializes the whole prefix locally, and a
+        # Above kache 0.21's 5%-of-disk default because the cap MUST stay above
+        # the remote prefix, while still leaving room for target/ and CARGO_HOME.
+        # `sync --pull --all` materializes the whole prefix locally, and a
         # cap under it makes the store evict mid-run - measured 2026-08-26 at a
         # 27.5 GiB prefix against the old 20GiB cap (138%), 13 failed transfers
         # and demand re-fetches during the build. D: holds ~147 GB total; the
