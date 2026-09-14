@@ -83,7 +83,7 @@ jobs:
       BAZEL_REMOTE_AUTH: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       # Without --all-systems the darwin and aarch64 outputs go unevaluated on
       # an x86_64 runner and the job passes anyway.
       - run: nix flake check --all-systems --no-update-lock-file
@@ -163,7 +163,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k27
+          s3-prefix: kache/pond/windows-verify/k31
           # verify only, never windows-dist: a restored harness has unresolved
           # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
           # of link time here; not worth it on the leg whose output ships.
@@ -262,7 +262,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k27
+          s3-prefix: kache/pond/windows-dist/k31
 
       # Same reasoning as the sibling job: a dispatch meant to prewarm a fresh
       # prefix prewarms nothing if moon serves the stored hash, and the release
@@ -327,13 +327,13 @@ jobs:
         with: { fetch-depth: 0, persist-credentials: false }
       # SHA-pinned, so the toolchain must be an explicit input (the action
       # otherwise derives it from the ref name).
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
         with: { toolchain: stable }
       # When GitHub's GraphQL API is degraded, the action's cargo-binstall cannot
       # discover the prebuilt release-plz asset and degrades to a source build.
       # RUSTUP_TOOLCHAIN outranks rust-toolchain.toml, so that build uses stable
       # rather than pond's pin, which is too old for release-plz's dep tree.
-      - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
+      - uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         with: { command: release-pr, config: .github/release-plz.toml }   # keep the release PR current; never publishes
         env:
           RUSTUP_TOOLCHAIN: stable
@@ -370,7 +370,7 @@ jobs:
     # CLI reads them ahead of the file, so removing them would change which
     # settings are live rather than just where they are written.
     # Credentials are deliberately env-only: they are the two KACHE_S3_*
-    # variables a 0.15.0 daemon spawn does not strip, and they never enter a
+    # variables a kache daemon spawn does not strip, and they never enter a
     # committed file.
     env:
       KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
@@ -378,7 +378,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond/linux-dist/k27
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k31
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache
@@ -540,7 +540,7 @@ jobs:
       - name: Add stable for the release-plz install fallback
         run: rustup toolchain install stable --no-self-update --profile minimal
 
-      - uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
+      - uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         id: release-plz
         with: { command: release, config: .github/release-plz.toml }
         env:

@@ -7,7 +7,7 @@
 # consumer is the `build-dist` task in the root moon.yml, which runs from the
 # repo root with RUSTC_WRAPPER=kache. This file replaces the two-line
 # ~/.config/kache/config.toml stub that task used to write, which named no
-# bucket and leaned on the job's KACHE_S3_* env - the env a 0.15.0 daemon
+# bucket and leaned on the job's KACHE_S3_* env - the env a kache daemon
 # spawn no longer inherits.
 #
 # The CLI still reads KACHE_S3_PREFIX ahead of this file, so the bootstrap
@@ -18,7 +18,7 @@ type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
-# Per-job and schema-tagged, same reasoning as windows-verify.toml. k27 is
-# kache 0.15.0's CACHE_KEY_VERSION - both legs bumped together, never one.
+# Per-job and schema-tagged, same reasoning as windows-verify.toml. k31 is
+# kache 0.21.0's CACHE_KEY_VERSION - both legs bumped together, never one.
 # The old shared kache/pond prefix is left in place as the revert window.
-prefix = "kache/pond/linux-dist/k27"
+prefix = "kache/pond/linux-dist/k31"
