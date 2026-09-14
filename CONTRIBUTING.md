@@ -6,7 +6,7 @@ Issues and pull requests are welcome. For anything larger than a bug fix, commen
 
 The most wanted contribution. The full playbook is [`.agents/skills/add-adapter/SKILL.md`](.agents/skills/add-adapter/SKILL.md) - loadable as the `/add-adapter` skill in Claude Code, readable as a document by anyone. The short form:
 
-- One self-contained PR: spec doc (`docs/adapters/<source_agent>.md` with the filled decision table), fixture, adapter, tests.
+- One self-contained PR: spec doc (`docs/knowledge/adapters/<source_agent>.md` with the filled decision table), fixture, adapter, tests.
 - The conformance fixture is a sandboxed self-capture of the agent (run it under a throwaway `HOME`), verified against [`packages/pond/tests/fixtures/README.md`](packages/pond/tests/fixtures/README.md). No vendored or real-home data.
 - Recommended: open the PR as a draft after the spec doc, so the decision table gets reviewed before you implement.
 - `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` green is the whole bar. No benchmarks: adapters are import-isolated from the store and query layer, and a guard test enforces it.
@@ -21,6 +21,12 @@ pond's changelog is generated from squash-commit messages, so what you write on 
 - **`## Release note` section** in the PR description (the template prompts for it) becomes the prose under that bullet. Write it for pond users rather than reviewers: **one paragraph, at most 300 characters, no bullets and no blank lines** - CI enforces all three, plus that it is the **last** section of the PR body. One to three plain sentences: what changed for the user, and what they must do about it. Short sentences, active voice, present tense, the same word for the same thing. Say the effect, not the work you did or how you validated it - that belongs in the sections above, which never reach the changelog. Required for `feat`/`fix`/`perf` PRs; leave it empty when users see nothing. A release-wide story or an `**Upgrading:**` block goes after a lone `[release-note]` line, which is exempt from the cap.
 - CI comments only when something is wrong, listing every problem at once, and clears the comment once the description passes.
 - If a note turns out wrong after merge, edit the PR description - the changelog is regenerated from it on the next release-PR refresh.
+
+## Toolchain and pre-commit
+
+Repo tasks run through moon; the pinned version lives in [`.prototools`](.prototools) and [`.moon/workspace.yml`](.moon/workspace.yml) enforces it as a floor, so an older moon refuses to run rather than disagreeing with CI silently. Committing runs that moon-managed pre-commit hook, so moon has to be on PATH to commit at all.
+
+Two ways to get it: `nix develop`, or `direnv allow` to have the committed [`.envrc`](.envrc) enter that shell for you on every `cd`. Either gives you the pinned moon plus gitleaks and a Python with PyYAML - everything the hook and the gates want. Otherwise install moon yourself at the version [`.prototools`](.prototools) names.
 
 ## Everything else
 

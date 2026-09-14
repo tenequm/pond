@@ -2,7 +2,7 @@
 //! family.
 //!
 //! These types are the load-bearing contract for pond's adapter ecosystem
-//! (CLAUDE.md "Adapter seam"). They make ONE thing impossible to express:
+//! (AGENTS.md "Adapter seam"). They make ONE thing impossible to express:
 //! synthesizing a value the source data did not carry. The schema fields
 //! that hold "did the source say this?" data are typed as
 //! `Option<Extracted<T>>`, and the only way to construct an

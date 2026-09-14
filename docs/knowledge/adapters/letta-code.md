@@ -1,6 +1,28 @@
+---
+type: Adapter
+title: letta-code
+description: Upstream format archaeology and mapping decision record for the letta-code adapter.
+tags: [adapter, letta-code]
+status: stable
+generated: { by: "claude-code/opus-5", at: "2026-09-11T14:49:41Z" }
+verified:
+  - { by: "claude-code", at: "2026-08-24T00:00:00Z" }
+stale_after: "2026-12-11T00:00:00Z"
+sources:
+  - id: fixtures
+    resource: committed fixture capture under packages/pond/tests/fixtures/ (see the doc body for the exact capture)
+    title: The committed letta-code conformance fixture
+  - id: upstream
+    resource: letta-code reflection transcript JSONL store, inspected at letta-code v0.30.30
+    title: The letta-code reflection transcript store, as inspected at v0.30.30
+  - id: upstream-repo
+    resource: https://github.com/letta-ai/letta-code
+    title: letta-ai/letta-code upstream repository
+---
+
 # letta-code
 
-Last verified: 2026-08-24, against letta-code v0.30.30 (b2745ce), npm `@letta-ai/letta-code`.
+Verified against: letta-code v0.30.30 (b2745ce), npm `@letta-ai/letta-code`. The date of that check is the frontmatter `verified` event.
 
 Format archaeology and the decision record for the `letta-code` adapter (issue [#170](https://github.com/tenequm/pond/issues/170)). The adapter code in `packages/pond/src/adapter/letta_code.rs` stays authoritative for extraction behavior; this document records facts about the upstream format and the choices made against them.
 

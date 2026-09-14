@@ -2,6 +2,10 @@
 # packages/pond, the OpenClaw plugin under packages/openclaw-pond, the Hermes
 # plugin under packages/hermes-pond, the pi extension under packages/pi-pond,
 # and repo-level tasks (changelog gate, dist build) on the root `repo` project.
+# The enforced floor for the moon binary itself; the exact pin lives in
+# .prototools, and the nix devShell and CI bootstrap both derive from it.
+versionConstraint: '>=2.5.4'
+
 projects:
   pond: 'packages/pond'
   openclaw-pond: 'packages/openclaw-pond'
@@ -12,10 +16,14 @@ projects:
 vcs:
   defaultBranch: 'main'
   # sync: true wires core.hooksPath -> .moon/hooks on every moon run, so the
-  # secret-scan gate configures itself on any fresh clone (no manual setup).
+  # pre-commit gate configures itself on any fresh clone (no manual setup).
+  # The gate is moon tasks directly - one moon session, portable to the .ps1
+  # hooks moon generates on Windows. check-changelog and check-knowledge
+  # declare inputs, so an untouched input is an instant cache replay;
+  # secret-scan reads the git index and never caches.
   hooks:
     pre-commit:
-      - './.github/hooks/pre-commit'
+      - 'moon run repo:secret-scan repo:check-changelog repo:check-knowledge'
   sync: true
 
 # .claude/ and .agents/ hold local Claude Code settings and skill symlinks that

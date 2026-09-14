@@ -1,11 +1,31 @@
+---
+type: Runbook
+title: Computing token usage and cost from a pond store
+description: Turn options usage fields into correct token counts and dollars - dedup by provider message id first, or overstate by 2x or more.
+tags: [usage, cost, sql, accounting]
+status: stable
+generated: { by: claude-code/fable-5, at: "2026-09-11T10:56:35Z" }
+# Pegged to pricing-table and model-list rot: new Anthropic models or price
+# changes invalidate the rate table, not the method.
+stale_after: "2027-03-11T00:00:00Z"
+sources:
+  - id: ccusage
+    resource: https://github.com/ryoppippi/ccusage
+    title: ccusage (independent reference implementation, cross-checked 2026-08-27)
+  - id: store
+    resource: one operator pond store, measured 2026-08-27 (row counts, dedup ratios, cross-check totals)
+  - id: cost-state
+    resource: Claude Code local cost-state records (ground-truth per-model costUSD, 17 sessions)
+---
+
 # Computing token usage and cost from a pond store
 
 How to turn `options.anthropic.usage` into correct token counts and dollar
 figures. The naive query overstates by 2x or more, so the dedup rule below is
 not optional.
 
-Verified 2026-08-27 against two independent references: `ccusage`
-(github.com/ryoppippi/ccusage) and Claude Code's own `cost-state` records.
+Verified 2026-08-27 against two independent references: `ccusage`[^ccusage]
+and Claude Code's own `cost-state` records.[^cost-state]
 
 ## Where the usage lives
 
@@ -37,7 +57,7 @@ single provider message id, and each line repeats that turn's usage snapshot.
 
 Summing rows therefore counts one API call several times. Measured over one
 7-day window: 66,014 assistant rows for 32,298 real API calls, a 2.04x
-overstatement. Month-by-month the ratio ranged 1.44x to 2.58x, so no fixed
+overstatement.[^store] Month-by-month the ratio ranged 1.44x to 2.58x, so no fixed
 correction factor exists - you have to dedup.
 
 **Group by `options.anthropic.id`, take `MAX` of each usage field, then sum the
@@ -314,3 +334,7 @@ If you want their real economics, the unit is GPU-hours, and an effective
 $/Mtok is the pod's hourly rate times its uptime, divided by the tokens produced
 in that window. That is the number that says whether renting beat a metered API,
 but it has to come from the rental records, not from pond.
+
+[^ccusage]: ccusage (github.com/ryoppippi/ccusage), independent reference implementation
+[^cost-state]: Claude Code local cost-state records, ground-truth per-model costUSD
+[^store]: one operator pond store, measured 2026-08-27

@@ -35,7 +35,7 @@ Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/p
     <img src="docs/site/assets/tokens-chart-light.svg" alt="Bar chart: tokens into context for one recall answer. pond_search returns a complete ranked answer in 1.5-3k tokens; grep plus reading one matching transcript costs 90-255k tokens, chosen from 23-3,270 unranked matching files" width="920">
   </picture>
 </p>
-<p align="center"><sub>Five real recall questions, one corpus, one machine - method, raw numbers, and a rerunnable script in <a href="docs/benchmarks/recall-context-cost.md">docs/benchmarks</a></sub></p>
+<p align="center"><sub>Five real recall questions, one corpus, one machine - method, raw numbers, and a rerunnable script in <a href="packages/pond/benches/docs/recall-context-cost.md">packages/pond/benches/docs</a></sub></p>
 
 Status: pre-v1. Schemas, wire shapes, and config keys are subject to breaking change until v1. Full documentation lives at [pond.locker](https://pond.locker/); the contract is [`docs/spec.md`](docs/spec.md).
 

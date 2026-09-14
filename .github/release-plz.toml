@@ -29,7 +29,7 @@ name = "pond-db"
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
 # Keep the changelog at the repo root (path is relative to the workspace root),
-# where check-changelog-headers.sh and the pre-commit hook already read it.
+# where the repo:check-changelog moon task already reads it.
 changelog_path = "CHANGELOG.md"
 
 # Lance-style release notes: emoji-grouped sections, scope-bolded entries, PR
@@ -107,7 +107,7 @@ commit_preprocessors = [
   # when the squash commit landed without one (see the script for why that
   # happens and why it cannot be fixed after the fact). Both the changelog and
   # the GitHub release body render from this, so both stay correct.
-  { pattern = '(?s)^.*$', replace_command = "ops/scripts/release-note-from-pr.sh" },
+  { pattern = '(?s)^.*$', replace_command = ".github/scripts/release-note-from-pr.sh" },
   { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/tenequm/pond/pull/${1}))" },
 ]
 commit_parsers = [

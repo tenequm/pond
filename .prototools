@@ -1,0 +1,6 @@
+# The repo-owned moon pin - the single place a moon bump is typed. Everything
+# else derives from it: proto-managed installs resolve it directly, the nix
+# devShell reads it through ops/moon-cli.nix (bump the hashes there with
+# it), CI's bootstrap action and the npm-publish job grep it, and
+# .moon/workspace.yml's versionConstraint sets the floor it must satisfy.
+moon = "2.5.4"

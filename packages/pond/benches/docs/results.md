@@ -4,9 +4,11 @@ An append-only lab notebook, not a regression gate. Every number here is host-, 
 
 Entries are newest first within each bench. Output is pasted verbatim: the bench's printed table is the schema, and retyping it into a normalized one is where transcription drift enters.
 
-Numbers that have hardened into rules live in CLAUDE.md as prose (the S3 commit-latency law, the sync change-detection oracle, the `count_rows` inequality trap). This file is the underlying measurements, including runs whose only conclusion was "no change".
+Numbers that have hardened into rules live in AGENTS.md as prose (the S3 commit-latency law, the sync change-detection oracle, the `count_rows` inequality trap). This file is the underlying measurements, including runs whose only conclusion was "no change".
 
 `write_bench` was named `copy_bench` until v0.11.1 (`ad9134f`, 2026-07-01); recovered entries predating the rename say so. Older runs not yet transcribed here can be recovered from pond itself - the bench output is a tool body, so it is reachable through `pond_sql` on `parts.variant_data`, not through `pond_search`.
+
+The bench gate is now the moon task `moon run pond:bench-gate`. Entries below that predate this branch name the invocation of their day instead (`bash ops/scripts/bench-gate.sh`, a script since deleted, or `moon run repo:bench-gate`, the task id before it moved into the crate), so read those lines as a record of what was run rather than as a command to run now.
 
 ## Environments
 
@@ -76,7 +78,7 @@ Recorded as a trap, not as a write-path result. `append_absent_rows` issues a fr
 
 ### 2026-06-30 - s3-nbg1, the commit-latency law (recovered from session history; `copy_bench`)
 
-Roughly 1 s per commit, flat from 1 to 512 rows - the measurement behind the CLAUDE.md rule that S3 write cost is commit-count-bound, not bandwidth-bound. Source was a local 1000 x 30 corpus, cap 30 commits.
+Roughly 1 s per commit, flat from 1 to 512 rows - the measurement behind the AGENTS.md rule that S3 write cost is commit-count-bound, not bandwidth-bound. Source was a local 1000 x 30 corpus, cap 30 commits.
 
 ```
  batch      rows    commits    wall_ms    ms/commit

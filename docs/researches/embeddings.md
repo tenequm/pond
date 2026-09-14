@@ -1,6 +1,8 @@
 # Hybrid search tuning
 
-Research record for pond's hybrid retrieval. `docs/spec.md#search` is the source of truth for behavior; this file explains the tuning behind the spec-allowed defaults and the experiments that produced them. The harness lives at `ops/search-benchmarks/`.
+Research record for pond's hybrid retrieval. `docs/spec.md#search` is the source of truth for behavior; this file explains the tuning behind the spec-allowed defaults and the experiments that produced them. The harness lives at `packages/pond/benches/docs/search-benchmarks/`.
+
+**Status: historical record, superseded.** Hybrid fusion has since been removed: `pond_search` runs one arm per request, `fts` (BM25, the default) or `vector` (kNN), chosen per query, and embeddings became opt-in and off by default (see `packages/pond/src/handlers.rs` and `docs/knowledge/decisions/embeddings-are-opt-in.md`). Everything below describes the fusion design as it stood when it was measured; the measurements stand, the described behavior does not.
 
 ## What is measured and how
 
@@ -19,7 +21,7 @@ Together they identify whether fusion is a genuine improvement over both compone
 
 ### Query strata
 
-Two seed sets ship in `ops/search-benchmarks/`:
+Two seed sets ship in `packages/pond/benches/docs/search-benchmarks/`:
 
 - `queries-en.tsv` (21 English entries) and `queries-uk-translated.tsv` (21 Ukrainian-translated entries against the same English-language session-id targets). Strata cover natural-language, conceptual, symbol-lookup, error-message, bare-keyword. The UK twin isolates "is the retriever cross-lingual?" from "does the corpus contain this conversation?".
 
@@ -43,11 +45,11 @@ Rule: **before any retrieval mode is run against a new query set, run `bench.py 
 
 ### Pool-size invariant
 
-Production hybrid runs `fts_search(pool=100)` and `vector_search(vector_pool=200)` internally (`src/handlers.rs::plan_search`) and fuses those candidates. If a fusion simulator (`bench.py sweep`) replays arm fixtures captured at `pond search --limit 20`, it only sees the top-20 from each arm and misses cross-arm agreement signal at deeper ranks. Always capture fixtures at `--limit 100` (FTS) and `--limit 200` (Vector) before drawing conclusions.
+Production hybrid ran `fts_search(pool=100)` and `vector_search(vector_pool=200)` internally (`packages/pond/src/handlers.rs::plan_search`) and fused those candidates. If a fusion simulator (`bench.py sweep`) replays arm fixtures captured at `pond search --limit 20`, it only sees the top-20 from each arm and misses cross-arm agreement signal at deeper ranks. Always capture fixtures at `--limit 100` (FTS) and `--limit 200` (Vector) before drawing conclusions.
 
-## Current production fusion: score-normalized
+## Production fusion as measured (since removed): score-normalized
 
-After per-arm score shaping (max-norm BM25 for FTS, rank-norm `1 - idx/n` for Vector), each arm's surviving (post intra-arm dedup by `session_root`) hits are min-max normalized over the full arm pool, then combined as `score = FTS_FUSION_WEIGHT * norm_fts + VECTOR_FUSION_WEIGHT * norm_vec`. Constants in `src/handlers.rs`:
+After per-arm score shaping (max-norm BM25 for FTS, rank-norm `1 - idx/n` for Vector), each arm's surviving (post intra-arm dedup by `session_root`) hits are min-max normalized over the full arm pool, then combined as `score = FTS_FUSION_WEIGHT * norm_fts + VECTOR_FUSION_WEIGHT * norm_vec`. Constants in `packages/pond/src/handlers.rs`:
 
 - `FTS_FUSION_WEIGHT = 0.135`
 - `VECTOR_FUSION_WEIGHT = 1.0`
@@ -85,10 +87,9 @@ Query expansion is also explicitly a caller-layer concern. Lexical expansion is 
 
 ## Files
 
-- `ops/search-benchmarks/bench.py` - the harness; subcommands `run` / `verify` / `score` / `pair` (end-to-end) and `sweep` / `variant` (fixture replay through fusion variants).
-- `ops/search-benchmarks/queries-en.tsv`, `queries-uk-translated.tsv` - the shipped seed sets.
-- `src/handlers.rs::fuse_arms` - the production fusion.
-- `src/handlers.rs::FTS_FUSION_WEIGHT`, `VECTOR_FUSION_WEIGHT` - the constants.
+- `packages/pond/benches/docs/search-benchmarks/bench.py` - the harness; subcommands `run` / `verify` / `score` / `pair` (end-to-end) and `sweep` / `variant` (fixture replay through fusion variants).
+- `packages/pond/benches/docs/search-benchmarks/queries-en.tsv`, `queries-uk-translated.tsv` - the shipped seed sets.
+- `packages/pond/src/handlers.rs` - held the production fusion (`fuse_arms`) and its weight constants (`FTS_FUSION_WEIGHT`, `VECTOR_FUSION_WEIGHT`). All three are gone: the handler now runs a single arm per request and there is no hybrid fusion.
 
 ## Runtime / memory footprint
 

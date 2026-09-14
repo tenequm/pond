@@ -12,7 +12,7 @@
 # .github/release-plz.toml), so this is the last moment feedback can still change
 # the message cheaply. It is not the last line of defence: a squash that lands
 # with an empty body is repaired at generation time from the PR description
-# (ops/scripts/release-note-from-pr.sh), so a merge can no longer lose the note.
+# (.github/scripts/release-note-from-pr.sh), so a merge can no longer lose the note.
 name: release-note
 
 on:
