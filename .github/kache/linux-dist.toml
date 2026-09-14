@@ -7,7 +7,7 @@
 # consumer is the `build-dist` task in the root moon.yml, which runs from the
 # repo root with RUSTC_WRAPPER=kache. This file replaces the two-line
 # ~/.config/kache/config.toml stub that task used to write, which named no
-# bucket and leaned on the job's KACHE_S3_* env - the env a 0.15.0 daemon
+# bucket and leaned on the job's KACHE_S3_* env - the env a kache daemon
 # spawn no longer inherits.
 #
 # The CLI still reads KACHE_S3_PREFIX ahead of this file, so the bootstrap

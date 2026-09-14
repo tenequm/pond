@@ -1,5 +1,5 @@
 # kache's remote for the windows-verify leg, in a committed file rather than in
-# the job's environment because a daemon cannot watch an environment: 0.15.0
+# the job's environment because a daemon cannot watch an environment: kache
 # strips KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
 # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) and keeps KACHE_CONFIG,
 # which is why "file for the remote, env for the secrets" is the shape that
