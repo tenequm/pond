@@ -163,7 +163,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k27
+          s3-prefix: kache/pond/windows-verify/k31
           # verify only, never windows-dist: a restored harness has unresolved
           # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
           # of link time here; not worth it on the leg whose output ships.
@@ -262,7 +262,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k27
+          s3-prefix: kache/pond/windows-dist/k31
 
       # Same reasoning as the sibling job: a dispatch meant to prewarm a fresh
       # prefix prewarms nothing if moon serves the stored hash, and the release
@@ -370,7 +370,7 @@ jobs:
     # CLI reads them ahead of the file, so removing them would change which
     # settings are live rather than just where they are written.
     # Credentials are deliberately env-only: they are the two KACHE_S3_*
-    # variables a 0.15.0 daemon spawn does not strip, and they never enter a
+    # variables a kache daemon spawn does not strip, and they never enter a
     # committed file.
     env:
       KACHE_S3_ACCESS_KEY: ${{ secrets.KACHE_S3_ACCESS_KEY }}
@@ -378,7 +378,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond/linux-dist/k27
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k31
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache

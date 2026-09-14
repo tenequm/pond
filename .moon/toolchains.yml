@@ -14,7 +14,7 @@
 javascript: {}
 
 node:
-  version: '24.18.1'
+  version: '24.21.0'
 
 npm:
   version: '11.19.0'
