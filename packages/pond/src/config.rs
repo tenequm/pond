@@ -878,6 +878,11 @@ fn expand_path_array(
     blob: Value,
     enabled_total: usize,
 ) -> Result<Vec<ResolvedAdapter>> {
+    if blob.get("path").and_then(Value::as_str) == Some("") {
+        bail!(
+            "[adapters.{name}] has an empty `path`; set it to a directory, or disable the adapter with `pond adapters disable {name}`"
+        );
+    }
     let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
         return Ok(vec![ResolvedAdapter {
             name,
@@ -907,6 +912,13 @@ fn expand_path_array(
                 "[adapters.{name}] `path` array holds a non-string element ({path}); every element must be a directory path string{others}"
             );
         };
+        // Same refusal as the scalar shape above: an empty element resolves to
+        // a pass whose every surface names no path at all.
+        if path.is_empty() {
+            bail!(
+                "[adapters.{name}] has an empty `path` element; set it to a directory, remove it, or disable the adapter with `pond adapters disable {name}`{others}"
+            );
+        }
         // Literal duplicates only, as a typo courtesy. Aliases (`~/x` vs its
         // expansion, symlinks, trailing slashes) are deliberately not
         // canonicalized: expansion happens later inside each factory's

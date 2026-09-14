@@ -3784,6 +3784,16 @@ pub struct IngestSummary {
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
+    /// First `skipped_files` reason, verbatim. One string, never a list;
+    /// the count carries the magnitude.
+    pub first_skip_reason: Option<String>,
+    /// Source read or decode failures kept separate from categorized validator
+    /// drops so warnings name the cause.
+    pub unreadable_events: usize,
+    /// First `unreadable_events` reason, verbatim. Deliberately not named for
+    /// the validator's drops: those carry a `drop_reasons` key instead, and a
+    /// read failure has none.
+    pub first_unreadable_reason: Option<String>,
     /// Files that produced no importable session and were benignly skipped:
     /// empty `.jsonl`, sidecar-only rows (e.g. an `ai-title`/`agent-name`
     /// metadata file), or an unextractable header. Never an error or a drop;
@@ -3797,18 +3807,13 @@ pub struct IngestSummary {
     /// session was ingested from another source form this run (currently:
     /// opencode tree copies superseded by the DB). Counted, never silent.
     pub skipped_superseded: usize,
-    /// Storage-layer failures whose retries were exhausted (commit
-    /// conflicts, transient IO that didn't recover). Hard zero on healthy
-    /// runs.
-    pub storage_errors: usize,
+    /// Sessions excluded by the adapter's documented ingestion contract.
+    pub skipped_unimportable: usize,
     /// Oversized values truncated to a bounded sentinel at the seam
     /// (spec.md#adapter-bounded-values); the rest of each such record is intact.
     pub truncated_values: usize,
-    /// Histogram of stable reason keys for the combined `dropped_events +
-    /// dropped_sessions` populations. Keys are `&'static str` (see the
-    /// `DROP_REASON_*` constants) so consumers can match by identity.
-    /// Empty on a clean run. Used by `pond sync` to print the top reasons
-    /// and by `benches/ingest_bench.rs` to bucket Partial drops by cause.
+    /// Stable validator reason keys serialized by `pond sync --format json` and
+    /// bucketed by the ingest bench, excluding adapter read failures without keys.
     pub drop_reasons: BTreeMap<&'static str, usize>,
 }
 
@@ -3889,13 +3894,20 @@ impl IngestSummary {
         self.messages_matched_searchable += other.messages_matched_searchable;
         self.parts_matched += other.parts_matched;
         self.dropped_events += other.dropped_events;
+        self.unreadable_events += other.unreadable_events;
+        if self.first_unreadable_reason.is_none() {
+            self.first_unreadable_reason = other.first_unreadable_reason.clone();
+        }
         self.dropped_sessions += other.dropped_sessions;
         self.relabeled_sessions += other.relabeled_sessions;
         self.skipped_files += other.skipped_files;
+        if self.first_skip_reason.is_none() {
+            self.first_skip_reason = other.first_skip_reason.clone();
+        }
         self.skipped_empty += other.skipped_empty;
         self.skipped_fresh += other.skipped_fresh;
         self.skipped_superseded += other.skipped_superseded;
-        self.storage_errors += other.storage_errors;
+        self.skipped_unimportable += other.skipped_unimportable;
         self.truncated_values += other.truncated_values;
         for (key, value) in &other.drop_reasons {
             *self.drop_reasons.entry(key).or_insert(0) += value;
@@ -7277,6 +7289,31 @@ mod tests {
             .iter()
             .filter(|outcome| outcome.status == target)
             .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_then_flush_counts_a_rejected_session_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut session = base_session();
+        session.source_agent = "   ".to_owned();
+        let mut validator = IngestValidator::default();
+        let mut summary = IngestSummary::default();
+
+        let pushed = validator
+            .push(&store, 0, IngestEvent::Session(session))
+            .await?;
+        summary.add_outcomes(&pushed);
+        let (flushed, batch) = validator.finish(&store).await?;
+        summary.add_outcomes_errors_only(&flushed);
+        summary.add_batch(&batch);
+
+        assert_eq!(summary.dropped_sessions, 1);
+        assert_eq!(
+            summary.drop_reasons.get(DROP_REASON_EMPTY_SOURCE_AGENT),
+            Some(&1),
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

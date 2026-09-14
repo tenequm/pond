@@ -543,8 +543,8 @@ async fn verify_bypasses_the_freshness_skip_and_re_reads_every_session() -> anyh
         "re-reading complete sessions is an idempotent no-op, not a duplicate insert"
     );
     assert_eq!(
-        verified.storage_errors, 0,
-        "--verify re-ingest must not error"
+        verified.dropped_sessions, 0,
+        "--verify re-ingest must not reject a session it already stored"
     );
 
     Ok(())

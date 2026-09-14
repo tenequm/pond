@@ -221,7 +221,7 @@ async fn opencode_provider_sessions_are_composed_and_reattributed() -> anyhow::R
 }
 
 /// codex-provider sessions keep history server-side (no on-disk transcript), so
-/// they surface as visible `Unsupported` skips enumerated from `v2.db` metadata -
+/// they surface as counted `Unimportable` skips enumerated from `v2.db` metadata -
 /// both a direct `agent_provider='codex'` and a NULL provider falling back to a
 /// codex group default. A claude session is never skipped.
 #[tokio::test(flavor = "multi_thread")]
@@ -246,7 +246,7 @@ async fn codex_provider_sessions_are_visibly_skipped() -> anyhow::Result<()> {
     let mut skipped: Vec<(String, String)> = Vec::new();
     let summary = ingest_adapter(&store, &adapter, &NoopOracle, |event| {
         if let SyncEvent::SessionDone(outcome) = event
-            && let SyncStatus::Skipped { reason } = outcome.status
+            && let SyncStatus::Unimportable { reason } = outcome.status
         {
             skipped.push((outcome.session_id.unwrap_or_default(), reason));
         }
@@ -254,8 +254,12 @@ async fn codex_provider_sessions_are_visibly_skipped() -> anyhow::Result<()> {
     .await?;
 
     assert_eq!(
-        summary.skipped_files, 2,
-        "both codex sessions surface as counted Unsupported skips"
+        summary.skipped_unimportable, 2,
+        "both codex sessions surface as counted Unimportable skips"
+    );
+    assert_eq!(
+        summary.skipped_files, 0,
+        "contract exclusions do not degrade"
     );
     let skipped_ids: Vec<&str> = skipped.iter().map(|(id, _)| id.as_str()).collect();
     assert!(skipped_ids.contains(&"sess-codex-direct"));

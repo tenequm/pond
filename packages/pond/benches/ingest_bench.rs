@@ -251,7 +251,10 @@ async fn main() -> Result<()> {
                             sync_partial_drops += *dropped_events as u64;
                         }
                         SyncStatus::Superseded => sync_superseded += 1,
-                        SyncStatus::Ok | SyncStatus::Fresh | SyncStatus::Empty => {}
+                        SyncStatus::Ok
+                        | SyncStatus::Fresh
+                        | SyncStatus::Empty
+                        | SyncStatus::Unimportable { .. } => {}
                     }
                 }
             })

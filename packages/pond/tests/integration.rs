@@ -22,6 +22,8 @@ mod embed;
 mod index_fold;
 #[path = "integration/lance_smoke.rs"]
 mod lance_smoke;
+#[path = "integration/missing_source.rs"]
+mod missing_source;
 #[path = "integration/optimize_under_contention.rs"]
 mod optimize_under_contention;
 #[path = "integration/recovery.rs"]

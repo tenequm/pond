@@ -3412,7 +3412,23 @@ impl OpenClawAdapter {
                 Some(conn) => live_entry_table(conn),
                 None => Ok(None),
             };
-            let deleted = deleted_archive_ids(&agent.sessions_dir);
+            let deleted = match deleted_archive_ids(&agent.sessions_dir) {
+                Ok(deleted) => deleted,
+                // Preserve, per this pass's own ambiguity rule: an unreadable
+                // archive dir means deletions cannot be detected, not that the
+                // run should fail. Failing here would abort the whole sync,
+                // including adapters that already ingested (`#236`).
+                Err(error) => {
+                    tracing::warn!(
+                        target: "pond::sync",
+                        adapter = NAME,
+                        path = %agent.sessions_dir.display(),
+                        %error,
+                        "could not enumerate deleted archives; preserving this agent's sessions",
+                    );
+                    continue;
+                }
+            };
             for session_id in deleted {
                 // Only sessions pond already stored can be erased; the archived
                 // key is recovered from pond's stored project (= session_key).
@@ -3542,12 +3558,18 @@ impl OpenClawAdapter {
     }
 }
 
-fn deleted_archive_ids(dir: &Path) -> Vec<String> {
+fn deleted_archive_ids(dir: &Path) -> std::io::Result<Vec<String>> {
     let mut ids = Vec::new();
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return ids;
-    };
-    for entry in read.flatten() {
+    // Same probe as `collect_file_sessions`, so the two readers tolerate the
+    // same set: an agent dir with no `sessions/` yet, a `sessions` that is not
+    // a directory, and a parent that cannot be stat'ed are all supported
+    // states rather than failures. What survives the probe is a real read
+    // failure, which the caller reports without failing the run.
+    if !dir.is_dir() {
+        return Ok(ids);
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
         if let Some(name) = entry.file_name().to_str()
             && let Some((_, reason, _)) = parse_archive_name(name)
             && reason == "deleted"
@@ -3562,7 +3584,7 @@ fn deleted_archive_ids(dir: &Path) -> Vec<String> {
     }
     ids.sort();
     ids.dedup();
-    ids
+    Ok(ids)
 }
 
 /// Is this session key still live in the agent DB?
@@ -4111,6 +4133,46 @@ mod tests {
                 true
             ))
         );
+    }
+
+    #[test]
+    fn a_missing_sessions_dir_scans_as_empty_not_as_an_error() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        // `list_agents` manufactures an AgentDir for every dir under `agents/`
+        // without probing `sessions/`, so this is the ordinary shape of a fresh
+        // agent - reconciliation must not fail the whole sync over it.
+        let ids = deleted_archive_ids(&temp.path().join("absent"))?;
+        assert!(ids.is_empty(), "{ids:?}");
+        // Same for a `sessions` that is not a directory: `collect_file_sessions`
+        // reads it as "nothing here", and the two must tolerate the same set.
+        let not_a_dir = temp.path().join("sessions");
+        std::fs::write(&not_a_dir, b"not a directory")?;
+        let ids = deleted_archive_ids(&not_a_dir)?;
+        assert!(ids.is_empty(), "{ids:?}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_archive_scan_surfaces_a_read_dir_error() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new()?;
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions)?;
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o000))?;
+        if std::fs::read_dir(&sessions).is_ok() {
+            // Root is not denied by mode bits; there is nothing to test.
+            std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755))?;
+            return Ok(());
+        }
+        let result = deleted_archive_ids(&sessions);
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755))?;
+        assert!(
+            result.is_err(),
+            "an unreadable archive root must not look empty"
+        );
+        Ok(())
     }
 
     #[test]
