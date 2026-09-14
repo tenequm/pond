@@ -349,8 +349,8 @@ pub mod mcp {
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
             CacheScope, CallToolResult, ContentBlock, ErrorCode as JsonRpcErrorCode,
-            Implementation, ListResourcesResult, ListToolsResult, MetaObject,
-            PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+            Implementation, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+            MetaObject, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
             ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
             ServerCapabilities, ServerInfo,
         },
@@ -1269,34 +1269,49 @@ Examples (4 patterns the agent should recognize):
             _request: Option<PaginatedRequestParams>,
             context: RequestContext<RoleServer>,
         ) -> Result<ListResourcesResult, ErrorData> {
-            let result = ListResourcesResult::with_all_items(vec![
+            let mut result = ListResourcesResult::with_all_items(vec![
                 Resource::new("schema://pond", "pond search schema"),
                 Resource::new("schema://pond-sql", "pond SQL table schema"),
                 Resource::new("stats://pond", "pond corpus stats"),
             ]);
-            Ok(if wants_cache_hints(&context) {
-                result.with_ttl_ms(0).with_cache_scope(CacheScope::Public)
-            } else {
-                result
-            })
+            (result.ttl_ms, result.cache_scope) = cache_hints(&context, CacheScope::Public);
+            Ok(result)
+        }
+
+        /// pond has no resource templates. Overridden only because rmcp's
+        /// default result carries no cache hints.
+        async fn list_resource_templates(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            context: RequestContext<RoleServer>,
+        ) -> Result<ListResourceTemplatesResult, ErrorData> {
+            let mut result = ListResourceTemplatesResult::with_all_items(Vec::new());
+            (result.ttl_ms, result.cache_scope) = cache_hints(&context, CacheScope::Public);
+            Ok(result)
         }
 
         async fn read_resource(
             &self,
             request: ReadResourceRequestParams,
-            _context: RequestContext<RoleServer>,
+            context: RequestContext<RoleServer>,
         ) -> Result<ReadResourceResponse, ErrorData> {
-            match request.uri.as_str() {
-                "schema://pond" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    schema_doc_for(crate::embed::embeddings_enabled()),
-                    request.uri,
-                )])
-                .into()),
-                "schema://pond-sql" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                    SQL_SCHEMA_DOC,
-                    request.uri,
-                )])
-                .into()),
+            // The schema docs are the same for every caller; stats and exports
+            // are this store's data, which no shared cache may hand to another.
+            let (mut result, scope) = match request.uri.as_str() {
+                "schema://pond" => (
+                    ReadResourceResult::new(vec![ResourceContents::text(
+                        schema_doc_for(crate::embed::embeddings_enabled()),
+                        request.uri,
+                    )]),
+                    CacheScope::Public,
+                ),
+                "schema://pond-sql" => (
+                    ReadResourceResult::new(vec![ResourceContents::text(
+                        SQL_SCHEMA_DOC,
+                        request.uri,
+                    )]),
+                    CacheScope::Public,
+                ),
                 // `pond_sql` export artifacts: read the file pond wrote
                 // (parquet -> base64 blob, ndjson -> text). The filename is
                 // validated to a minted `<uuid>.<ext>` so the URI can't traverse.
@@ -1321,7 +1336,7 @@ Examples (4 patterns the agent should recognize):
                         ResourceContents::blob(STANDARD.encode(&bytes), request.uri)
                             .with_mime_type("application/vnd.apache.parquet")
                     };
-                    Ok(ReadResourceResult::new(vec![contents]).into())
+                    (ReadResourceResult::new(vec![contents]), CacheScope::Private)
                 }
                 "stats://pond" => {
                     let store = &self.state.store;
@@ -1394,17 +1409,23 @@ Examples (4 patterns the agent should recognize):
                         },
                         "indices": index_rows,
                     });
-                    Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                        stats.to_string(),
-                        request.uri,
-                    )])
-                    .into())
+                    (
+                        ReadResourceResult::new(vec![ResourceContents::text(
+                            stats.to_string(),
+                            request.uri,
+                        )]),
+                        CacheScope::Private,
+                    )
                 }
-                other => Err(ErrorData::resource_not_found(
-                    format!("unknown resource: {other}"),
-                    None,
-                )),
-            }
+                other => {
+                    return Err(ErrorData::resource_not_found(
+                        format!("unknown resource: {other}"),
+                        None,
+                    ));
+                }
+            };
+            (result.ttl_ms, result.cache_scope) = cache_hints(&context, scope);
+            Ok(result.into())
         }
 
         async fn list_tools(
@@ -1415,26 +1436,36 @@ Examples (4 patterns the agent should recognize):
             let mut result = ListToolsResult::with_all_items(self.tool_router.list_all());
             annotate_tool_limits(&mut result);
             annotate_search_mode_with(&mut result, crate::embed::embeddings_enabled());
-            Ok(if wants_cache_hints(&context) {
-                result.with_ttl_ms(0).with_cache_scope(CacheScope::Public)
-            } else {
-                result
-            })
+            (result.ttl_ms, result.cache_scope) = cache_hints(&context, CacheScope::Public);
+            Ok(result)
         }
     }
 
-    /// SEP-2549 makes `ttlMs` and `cacheScope` required on list results once
-    /// the client negotiates 2026-07-28, and a strict client (Claude Code)
-    /// rejects the whole response without them - dropping every tool while the
-    /// connection still looks healthy. rmcp stamps them in the handler macros
-    /// (rust-sdk#1120), but pond overrides `list_tools` and `list_resources`,
-    /// so the override has to stamp them itself. Callers pair this with
-    /// `ttl_ms = 0` (immediately stale): the tool surface varies with instance
-    /// config, so a cached list would advertise the wrong one.
-    fn wants_cache_hints(context: &RequestContext<RoleServer>) -> bool {
-        context
+    /// `ttlMs` on every result pond hints: immediately stale. Within one
+    /// process nothing it lists changes, but a shared gateway may serve a
+    /// `public` result across pond instances, whose config (the `pond_search`
+    /// surface) and data differ.
+    const CACHE_HINT_TTL_MS: u64 = 0;
+
+    /// The `(ttl_ms, cache_scope)` pair for a cacheable result. SEP-2549 makes
+    /// both required on `tools/list`, `resources/list`,
+    /// `resources/templates/list` and `resources/read` once the client
+    /// negotiates 2026-07-28, and a strict client (Claude Code) rejects the
+    /// whole response without them - a connected server that yields no tools
+    /// and no readable resources. rmcp stamps them only in its handler macros
+    /// (rust-sdk#1120), and pond overrides each of those handlers, so every
+    /// override stamps them itself. Older clients get neither field.
+    fn cache_hints(
+        context: &RequestContext<RoleServer>,
+        scope: CacheScope,
+    ) -> (Option<u64>, Option<CacheScope>) {
+        let supports_cache_hints = context
             .protocol_version()
-            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
+        (
+            supports_cache_hints.then_some(CACHE_HINT_TTL_MS),
+            supports_cache_hints.then_some(scope),
+        )
     }
 
     /// `pond_search` description with the whole `mode=` sentence removed - what
@@ -1638,28 +1669,8 @@ Examples (4 patterns the agent should recognize):
         /// negotiates the classic handshake and stops exercising discovery.
         #[tokio::test]
         async fn discovery_startup_exposes_pond_tools() -> anyhow::Result<()> {
-            use rmcp::{ClientLifecycleMode, ClientServiceExt, model::ProtocolVersion};
-
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                let temp = tempfile::TempDir::new()?;
-                let server = PondMcp::new(AppState {
-                    store: Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
-                    embedder: Arc::new(crate::embed::LazyEmbedder::candle()),
-                    search: crate::config::SearchConfig::default(),
-                });
-                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-                let server_task = tokio::spawn(async move {
-                    server.serve(server_io).await?.waiting().await?;
-                    anyhow::Ok(())
-                });
-                let client = ()
-                    .serve_with_lifecycle(
-                        client_io,
-                        ClientLifecycleMode::Discover {
-                            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                        },
-                    )
-                    .await?;
+                let (_temp, client, server_task) = connect(true).await?;
                 let info = client.peer_info().unwrap();
                 assert_eq!(info.server_info.as_ref().unwrap().name, "pond");
                 let tools = client.list_all_tools().await?;
@@ -1681,13 +1692,18 @@ Examples (4 patterns the agent should recognize):
             .await?
         }
 
-        /// Spin pond's MCP server over an in-memory duplex and return what a
-        /// client sees on the two list surfaces, negotiating either the
-        /// 2026-07-28 discovery handshake or the classic one.
-        async fn list_results(
+        /// Spin pond's MCP server over an in-memory duplex and connect a client,
+        /// negotiating either the 2026-07-28 discovery handshake or the classic
+        /// one. The returned `TempDir` backs the store, so hold it until the
+        /// server task is joined.
+        async fn connect(
             modern: bool,
-        ) -> anyhow::Result<(ListToolsResult, ListResourcesResult)> {
-            use rmcp::{ClientLifecycleMode, ClientServiceExt, model::ProtocolVersion};
+        ) -> anyhow::Result<(
+            tempfile::TempDir,
+            rmcp::service::RunningService<rmcp::RoleClient, ()>,
+            tokio::task::JoinHandle<anyhow::Result<()>>,
+        )> {
+            use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
             let temp = tempfile::TempDir::new()?;
             let server = PondMcp::new(AppState {
@@ -1711,57 +1727,77 @@ Examples (4 patterns the agent should recognize):
             } else {
                 ().serve(client_io).await?
             };
-            let tools = client.list_tools(None).await?;
-            let resources = client.list_resources(None).await?;
-            client.cancel().await?;
-            server_task.await??;
-            Ok((tools, resources))
+            Ok((temp, client, server_task))
         }
 
-        /// SEP-2549 makes `ttlMs` and `cacheScope` required on list results at
-        /// 2026-07-28, and a strict client rejects the whole response without
-        /// them - Claude Code showed this as a connected pond MCP server
-        /// carrying zero tools and zero resources. `list_all_tools` in the
-        /// discovery test above cannot catch it: rmcp's own client parses the
-        /// fields as optional, so only asserting the envelope fails.
+        /// The `(ttl_ms, cache_scope)` a client sees on every cacheable surface
+        /// pond serves, one read per `CacheScope` arm.
+        async fn cache_hints_seen(
+            modern: bool,
+        ) -> anyhow::Result<Vec<(&'static str, Option<u64>, Option<CacheScope>)>> {
+            let (_temp, client, server_task) = connect(modern).await?;
+            let tools = client.list_tools(None).await?;
+            let resources = client.list_resources(None).await?;
+            let templates = client.list_resource_templates(None).await?;
+            let schema = client
+                .read_resource(ReadResourceRequestParams::new("schema://pond"))
+                .await?;
+            let stats = client
+                .read_resource(ReadResourceRequestParams::new("stats://pond"))
+                .await?;
+            client.cancel().await?;
+            server_task.await??;
+            Ok(vec![
+                ("tools/list", tools.ttl_ms, tools.cache_scope),
+                ("resources/list", resources.ttl_ms, resources.cache_scope),
+                (
+                    "resources/templates/list",
+                    templates.ttl_ms,
+                    templates.cache_scope,
+                ),
+                (
+                    "resources/read schema://pond",
+                    schema.ttl_ms,
+                    schema.cache_scope,
+                ),
+                (
+                    "resources/read stats://pond",
+                    stats.ttl_ms,
+                    stats.cache_scope,
+                ),
+            ])
+        }
+
+        /// Claude Code showed the missing hints as a connected pond server with
+        /// zero tools and unreadable resources. The discovery test cannot catch
+        /// it: `list_all_tools` returns only the items, and rmcp's own client
+        /// parses both fields as optional, so the envelope has to be asserted.
         #[tokio::test]
-        async fn modern_list_results_carry_the_required_cache_hints() -> anyhow::Result<()> {
+        async fn modern_results_carry_the_required_cache_hints() -> anyhow::Result<()> {
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                let (tools, resources) = list_results(true).await?;
-                assert_eq!(
-                    (
-                        tools.ttl_ms,
-                        tools.cache_scope,
-                        resources.ttl_ms,
-                        resources.cache_scope,
-                    ),
-                    (
-                        Some(0),
-                        Some(CacheScope::Public),
-                        Some(0),
-                        Some(CacheScope::Public),
-                    )
-                );
+                let public = (Some(0), Some(CacheScope::Public));
+                let private = (Some(0), Some(CacheScope::Private));
+                let expected = [
+                    ("tools/list", public),
+                    ("resources/list", public),
+                    ("resources/templates/list", public),
+                    ("resources/read schema://pond", public),
+                    ("resources/read stats://pond", private),
+                ]
+                .map(|(surface, (ttl_ms, scope))| (surface, ttl_ms, scope));
+                assert_eq!(cache_hints_seen(true).await?, expected);
                 anyhow::Ok(())
             })
             .await?
         }
 
-        /// A classic client keeps the pre-SEP wire shape: the hints are absent,
-        /// not null.
+        /// A classic client keeps the pre-SEP wire shape: the hints are unset.
         #[tokio::test]
-        async fn legacy_list_results_omit_the_cache_hints() -> anyhow::Result<()> {
+        async fn legacy_results_omit_the_cache_hints() -> anyhow::Result<()> {
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                let (tools, resources) = list_results(false).await?;
-                assert_eq!(
-                    (
-                        tools.ttl_ms,
-                        tools.cache_scope,
-                        resources.ttl_ms,
-                        resources.cache_scope,
-                    ),
-                    (None, None, None, None)
-                );
+                for (surface, ttl_ms, scope) in cache_hints_seen(false).await? {
+                    assert_eq!((ttl_ms, scope), (None, None), "{surface}");
+                }
                 anyhow::Ok(())
             })
             .await?
