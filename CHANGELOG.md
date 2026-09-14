@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.3](https://github.com/tenequm/pond/compare/v0.17.2...v0.17.3) - 2026-09-14
+
+### <!-- 2 -->🐛 Bug Fixes
+- **mcp:** emit the SEP-2549 cache hints 2026-07-28 clients require ([#241](https://github.com/tenequm/pond/pull/241)) ([ed1f932](https://github.com/tenequm/pond/commit/ed1f932d792b4dcc26d514899ed7b9ece064e72c))
+  Clients that negotiate MCP protocol 2026-07-28, such as recent Claude Code, see pond's tools again and can read its resources. pond omitted the ttlMs and cacheScope fields that version requires, so strict clients rejected its lists and resource reads.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.17.2...v0.17.3
+
 ## [0.17.2](https://github.com/tenequm/pond/compare/v0.17.1...v0.17.2) - 2026-09-11
 
 ### <!-- 1 -->🎉 New Features
