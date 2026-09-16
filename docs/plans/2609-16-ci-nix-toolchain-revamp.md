@@ -280,7 +280,7 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   edit together: the flake's `nixConfig`, explicit flags on the pond-ci nix
   invocation (nixConfig is ignored for an untrusted user), and `flake-check`'s
   `install-nix-action` `extra_nix_config`. **Pushing is its own change, stacked
-  on that one**: a last step in `build-and-test`, gated on a push to `main`
+  on that one** (PR #268): a last step in `build-and-test`, gated on a push to `main`
   (2.8 point 2), `nix copy`s the devshell profile's closure to the bucket and
   signs each path on the way up with a key file written from
   `NIX_CACHE_SIGNING_KEY` into the pod's scratch. Non-fatal by design - the
