@@ -4080,6 +4080,16 @@ struct BufferedPart {
 /// a bounded version of the roughly 10x transient amplification measured in #229.
 pub(crate) const INGEST_FLUSH_BYTE_BUDGET: usize = 32 << 20;
 
+/// Bytes a buffered message row costs downstream on top of its own payload:
+/// `embedding_columns` materializes a dense `embedding_dim()` x f16 slot per
+/// row plus an `embedding_model` offset even when every vector is null (the
+/// embedder-less ingest case), so the source JSON is not a complete proxy for
+/// what a flush allocates. Counting it keeps that buffer bounded by the flush
+/// window instead of letting it grow with the whole batch.
+fn message_row_fixed_bytes() -> usize {
+    embedding_dim() * size_of::<half::f16>() + size_of::<i32>()
+}
+
 /// State machine that turns the `events: Vec<IngestEvent>` array into a
 /// flat `Vec<RowOutcome>` matching the array's index space. A validation error
 /// on a single event drops *that event* (one [`OutcomeStatus::Error`] outcome)
@@ -4365,6 +4375,7 @@ impl IngestValidator {
             )];
         }
         self.flush_current_message();
+        let bytes = bytes + message_row_fixed_bytes();
         self.buffered_bytes += bytes;
         self.current_message = Some(BufferedMessage {
             index,
@@ -5735,7 +5746,7 @@ fn messages_batch_from(
         for bytes in columns {
             guard_cell("messages", row.message.id(), bytes)?;
         }
-        let row_bytes = columns.iter().sum::<usize>();
+        let row_bytes = columns.iter().sum::<usize>() + message_row_fixed_bytes();
         if running + row_bytes > INGEST_FLUSH_BYTE_BUDGET && end > start {
             break;
         }
@@ -6361,18 +6372,19 @@ mod tests {
         }
     }
 
-    fn large_message(session_id: &str, id: &str) -> Message {
+    fn padded_message(session_id: &str, id: &str, payload_bytes: usize) -> Message {
         let mut options = ProviderOptions::new();
-        options.insert(
-            "payload".to_owned(),
-            json!("x".repeat(INGEST_FLUSH_BYTE_BUDGET / 2 + 1024)),
-        );
+        options.insert("payload".to_owned(), json!("x".repeat(payload_bytes)));
         Message::User {
             id: id.to_owned(),
             session_id: session_id.to_owned(),
             timestamp: Utc::now(),
             options,
         }
+    }
+
+    fn large_message(session_id: &str, id: &str) -> Message {
+        padded_message(session_id, id, INGEST_FLUSH_BYTE_BUDGET / 2 + 1024)
     }
 
     /// Counts the texts handed to the backend so a test can assert how many rows
@@ -6730,6 +6742,44 @@ mod tests {
         assert_eq!(summary.sessions_inserted, 1);
         assert_eq!(summary.messages_inserted_total, 2);
         assert_eq!(store.row_counts().await?, (1, 2, 0));
+        Ok(())
+    }
+
+    /// A batch of modest messages allocates a dense all-null vector slot per row
+    /// that `json_size` cannot see, so the source bytes alone are not a complete
+    /// flush-size proxy. Here the JSON stays well under the budget while the
+    /// counted vector width is what trips the flush.
+    #[tokio::test]
+    async fn byte_budget_counts_the_fixed_vector_width_per_message() -> anyhow::Result<()> {
+        const PAYLOAD_BYTES: usize = 512;
+
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("vector-width-budget");
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+
+        let probe = padded_message(&session.id, "probe", PAYLOAD_BYTES);
+        let per_message = json_size(&IngestEvent::Message(probe))? + message_row_fixed_bytes();
+        let count = INGEST_FLUSH_BYTE_BUDGET.div_ceil(per_message);
+        for index in 0..count {
+            let message = padded_message(&session.id, &format!("message-{index}"), PAYLOAD_BYTES);
+            validator
+                .push(&store, index + 1, IngestEvent::Message(message))
+                .await?;
+        }
+
+        assert!(validator.byte_budget_reached());
+        let source_bytes = validator.buffered_bytes - count * message_row_fixed_bytes();
+        assert!(
+            source_bytes < INGEST_FLUSH_BYTE_BUDGET,
+            "source bytes alone ({source_bytes}) must stay under the budget"
+        );
+
+        let (_, counts) = validator.flush(&store).await?;
+        assert_eq!(counts.messages_inserted_total, count - 1);
         Ok(())
     }
 
