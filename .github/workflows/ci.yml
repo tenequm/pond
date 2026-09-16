@@ -244,6 +244,14 @@ jobs:
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
+          # The bootstrap's warm pull runs detached, so this log is the only
+          # record of whether it finished before the build did - and the only
+          # place a `Plan:` count or a failed transfer is reported.
+          if ($env:KACHE_WARM_LOG -and (Test-Path $env:KACHE_WARM_LOG)) {
+            "--- background warm pull ---"
+            Get-Content -Tail 40 $env:KACHE_WARM_LOG
+            if (Test-Path "$($env:KACHE_WARM_LOG).err") { Get-Content -Tail 40 "$($env:KACHE_WARM_LOG).err" }
+          } else { "no background warm-pull log" }
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
@@ -339,6 +347,14 @@ jobs:
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
+          # The bootstrap's warm pull runs detached, so this log is the only
+          # record of whether it finished before the build did - and the only
+          # place a `Plan:` count or a failed transfer is reported.
+          if ($env:KACHE_WARM_LOG -and (Test-Path $env:KACHE_WARM_LOG)) {
+            "--- background warm pull ---"
+            Get-Content -Tail 40 $env:KACHE_WARM_LOG
+            if (Test-Path "$($env:KACHE_WARM_LOG).err") { Get-Content -Tail 40 "$($env:KACHE_WARM_LOG).err" }
+          } else { "no background warm-pull log" }
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
