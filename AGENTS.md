@@ -18,6 +18,14 @@
 - Format: `cargo fmt --check` (use `cargo fmt` to fix)
 - Lockfile is enforced in CI with `--locked`; locally, plain commands are fine. If `Cargo.lock` changes unexpectedly, `git status` will show it.
 
+## Toolchain
+
+`flake.nix` is the single source of truth for every tool - rust (read from `rust-toolchain.toml`), zig, cargo-zigbuild, rcodesign, the macOS SDK stubs, moon, protoc, uv, node/npm, kache. `nix eval --json .#lib.toolVersions` prints the pins; CI asserts they match the text the Windows leg extracts.
+
+- Enter it once per shell, not per command: `direnv allow` (first time in a fresh worktree), then commands run in the shell as usual. Run a single command in it with `direnv exec . <cmd>`, or load it for the whole session with `eval "$(direnv export bash)"`.
+- Never `nix develop -c <cmd>` per command: it re-evaluates the flake after every file edit, which costs seconds each time. nix-direnv caches the environment and `.envrc` watches `rust-toolchain.toml`, so a toolchain bump still reloads.
+- `CARGO_HOME` defaults to `~/.cargo-pond` inside the shell, deliberately: moon's rust plugin puts `$CARGO_HOME/bin` first on PATH and a rustup proxy left in `~/.cargo/bin` would shadow the flake's rustc. An explicitly set `CARGO_HOME` still wins.
+
 ## Tests
 
 > **PLACEMENT RULE - read before writing any test.** A test lives next to the code it exercises. If it tests one module's behavior - even when it goes through a `Store` or handler call - it is a UNIT test and belongs in `#[cfg(test)] mod tests` at the bottom of that `src/...` file. `tests/integration/` is ONLY for genuine cross-module integration: multiple subsystems wired end to end (e.g. ingest -> search -> get over a fixture corpus). A `Store`-level, single-module, or pure-helper test in `tests/integration/` is in the WRONG place - move it to `src/`. When in doubt, default to a unit test in `src/`.
