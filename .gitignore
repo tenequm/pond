@@ -20,6 +20,8 @@ Thumbs.db
 *.swp
 
 .env*
+# ...except the tracked direnv entrypoint, which `.env*` would otherwise swallow.
+!/.envrc
 .secrets*
 tmp/
 .mcp.json
@@ -81,6 +83,9 @@ skills-lock.json
 
 # nix build output symlink
 /result
+
+# nix-direnv's cached devshell env and its GC roots
+/.direnv/
 
 # playwright-cli local session state (directory, plus the stray marker file it drops)
 /.playwright-cli

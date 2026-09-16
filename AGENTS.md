@@ -18,6 +18,14 @@
 - Format: `cargo fmt --check` (use `cargo fmt` to fix)
 - Lockfile is enforced in CI with `--locked`; locally, plain commands are fine. If `Cargo.lock` changes unexpectedly, `git status` will show it.
 
+## Toolchain
+
+`flake.nix` is the single source of truth for the dev toolchain - rust (read from `rust-toolchain.toml`), zig, cargo-zigbuild, rcodesign, the macOS SDK stubs, moon, protoc, uv, node/npm, kache, gh. `nix eval --json .#lib.toolVersions` prints the pins, and the flake-check job asserts the table's text form matches what it evaluates to. CI does not enter this shell yet: `.github/actions/bootstrap` and `windows-bootstrap` still install their own moon/protoc/uv/kache, so bumping one of those four is two edits until those actions are retired.
+
+- Enter it once per shell, not per command: `direnv allow` (first time in a fresh worktree), then commands run in the shell as usual. Run a single command in it with `direnv exec . <cmd>`, or load it for the whole session with `eval "$(direnv export bash)"`.
+- Never `nix develop -c <cmd>` per command: it re-evaluates the flake after every file edit, which costs seconds each time. nix-direnv caches the environment and `.envrc` watches `rust-toolchain.toml`, so a toolchain bump still reloads.
+- `CARGO_HOME` defaults to `~/.cargo-pond` inside the shell, deliberately: moon's rust plugin puts `$CARGO_HOME/bin` first on PATH and a rustup proxy left in `~/.cargo/bin` would shadow the flake's rustc. An explicitly set `CARGO_HOME` still wins.
+
 ## moon (the task runner CI runs)
 
 - CI runs `moon ci <targets>` for the Linux test leg and `moon run <target>` everywhere else (the Windows legs and the release builds). Locally, `moon run pond:lint pond:test` reproduces the gate; `moon ci` needs a diff base and is not what you want on a dirty tree.
@@ -89,9 +97,9 @@ The wizard prompts (`pond init`, source discovery, etc.) go through cliclack/dia
 
 ## Benchmarking storage-path changes: both sides, before the new binary writes
 
-- A change that materially alters the read or write path (lance/DataFusion upgrades, index roster changes, storage-layer rewrites) must be benchmarked on BOTH sides before landing. `moon run bench-gate` covers both in one run - read probes/benches against the configured store, write benches (copy suite, commit sweep, index build/fold) against ephemeral scratch stores beside it - and appends one row per run to `docs/benchmarks/bench-gate-baseline.jsonl`.
+- A change that materially alters the read or write path (lance/DataFusion upgrades, index roster changes, storage-layer rewrites) must be benchmarked on BOTH sides before landing. `moon run repo:bench-gate` covers both in one run - read probes/benches against the configured store, write benches (copy suite, commit sweep, index build/fold) against ephemeral scratch stores beside it - and appends one row per run to `docs/benchmarks/bench-gate-baseline.jsonl`.
 - Run the old-side row (the gate at the pre-change commit) BEFORE the new binary ever writes to the real store: writes mutate store state, so the old-side read baseline is unrecoverable afterwards except via s5cmd scratch copies (the lance 8->10 upgrade lost its sync-write baseline exactly this way). The gate's write metrics have no such hazard - they run on fixed synthetic scratch stores either way.
-- `POND_BIN=/path/to/pond moon run bench-gate` snapshots a prebuilt binary (e.g. the released one) through the CLI probes; the cargo-bench fields land null since those compile HEAD. A full old-side row needs the gate run from the old commit's checkout.
+- `POND_BIN=/path/to/pond moon run repo:bench-gate` snapshots a prebuilt binary (e.g. the released one) through the CLI probes; the cargo-bench fields land null since those compile HEAD. A full old-side row needs the gate run from the old commit's checkout.
 - Rows are comparable only within the same `store` digest and `write_corpus` tag; the delta printer warns on store changes and flags rows with no write metrics.
 - The gate measures the paths its probes name and nothing else, so confirm a probe reads yours before citing a row as evidence - its `[sync] change-detection oracle` spent months timing a function with no production callers, leaving real sync-oracle changes unmeasured (#232). Otherwise add a probe, or measure separately and say so in the write-up.
 - One row does not bracket a change on a remote store: two runs 65 minutes apart on identical code moved `search_dated_s` +129%, `row_counts_ms` -59% and `open_store_ms` +90%, which buries a few hundred ms of real regression. Bracket a small effect with a targeted A/B over many runs (`hyperfine`, medians - S3 outliers drag means), each run on its own store path.

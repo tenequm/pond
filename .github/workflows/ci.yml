@@ -112,6 +112,26 @@ jobs:
       # flake check only evaluates - nothing above ever fetches a tarball. This
       # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
       - run: nix run .#pond -- --version
+      # toolVersions is plain literals so a reader without Nix can extract it by
+      # text - which is how the Windows leg will read the pins once it stops
+      # carrying its own copies (plan phase 5). This step keeps that text form
+      # honest: the literals, plus rust-toolchain.toml's channel which is not
+      # repeated there, must equal what the flake evaluates to. It does NOT yet
+      # cover the two bootstrap actions; their "bumped in lockstep, never alone"
+      # comments are still the only guard for those copies.
+      - name: toolVersions text extraction matches the evaluated attrset
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP:-$(mktemp -d)}"
+          nix eval --json .#lib.toolVersions | jq -S . > "$out/evaluated.json"
+          # rust-toolchain.toml is read LAST so its channel wins the jq merge: a
+          # `rust` literal smuggled into the table would otherwise match the
+          # eval and pass green, defeating the one cross-file assertion here.
+          {
+            sed -n '/toolVersions = {/,/^      };/s/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\)[[:space:]]*=[[:space:]]*"\([^"]*\)";.*/\1 \2/p' flake.nix
+            sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/rust \1/p' rust-toolchain.toml
+          } | jq -Rn '[inputs | split(" ") | {(.[0]): .[1]}] | add' | jq -S . > "$out/extracted.json"
+          diff -u "$out/evaluated.json" "$out/extracted.json"
 
   # Windows runs as TWO jobs, deliberately. One serial job cost 46 min warm
   # (20.7 test + 23.8 dist). Split, they start together on separate hosted
