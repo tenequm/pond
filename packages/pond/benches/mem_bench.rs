@@ -301,19 +301,19 @@ fn session_events(index: usize, messages: usize) -> Vec<IngestEvent> {
 const SEED_FLUSH_BATCH: usize = 100;
 
 /// Seed through the real batched ingest path - the same `IngestValidator`
-/// push/flush/finish cycle `ingest_adapter` drives in production.
+/// push/flush/finish cycle `ingest_adapter` drives in production, including
+/// its flush test: after every event, on the substream count OR the byte
+/// budget. Testing only at session end would miss the budget inside one large
+/// session, and would flush the open session's messages as a partial write
+/// production never makes.
 async fn ingest_batched(
     store: &Store,
     sessions: impl IntoIterator<Item = Vec<IngestEvent>>,
 ) -> Result<()> {
     let mut validator = IngestValidator::default();
-    let mut index = 0usize;
-    for events in sessions {
-        for event in events {
-            validator.push(store, index, event).await?;
-            index += 1;
-        }
-        if validator.pending_substreams() >= SEED_FLUSH_BATCH {
+    for (index, event) in sessions.into_iter().flatten().enumerate() {
+        validator.push(store, index, event).await?;
+        if validator.pending_substreams() >= SEED_FLUSH_BATCH || validator.byte_budget_reached() {
             validator.flush(store).await?;
         }
     }
@@ -761,8 +761,8 @@ async fn scenario_mcp_query_growth(corpus: &Corpus, iterations: usize) -> Result
 async fn scenario_ingest_large_session(steps: usize) -> Result<(Readings, Value)> {
     let temp = tempfile::tempdir().context("scratch store dir")?;
     let store = Store::open_local(temp.path()).await?;
-    // One session with `steps` messages: the flush batch is bounded by session
-    // count, not bytes (#229), so a single huge session is the worst shape.
+    // One session with `steps` messages: the substream-count flush never fires
+    // inside it (#229), so only the byte budget bounds the buffer here.
     // Generated before the probe starts, like the cached corpus is: `steps` is
     // up to 200k, and counting the generator's own allocations would swamp the
     // ingest peak this row exists to measure.
