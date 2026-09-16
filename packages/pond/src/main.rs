@@ -1132,14 +1132,11 @@ fn raise_lance_mem_pool() {
     tracing::debug!("LANCE_MEM_POOL_SIZE defaulted to 1 GiB");
 }
 
-/// Bound the per-scan readahead buffer for the long-lived read servers
-/// (`pond mcp` / `pond serve`). Lance's `LANCE_DEFAULT_IO_BUFFER_SIZE` defaults
-/// to 2 GiB, which lets a single scan balloon RSS; 256 MiB keeps a warm server
-/// inside a fixed budget while still feeding the IO threads for the small
-/// result sets reads return (spec.md#search). Set only in server processes -
-/// throughput-bound `copy`/`sync` run in their own processes and keep the
-/// default. Index/metadata caches are bounded separately in `resolve_cache_caps`.
-fn cap_serve_io_buffer() {
+/// Bound Lance's per-scan readahead buffer in scan-heavy processes; Phase 0
+/// reduced warm sync peak RSS from 207 to 173 MB, while an uncapped cold full
+/// re-read peaked at 738 MB, so this is not the fix for #245's 3.8 GB spike.
+/// `LANCE_DEFAULT_IO_BUFFER_SIZE` overrides the 256 MiB default.
+fn cap_scan_io_buffer() {
     if std::env::var_os("LANCE_DEFAULT_IO_BUFFER_SIZE").is_some() {
         return;
     }
@@ -1149,7 +1146,7 @@ fn cap_serve_io_buffer() {
     unsafe {
         std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "268435456");
     }
-    tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB for serving");
+    tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB");
 }
 
 /// How often a serving process re-ensures the resident meta map after the
@@ -1456,6 +1453,7 @@ async fn run() -> anyhow::Result<()> {
             no_wait,
             format,
         } => {
+            cap_scan_io_buffer();
             let config_file = config_path(config);
             let loaded = Config::load(&config_file)?;
             run_sync(
@@ -1574,7 +1572,7 @@ async fn run() -> anyhow::Result<()> {
             sync_every,
             bootstrap,
         } => {
-            cap_serve_io_buffer();
+            cap_scan_io_buffer();
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1630,7 +1628,7 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Mcp {} => {
-            cap_serve_io_buffer();
+            cap_scan_io_buffer();
             let config = Config::load(config_path(config))?;
             // Lazy: idle `pond mcp` instances in every Claude Code session stay
             // light. The model load happens once per process - on the first
@@ -1787,6 +1785,7 @@ async fn run() -> anyhow::Result<()> {
             to,
             verify_only,
         } => {
+            cap_scan_io_buffer();
             run_copy(from, to, verify_only, storage_path, config).await?;
         }
         Command::Sql {
