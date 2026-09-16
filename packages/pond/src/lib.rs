@@ -2,6 +2,10 @@ pub mod adapter;
 pub mod config;
 pub mod embed;
 pub mod handlers;
+// Bench/profiling instrumentation only: the module (and with it the
+// `#[global_allocator]` swap) does not exist in a default build.
+#[cfg(any(feature = "mem-probe", feature = "dhat-heap"))]
+pub mod memprobe;
 pub mod render;
 pub mod rowmap;
 pub mod sessions;
