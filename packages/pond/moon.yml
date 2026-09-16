@@ -35,7 +35,8 @@ tasks:
     command: 'cargo fmt --check'
     inputs: ['@group(sources)', '@group(tests)']
   lint:
-    command: 'cargo clippy --locked -- -D warnings'
+    # --all-targets: without it tests/ and benches/ were linted only on Windows.
+    command: 'cargo clippy --locked --all-targets -- -D warnings'
     inputs: ['@group(sources)', '@group(tests)']
   test:
     command: 'cargo test --locked'

@@ -991,7 +991,7 @@ mod tests {
                 .project
                 .starts_with("/private/tmp/grok-fixture/project/nested-directory-001"),
             "the hash bucket resolves through .cwd: {}",
-            &*long.session.project,
+            *long.session.project,
         );
         assert_eq!(long.session.source_agent, NAME);
         Ok(())

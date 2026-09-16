@@ -1,4 +1,7 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+// The deep async ingest futures in `run_bench` exceed rustc's default
+// query-depth limit of 128.
+#![recursion_limit = "256"]
 
 //! Backend latency comparison: local file:// vs an object-store URL the user
 //! passes via `--s3-url`. Reads `[storage]` from the user config the same way

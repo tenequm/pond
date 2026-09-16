@@ -356,6 +356,9 @@ async fn ingest_batched(
         for event in events {
             validator.push(store, index, event).await?;
             index += 1;
+            if validator.byte_budget_reached() {
+                validator.flush(store).await?;
+            }
         }
         if validator.pending_substreams() >= SEED_FLUSH_BATCH {
             validator.flush(store).await?;

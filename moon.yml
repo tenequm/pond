@@ -46,6 +46,50 @@ tasks:
       cache: false
       outputStyle: stream
 
+  # Memory gate (#245, track A): one mem_bench scenario per process, appending
+  # to docs/benchmarks/mem-gate-baseline.jsonl and printing the delta vs the
+  # previous run. Local-only in v1 - no thresholds, not in CI. Pass flags
+  # through: `moon run repo:mem-gate -- --profile large`.
+  mem-gate:
+    command: 'bash ops/scripts/mem-gate.sh'
+    toolchains: 'system'
+    options:
+      cache: false
+      outputStyle: stream
+
+  # CI shape of the memory gate: same scenarios, but compares against the last
+  # committed baseline row per (scenario, profile) instead of appending, and
+  # fails past MEM_GATE_MAX_REGRESSION_PCT (default 20%). Cached and
+  # input-hashed so an unchanged tree - or a PR that touches none of the
+  # inputs, under `moon ci` affected filtering - skips the ~40 min run.
+  # Deliberately NOT wired into any workflow yet (plan hardening phase).
+  mem-gate-ci:
+    extends: 'mem-gate'
+    args: '--check'
+    inputs:
+      - 'packages/pond/src/**/*'
+      - 'packages/pond/benches/mem_bench.rs'
+      - 'packages/pond/build.rs'
+      - 'packages/pond/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      # A toolchain bump changes codegen and with it what the row measures; omit
+      # it and moon replays a cached pass over a different compiler.
+      - 'rust-toolchain.toml'
+      - 'ops/scripts/mem-gate.sh'
+      - 'docs/benchmarks/mem-gate-baseline.jsonl'
+    options:
+      cache: true
+
+  # Allocation-site attribution for one mem_bench scenario:
+  # `moon run repo:profile-mem -- <scenario> [heaptrack|dhat]`.
+  profile-mem:
+    command: 'bash ops/scripts/profile-mem.sh'
+    toolchains: 'system'
+    options:
+      cache: false
+      outputStyle: stream
+
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
   # cross-compiled. It is a separate task for the same reason `test-msvc` is
   # separate from `test`: moon's fingerprint carries no OS, so a shared task
@@ -72,13 +116,13 @@ tasks:
       # here - it lives in .github/kache/linux-dist.toml, which the bootstrap
       # selects through KACHE_CONFIG, so the wrapper and any daemon kache spawns
       # for itself both resolve it from a file they can re-read. The old stub
-      # named no bucket and leaned on the job's KACHE_S3_* env, which 0.15.0
+      # named no bucket and leaned on the job's KACHE_S3_* env, which kache
       # strips from a daemon spawn. Push on EXIT, not after success: crates
       # compiled before a failure still warm the retry.
       # --all: one paginated LIST of the per-job prefix instead of one LIST
       # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
       # worse from a runner). Safe only because the prefix holds exactly this
-      # job's artifacts. --allow-partial: 0.15.0 exits non-zero on any failed
+      # job's artifacts. --allow-partial: kache exits non-zero on any failed
       # transfer, and under `set -euo pipefail` that would redden a job that
       # would compile through fine - a partial pull is a slower build, never a
       # broken one.
