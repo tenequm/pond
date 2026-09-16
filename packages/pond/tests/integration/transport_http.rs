@@ -85,11 +85,11 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
         .into_result()?;
 
     let store = Arc::new(store);
-    let state = AppState {
-        store: Arc::clone(&store),
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
-        search: pond::config::SearchConfig::default(),
-    };
+    let state = AppState::new(
+        Arc::clone(&store),
+        Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
+        pond::config::SearchConfig::default(),
+    );
     Ok((
         temp,
         store,
@@ -102,13 +102,13 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
 async fn empty_state(temp: &TempDir) -> anyhow::Result<AppState> {
     // The vector arm is refused unless this instance opted in.
     pond::embed::init_enabled(true);
-    Ok(AppState {
-        store: Arc::new(Store::open_local(temp.path()).await?),
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
+    Ok(AppState::new(
+        Arc::new(Store::open_local(temp.path()).await?),
+        Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
             FakeBackend,
         ))),
-        search: pond::config::SearchConfig::default(),
-    })
+        pond::config::SearchConfig::default(),
+    ))
 }
 
 /// Shutdown has to finish while an MCP client is attached. axum's graceful
@@ -325,6 +325,48 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, HeaderMap,
         .await
         .unwrap();
     (status, headers, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// The periodic allocator trim in `spawn_prewarm` only fires when a request
+/// completed since the previous interval, so two properties have to hold or
+/// the trim silently stops happening (or starts happening on an idle server,
+/// paying for a glibc arena walk every 30 s for nothing): every request path
+/// arms the flag, including one that answers with an error, and taking it
+/// clears it. Neither is visible in RSS, so nothing else would catch a handler
+/// that lost its guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_requests_arm_the_periodic_allocator_trim() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let state = empty_state(&temp).await?;
+    let app = http::router(
+        state.clone(),
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+
+    assert!(
+        !state.take_completed_activity(),
+        "a process that has served nothing is idle"
+    );
+
+    // Not-found is still work done: the handler allocated to answer it.
+    let (status, _, _) = post(
+        &app,
+        "/v1/get-session",
+        &json!({"protocol_version": PROTOCOL_VERSION, "session_id": "absent"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        state.take_completed_activity(),
+        "a completed request arms the next trim"
+    );
+    assert!(
+        !state.take_completed_activity(),
+        "taking the flag disarms it: an interval with no request must not trim"
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
