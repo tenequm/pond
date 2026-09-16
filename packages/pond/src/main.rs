@@ -1132,14 +1132,18 @@ fn raise_lance_mem_pool() {
     tracing::debug!("LANCE_MEM_POOL_SIZE defaulted to 1 GiB");
 }
 
-/// Bound the per-scan readahead buffer for the long-lived read servers
-/// (`pond mcp` / `pond serve`). Lance's `LANCE_DEFAULT_IO_BUFFER_SIZE` defaults
-/// to 2 GiB, which lets a single scan balloon RSS; 256 MiB keeps a warm server
-/// inside a fixed budget while still feeding the IO threads for the small
-/// result sets reads return (spec.md#search). Set only in server processes -
-/// throughput-bound `copy`/`sync` run in their own processes and keep the
-/// default. Index/metadata caches are bounded separately in `resolve_cache_caps`.
-fn cap_serve_io_buffer() {
+/// Bound Lance's per-scan readahead buffer in the scan-heavy commands
+/// (`sync`, `copy`, `serve`, `mcp`). `LANCE_DEFAULT_IO_BUFFER_SIZE` defaults to
+/// 2 GiB, which lets a single scan balloon RSS; 256 MiB keeps the peak inside a
+/// fixed budget while still feeding the IO threads. A value already in the
+/// environment always wins, so an operator can restore the Lance default.
+///
+/// A bound, not the fix for #245's 3.8 GB spike: the capped warm sync peaked at
+/// 173 MB against 207 MB uncapped, and even an uncapped cold full re-read only
+/// reached 738 MB (`docs/plans/2609-16-memory-instrumentation.md`). Every other
+/// command keeps the Lance default until its read path is benched on both
+/// sides; index/metadata caches are bounded separately in `resolve_cache_caps`.
+fn cap_scan_io_buffer() {
     if std::env::var_os("LANCE_DEFAULT_IO_BUFFER_SIZE").is_some() {
         return;
     }
@@ -1149,7 +1153,7 @@ fn cap_serve_io_buffer() {
     unsafe {
         std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "268435456");
     }
-    tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB for serving");
+    tracing::debug!("LANCE_DEFAULT_IO_BUFFER_SIZE defaulted to 256 MiB");
 }
 
 /// How often a serving process re-ensures the resident meta map after the
@@ -1258,6 +1262,14 @@ async fn run() -> anyhow::Result<()> {
         tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
     }
     raise_lance_mem_pool();
+    // Which commands take the cap is the policy, so it reads as one list beside
+    // the sibling mem-pool lever rather than as a call inside each arm.
+    if matches!(
+        cli.command,
+        Command::Sync { .. } | Command::Copy { .. } | Command::Serve { .. } | Command::Mcp {}
+    ) {
+        cap_scan_io_buffer();
+    }
     // `-v` opts default `pond status` into the embedding probe, which scans the
     // `vector` and `search_text` columns on the 2M-row messages table - tens of
     // seconds on a cold remote store, because Lance v2 has no per-column
@@ -1574,7 +1586,6 @@ async fn run() -> anyhow::Result<()> {
             sync_every,
             bootstrap,
         } => {
-            cap_serve_io_buffer();
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1630,7 +1641,6 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Mcp {} => {
-            cap_serve_io_buffer();
             let config = Config::load(config_path(config))?;
             // Lazy: idle `pond mcp` instances in every Claude Code session stay
             // light. The model load happens once per process - on the first
