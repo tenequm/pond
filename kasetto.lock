@@ -1,0 +1,35 @@
+version: 3
+skills:
+  ./skills::add-adapter:
+    destination: .claude/skills/add-adapter,.agents/skills/add-adapter
+    hash: 2755fbe162741df3f70b69209a4ef48b62a79a14524b489b0666979f3872c5a2
+    skill: add-adapter
+    description: Playbook for adding a new source-agent adapter to pond - spec the format from the upstream writer, capture a sandboxed fixture, implement the bidirectional codec, and prove conformance. Use when adding an adapter under packages/pond/src/adapter/ or reworking an existing one.
+    source: ./skills
+    source_revision: local
+    scope: project
+  https://github.com/tenequm/skills::lance-format:
+    destination: .claude/skills/lance-format,.agents/skills/lance-format
+    hash: 7fa09bd20addf483802da9c2cdf56a71a2f49f862e244764bfe43611ae4495f9
+    skill: lance-format
+    description: Deep reference for Lance v12 columnar format, its Rust crates, and pylance - file encodings, table format, indexes, schema evolution, time travel. Use when building on the Lance crates or reading .lance datasets, not the LanceDB product.
+    source: https://github.com/tenequm/skills
+    source_revision: branch:main
+    scope: project
+  https://github.com/tenequm/skills::mcp-best-practices:
+    destination: .claude/skills/mcp-best-practices,.agents/skills/mcp-best-practices
+    hash: cd6821a26aea52a0fdae209604bc6a587d0b2602312032c8e196579722bd8547
+    skill: mcp-best-practices
+    description: Build, harden, and debug production MCP servers with the TypeScript SDK. Use when writing or reviewing an MCP server - transports, tool schemas, errors, OAuth, token bloat, SDK migrations, MCP Apps, Registry. Assumes a server already exists.
+    source: https://github.com/tenequm/skills
+    source_revision: branch:main
+    scope: project
+  https://github.com/tenequm/skills::rust-dev:
+    destination: .claude/skills/rust-dev,.agents/skills/rust-dev
+    hash: 0a03c226421917660b341917fc4f13cb94c69527132dcf02c48fd2059ff06c5c
+    skill: rust-dev
+    description: Day-1 guide to building well in Rust - ownership, errors as values, String vs &str, Box/Rc/Arc, anyhow vs thiserror, and a crate shortlist (tokio, serde, axum, sqlx). Use when starting a Rust project, fighting the borrow checker, or picking crates.
+    source: https://github.com/tenequm/skills
+    source_revision: branch:main
+    scope: project
+assets: {}

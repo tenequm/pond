@@ -1,0 +1,7 @@
+scope: project
+agent: [claude-code, codex]
+skills:
+  - source: ./skills
+    skills: "*"
+  - source: https://github.com/tenequm/skills
+    skills: [rust-dev, lance-format, mcp-best-practices]
