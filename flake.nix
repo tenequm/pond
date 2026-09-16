@@ -37,10 +37,12 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # Every tool version in one place, in plain `name = "x.y.z";` form on
-      # purpose: the Windows leg has no Nix and reads these by text extraction,
-      # and the flake-check job fails when that text and `nix eval --json
-      # .#lib.toolVersions` disagree. Rust is not repeated here - it is read
-      # from rust-toolchain.toml, which stays the single Rust pin.
+      # purpose: a reader without Nix can extract it by text, which is how the
+      # Windows leg will read these once it stops carrying its own copies (plan
+      # phase 5). The flake-check job keeps that text form honest today - it
+      # fails when the literals and `nix eval --json .#lib.toolVersions`
+      # disagree. Rust is not repeated here - it is read from
+      # rust-toolchain.toml, which stays the single Rust pin.
       #
       # The four that come from nixpkgs-toolchain (zig, cargoZigbuild,
       # rcodesign, gh) are asserted against the package's own `version` below,
@@ -135,8 +137,8 @@
             hash = "sha256-GUaUMOTH8ai8xWHCjBX9SH0ytR68Yski1x7n3iHwYPA=";
           };
         };
-        # npm is one tarball for every platform: node 24.21.0 bundles npm
-        # 11.19.0, and .moon/toolchains.yml pins 11.19.1.
+        # npm is one tarball for every platform. node bundles an older npm than
+        # .moon/toolchains.yml pins, so the pinned one is unpacked over it.
         npm = {
           url = "https://registry.npmjs.org/npm/-/npm-${v.npm}.tgz";
           hash = "sha256-n1i/8BYEyxsUAI/vFNzrFNg2pJIl5FxsLjfeO+PnB/A=";
@@ -167,7 +169,7 @@
             if pkg.version == want then
               pkg
             else
-              throw "nixpkgs-toolchain has ${pkg.pname} ${pkg.version}, toolVersions pins ${want}: bump the pin (and the CI text extraction) with the input";
+              throw "nixpkgs-toolchain has ${pkg.pname} ${pkg.version}, toolVersions pins ${want}: bump the pin with the input";
 
           src = tool: pkgs.fetchurl (sources.${tool}.${system} or sources.${tool});
 
@@ -180,15 +182,24 @@
                 # Release binaries are already stripped, and stripping a signed
                 # darwin binary invalidates its signature.
                 dontStrip = true;
+                # Additive rather than `//`-overridable: a caller passing its
+                # own nativeBuildInputs would otherwise drop autoPatchelfHook
+                # and ship an ELF that only fails at first exec.
                 nativeBuildInputs =
                   lib.optionals stdenv.hostPlatform.isLinux [ pkgs.autoPatchelfHook ]
-                  ++ lib.optional (lib.hasSuffix ".zip" args.src.name) pkgs.unzip;
-                buildInputs = lib.optionals stdenv.hostPlatform.isLinux [
-                  stdenv.cc.cc.lib
-                  pkgs.zlib
-                ];
+                  ++ lib.optional (lib.hasSuffix ".zip" args.src.name) pkgs.unzip
+                  ++ (args.nativeBuildInputs or [ ]);
+                buildInputs =
+                  lib.optionals stdenv.hostPlatform.isLinux [
+                    stdenv.cc.cc.lib
+                    pkgs.zlib
+                  ]
+                  ++ (args.buildInputs or [ ]);
               }
-              // args
+              // removeAttrs args [
+                "nativeBuildInputs"
+                "buildInputs"
+              ]
             );
 
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
@@ -219,7 +230,8 @@
           };
 
           # nixpkgs' protobuf is deliberately not used: protoc's exact version
-          # is a pin the Windows leg mirrors, and it tracks nixpkgs there.
+          # is a pin the bootstrap actions mirror by hand, and nixpkgs' would
+          # float with the input instead of staying that pin.
           protoc = prebuilt {
             pname = "protoc";
             version = v.protoc;
@@ -254,7 +266,7 @@
             pname = "nodejs";
             version = v.node;
             src = src "node";
-            npmSrc = pkgs.fetchurl sources.npm;
+            npmSrc = src "npm";
             installPhase = ''
               mkdir -p $out
               cp -a bin include lib share $out/
@@ -349,8 +361,8 @@
       # job: this shell is the single source of truth for the toolchain -
       # rust-toolchain.toml's rust, the cross-compile set (zig, cargo-zigbuild,
       # rcodesign, the SDK stubs) and the pinned user-space binaries (moon,
-      # protoc, uv, node/npm, kache). rustup is deliberately absent: it would
-      # be a second Rust pin resolving against a different source.
+      # protoc, uv, node/npm, kache, gh). rustup is deliberately absent: it
+      # would be a second Rust pin resolving against a different source.
       devShells = nixpkgs.lib.genAttrs systems (system: { default = mkDevShell system; });
     };
 }

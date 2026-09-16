@@ -20,7 +20,7 @@
 
 ## Toolchain
 
-`flake.nix` is the single source of truth for every tool - rust (read from `rust-toolchain.toml`), zig, cargo-zigbuild, rcodesign, the macOS SDK stubs, moon, protoc, uv, node/npm, kache. `nix eval --json .#lib.toolVersions` prints the pins; CI asserts they match the text the Windows leg extracts.
+`flake.nix` is the single source of truth for the dev toolchain - rust (read from `rust-toolchain.toml`), zig, cargo-zigbuild, rcodesign, the macOS SDK stubs, moon, protoc, uv, node/npm, kache, gh. `nix eval --json .#lib.toolVersions` prints the pins, and the flake-check job asserts the table's text form matches what it evaluates to. CI does not enter this shell yet: `.github/actions/bootstrap` and `windows-bootstrap` still install their own moon/protoc/uv/kache, so bumping one of those four is two edits until those actions are retired.
 
 - Enter it once per shell, not per command: `direnv allow` (first time in a fresh worktree), then commands run in the shell as usual. Run a single command in it with `direnv exec . <cmd>`, or load it for the whole session with `eval "$(direnv export bash)"`.
 - Never `nix develop -c <cmd>` per command: it re-evaluates the flake after every file edit, which costs seconds each time. nix-direnv caches the environment and `.envrc` watches `rust-toolchain.toml`, so a toolchain bump still reloads.
