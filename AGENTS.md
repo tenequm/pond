@@ -20,12 +20,13 @@
 
 ## moon (the task runner CI runs)
 
-- CI runs `moon ci <targets>` for the test leg and `moon run <target>` for the release legs. Locally, `moon run pond:lint pond:test` reproduces the gate; `moon ci` needs a diff base and is not what you want on a dirty tree.
+- CI runs `moon ci <targets>` for the Linux test leg and `moon run <target>` everywhere else (the Windows legs and the release builds). Locally, `moon run pond:lint pond:test` reproduces the gate; `moon ci` needs a diff base and is not what you want on a dirty tree.
+- **`moon ci` runs only what the changed files affect**, so a task is gated only by what it declares in `inputs`. `.moon/tasks/all.yml` adds each project's own `moon.yml` as an implicit input for exactly this reason - without it, a commit that edits only task definitions resolves zero targets and the gate job passes having run nothing.
 - **Set `MOON_OUTPUT_STYLE=buffer-only-failure`.** moon streams every task's output by default, which buries the one failure in thousands of lines of passing output. `buffer-only-failure` prints nothing for a task that passes and the full buffered output for one that fails. Pair it with `--summary` for the per-task pass/fail/cached table.
 - **Read the report, don't re-run the suite.** Every run writes `.moon/cache/runReport.json` (and `moon ci` writes `.moon/cache/ciReport.json`) with each action's status, duration, and cache verdict. Parse that to answer "what failed / what was cached" instead of running tasks again. They are overwritten by the next run, so copy one out if it matters.
 - `moon mcp` exposes the project/task graph as an MCP server - use it to ask what a target actually runs, what it depends on, and what its inputs are, rather than reading the YAML and guessing at inheritance.
-- `.moon/toolchains.yml` declares `rust` versionless on purpose: `rust-toolchain.toml` is the pin, moon resolves rustc from PATH, and the declaration exists so the host triple lands in every task hash. `node` and `npm` keep exact versions because nothing installs node on the CI runner - moon provisions it through proto. `/flake.lock` is a declared input of the Rust file groups, so a toolchain bump invalidates the task hashes.
-- `packages/openclaw-pond` and `packages/pi-pond` have an `install` task with a `condition` check: it skips `npm ci` when `node_modules/.moon-install-stamp` still matches `package-lock.json`. Delete the stamp to force a reinstall.
+- `.moon/toolchains.yml` declares `rust` versionless on purpose: `rust-toolchain.toml` is the pin, moon resolves rustc from PATH, and the declaration exists so the host triple lands in every task hash. `node` and `npm` keep exact versions because nothing installs node on the CI runner - moon provisions it through proto. `/flake.lock` is a declared input of the Rust file groups, ahead of the flake actually supplying the toolchain: today CI's compiler still comes from `rust-toolchain.toml` and its protoc from the bootstrap, so a protoc or zig bump still moves no declared input.
+- `packages/openclaw-pond` and `packages/pi-pond` have an `install` task with a `condition` check: it skips `npm ci` when `node_modules/.moon-install-stamp` still matches `package.json` + `package-lock.json`. Delete the stamp to force a reinstall.
 
 ## Tests
 

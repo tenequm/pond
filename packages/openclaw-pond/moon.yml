@@ -20,17 +20,22 @@ tasks:
   #
   # The moon v2.4 `condition` check is the safe form of that skip: it asks the
   # filesystem instead of a hash. `npm ci` wipes node_modules/ before it
-  # installs, so a stamp INSIDE node_modules/ that still matches
-  # package-lock.json can only mean this tree was installed from this lockfile.
-  # A condition check skips the task only when it exits 0, so every doubt - no
-  # node_modules/, a changed lockfile, no `cmp` on the machine - runs the
-  # install as before. This is what stops agents and warm runners reinstalling
-  # node_modules on every invocation.
+  # installs, so a stamp INSIDE node_modules/ that still matches the manifests
+  # can only mean this tree was installed from them. A condition check skips the
+  # task only when it exits 0, so every doubt - no node_modules/, a changed
+  # manifest, no `cmp` on the machine - runs the install as before. This is what
+  # stops agents and warm runners reinstalling node_modules on every invocation.
+  #
+  # The stamp covers package.json as well as the lockfile, and has to: `npm ci`
+  # validates the two against each other and fails on a desync, but it only
+  # reaches that check - and only wipes node_modules/ - when it actually runs.
+  # Stamping the lockfile alone would skip the install after a package.json-only
+  # edit, and the desync `npm ci` exists to catch would go unreported.
   install:
-    script: 'npm ci && cp package-lock.json node_modules/.moon-install-stamp'
+    script: 'npm ci && cat package.json package-lock.json > node_modules/.moon-install-stamp'
     checks:
       - check: 'condition'
-        script: 'cmp -s package-lock.json node_modules/.moon-install-stamp'
+        script: 'cat package.json package-lock.json | cmp -s - node_modules/.moon-install-stamp'
     inputs:
       - 'package.json'
       - 'package-lock.json'

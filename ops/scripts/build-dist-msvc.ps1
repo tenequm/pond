@@ -10,6 +10,14 @@
 # `Select-String -Quiet` hands the still-writing binary - which is why the
 # emptiness check reads the file back instead of piping into it.
 $ErrorActionPreference = 'Stop'
+# 'Stop' alone governs cmdlets only - a native command that exits non-zero is
+# not an error to PowerShell, and this variable is what makes it one (pwsh 7.3+,
+# default $false). Without it a failed `cargo build` falls through to the
+# packaging below, which is the one way this task could ship a zip built from
+# something other than this commit. Today every later step would still throw on
+# the missing exe, but that is a property of a runner whose target/ starts
+# empty, not of this script.
+$PSNativeCommandUseErrorActionPreference = $true
 $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
 # --features windows-launcher builds pondw.exe (gated in Cargo.toml).
 cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher

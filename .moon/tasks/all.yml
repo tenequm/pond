@@ -1,0 +1,17 @@
+# Inherited by every project (no `inheritedBy` condition).
+#
+# moon's built-in implicit input is `.moon/*.{yml,...}` only - a project's own
+# moon.yml is an input of nothing. That is invisible under `moon run`, which
+# runs what it is told, but `moon ci` selects on affected inputs: without this,
+# a commit that edits only a moon.yml (a task command, its inputs, a fileGroup)
+# resolves ZERO targets and the gate job goes green having run nothing.
+# Verified both ways with `moon ci --stdin`: a touched moon.yml then affects
+# exactly that project's tasks, and an unrelated file still resolves none.
+#
+# Must live under .moon/tasks/ - a flat .moon/tasks.yml is silently ignored
+# (crates/config-loader: get_tasks_files reads <config_dir>/tasks only).
+implicitInputs:
+  - 'moon.yml'
+  # And this file: moon's built-in glob is `.moon/*.{yml,...}`, one level up
+  # from here, so without the line an edit to it would invalidate nothing.
+  - '/.moon/tasks/**/*'
