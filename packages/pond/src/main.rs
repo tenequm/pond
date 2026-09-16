@@ -3872,7 +3872,6 @@ struct SyncReport {
 
 /// Stable kind for an absent source root, shared by `failed_adapters`, dry-run
 /// rows, and status rows so one condition reads the same on every surface.
-/// A cause that cannot be named carries no token rather than a guessed one.
 const FAILURE_REASON_SOURCE_MISSING: &str = "source_missing";
 
 /// One adapter skipped because its configured source root does not exist on

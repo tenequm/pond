@@ -3814,8 +3814,7 @@ pub struct IngestSummary {
     pub truncated_values: usize,
     /// Stable validator reason keys serialized by `pond sync --format json` and
     /// bucketed by the ingest bench, excluding adapter read failures without keys.
-    /// Spans per-event and session-level rejections alike, so a session-level
-    /// key also counts in `dropped_sessions` - one rejection, two surfaces.
+    /// A session-level rejection lands here and in `dropped_sessions`.
     pub drop_reasons: BTreeMap<&'static str, usize>,
 }
 
