@@ -1,11 +1,12 @@
 # Toolchains moon provisions itself, through proto, on first use of a task that
-# needs them. This is what lets the plugin suites run on a bare CI runner
-# without the bootstrap hand-installing node or uv: the runner only supplies
-# moon, and moon supplies the rest.
+# needs them. Because these carry explicit versions, moon downloads its own node
+# and npm into PROTO_HOME even though the devshell already ships both - which is
+# why CI still points PROTO_HOME at the /ci-cache PVC. Going versionless (so
+# proto downloads nothing and moon uses PATH) is a separate, staged change.
 #
-# The Rust toolchain is deliberately absent. rust-toolchain.toml pins it and
-# the bootstrap materializes that pin with rustup; declaring `rust` here would
-# be a second pin resolving against a different source.
+# The Rust toolchain is deliberately absent. rust-toolchain.toml pins it and the
+# flake devShell materializes that pin; declaring `rust` here would be a second
+# pin resolving against a different source.
 #
 # Versions are exact for the same reason every other tool in this repo is
 # pinned exactly (protoc, moon, kache): a floating '24' silently changes what
@@ -21,6 +22,6 @@ npm:
 # No python/uv toolchains. `unstable_python` provisions cleanly, but proto's uv
 # plugin does not: it writes the version metadata and then fails to locate a
 # binary it never unpacked (proto::locate::missing_executable), on the CI runner
-# and once locally. uv is pinned in the CI bootstrap instead, and hermes-pond
+# and once locally. uv is pinned in the flake devShell instead, and hermes-pond
 # runs on the system toolchain. Worth revisiting when those plugins leave
 # `unstable_` - the intent is for this file to own that too.

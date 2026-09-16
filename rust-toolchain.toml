@@ -1,5 +1,14 @@
 [toolchain]
 channel = "1.98.1"
 components = ["rustfmt", "clippy", "rust-src"]
-targets = ["aarch64-apple-darwin"]
+# Every target `repo:build-dist` cross-compiles, listed here because this file is
+# the one Rust pin: rust-overlay reads it for the Nix devshell and rustup reads it
+# on the Windows leg. It used to carry only darwin, with the two Linux targets
+# added imperatively by `rustup target add` inside the dist task - which cannot
+# work once rustup is gone.
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+]
 profile = "minimal"

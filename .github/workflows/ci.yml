@@ -43,9 +43,10 @@ env:
 
 jobs:
   build-and-test:
-    # In-cluster ARC ephemeral runner (scale set `pond-ci`). Toolchain, cargo
-    # registry, and target/ live on the runner's /ci-cache PVC, which persists
-    # across the ephemeral pods.
+    # In-cluster ARC ephemeral runner (scale set `pond-ci`). The toolchain comes
+    # from the flake devShell, realized in the node's /nix store volume; the
+    # cargo registry, target/ and proto's tool tree stay on the /ci-cache PVC.
+    # Both persist across the ephemeral pods.
     runs-on: pond-ci
     timeout-minutes: 60
     # A newer push to the same ref supersedes an in-flight build.
@@ -56,12 +57,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: ./.github/actions/bootstrap
+      - uses: ./.github/actions/devshell
       # One moon session: independent tasks interleave (cargo serializes the
       # heavy ones on its target-dir lock; format/changelog are instant). The
       # plugin suites run here too - they cost seconds next to the Rust build,
-      # and moon provisions their node/uv itself, so they need nothing from the
-      # bootstrap.
+      # and moon provisions their node itself through proto (the devshell's node
+      # is for direct use; .moon/toolchains.yml still pins a version, so moon
+      # downloads its own into PROTO_HOME either way).
       - run: >
           moon run
           repo:check-changelog
@@ -70,9 +72,10 @@ jobs:
           pi-pond:typecheck pi-pond:test
           hermes-pond:test
 
-  # Hosted, never pond-ci: those runner pods are unprivileged with a root-owned
-  # /nix (the image ships nix-bin only for `nix-hash`), so nix there would need
-  # its sandbox off - weaker conditions than the users this check protects.
+  # Hosted, never pond-ci: the pond-ci pods are unprivileged, so their nix runs
+  # with `sandbox = false` - weaker conditions than the users this check
+  # protects. That the toolchain jobs next door now enter a devshell does not
+  # change it; this is the one job whose job is to be reproducible.
   flake-check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -84,6 +87,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          # pond's binary cache, public read and no credential. Written into
+          # nix.conf rather than relied on from the flake's own nixConfig:
+          # `nix flake check --all-systems` builds the devShells, and the
+          # toolchain closure is most of that.
+          extra_nix_config: |
+            extra-substituters = https://pond-nix-cache.nbg1.your-objectstorage.com
+            extra-trusted-public-keys = pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=
       # Without --all-systems the darwin and aarch64 outputs go unevaluated on
       # an x86_64 runner and the job passes anyway.
       - run: nix flake check --all-systems --no-update-lock-file
@@ -370,8 +381,9 @@ jobs:
   dist-build:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
-    # ARC runner pod: zig/zigbuild/SDK/rcodesign come from the pond-runner
-    # image, incremental cache on /ci-cache - no docker, no buildkit.
+    # ARC runner pod: rust + its three cross targets, zig/zigbuild/SDK/rcodesign
+    # all come from the flake devShell; incremental cache on /ci-cache - no
+    # docker, no buildkit.
     runs-on: pond-ci
     # A fully cold 3-target dist build measured 56m; warm runs are minutes.
     timeout-minutes: 90
@@ -379,10 +391,10 @@ jobs:
     outputs:
       v: ${{ steps.ver.outputs.v }}
       signed: ${{ steps.identity.outputs.signed }}
-    # Job-level, not step-level, so the bootstrap can see KACHE_S3_PREFIX and
-    # assert it against the prefix in .github/kache/linux-dist.toml before
-    # anything compiles. Bucket/endpoint/region stay here as well because the
-    # CLI reads them ahead of the file, so removing them would change which
+    # Job-level, not step-level, so the prefix assertion below sees
+    # KACHE_S3_PREFIX and can check it against .github/kache/linux-dist.toml
+    # before anything compiles. Bucket/endpoint/region stay here as well because
+    # the CLI reads them ahead of the file, so removing them would change which
     # settings are live rather than just where they are written.
     # Credentials are deliberately env-only: they are the two KACHE_S3_*
     # variables a kache daemon spawn does not strip, and they never enter a
@@ -401,7 +413,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
-      - uses: ./.github/actions/bootstrap
+      - uses: ./.github/actions/devshell
+
+      # This job is the only caller that declares a kache remote, and the CLI
+      # reads KACHE_S3_PREFIX ahead of the file. Assert the two agree, so the
+      # CLI (env) and a daemon (file) can never split across two prefixes - a
+      # split makes prefetch fetch from one place while the manifest is written
+      # to another, and nothing says so. It lived in the deleted bootstrap, which
+      # every job paid for; here it sits where the remote actually is.
+      - name: Assert the kache prefix matches the config file
+        run: |
+          set -euo pipefail
+          test -f "$KACHE_CONFIG"
+          file_prefix=$(awk -F'"' '/^[[:space:]]*prefix[[:space:]]*=/ { print $2; exit }' "$KACHE_CONFIG")
+          if [ "$file_prefix" != "$KACHE_S3_PREFIX" ]; then
+            echo "kache prefix mismatch: $KACHE_CONFIG has '$file_prefix', job env has '$KACHE_S3_PREFIX'" >&2
+            exit 1
+          fi
 
       # Reports only whether the cert exists, never its value: the signature
       # and notarize steps skip cleanly until the Apple secrets are populated,
@@ -410,8 +438,8 @@ jobs:
         run: echo "signed=${{ secrets.APPLE_P12_BASE64 != '' }}" >> "$GITHUB_OUTPUT"
 
       # The KACHE_S3_* / KACHE_CACHE_DIR block this step used to carry now sits
-      # at job level, so the bootstrap can assert the prefix against the config
-      # file. Only the signing credentials stay step-scoped.
+      # at job level, so the prefix assertion above can read it. Only the
+      # signing credentials stay step-scoped.
       - name: Build + package binaries
         run: moon run repo:build-dist
         env:
@@ -512,8 +540,8 @@ jobs:
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
     needs: [dist-build, macos-verify, windows-verify, windows-dist]
-    # ARC runner pod: gh + nix-bin come from the runner image; rust lives on
-    # the /ci-cache PVC (release-plz runs `cargo publish` here).
+    # ARC runner pod: gh and rust both come from the flake devShell (release-plz
+    # runs `cargo publish` here); the cargo registry stays on the /ci-cache PVC.
     runs-on: pond-ci
     timeout-minutes: 30
     permissions:
@@ -528,7 +556,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
-      - uses: ./.github/actions/bootstrap
+      - uses: ./.github/actions/devshell
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-all, path: dist }
       # The msvc zip is built natively by windows-dist, not by the moon dist
@@ -548,18 +576,21 @@ jobs:
           ( cd dist && sha256sum pond-* > checksums.txt )
           cat dist/checksums.txt
 
-      # Same binstall exposure as release-prep (see the comment there). The Linux
-      # bootstrap installs rustup with --default-toolchain none and materializes
-      # only the pin, so stable has to be added explicitly - rustup 1.28+ no
-      # longer auto-installs the toolchain RUSTUP_TOOLCHAIN names.
-      - name: Add stable for the release-plz install fallback
-        run: rustup toolchain install stable --no-self-update --profile minimal
-
+      # No rustup here any more, so neither the `rustup toolchain install stable`
+      # step nor the RUSTUP_TOOLCHAIN=stable that used to sit on this action
+      # survives: without rustup, plain cargo ignores RUSTUP_TOOLCHAIN and the
+      # install step is a missing command. The action's normal path is
+      # cargo-binstall pulling a PREBUILT release-plz, which needs no Rust at
+      # all. Its degraded path - GitHub's GraphQL API down, so binstall cannot
+      # discover the asset - now source-builds against pond's pinned rustc
+      # instead of stable, and the pin may be too old for release-plz's dep
+      # tree. That is a loud failure on a step `gh run rerun --failed` retries,
+      # not a silent second toolchain; release-prep, which runs on every main
+      # push, keeps its hosted dtolnay/rust-toolchain stable for that fallback.
       - uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         id: release-plz
         with: { command: release, config: .github/release-plz.toml }
         env:
-          RUSTUP_TOOLCHAIN: stable
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

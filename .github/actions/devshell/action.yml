@@ -1,0 +1,132 @@
+name: Enter the pond devshell
+description: >
+  Puts the flake's devShell into the job environment, once, at the top of a
+  pond-ci job: every later step then runs with the pinned toolchain on PATH and
+  zero Nix overhead - no `nix develop -c` wrapper per command, which would
+  re-evaluate the flake after every file edit. Replaces the curl-bootstrap that
+  hand-installed moon/protoc/uv/kache/rustup onto the /ci-cache PVC; the flake
+  is now the single source of truth for every tool (plan 2609-16 2.1/2.2).
+  The /ci-cache exports that bootstrap also owned survive here - they are cache
+  locations, not tools, and the PVC is still what makes a warm pod warm.
+runs:
+  using: composite
+  steps:
+    - name: Enter the nix devshell
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$GITHUB_WORKSPACE"
+
+        # The devShell derivation depends on exactly these three files (it must
+        # not reference `self` or the source tree - see the comment above
+        # mkDevShell in flake.nix), so their hash is a sound profile key. The
+        # flake EVALUATION cache cannot help us: it is keyed on the git
+        # fingerprint, so every commit misses it. A profile hit skips evaluation
+        # entirely - measured at ~0.1 s against ~30 s for a cold eval.
+        key=$(sha256sum flake.nix flake.lock rust-toolchain.toml | sha256sum | cut -c1-32)
+        profile="/nix/var/nix/profiles/pond-dev-$key"
+
+        # No flock, unlike the bootstrap this replaces: that one hand-rolled
+        # curl+mv into shared paths and had to serialize concurrent pods itself.
+        # Nix locks the store and the profile generation on its own, so two pods
+        # racing here converge instead of clobbering.
+        #
+        # The substituter is pond's own public-read binary cache: no credential,
+        # so fork PRs and dev machines pull the same toolchain closure. Passed as
+        # flags as well as declared in the flake's nixConfig, because nixConfig
+        # is ignored for a user nix does not trust.
+        nix=(nix
+          --extra-experimental-features 'nix-command flakes'
+          --extra-substituters 'https://pond-nix-cache.nbg1.your-objectstorage.com'
+          --extra-trusted-public-keys 'pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU='
+        )
+        json="$RUNNER_TEMP/pond-dev-env.json"
+        if [ -e "$profile" ]; then
+          echo "devshell profile hit: $profile"
+          "${nix[@]}" print-dev-env --json "$profile" > "$json"
+        else
+          echo "devshell profile miss, building: $profile"
+          # --profile both records the result and makes it a GC root, so the
+          # next job on this node takes the branch above.
+          "${nix[@]}" print-dev-env --json --profile "$profile" .# > "$json"
+        fi
+
+        # jq is not guaranteed on the stripped runner image, and this runs
+        # before the devshell (which does ship jq) is on PATH. Resolve it from
+        # the flake's own locked nixpkgs rather than the registry, so the
+        # fallback is as pinned as everything else.
+        if command -v jq >/dev/null 2>&1; then
+          jq=(jq)
+        else
+          jq=("${nix[@]}" run --inputs-from . nixpkgs#jq --)
+        fi
+
+        # Uppercase-initial names only: every lowercase key in the dump is a
+        # derivation attribute (out, outputs, buildInputs, shellHook, system...)
+        # that means nothing outside a build sandbox. The deny list then drops
+        # the ones that would actively break the runner - HOME above all, which
+        # the build env sets to /homeless-shelter. PATH is handled separately
+        # because it must PREPEND, not replace.
+        deny='^(HOME|OLDPWD|PATH|PWD|SHELL|SHLVL|TEMP|TEMPDIR|TMP|TMPDIR|TERM|TZ|NIX_BUILD_TOP|NIX_BUILD_CORES|NIX_LOG_FD|NIX_STORE)$'
+        delim="POND_DEVSHELL_$(date +%s%N)"
+        "${jq[@]}" -r --arg delim "$delim" --arg deny "$deny" '
+          .variables
+          | to_entries[]
+          | select(.value.type == "exported")
+          | select(.key | test("^[A-Z]"))
+          | select(.key | test($deny) | not)
+          | "\(.key)<<\($delim)\n\(.value.value)\n\($delim)"
+        ' "$json" >> "$GITHUB_ENV"
+
+        # GITHUB_PATH prepends in file order, so the shell's entries win over
+        # the image's while git, the runner's node and docker stay reachable.
+        "${jq[@]}" -r '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' >> "$GITHUB_PATH"
+
+        # The cache locations the deleted bootstrap also exported. RUSTUP_HOME
+        # is gone with rustup itself; PROTO_HOME stays only because
+        # .moon/toolchains.yml still pins node/npm, so moon provisions them
+        # through proto - it goes when those go versionless (plan 2.3).
+        # KACHE_CONFIG points at the committed remote settings: a daemon cannot
+        # watch an environment, and kache strips KACHE_S3_BUCKET/ENDPOINT/
+        # REGION/PREFIX/PROFILE from every daemon it spawns itself while keeping
+        # KACHE_CONFIG. Inert in the jobs that never set RUSTC_WRAPPER.
+        mkdir -p /ci-cache/cargo /ci-cache/target /ci-cache/proto /ci-cache/npm /ci-cache/uv
+        {
+          echo "CARGO_HOME=/ci-cache/cargo"
+          echo "CARGO_TARGET_DIR=/ci-cache/target"
+          echo "PROTO_HOME=/ci-cache/proto"
+          echo "npm_config_cache=/ci-cache/npm"
+          echo "UV_CACHE_DIR=/ci-cache/uv"
+          echo "KACHE_CONFIG=$GITHUB_WORKSPACE/.github/kache/linux-dist.toml"
+          # Concurrent pods share cache bytes, never daemon state.
+          echo "KACHE_RUNTIME_DIR=$RUNNER_TEMP/kache-runtime"
+        } >> "$GITHUB_ENV"
+
+    # A separate step so it runs with the PATH and env the step above wrote.
+    - name: Verify the toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        # moon's rust plugin prepends $CARGO_HOME/bin to PATH
+        # (toolchains/rust/src/tier2.rs), so a rustup proxy left behind by the
+        # old bootstrap would silently shadow this shell's rustc and build the
+        # release with a different compiler. Fail here instead.
+        for proxy in rustc cargo rustup; do
+          if [ -e "$CARGO_HOME/bin/$proxy" ]; then
+            echo "::error::$CARGO_HOME/bin/$proxy is a leftover rustup proxy and would shadow the devshell toolchain. Delete /ci-cache/{rustup,bin} and the rustup proxies in /ci-cache/cargo/bin (keep the registry cache) on the runner PVC." >&2
+            exit 1
+          fi
+        done
+        # Fail loudly here rather than N steps later with a cryptic error.
+        rustc -vV
+        cargo --version
+        moon --version
+        protoc --version
+        kache --version
+        zig version
+        # cargo-zigbuild has no --version flag of its own; the flake's `pinned`
+        # assertion is what fixes its version, so presence is all there is to check.
+        command -v cargo-zigbuild
+        rcodesign --version
+        gh --version
+        xz --version | head -1

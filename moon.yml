@@ -95,21 +95,21 @@ tasks:
   # separate from `test`: moon's fingerprint carries no OS, so a shared task
   # would hit the hash this one already cached and ship nothing.
   #
-  # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
-  # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via
-  # SDKROOT + rcodesign) and rustup on PATH. Incremental cache = the runner's
-  # persistent CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the
-  # workspace target dir and dist/ lands at the root where publish-release reads it.
+  # Machine cross-compile on the pond-ci runner (no docker/buildkit): the whole
+  # toolchain (rust + its three cross targets, zig 0.16, cargo-zigbuild, the
+  # macOS SDK via SDKROOT, rcodesign) comes from the flake devShell the job
+  # enters before this runs. Incremental cache = the runner's persistent
+  # CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the workspace
+  # target dir and dist/ lands at the root where publish-release reads it.
   build-dist:
     script: |
       set -euo pipefail
       export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
       TD="${CARGO_TARGET_DIR:-target}"
 
-      # `profile = "minimal"` + targets-in-toml does not reliably fetch
-      # rust-std for non-host targets.
-      rustup target add aarch64-apple-darwin \
-                        aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+      # No `rustup target add` here any more: rust-toolchain.toml lists all three
+      # targets and rust-overlay materializes them with the toolchain, so there
+      # is nothing left to fetch imperatively - and no rustup to fetch it with.
 
       # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
       # cold-start net for a fresh /ci-cache. The remote is no longer written

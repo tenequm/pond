@@ -1,6 +1,17 @@
 {
   description = "pond - lossless session storage and search for AI agent clients";
 
+  # pond's own binary cache: public read, signed paths, no credential - so fork
+  # PRs, hosted runners and dev machines all pull the same toolchain closure
+  # instead of rebuilding it (plan 2609-16 2.7). Nix ignores a flake's config
+  # for a user it does not trust, which is why the pond-ci devshell-entry step
+  # passes the same two settings as explicit flags; a dev machine that wants
+  # them needs `--accept-flake-config` or the settings in its own nix.conf.
+  nixConfig = {
+    extra-substituters = [ "https://pond-nix-cache.nbg1.your-objectstorage.com" ];
+    extra-trusted-public-keys = [ "pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -298,16 +309,29 @@
               pkgs.pkg-config
               # ops/scripts/*.sh and the dist build's patch-macos-sdk.py.
               pkgs.python3
+              # Declared, not inherited: `tar -cJf` in the dist build shells out
+              # to xz, and xz is only on PATH today because stdenv's initialPath
+              # happens to carry it. That is not a pin anyone chose, and the
+              # archive it compresses is the released artifact.
+              pkgs.xz
+              # The runner image is stock actions-runner now, so nothing off the
+              # shell is guaranteed: `cargo metadata | jq` in ci.yml and the
+              # devshell-entry step's own env filtering both need it.
+              pkgs.jq
             ]
             # The SDK is the cross-link stub set; on darwin the native SDK that
             # comes with the stdenv clang wrapper is the right one.
             ++ lib.optional stdenv.hostPlatform.isLinux macosSdk;
 
-            # bindgen consumers need libclang at runtime. The C compiler itself
-            # stays the stdenv default (gcc on Linux, clang on darwin), which is
-            # what the runner image and macos-verify use today - putting a
-            # second clang on PATH would silently change who builds cc-crate code.
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            # No LIBCLANG_PATH and no clang here on purpose. `bindgen` is not in
+            # Cargo.lock at all, so nothing in the resolved graph runs it: the
+            # -sys crates that CAN use it (aws-lc-sys, libsqlite3-sys, zstd-sys,
+            # lz4-sys) all resolve to their prebuilt-bindings path, and
+            # aws-lc-sys 0.41.0 depends only on cc/cmake/dunce/fs_extra. The
+            # C compiler stays the stdenv default (gcc on Linux, clang on
+            # darwin) for the same reason it always did - a second clang on PATH
+            # would silently change who builds cc-crate code. Re-add both
+            # together, not the env var alone, if a bindgen consumer ever lands.
 
             # moon's rust plugin prepends $CARGO_HOME/bin to PATH
             # (toolchains/rust/src/tier2.rs), so a rustup proxy left in the
