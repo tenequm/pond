@@ -57,6 +57,26 @@ tasks:
       cache: false
       outputStyle: stream
 
+  # CI shape of the memory gate: same scenarios, but compares against the last
+  # committed baseline row per (scenario, profile) instead of appending, and
+  # fails past MEM_GATE_MAX_REGRESSION_PCT (default 20%). Cached and
+  # input-hashed so an unchanged tree - or a PR that touches none of the
+  # inputs, under `moon ci` affected filtering - skips the ~40 min run.
+  # Deliberately NOT wired into any workflow yet (plan hardening phase).
+  mem-gate-ci:
+    extends: 'mem-gate'
+    args: '--check'
+    inputs:
+      - 'packages/pond/src/**/*'
+      - 'packages/pond/benches/mem_bench.rs'
+      - 'packages/pond/Cargo.toml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'ops/scripts/mem-gate.sh'
+      - 'docs/benchmarks/mem-gate-baseline.jsonl'
+    options:
+      cache: true
+
   # Allocation-site attribution for one mem_bench scenario:
   # `moon run repo:profile-mem -- <scenario> [heaptrack|dhat]`.
   profile-mem:
