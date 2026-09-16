@@ -1163,9 +1163,10 @@ const ROWMAP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// serving starts immediately and a failure is logged, not fatal. After warming,
 /// the task stays alive refreshing the resident meta map so a long-running
 /// server tracks new data instead of decaying to the take_rows fallback.
-fn spawn_prewarm(store: Arc<Store>) {
+fn spawn_prewarm(state: AppState) {
     let cache_dir = default_cache_dir();
     tokio::spawn(async move {
+        let store = &state.store;
         let started = std::time::Instant::now();
         tracing::info!("prewarm: warming search indices");
         match store.prewarm(&cache_dir).await {
@@ -1183,6 +1184,9 @@ fn spawn_prewarm(store: Arc<Store>) {
                 tracing::debug!(%error, "rowmap refresh skipped");
             }
             store.prune_index_cache(&cache_dir).await;
+            if state.take_completed_activity() {
+                pond::memory::trim_allocator();
+            }
         }
     });
 }
@@ -1599,12 +1603,8 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 opened
             });
-            let state = AppState {
-                store,
-                embedder,
-                search: config.search.clone(),
-            };
-            spawn_prewarm(state.store.clone());
+            let state = AppState::new(store, embedder, config.search.clone());
+            spawn_prewarm(state.clone());
             // `--with-sync`: fold the periodic sync into this process, reusing
             // the store + embedder above (no separate child cold-loading a
             // second ~500 MB model). The loop logs to tracing only; stdout is
@@ -1645,13 +1645,9 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 opened
             });
-            spawn_prewarm(store.clone());
-            transport::mcp::serve_stdio(AppState {
-                store,
-                embedder,
-                search: config.search.clone(),
-            })
-            .await?;
+            let state = AppState::new(store, embedder, config.search.clone());
+            spawn_prewarm(state.clone());
+            transport::mcp::serve_stdio(state).await?;
         }
         Command::Search {
             query,
@@ -4537,6 +4533,7 @@ async fn run_sync_pipeline(
         render_sync_summary(store).await?;
     }
     tracing::debug!(target: "pond::perf", stage = "render_summary", elapsed_ms = summary_started.elapsed().as_millis() as u64, "sync stage");
+    pond::memory::trim_allocator();
     Ok(())
 }
 

@@ -171,11 +171,11 @@ async fn synthetic_state(temp: &TempDir) -> anyhow::Result<AppState> {
         .await?
         .into_result()?;
 
-    Ok(AppState {
-        store: Arc::new(store),
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
-        search: pond::config::SearchConfig::default(),
-    })
+    Ok(AppState::new(
+        Arc::new(store),
+        Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
+        pond::config::SearchConfig::default(),
+    ))
 }
 
 fn first_text(result: &CallToolResult) -> Option<&str> {

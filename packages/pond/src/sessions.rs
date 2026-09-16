@@ -2156,6 +2156,7 @@ impl Store {
             discover_chain(cache_dir, store_key).context("rowmap chain missing after build")?;
         let set = RowMetaSet::open(&chain)?;
         Self::sweep_stale_rowmaps(cache_dir, store_key, base_version);
+        crate::memory::trim_allocator();
         Ok(Some(set))
     }
 

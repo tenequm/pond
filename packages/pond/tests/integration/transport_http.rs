@@ -85,11 +85,11 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
         .into_result()?;
 
     let store = Arc::new(store);
-    let state = AppState {
-        store: Arc::clone(&store),
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
-        search: pond::config::SearchConfig::default(),
-    };
+    let state = AppState::new(
+        Arc::clone(&store),
+        Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(backend))),
+        pond::config::SearchConfig::default(),
+    );
     Ok((
         temp,
         store,
@@ -102,13 +102,13 @@ async fn router() -> anyhow::Result<(TempDir, Arc<Store>, Router)> {
 async fn empty_state(temp: &TempDir) -> anyhow::Result<AppState> {
     // The vector arm is refused unless this instance opted in.
     pond::embed::init_enabled(true);
-    Ok(AppState {
-        store: Arc::new(Store::open_local(temp.path()).await?),
-        embedder: Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
+    Ok(AppState::new(
+        Arc::new(Store::open_local(temp.path()).await?),
+        Arc::new(pond::embed::LazyEmbedder::from_loaded(Arc::new(
             FakeBackend,
         ))),
-        search: pond::config::SearchConfig::default(),
-    })
+        pond::config::SearchConfig::default(),
+    ))
 }
 
 /// Shutdown has to finish while an MCP client is attached. axum's graceful
