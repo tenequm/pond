@@ -17,9 +17,11 @@ runs:
         PROTOC_VERSION=36.1
         # Bumped in lockstep with the kache-action `version:` in
         # windows-bootstrap and the k-tag in the .github/kache/*.toml prefixes,
-        # never alone: a bump changes CACHE_KEY_VERSION (21 at 0.9.0, 25 at
-        # 0.14.2, 27 at 0.15.0, 31 at 0.21.0) and costs one cold run per leg.
-        KACHE_VERSION=0.21.0
+        # never alone: a bump CAN change CACHE_KEY_VERSION (21 at 0.9.0, 25 at
+        # 0.14.2, 27 at 0.15.0, 31 from 0.17.0 through 0.22.0) and then costs
+        # one cold run per leg. 0.22.0 keeps schema 31, so the k31 prefixes
+        # stay and this bump is free.
+        KACHE_VERSION=0.22.0
         UV_VERSION=0.12.13
 
         mkdir -p /ci-cache/bin /ci-cache/tmp

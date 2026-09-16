@@ -14,11 +14,14 @@ on:
       force_build:
         description: >
           Compile for real instead of replaying moon's remote cache. Required
-          for any run whose kache numbers will be read, and for prewarming a
-          fresh prefix: a CI-only diff changes none of the declared inputs of
-          lint-msvc / test-msvc / build-dist-msvc, so moon serves the hash main
-          already stored, cargo never runs, and the run yields no kache data
-          and no warm store.
+          for any run whose kache numbers will be read: a CI-only diff changes
+          none of the declared inputs of lint-msvc / test-msvc /
+          build-dist-msvc, so moon serves the hash main already stored, cargo
+          never runs, and the run yields no kache data.
+          NOT a way to prewarm a kache prefix. Since kache 0.17 the remote is
+          forced read-only on every event except a push to a protected branch
+          (src/policy.rs), so a dispatch pulls and compiles but uploads
+          nothing - warm a fresh prefix with a push to main instead.
         type: boolean
         default: false
 
@@ -264,9 +267,11 @@ jobs:
           manifest-key: windows-dist
           s3-prefix: kache/pond/windows-dist/k31
 
-      # Same reasoning as the sibling job: a dispatch meant to prewarm a fresh
-      # prefix prewarms nothing if moon serves the stored hash, and the release
-      # then pays the cold build inline. Same `true`-not-`1` constraint too.
+      # Same reasoning as the sibling job: without this, moon serves the stored
+      # hash and nothing is actually compiled or measured. Same `true`-not-`1`
+      # constraint too. This still cannot prewarm the prefix - kache forces the
+      # remote read-only outside a protected-branch push (src/policy.rs) - so a
+      # rotated prefix is warmed by the next push to main, not by a dispatch.
       - name: Force a real compile
         if: inputs.force_build
         shell: pwsh
