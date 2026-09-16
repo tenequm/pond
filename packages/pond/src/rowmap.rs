@@ -18,13 +18,13 @@
 //! [DictEntry; agent] | [DictEntry; role] | [BlockEntry] | blob`. Records are
 //! sorted by `row_id` (binary search); a row's block is `record_index /
 //! BLOCK_ROWS`. The blob holds the compressed `search_text` blocks, then per-row
-//! `{32-byte header + message_id}`, then per-session `session_id` bytes, then the
+//! `{36-byte header + message_id}`, then per-session `session_id` bytes, then the
 //! dict value bytes. Each session entry also carries its max message timestamp,
 //! the watermark the `pond sync` skip oracle compares against the source.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
@@ -189,80 +189,21 @@ impl RowMetaMap {
         let roles = distinct_sorted(entries.iter().map(|entry| entry.role.as_str()));
         let role_index = index_of(roles.iter().copied());
 
-        let mut blob: Vec<u8> = Vec::new();
-
-        // Compressed search_text blocks first; spans record each row's
-        // offset+length within its decompressed block.
-        let mut block_entries = Vec::with_capacity(entries.len().div_ceil(BLOCK_ROWS));
-        let mut spans: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
-        for chunk in entries.chunks(BLOCK_ROWS) {
-            let mut plain = Vec::new();
-            for entry in chunk {
-                let off = u32::try_from(plain.len()).context("block too large")?;
-                let len = u32::try_from(entry.search_text.len()).context("search_text too long")?;
-                plain.extend_from_slice(entry.search_text.as_bytes());
-                spans.push((off, len));
-            }
-            let compressed = zstd::bulk::compress(&plain, ZSTD_LEVEL).context("zstd compress")?;
-            block_entries.push(BlockEntry {
-                comp_off: blob.len() as u64,
-                comp_len: u32::try_from(compressed.len()).context("compressed block too large")?,
-                decomp_len: u32::try_from(plain.len()).context("block too large")?,
-            });
-            blob.extend_from_slice(&compressed);
-        }
-
-        let mut records = Vec::with_capacity(entries.len());
-        for (entry, (text_off, text_len)) in entries.iter().zip(&spans) {
-            let blob_off = blob.len() as u64;
-            blob.extend_from_slice(&entry.timestamp_micros.to_le_bytes());
-            blob.extend_from_slice(&session_index[entry.session_id.as_str()].to_le_bytes());
-            blob.extend_from_slice(&project_index[entry.project.as_str()].to_le_bytes());
-            blob.extend_from_slice(&agent_index[entry.source_agent.as_str()].to_le_bytes());
-            blob.extend_from_slice(&role_index[entry.role.as_str()].to_le_bytes());
-            let mid_len = u32::try_from(entry.message_id.len()).context("message_id too long")?;
-            blob.extend_from_slice(&mid_len.to_le_bytes());
-            blob.extend_from_slice(&text_off.to_le_bytes());
-            blob.extend_from_slice(&text_len.to_le_bytes());
-            blob.extend_from_slice(entry.message_id.as_bytes());
-            records.push(Record {
-                row_id: entry.row_id,
-                blob_off,
-            });
-        }
-
-        let session_entries = sessions
-            .iter()
-            .map(|(sid, count, max_ts_micros)| {
-                let off = blob.len() as u64;
-                blob.extend_from_slice(sid.as_bytes());
-                Ok(SessionEntry {
-                    sid_off: off,
-                    max_ts_micros: *max_ts_micros,
-                    sid_len: u32::try_from(sid.len()).context("session_id too long")?,
-                    count: *count,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let project_entries = dict_entries(&mut blob, &projects)?;
-        let agent_entries = dict_entries(&mut blob, &agents)?;
-        let role_entries = dict_entries(&mut blob, &roles)?;
-
+        let block_count = entries.len().div_ceil(BLOCK_ROWS);
         let blob_offset = (size_of::<Header>()
-            + records.len() * size_of::<Record>()
-            + session_entries.len() * size_of::<SessionEntry>()
-            + (project_entries.len() + agent_entries.len() + role_entries.len())
-                * size_of::<DictEntry>()
-            + block_entries.len() * size_of::<BlockEntry>()) as u64;
+            + entries.len() * size_of::<Record>()
+            + sessions.len() * size_of::<SessionEntry>()
+            + (projects.len() + agents.len() + roles.len()) * size_of::<DictEntry>()
+            + block_count * size_of::<BlockEntry>()) as u64;
         let header = Header {
             magic: MAGIC,
             version,
-            count: records.len() as u64,
-            session_count: session_entries.len() as u64,
-            project_count: project_entries.len() as u64,
-            agent_count: agent_entries.len() as u64,
-            role_count: role_entries.len() as u64,
-            block_count: block_entries.len() as u64,
+            count: entries.len() as u64,
+            session_count: sessions.len() as u64,
+            project_count: projects.len() as u64,
+            agent_count: agents.len() as u64,
+            role_count: roles.len() as u64,
+            block_count: block_count as u64,
             blob_offset,
         };
 
@@ -274,18 +215,119 @@ impl RowMetaMap {
             std::process::id(),
             fastrand::u64(..)
         ));
-        {
-            let mut file = File::create(&tmp)
+        // Serialization runs with the temp already open, so its failures reclaim
+        // the temp here. The rename stays outside: a build that could not publish
+        // must leave one for `sweep_orphan_temps` (`rowmap_purge_probe` pins it).
+        let stream = || -> Result<()> {
+            let file = File::create(&tmp)
                 .with_context(|| format!("create row meta map temp {}", tmp.display()))?;
-            file.write_all(bytemuck::bytes_of(&header))?;
-            file.write_all(bytemuck::cast_slice(&records))?;
-            file.write_all(bytemuck::cast_slice(&session_entries))?;
-            file.write_all(bytemuck::cast_slice(&project_entries))?;
-            file.write_all(bytemuck::cast_slice(&agent_entries))?;
-            file.write_all(bytemuck::cast_slice(&role_entries))?;
-            file.write_all(bytemuck::cast_slice(&block_entries))?;
-            file.write_all(&blob)?;
+            // 1 MiB: the row pass issues nine small writes per row, so the default
+            // 8 KiB buffer would flush thousands of times on a real corpus.
+            let mut writer = BufWriter::with_capacity(1 << 20, file);
+            writer.seek(SeekFrom::Start(blob_offset))?;
+            let mut blob_len = 0u64;
+
+            // Compressed search_text blocks first; spans record each row's
+            // offset+length within its decompressed block. `plain` is reused so
+            // each chunk regrows a warm buffer instead of allocating from zero.
+            let mut block_entries = Vec::with_capacity(block_count);
+            let mut spans: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
+            let mut plain: Vec<u8> = Vec::new();
+            for chunk in entries.chunks(BLOCK_ROWS) {
+                plain.clear();
+                for entry in chunk {
+                    let off = u32::try_from(plain.len()).context("block too large")?;
+                    let len =
+                        u32::try_from(entry.search_text.len()).context("search_text too long")?;
+                    plain.extend_from_slice(entry.search_text.as_bytes());
+                    spans.push((off, len));
+                }
+                let compressed =
+                    zstd::bulk::compress(&plain, ZSTD_LEVEL).context("zstd compress")?;
+                block_entries.push(BlockEntry {
+                    comp_off: blob_len,
+                    comp_len: u32::try_from(compressed.len())
+                        .context("compressed block too large")?,
+                    decomp_len: u32::try_from(plain.len()).context("block too large")?,
+                });
+                writer.write_all(&compressed)?;
+                blob_len += compressed.len() as u64;
+            }
+
+            let mut records = Vec::with_capacity(entries.len());
+            for (entry, (text_off, text_len)) in entries.iter().zip(&spans) {
+                let blob_off = blob_len;
+                writer.write_all(&entry.timestamp_micros.to_le_bytes())?;
+                writer.write_all(&session_index[entry.session_id.as_str()].to_le_bytes())?;
+                writer.write_all(&project_index[entry.project.as_str()].to_le_bytes())?;
+                writer.write_all(&agent_index[entry.source_agent.as_str()].to_le_bytes())?;
+                writer.write_all(&role_index[entry.role.as_str()].to_le_bytes())?;
+                let mid_len =
+                    u32::try_from(entry.message_id.len()).context("message_id too long")?;
+                writer.write_all(&mid_len.to_le_bytes())?;
+                writer.write_all(&text_off.to_le_bytes())?;
+                writer.write_all(&text_len.to_le_bytes())?;
+                writer.write_all(entry.message_id.as_bytes())?;
+                blob_len += ROW_HEADER_LEN as u64 + u64::from(mid_len);
+                records.push(Record {
+                    row_id: entry.row_id,
+                    blob_off,
+                });
+            }
+
+            let session_entries = sessions
+                .iter()
+                .map(|(sid, count, max_ts_micros)| {
+                    let off = blob_len;
+                    writer.write_all(sid.as_bytes())?;
+                    let sid_len = u32::try_from(sid.len()).context("session_id too long")?;
+                    blob_len += u64::from(sid_len);
+                    Ok(SessionEntry {
+                        sid_off: off,
+                        max_ts_micros: *max_ts_micros,
+                        sid_len,
+                        count: *count,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let project_entries = write_dict_entries(&mut writer, &mut blob_len, &projects)?;
+            let agent_entries = write_dict_entries(&mut writer, &mut blob_len, &agents)?;
+            let role_entries = write_dict_entries(&mut writer, &mut blob_len, &roles)?;
+
+            // The row pass hand-sums ROW_HEADER_LEN across nine writes, so a field
+            // added there would silently shift every offset already recorded.
+            #[cfg(debug_assertions)]
+            {
+                writer.flush()?;
+                debug_assert_eq!(
+                    writer.stream_position()?,
+                    blob_offset + blob_len,
+                    "rowmap blob accounting desynced from the bytes actually written",
+                );
+            }
+
+            writer.seek(SeekFrom::Start(0))?;
+            writer.write_all(bytemuck::bytes_of(&header))?;
+            writer.write_all(bytemuck::cast_slice(&records))?;
+            writer.write_all(bytemuck::cast_slice(&session_entries))?;
+            writer.write_all(bytemuck::cast_slice(&project_entries))?;
+            writer.write_all(bytemuck::cast_slice(&agent_entries))?;
+            writer.write_all(bytemuck::cast_slice(&role_entries))?;
+            writer.write_all(bytemuck::cast_slice(&block_entries))?;
+            // Closed before the rename publishes it - this module never renames a
+            // path it still holds a handle to (see `sweep_stale_rowmaps` on why
+            // Windows file semantics are load-bearing here).
+            let file = writer
+                .into_inner()
+                .map_err(|err| err.into_error())
+                .context("flush row meta map temp")?;
             file.sync_all()?;
+            drop(file);
+            Ok(())
+        };
+        if let Err(error) = stream() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
         }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename row meta map into place {}", path.display()))?;
@@ -886,7 +928,7 @@ impl RowMetaSet {
     /// Every row across all segments, newest-segment-wins on `row_id`
     /// collision - the input to a base rebuild at compaction.
     pub fn merged_entries(&self) -> Vec<RowMetaEntry> {
-        let mut by_row: HashMap<u64, RowMetaEntry> = HashMap::new();
+        let mut by_row: HashMap<u64, RowMetaEntry> = HashMap::with_capacity(self.len());
         for seg in &self.segments {
             for entry in seg.entries() {
                 by_row.insert(entry.row_id, entry);
@@ -897,10 +939,7 @@ impl RowMetaSet {
 }
 
 fn distinct_sorted<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    let mut distinct: Vec<&str> = values.collect();
-    distinct.sort_unstable();
-    distinct.dedup();
-    distinct
+    values.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 fn index_of<'a>(values: impl Iterator<Item = &'a str>) -> HashMap<&'a str, u32> {
@@ -910,17 +949,19 @@ fn index_of<'a>(values: impl Iterator<Item = &'a str>) -> HashMap<&'a str, u32> 
         .collect()
 }
 
-fn dict_entries(blob: &mut Vec<u8>, values: &[&str]) -> Result<Vec<DictEntry>> {
+fn write_dict_entries(
+    writer: &mut impl Write,
+    blob_len: &mut u64,
+    values: &[&str],
+) -> Result<Vec<DictEntry>> {
     values
         .iter()
         .map(|value| {
-            let off = blob.len() as u64;
-            blob.extend_from_slice(value.as_bytes());
-            Ok(DictEntry {
-                off,
-                len: u32::try_from(value.len()).context("dictionary value too long")?,
-                _pad: 0,
-            })
+            let off = *blob_len;
+            writer.write_all(value.as_bytes())?;
+            let len = u32::try_from(value.len()).context("dictionary value too long")?;
+            *blob_len += u64::from(len);
+            Ok(DictEntry { off, len, _pad: 0 })
         })
         .collect()
 }
@@ -1150,6 +1191,52 @@ mod tests {
         assert_eq!(merged[0].row_id, 10);
         assert_eq!(merged[4].row_id, 21);
         assert_eq!(merged[4].search_text, "delta twentyone");
+    }
+
+    #[test]
+    fn build_writes_a_dense_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = RowMetaMap::path_for(dir.path(), "dense", 1);
+        let entries: Vec<RowMetaEntry> = (0..(BLOCK_ROWS as u64 * 2 + 3))
+            .map(|i| {
+                entry(
+                    i,
+                    "sess",
+                    &format!("msg-{i}"),
+                    i as i64,
+                    &format!("body {i}"),
+                )
+            })
+            .collect();
+        RowMetaMap::build(&path, 1, entries).unwrap();
+
+        let map = RowMetaMap::open(&path).unwrap();
+        // The role dictionary is the last thing the blob pass writes, so its
+        // final value ends exactly at the blob's end. A seek-back pass that
+        // wrote fewer than blob_offset bytes would leave a zero hole, and a
+        // mis-summed blob_len would leave slack - both show up as a length
+        // mismatch here.
+        let blob_len = map
+            .dict_entries(map.roles_off, map.role_count)
+            .last()
+            .map(|dict| dict.off + u64::from(dict.len))
+            .expect("role dictionary is non-empty");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            map.blob_offset as u64 + blob_len,
+            "built file must hold exactly the header region plus the blob",
+        );
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| is_orphan_temp(name, "dense"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "build left a temp behind: {leftovers:?}"
+        );
     }
 
     #[test]

@@ -2242,6 +2242,7 @@ impl Store {
             discover_chain(cache_dir, store_key).context("rowmap chain missing after build")?;
         let set = RowMetaSet::open(&chain)?;
         Self::sweep_stale_rowmaps(cache_dir, store_key, base_version);
+        crate::memory::trim_allocator();
         Ok(Some(set))
     }
 
@@ -2730,11 +2731,12 @@ impl Store {
     /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
     /// scattered per-hit take it replaces; `search_text` dominates the bytes.
     pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
+        let row_count = self.handle.count_rows(Table::Messages).await?;
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
         scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(row_count);
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let rowids = uint64(&batch, "_rowid")?;

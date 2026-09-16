@@ -342,8 +342,8 @@ name = "mem_bench"
 harness = false
 
 [lints.rust]
-# `deny` not `forbid` so candle's mmap-based safetensors loader (an inherently
-# unsafe FFI to memmap2) can be opted into per-call. See src/embed.rs.
+# `deny` not `forbid` so candle's mmap loader and narrow platform FFI can be
+# opted into per-call. See src/embed.rs and src/memory.rs.
 unsafe_code = "deny"
 unreachable_pub = "warn"
 
