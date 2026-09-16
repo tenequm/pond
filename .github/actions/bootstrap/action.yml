@@ -13,14 +13,14 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        MOON_VERSION=2.5.1
-        PROTOC_VERSION=35.1
+        MOON_VERSION=2.5.4
+        PROTOC_VERSION=36.1
         # Bumped in lockstep with the kache-action `version:` in
         # windows-bootstrap and the k-tag in the .github/kache/*.toml prefixes,
         # never alone: a bump changes CACHE_KEY_VERSION (21 at 0.9.0, 25 at
-        # 0.14.2, 27 at 0.15.0) and costs one cold run per leg.
-        KACHE_VERSION=0.15.0
-        UV_VERSION=0.11.33
+        # 0.14.2, 27 at 0.15.0, 31 at 0.21.0) and costs one cold run per leg.
+        KACHE_VERSION=0.21.0
+        UV_VERSION=0.12.13
 
         mkdir -p /ci-cache/bin /ci-cache/tmp
         echo "/ci-cache/bin" >> "$GITHUB_PATH"
@@ -32,7 +32,7 @@ runs:
         #
         # KACHE_CONFIG points at the committed remote settings rather than at
         # the ~/.config/kache stub the build-dist task used to write. A daemon
-        # cannot watch an environment, and 0.15.0 strips
+        # cannot watch an environment, and kache strips
         # KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
         # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) while keeping
         # KACHE_CONFIG. Discovery is KACHE_CONFIG > nearest .kache.toml > XDG
@@ -48,6 +48,8 @@ runs:
           echo "npm_config_cache=/ci-cache/npm"
           echo "UV_CACHE_DIR=/ci-cache/uv"
           echo "KACHE_CONFIG=$KACHE_CONFIG"
+          # Concurrent pods share cache bytes, never daemon state.
+          echo "KACHE_RUNTIME_DIR=$RUNNER_TEMP/kache-runtime"
         } >> "$GITHUB_ENV"
 
         # dist-build is the only caller that declares a remote, and the CLI
