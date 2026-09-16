@@ -4210,23 +4210,29 @@ impl IngestValidator {
         }
         let mut completed = std::mem::take(&mut self.completed);
         if !self.messages.is_empty() {
-            let messages = std::mem::take(&mut self.messages);
-            let bytes = messages.iter().map(|message| message.bytes).sum();
-            self.buffered_bytes = self.buffered_bytes.saturating_sub(bytes);
             let session = &self
                 .session
                 .as_ref()
                 .context("validator has complete messages without a session")?
                 .session;
+            let messages = std::mem::take(&mut self.messages);
             completed.push(CompletedSubstream {
                 session_index: None,
                 session: session.clone(),
+                bytes: messages.iter().map(|message| message.bytes).sum(),
                 messages,
-                bytes: 0,
             });
         }
-        let completed_bytes = completed.iter().map(|substream| substream.bytes).sum();
-        self.buffered_bytes = self.buffered_bytes.saturating_sub(completed_bytes);
+        // Every buffered byte is charged once, against the same stored figure
+        // it was added under, so this is the sole subtraction site. The session
+        // row of a partial flush stays buffered and so stays charged.
+        let flushed_bytes: usize = completed.iter().map(|substream| substream.bytes).sum();
+        debug_assert!(
+            self.buffered_bytes >= flushed_bytes,
+            "buffered byte accounting underflowed: {} buffered, {flushed_bytes} flushed",
+            self.buffered_bytes,
+        );
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(flushed_bytes);
         store.upsert_session_batch(completed).await
     }
 
@@ -5592,22 +5598,24 @@ pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordB
     .context("failed to build embedding update batch")
 }
 
-/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
-/// is split before the running total of its text columns reaches this, and a
-/// single cell at or above it is rejected rather than left to panic inside
-/// `StringArray::from` (spec.md#adapter-bounded-values).
+/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a `sessions` or
+/// `parts` batch is split before the running total of its text columns reaches
+/// this, and a single cell at or above it is rejected rather than left to panic
+/// inside `StringArray::from` (spec.md#adapter-bounded-values). `messages` cuts
+/// on the far smaller [`INGEST_FLUSH_BYTE_BUDGET`] in [`messages_batch_from`]
+/// and so clears this wall by construction.
 const COLUMN_BYTE_BUDGET: usize = 1 << 30;
 
 /// Contiguous row ranges whose summed text-column byte cost each stays within
 /// `COLUMN_BYTE_BUDGET`. Budgeting the all-column total bounds every individual
 /// column too, since no single column's total can exceed it. `cells[i]` is row
 /// `i`'s byte cost summed across every text column.
-fn chunk_ranges(cells: &[usize], budget: usize) -> Vec<std::ops::Range<usize>> {
+fn chunk_ranges(cells: &[usize]) -> Vec<std::ops::Range<usize>> {
     let mut chunks = Vec::new();
     let mut start = 0usize;
     let mut running = 0usize;
     for (index, &row) in cells.iter().enumerate() {
-        if running + row > budget && index > start {
+        if running + row > COLUMN_BYTE_BUDGET && index > start {
             chunks.push(start..index);
             start = index;
             running = 0;
@@ -5663,7 +5671,7 @@ pub(crate) fn sessions_batches(sessions: &[Session]) -> Result<Vec<RecordBatch>>
         }
         cells.push(columns.iter().sum());
     }
-    chunk_ranges(&cells, COLUMN_BYTE_BUDGET)
+    chunk_ranges(&cells)
         .into_iter()
         .map(|range| sessions_chunk(&sessions[range.clone()], &options[range]))
         .collect()
@@ -5721,6 +5729,17 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
+/// One `messages` batch covering `rows[start..end]`, returned with that `end`
+/// so the caller can walk a long row set without ever holding two chunks alive.
+/// `vectors` is aligned to `rows` (same length): `Some` carries the inline
+/// embedding for that row, `None` writes a null `vector`/`embedding_model`.
+///
+/// The cut is `INGEST_FLUSH_BYTE_BUDGET` over the row's text columns plus
+/// [`message_row_fixed_bytes`] - the dense vector slot `messages_chunk` pays per
+/// row even when every vector is null, which is what makes an unchunked batch
+/// expensive. `guard_cell` still rejects a single cell at Arrow's `i32` wall;
+/// below that, a row wider than the whole budget takes a chunk of its own rather
+/// than stalling, so `end > start` whenever `start < rows.len()`.
 fn messages_batch_from(
     rows: &[MessageBatchRow<'_>],
     vectors: &[Option<Vec<f32>>],
@@ -5845,7 +5864,7 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         }
         cells.push(columns.iter().sum());
     }
-    chunk_ranges(&cells, COLUMN_BYTE_BUDGET)
+    chunk_ranges(&cells)
         .into_iter()
         .map(|range| {
             parts_chunk(
@@ -6670,18 +6689,18 @@ mod tests {
 
     #[test]
     fn chunk_ranges_splits_on_byte_budget() {
-        assert!(chunk_ranges(&[], COLUMN_BYTE_BUDGET).is_empty());
-        assert_eq!(chunk_ranges(&[10, 10, 10], COLUMN_BYTE_BUDGET), vec![0..3]);
+        assert!(chunk_ranges(&[]).is_empty());
+        assert_eq!(chunk_ranges(&[10, 10, 10]), vec![0..3]);
 
         let two_thirds = COLUMN_BYTE_BUDGET * 2 / 3;
         assert_eq!(
-            chunk_ranges(&[two_thirds, two_thirds, two_thirds], COLUMN_BYTE_BUDGET),
+            chunk_ranges(&[two_thirds, two_thirds, two_thirds]),
             vec![0..1, 1..2, 2..3],
         );
 
         // An oversized single row gets its own chunk, never an infinite loop.
         assert_eq!(
-            chunk_ranges(&[10, COLUMN_BYTE_BUDGET + 1, 10], COLUMN_BYTE_BUDGET),
+            chunk_ranges(&[10, COLUMN_BYTE_BUDGET + 1, 10]),
             vec![0..1, 1..2, 2..3],
         );
     }
