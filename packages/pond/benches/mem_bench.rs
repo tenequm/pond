@@ -17,8 +17,9 @@
 //! | `ingest-throughput`   | N synthetic sessions into a fresh store         | write throughput drift (record-only) |
 //! | `serve-sync-retention`| serve-like prewarm + sync, then a settling pause | a map or buffer pinned after sync ends |
 //! | `sync-under-contention`| sync while the rowmap build lock is held       | the trailing-oracle path's cost |
+//! | `rowmap-build-cold-partial-embed` | cold build after scattered embed windows | a fall back off the streaming build (fails the run) |
 //!
-//! The last four are RECORD-ONLY: they run in the gate and append rows, but
+//! The last five are RECORD-ONLY: they run in the gate and append rows, but
 //! `mem-gate.sh --check` judges none of their numbers - peak RSS and peak heap
 //! included - because the script's `RECORD_ONLY` list carves them out. Phase 1
 //! gathers the spread; phase 2 derives a threshold from the committed rows'
@@ -57,7 +58,8 @@ use pond::{
     handlers::{
         self, IngestEvent, IngestValidator, pond_get_message, pond_get_session, pond_search,
     },
-    sessions::{RowmapOracle, Store},
+    rowmap::rowmap_scan_fallbacks,
+    sessions::{EmbeddedMessage, RowmapOracle, Store},
     sql::{self, Mode, Tables},
     substrate::{MaintenancePolicy, Table},
     wire::{
@@ -1021,6 +1023,110 @@ async fn scenario_serve_sync_retention(corpus: &Corpus) -> Result<(Readings, Val
     ))
 }
 
+/// Every Nth corpus fragment gets an embed window in the partial-embed
+/// scenario, so the rewritten fragments are spread across the whole store.
+const PARTIAL_EMBED_FRAGMENT_STRIDE: usize = 5;
+
+/// Record-only cold build over a partially embedded store: the shape that took
+/// the unordered fallback before #260. An embed pass writes one
+/// `merge_update` per window (`embed.rs` `drain_window`), and each rewrite
+/// appends a fragment holding *lower* row ids than the fragments after it. So
+/// the setup embeds the first half of every Nth fragment, each as its own
+/// window, then the measured region is a cold `ensure_rowmap`.
+///
+/// The cached corpus is compacted into one `messages` fragment, where only the
+/// ends can be rewritten without splitting its live ids, so the setup ingests
+/// the profile's sessions into a fresh store instead: one fragment per
+/// production flush, the layout a store has before its first compaction.
+///
+/// Fails loudly if `rowmap_scan_fallbacks()` moves: a change that loses the
+/// fragment-order plan would otherwise just look like a slower row. One
+/// `merge_update` spanning several fragments is out of scope on purpose: its
+/// live ids interleave, no plan exists for it, and that fallback is by design.
+async fn scenario_rowmap_build_cold_partial_embed(profile: Profile) -> Result<(Probe, Value)> {
+    let scratch = tempfile::tempdir().context("scratch store dir")?;
+    let cache = tempfile::tempdir().context("scratch rowmap cache")?;
+    let messages = profile.messages;
+    let (windows, embedded_rows) = {
+        let store = Store::open_local(scratch.path()).await?;
+        ingest_batched(
+            &store,
+            (0..profile.sessions).map(|index| session_events(index, messages)),
+        )
+        .await?;
+        // The fresh store is append-only in session order, so fragment order is
+        // row order and row `r` is message `r % messages` of session
+        // `r / messages`.
+        let fragment_rows: Vec<usize> = store
+            .dataset(Table::Messages)
+            .await?
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().physical_rows.unwrap_or(0))
+            .collect();
+        let dim = pond::sessions::embedding_dim();
+        let (mut windows, mut embedded_rows, mut first_row) = (0usize, 0usize, 0usize);
+        for (ordinal, rows) in fragment_rows.iter().enumerate() {
+            if ordinal % PARTIAL_EMBED_FRAGMENT_STRIDE == 0 && *rows > 1 {
+                let window: Vec<EmbeddedMessage> = (first_row..first_row + rows / 2)
+                    .map(|row| {
+                        let session = session_id(row / messages);
+                        EmbeddedMessage {
+                            id: format!("{session}-msg-{}", row % messages),
+                            session_id: session,
+                            vector: vec![(row % 97) as f32 / 97.0; dim],
+                        }
+                    })
+                    .collect();
+                store.write_embeddings(&window).await?;
+                windows += 1;
+                embedded_rows += window.len();
+            }
+            first_row += rows;
+        }
+        if windows < 2 {
+            bail!(
+                "the fresh store has {} message fragments; the partial-embed shape needs at least \
+                 {} to scatter its windows",
+                fragment_rows.len(),
+                PARTIAL_EMBED_FRAGMENT_STRIDE + 1,
+            );
+        }
+        (windows, embedded_rows)
+    };
+
+    // A fresh handle, so the build reads the post-embed manifest cold.
+    let store = Store::open_local(scratch.path()).await?;
+    let fragments = store.dataset(Table::Messages).await?.get_fragments().len();
+    let (_, messages_in_store, _) = store.row_counts().await?;
+    let fallbacks_before = rowmap_scan_fallbacks();
+    let probe = Probe::begin();
+    store.ensure_rowmap(cache.path()).await?;
+    let fallbacks = rowmap_scan_fallbacks() - fallbacks_before;
+    if fallbacks != 0 {
+        bail!(
+            "rowmap-build-cold-partial-embed fell back off the streaming build {fallbacks} time(s); \
+             the fragment-order plan no longer covers a windowed embed backfill"
+        );
+    }
+    let entries = store.rowmap_snapshot().map_or(0, |set| set.len());
+    if entries != messages_in_store {
+        bail!("rowmap holds {entries} entries for {messages_in_store} messages");
+    }
+    Ok((
+        probe,
+        json!({
+            "rowmap_entries": entries,
+            "sessions": profile.sessions,
+            "messages_per_session": messages,
+            "embed_windows": windows,
+            "embedded_rows": embedded_rows,
+            "message_fragments": fragments,
+            "scan_fallbacks": fallbacks,
+        }),
+    ))
+}
+
 /// Hold the rowmap build lock the way a concurrent builder would: the same
 /// `flock` on the same path `Store::extend_rowmap_coordinated` takes. `flock`
 /// is per open file description, so this conflicts with a build in this very
@@ -1157,10 +1263,15 @@ async fn main() -> Result<()> {
             corpus.require_ready()?;
             close(scenario_sync_under_contention(&corpus).await?)
         }
+        // No `require_ready`: this one builds its own uncompacted store.
+        "rowmap-build-cold-partial-embed" => {
+            close(scenario_rowmap_build_cold_partial_embed(profile).await?)
+        }
         other => bail!(
             "unknown scenario {other:?}; expected sync-noop-local|sync-incremental|\
              rowmap-build-cold|mcp-query-growth|ingest-large-session|search-query-latency|\
-             ingest-throughput|serve-sync-retention|sync-under-contention"
+             ingest-throughput|serve-sync-retention|sync-under-contention|\
+             rowmap-build-cold-partial-embed"
         ),
     };
 

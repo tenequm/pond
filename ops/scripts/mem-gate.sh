@@ -41,18 +41,20 @@ while [ $# -gt 0 ]; do
 done
 
 BASELINE="docs/benchmarks/mem-gate-baseline.jsonl"
-SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
+SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
 # Scenarios that RUN and get a row, but whose numbers gate nothing yet. Their
 # peaks are dominated by a few MiB of transient buffers, so run-to-run spread
 # (measured: 39% on sync-under-contention's peak heap, 16% on
 # ingest-throughput's) is far wider than any regression worth catching - a
 # threshold here would only teach people to ignore the gate. Phase 2 promotes a
 # scenario by deleting it from this list once its committed rows say what
-# "normal" is.
+# "normal" is. rowmap-build-cold-partial-embed is here for the same reason, but
+# still gates in both modes: the bench itself exits nonzero if the cold build
+# falls back off the streaming path.
 #
 # `-` and not `:-`, so `RECORD_ONLY=` on the command line means "gate every
 # scenario" - the way to rehearse a promotion before editing this line.
-RECORD_ONLY="${RECORD_ONLY-search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
+RECORD_ONLY="${RECORD_ONLY-search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
