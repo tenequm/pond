@@ -2140,10 +2140,10 @@ impl Store {
             // (read locally from their mmaps) plus this delta into a fresh base -
             // no full store re-read.
             (Some((_, set)), Some(entries)) => {
-                let mut merged = set.merged_entries();
-                merged.extend(entries);
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
-                RowMetaMap::build(&path, version, merged)?;
+                // Merged out of the segments' mappings row by row, so compaction
+                // never rebuilds the corpus as owned entries.
+                set.compact_into(&path, version, entries)?;
                 version
             }
             // No chain, or a reclaimed base / deletion since it: full scan -> base.

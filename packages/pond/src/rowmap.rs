@@ -419,31 +419,13 @@ impl RowMetaMap {
         String::from_utf8(value.to_vec()).ok()
     }
 
-    /// Reconstruct every row as an owned [`RowMetaEntry`], decompressing each
-    /// block once. Used to merge segments into a fresh base at compaction
-    /// without re-reading the store.
-    pub fn entries(&self) -> Vec<RowMetaEntry> {
-        let records = self.records();
-        let mut out = Vec::with_capacity(records.len());
-        let mut current_block = usize::MAX;
-        let mut plain: Vec<u8> = Vec::new();
-        for (idx, record) in records.iter().enumerate() {
-            let block_idx = idx / BLOCK_ROWS;
-            if block_idx != current_block {
-                plain = self.decompress_block(block_idx).unwrap_or_default();
-                current_block = block_idx;
-            }
-            let Some(base) = self.blob_offset.checked_add(record.blob_off as usize) else {
-                continue;
-            };
-            if let Some(entry) = self.entry_at(record.row_id, base, &plain) {
-                out.push(entry);
-            }
-        }
-        out
-    }
-
-    fn entry_at(&self, row_id: u64, base: usize, block_plain: &[u8]) -> Option<RowMetaEntry> {
+    /// Borrowed view of record `index`, with `search_text` sliced out of
+    /// `block_plain` - the decompressed block that record belongs to. Every
+    /// other field borrows the mmap, so a whole-segment walk allocates only the
+    /// block buffers. `None` on a malformed record, which the walk skips.
+    fn row_ref<'a>(&'a self, index: usize, block_plain: &'a [u8]) -> Option<RowMetaRef<'a>> {
+        let record = self.records().get(index)?;
+        let base = self.blob_offset.checked_add(record.blob_off as usize)?;
         let header = self.mmap.get(base..base.checked_add(ROW_HEADER_LEN)?)?;
         let timestamp_micros = i64::from_le_bytes(header.get(0..8)?.try_into().ok()?);
         let session_idx = read_u32(header, 8)?;
@@ -454,26 +436,20 @@ impl RowMetaMap {
         let text_off = read_u32(header, 28)?;
         let text_len = read_u32(header, 32)?;
         let mut at = base + ROW_HEADER_LEN;
-        let message_id = self.slice_str(&mut at, mid_len)?.to_owned();
+        let message_id = self.slice_str(&mut at, mid_len)?;
         let search_text = if text_len == 0 {
-            String::new()
+            ""
         } else {
             let bytes = block_plain.get(text_off..text_off.checked_add(text_len)?)?;
-            String::from_utf8(bytes.to_vec()).ok()?
+            std::str::from_utf8(bytes).ok()?
         };
-        Some(RowMetaEntry {
-            row_id,
-            session_id: self.session_str(session_idx).to_owned(),
+        Some(RowMetaRef {
+            row_id: record.row_id,
+            session_id: self.session_str(session_idx),
             message_id,
-            role: self
-                .dict_str(self.roles_off, self.role_count, role_idx)
-                .to_owned(),
-            project: self
-                .dict_str(self.projects_off, self.project_count, project_idx)
-                .to_owned(),
-            source_agent: self
-                .dict_str(self.agents_off, self.agent_count, agent_idx)
-                .to_owned(),
+            role: self.dict_str(self.roles_off, self.role_count, role_idx),
+            project: self.dict_str(self.projects_off, self.project_count, project_idx),
+            source_agent: self.dict_str(self.agents_off, self.agent_count, agent_idx),
             timestamp_micros,
             search_text,
         })
@@ -1179,16 +1155,106 @@ impl RowMetaSet {
         Some(out)
     }
 
-    /// Every row across all segments, newest-segment-wins on `row_id`
-    /// collision - the input to a base rebuild at compaction.
-    pub fn merged_entries(&self) -> Vec<RowMetaEntry> {
-        let mut by_row: HashMap<u64, RowMetaEntry> = HashMap::with_capacity(self.len());
-        for seg in &self.segments {
-            for entry in seg.entries() {
-                by_row.insert(entry.row_id, entry);
+    /// Encode every row of the chain plus `appended` into a fresh base segment
+    /// at `path` - the compaction rebuild, which never re-reads the store.
+    ///
+    /// Segments are already `row_id`-sorted, so this is a k-way merge over their
+    /// records plus the sorted `appended` rows, pushed straight into
+    /// [`RowMetaBuilder`]. The corpus is never reconstructed as owned entries:
+    /// each row is a borrow into its segment's mapping and its one decompressed
+    /// text block. On a `row_id` collision the newest source wins - `appended`
+    /// over every segment, later segments over earlier ones - and the superseded
+    /// rows are skipped, so a row id appears exactly once.
+    pub fn compact_into(
+        &self,
+        path: &Path,
+        version: u64,
+        mut appended: Vec<RowMetaEntry>,
+    ) -> Result<()> {
+        appended.sort_unstable_by_key(|entry| entry.row_id);
+        let mut cursors: Vec<SegmentCursor<'_>> =
+            self.segments.iter().map(SegmentCursor::new).collect();
+        let mut next_appended = 0usize;
+        let mut builder = RowMetaBuilder::new(path, version, self.len() + appended.len())?;
+        loop {
+            let mut row_id = appended.get(next_appended).map(|entry| entry.row_id);
+            for cursor in &cursors {
+                if let Some(candidate) = cursor.peek() {
+                    row_id = Some(row_id.map_or(candidate, |current| current.min(candidate)));
+                }
+            }
+            let Some(row_id) = row_id else { break };
+
+            let from_appended = appended
+                .get(next_appended)
+                .is_some_and(|entry| entry.row_id == row_id);
+            if from_appended {
+                builder.push(appended[next_appended].as_row())?;
+            } else if let Some(newest) = cursors
+                .iter()
+                .rposition(|cursor| cursor.peek() == Some(row_id))
+            {
+                cursors[newest].load_block();
+                if let Some(row) = cursors[newest].row() {
+                    builder.push(row)?;
+                }
+            }
+
+            if from_appended {
+                next_appended += 1;
+            }
+            for cursor in &mut cursors {
+                if cursor.peek() == Some(row_id) {
+                    cursor.advance();
+                }
             }
         }
-        by_row.into_values().collect()
+        builder.finish()
+    }
+}
+
+/// Sequential reader over one segment's records, decompressing each text block
+/// once as it walks - the merge's view of an already `row_id`-sorted segment.
+struct SegmentCursor<'a> {
+    map: &'a RowMetaMap,
+    next: usize,
+    loaded_block: Option<usize>,
+    plain: Vec<u8>,
+}
+
+impl<'a> SegmentCursor<'a> {
+    fn new(map: &'a RowMetaMap) -> Self {
+        Self {
+            map,
+            next: 0,
+            loaded_block: None,
+            plain: Vec::new(),
+        }
+    }
+
+    fn peek(&self) -> Option<u64> {
+        self.map
+            .records()
+            .get(self.next)
+            .map(|record| record.row_id)
+    }
+
+    /// Records are visited in order, so the block holding the current row is
+    /// decompressed once for the whole run of rows that share it.
+    fn load_block(&mut self) {
+        let block = self.next / BLOCK_ROWS;
+        if self.loaded_block != Some(block) {
+            self.plain = self.map.decompress_block(block).unwrap_or_default();
+            self.loaded_block = Some(block);
+        }
+    }
+
+    fn row(&self) -> Option<RowMetaRef<'_>> {
+        self.map.row_ref(self.next, &self.plain)
+    }
+
+    fn advance(&mut self) {
+        self.next += 1;
     }
 }
 
@@ -1427,13 +1493,90 @@ mod tests {
         assert_eq!(set.lookup_max_ts("sess-c"), Some(5));
         assert_eq!(set.lookup_max_ts("missing"), None);
 
-        // Compaction input: all 5 distinct rows reconstructed.
-        let mut merged = set.merged_entries();
-        merged.sort_by_key(|entry| entry.row_id);
-        assert_eq!(merged.len(), 5);
-        assert_eq!(merged[0].row_id, 10);
-        assert_eq!(merged[4].row_id, 21);
-        assert_eq!(merged[4].search_text, "delta twentyone");
+        // Compaction: the whole chain merged into one fresh base.
+        let compacted_path = RowMetaMap::path_for(dir.path(), "k", 3);
+        set.compact_into(&compacted_path, 3, Vec::new()).unwrap();
+        let compacted = RowMetaMap::open(&compacted_path).unwrap();
+        assert_eq!(compacted.len(), 5, "all 5 distinct rows carried over");
+        assert_eq!(compacted.max_row_id(), Some(21));
+        assert_eq!(
+            compacted
+                .lookup_meta(21, &mut None)
+                .expect("row 21 present")
+                .search_text,
+            "delta twentyone"
+        );
+        assert_eq!(compacted.lookup_count("sess-a"), Some(3));
+        assert_eq!(compacted.lookup_max_ts("sess-c"), Some(5));
+    }
+
+    /// Compaction reads its rows out of the mmap'd chain instead of rebuilding
+    /// them as owned entries, so it gets its own byte-compat guard: the segment
+    /// it writes must equal what the buffering build encodes from the same rows.
+    /// The delta here overlaps the base on `row_id` 12 and appends past it, so
+    /// the newest-wins collision rule is part of what is compared.
+    #[test]
+    fn compaction_encodes_what_the_buffered_build_would() {
+        let dir = tempfile::tempdir().unwrap();
+        let base: Vec<RowMetaEntry> = (0..(BLOCK_ROWS as u64 + 9))
+            .map(|i| {
+                entry(
+                    i,
+                    &format!("sess-{}", i % 5),
+                    &format!("m{i}"),
+                    i as i64,
+                    &format!("base row {i}"),
+                )
+            })
+            .collect();
+        let mut delta: Vec<RowMetaEntry> = (0..7u64)
+            .map(|i| {
+                entry(
+                    300 + i,
+                    &format!("sess-{}", i % 3),
+                    &format!("d{i}"),
+                    500 + i as i64,
+                    &format!("delta row {i}"),
+                )
+            })
+            .collect();
+        // A row the base already holds: the newer segment must win.
+        delta.push(entry(
+            12,
+            "sess-new",
+            "m12-rewritten",
+            900,
+            "rewritten twelve",
+        ));
+        delta.sort_unstable_by_key(|entry| entry.row_id);
+        let appended = vec![entry(400, "sess-9", "a400", 1_000, "appended four hundred")];
+
+        RowMetaMap::build(&RowMetaMap::path_for(dir.path(), "c", 1), 1, base.clone()).unwrap();
+        RowMetaMap::build(
+            &RowMetaMap::delta_path(dir.path(), "c", 2),
+            2,
+            delta.clone(),
+        )
+        .unwrap();
+        let chain = discover_chain(dir.path(), "c").expect("chain present");
+        let set = RowMetaSet::open(&chain).unwrap();
+
+        let compacted = dir.path().join("compacted.rmm");
+        set.compact_into(&compacted, 3, appended.clone()).unwrap();
+
+        // The same rows collapsed by hand, newest source last.
+        let mut expected_rows: HashMap<u64, RowMetaEntry> = HashMap::new();
+        for entry in base.into_iter().chain(delta).chain(appended) {
+            expected_rows.insert(entry.row_id, entry);
+        }
+        let expected = dir.path().join("expected.rmm");
+        RowMetaMap::build(&expected, 3, expected_rows.into_values().collect()).unwrap();
+
+        assert_eq!(
+            digest(&compacted),
+            digest(&expected),
+            "the merged compaction and the buffered build must encode the same bytes"
+        );
     }
 
     #[test]
