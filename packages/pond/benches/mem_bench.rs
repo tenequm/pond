@@ -13,8 +13,8 @@
 //! | `rowmap-build-cold`   | `ensure_rowmap` from an empty cache             | the #61 rowmap transient |
 //! | `mcp-query-growth`    | N iterations of search + get + sql              | the per-query ratchet |
 //! | `ingest-large-session`| one session, many messages (#229 shape)         | flush-batch byte scaling |
-//! | `search-query-latency`| warmup, then N timed FTS searches               | query latency drift (record-only) |
-//! | `ingest-throughput`   | N synthetic sessions into a fresh store         | write throughput drift (record-only) |
+//! | `search-query-latency`| warmup, then N timed FTS searches               | query latency drift |
+//! | `ingest-throughput`   | N synthetic sessions into a fresh store         | write throughput drift |
 //! | `serve-sync-retention`| serve-like prewarm + sync, then a settling pause | a map or buffer pinned after sync ends |
 //! | `sync-under-contention`| sync while the rowmap build lock is held       | the trailing-oracle path's cost |
 //! | `rowmap-build-cold-partial-embed` | cold build after scattered embed windows | a cold build that stops streaming (`scan_fallbacks`) |
@@ -25,7 +25,8 @@
 //! out. Phase 1 gathers the spread; phase 2 derives a threshold from the
 //! committed rows' median/IQR and promotes a scenario by dropping it from that
 //! list. `scan_fallbacks` is exempt from all of that: it is a count, not a
-//! measurement, and the gate fails on any increase.
+//! measurement, and the gate fails on any increase, on every scenario that
+//! reports it.
 //!
 //! Heap numbers need `--features mem-probe` (the counting allocator); without
 //! it the row still carries wall time and the scenario detail, with null memory
@@ -56,7 +57,7 @@ use pond::{
         extract_self_str, is_session_fresh,
     },
     config::SearchConfig,
-    embed::LazyEmbedder,
+    embed::{DEFAULT_SORT_WINDOW, LazyEmbedder},
     handlers::{
         self, IngestEvent, IngestValidator, pond_get_message, pond_get_session, pond_search,
     },
@@ -308,8 +309,9 @@ const SEED_FLUSH_BATCH: usize = 100;
 /// push/flush/finish cycle `ingest_adapter` drives in production, including
 /// its flush test: after every event, on the substream count OR the byte
 /// budget. Testing only at session end would miss the budget inside one large
-/// session, and would flush the open session's messages as a partial write
-/// production never makes.
+/// session, and would drain the open session's messages on a substream-count
+/// flush - a partial write production never makes, because by then the count
+/// has already fired on the `Session` event that closed the previous one.
 async fn ingest_batched(
     store: &Store,
     sessions: impl IntoIterator<Item = Vec<IngestEvent>>,
@@ -823,8 +825,9 @@ async fn fragment_stats(store_dir: &Path) -> Result<FragmentStats> {
             let meta = fragment.metadata();
             count += 1;
             rows += meta.physical_rows.unwrap_or(0) as u64;
-            // A manifest without sizes contributes nothing rather than a wrong
-            // total; `frag_count` still says what the shape is.
+            // A fragment whose files do not all carry sizes contributes nothing
+            // rather than a wrong total; `frag_count` still says what the shape
+            // is.
             bytes += meta
                 .files
                 .iter()
@@ -920,8 +923,10 @@ async fn scenario_search_query_latency(
 /// so this scenario needs no prepared corpus - replayed into a fresh store
 /// through the production batched path. Events are built before the probe
 /// starts, like every other ingest scenario, and the rate's denominator is the
-/// ingest call alone: neither the generator nor the closing count is in it,
-/// though both are inside the measured region and so in the row's peaks.
+/// ingest call alone - not the closing `row_counts()`, which runs inside the
+/// measured region. The generator's buffer is still resident when the probe
+/// begins and drains only as the ingest consumes it, so it floors this row's
+/// peaks; `start_heap_bytes` records that floor.
 async fn scenario_ingest_throughput(profile: Profile) -> Result<(Readings, Value)> {
     let (sessions, messages) = (profile.throughput_sessions, profile.messages);
     let corpus_sessions: Vec<Vec<IngestEvent>> = (0..sessions)
@@ -1029,9 +1034,9 @@ async fn scenario_serve_sync_retention(corpus: &Corpus) -> Result<(Readings, Val
 /// the rewritten fragments are spread across the whole store.
 const PARTIAL_EMBED_FRAGMENT_STRIDE: usize = 5;
 
-/// Rows per `merge_update`, mirroring `embed::DEFAULT_SORT_WINDOW` - the size
-/// `EmbedWorker::drain_window` actually writes in.
-const PARTIAL_EMBED_WINDOW: usize = 2048;
+/// Rows per `merge_update` - the size `EmbedWorker::drain_window` actually
+/// writes in, taken from the constant itself so it cannot drift.
+const PARTIAL_EMBED_WINDOW: usize = DEFAULT_SORT_WINDOW;
 
 /// Record-only cold build over a partially embedded store: the shape that took
 /// the unordered fallback before #260. An embed pass writes one
@@ -1097,8 +1102,9 @@ async fn scenario_rowmap_build_cold_partial_embed(profile: Profile) -> Result<(P
         }
         if windows < 2 {
             bail!(
-                "the fresh store has {} message fragments; the partial-embed shape needs at least \
-                 {} to scatter its windows",
+                "the fresh store embedded {windows} of its {} message fragments; the partial-embed \
+                 shape needs at least two windows, so at least {} fragments of more than one row \
+                 each at stride {PARTIAL_EMBED_FRAGMENT_STRIDE}",
                 fragment_rows.len(),
                 PARTIAL_EMBED_FRAGMENT_STRIDE + 1,
             );
@@ -1303,8 +1309,9 @@ async fn main() -> Result<()> {
         "latency_p95_ms": detail.get("latency_p95_ms").cloned(),
         "latency_max_ms": detail.get("latency_max_ms").cloned(),
         "throughput_rows_per_s": detail.get("throughput_rows_per_s").cloned(),
-        // Judged by `mem-gate.sh --check` on every scenario, record-only ones
-        // included: a cold build that stops streaming is a cliff, not a drift.
+        // Judged by `mem-gate.sh --check` on every scenario that reports it,
+        // record-only ones included: a cold build that stops streaming is a
+        // cliff, not a drift.
         "scan_fallbacks": detail.get("scan_fallbacks").cloned(),
         "frag_count": detail.get("frag_count").cloned(),
         "data_file_bytes": detail.get("data_file_bytes").cloned(),

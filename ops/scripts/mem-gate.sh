@@ -45,14 +45,15 @@ done
 
 BASELINE="docs/benchmarks/mem-gate-baseline.jsonl"
 SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
-# Scenarios that RUN and get a row, but whose numbers gate nothing yet. Their
-# peaks are dominated by a few MiB of transient buffers, so run-to-run spread
-# (measured: 39% on sync-under-contention's peak heap, 16% on
-# ingest-throughput's) is far wider than any regression worth catching - a
-# threshold here would only teach people to ignore the gate. Phase 2 promotes a
-# scenario by deleting it from this list once its committed rows say what
-# "normal" is. rowmap-build-cold-partial-embed is here for its memory numbers
-# only - its scan_fallbacks count is judged above like every other scenario's.
+# Scenarios that RUN and get a row, but whose numbers gate nothing yet. Over ten
+# interleaved ci runs the two small-allocation scenarios swing several times
+# wider than the gate's own 20% threshold (peak heap: 139% on
+# sync-under-contention, 19% on ingest-throughput), so a threshold there would
+# fire on noise and teach people to ignore the gate. The other three are tighter
+# than that already (0.1-7%) and wait only for enough committed rows to say what
+# "normal" is. Phase 2 promotes a scenario by deleting it from this list.
+# rowmap-build-cold-partial-embed is here for its memory numbers only - its
+# scan_fallbacks count is judged above like every other scenario's.
 #
 # `-` and not `:-`, so `RECORD_ONLY=` on the command line means "gate every
 # scenario" - the way to rehearse a promotion before editing this line.
@@ -179,6 +180,11 @@ for scenario in scenarios:
         now = fresh.get(key)
         before = same[-1].get(key) if same else None
         if not isinstance(now, int) or not isinstance(before, int):
+            # Say so rather than skipping in silence: a record-only scenario
+            # never reaches the "no committed baseline row" failure below, so
+            # this line is the only sign the counter went unjudged.
+            if now is not None or before is not None:
+                print(f"  skip {key}: not comparable (now={now!r}, baseline={before!r})")
             continue
         verdict = "FAIL" if now > before else "ok"
         if now > before:
@@ -194,7 +200,8 @@ for scenario in scenarios:
                 isinstance(now, (int, float)) and isinstance(before, (int, float)) and before > 0
             )
             delta = f"{(now - before) / before * 100:+.1f}%" if comparable else "n/a"
-            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {now:<14} {delta:>7}  (record-only)")
+            shown_now = now if now is not None else "-"
+            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {shown_now:<14} {delta:>7}  (record-only)")
         continue
     if not same:
         print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
