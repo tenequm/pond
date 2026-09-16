@@ -9,9 +9,10 @@
 //! block-compressed ([`BLOCK_ROWS`] rows per zstd block). On the real 2M-message
 //! corpus that takes the map from ~655 MB (flat) to ~270 MB.
 //!
-//! Built via temp + atomic rename and `mmap`'d read-only, so N pond processes on
-//! the box share one physical copy in the OS page cache and a restart re-`open`s
-//! instantly. Stable row ids (`enable_stable_row_ids`) keep a built map valid
+//! Encoded row by row by [`RowMetaBuilder`], which holds one block of text and
+//! the dictionaries rather than the corpus, then published via temp + atomic
+//! rename and `mmap`'d read-only, so N pond processes on the box share one
+//! physical copy in the OS page cache and a restart re-`open`s instantly. Stable row ids (`enable_stable_row_ids`) keep a built map valid
 //! across compaction; it only rebuilds when the dataset version advances.
 //!
 //! Layout: `Header | [Record; count] | [SessionEntry] | [DictEntry; project] |
@@ -963,9 +964,10 @@ impl ChainPaths {
 /// One definition, two enforcement points: `Store::sweep_orphan_temps` reclaims
 /// by it, and the rowmap purge probe asserts that a rebuild which could not
 /// rename leaves behind something it matches. Held here, beside the
-/// `with_extension("tmp-{pid}-{nonce}")` in `build`, because that is what makes
-/// the shape true - duplicating the predicate let the sweep change while the
-/// probe kept passing on a rule that no longer held.
+/// `with_extension("tmp-{pid}-{nonce}")` in `RowMetaBuilder::new` - which names
+/// the segment temp and both staging extents - because that is what makes the
+/// shape true; duplicating the predicate let the sweep change while the probe
+/// kept passing on a rule that no longer held.
 pub fn is_orphan_temp(file_name: &str, store_key: &str) -> bool {
     file_name.starts_with(&format!("rowmetamap-{store_key}-")) && file_name.contains(".tmp-")
 }
