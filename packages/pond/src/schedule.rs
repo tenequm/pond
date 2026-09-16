@@ -1416,13 +1416,11 @@ mod windows {
                 .and_then(|s| s.strip_suffix('M'))
             {
                 m.parse::<u32>().ok().map(|m| m * 60)
-            } else if let Some(h) = interval
-                .strip_prefix("PT")
-                .and_then(|s| s.strip_suffix('H'))
-            {
-                h.parse::<u32>().ok().map(|h| h * 3_600)
             } else {
-                return None;
+                let h = interval
+                    .strip_prefix("PT")
+                    .and_then(|s| s.strip_suffix('H'))?;
+                h.parse::<u32>().ok().map(|h| h * 3_600)
             }?;
             return ScheduleEvery::from_secs(secs);
         }
@@ -1503,8 +1501,10 @@ mod windows {
 
     fn decode_utf16le(bytes: &[u8]) -> String {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         String::from_utf16_lossy(&units)
     }

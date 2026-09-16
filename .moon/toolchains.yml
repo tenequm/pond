@@ -14,10 +14,10 @@
 javascript: {}
 
 node:
-  version: '24.18.1'
+  version: '24.21.0'
 
 npm:
-  version: '11.19.0'
+  version: '11.19.1'
 # No python/uv toolchains. `unstable_python` provisions cleanly, but proto's uv
 # plugin does not: it writes the version metadata and then fails to locate a
 # binary it never unpacked (proto::locate::missing_executable), on the CI runner

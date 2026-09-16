@@ -53,12 +53,12 @@
         rcodesign = "0.29.0";
         gh = "2.100.0";
         macosSdk = "15.5";
-        moon = "2.5.1";
-        protoc = "35.1";
-        uv = "0.11.33";
-        node = "24.18.1";
-        npm = "11.19.0";
-        kache = "0.15.0";
+        moon = "2.5.4";
+        protoc = "36.1";
+        uv = "0.12.13";
+        node = "24.21.0";
+        npm = "11.19.1";
+        kache = "0.21.0";
       };
 
       v = toolVersions;
@@ -68,78 +68,78 @@
         moon = {
           x86_64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-x86_64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-PKK4fpjGGjAci3Tp03HB0h1zaKNPqPUCOiCtzczY9Ks=";
+            hash = "sha256-uqbwzaj+nXUT/+uykIz9lSiIxmZZt5XaAqFO8hVutcc=";
           };
           aarch64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-4wtyC5waasOgpkelFYvQtLpFCl8kq/1CSqMiz90Xlq0=";
+            hash = "sha256-Up4z5tyBKw3oJA+mNpg6Z2UFzCZtNGM3H/+tk6EfVMY=";
           };
           aarch64-darwin = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-apple-darwin.tar.xz";
-            hash = "sha256-mAswo7rnip1c87tue8ID3eRWwxARtuuH/yom0u+n0vw=";
+            hash = "sha256-xOD0H0P4BTO+QSCReFjKaOHWUGM3XeAIiII0LkU2aGc=";
           };
         };
         protoc = {
           x86_64-linux = {
             url = "https://github.com/protocolbuffers/protobuf/releases/download/v${v.protoc}/protoc-${v.protoc}-linux-x86_64.zip";
-            hash = "sha256-aTDr9ivU6mB7mP/wUllsbuVkuYNbTOFyx1o/U66dkbc=";
+            hash = "sha256-xLxnLZ1JIU3Iyv3OrfTfkhgtbKjj7GWlay195WAmabQ=";
           };
           aarch64-linux = {
             url = "https://github.com/protocolbuffers/protobuf/releases/download/v${v.protoc}/protoc-${v.protoc}-linux-aarch_64.zip";
-            hash = "sha256-Ab+dCICMf5Zni2P0vY76VZu0+D1aeicNXtr1B/nV2c8=";
+            hash = "sha256-I3pohW7fG9KLYgS93QWWwc9G0pi8KcYgASVAsuRMc+c=";
           };
           aarch64-darwin = {
             url = "https://github.com/protocolbuffers/protobuf/releases/download/v${v.protoc}/protoc-${v.protoc}-osx-aarch_64.zip";
-            hash = "sha256-GTKJrwRwxqGq2jV9T7oLv414v6rIteQsowry73VYPeI=";
+            hash = "sha256-3lbVev4wxdGRsR0k/5PdQCVyjX+0O3c4hrLTYT4L27I=";
           };
         };
         uv = {
           x86_64-linux = {
             url = "https://github.com/astral-sh/uv/releases/download/${v.uv}/uv-x86_64-unknown-linux-gnu.tar.gz";
-            hash = "sha256-qp/KgjwDKJ+240YLPchk8+qJXK+vm5kkdwGmexfRsBg=";
+            hash = "sha256-dFdlo7bjYK12dDWZrlxC6SeMft+Lv/n8dtBb8mI6BN0=";
           };
           aarch64-linux = {
             url = "https://github.com/astral-sh/uv/releases/download/${v.uv}/uv-aarch64-unknown-linux-gnu.tar.gz";
-            hash = "sha256-ntiKmkLeMQL5cE0CGrGG/fimmnrZodPzSGrGseVdYUE=";
+            hash = "sha256-LqpdlPXbezoaCSFWuUIEWeQqsCF9kX/nSodjCc75tek=";
           };
           aarch64-darwin = {
             url = "https://github.com/astral-sh/uv/releases/download/${v.uv}/uv-aarch64-apple-darwin.tar.gz";
-            hash = "sha256-1149K/wgPRc4jtqr06o3lY7by/w2IZ4+4NMbsIC0uqI=";
+            hash = "sha256-fm3bkxaswA8ilsgv9NmZd4cO40svDdyulETXFNuTZO0=";
           };
         };
         node = {
           x86_64-linux = {
             url = "https://nodejs.org/dist/v${v.node}/node-v${v.node}-linux-x64.tar.xz";
-            hash = "sha256-1sZk3z8/YUWOjCd1hVcTKFItcFFmcjp8eCOpJTpNFaA=";
+            hash = "sha256-/Y5Z1aURUQ9qKYr7VI8Yx9KxvkBNi0on2U++SfVsstY=";
           };
           aarch64-linux = {
             url = "https://nodejs.org/dist/v${v.node}/node-v${v.node}-linux-arm64.tar.xz";
-            hash = "sha256-cgHjoJ3IJbrFeGfIGRPiuPDvh9BMuQgq9M2oL2/z2Iw=";
+            hash = "sha256-atEyXtvbVknDebdaI3FHpmbJXU+a6NNA/vLRV10omtI=";
           };
           aarch64-darwin = {
             url = "https://nodejs.org/dist/v${v.node}/node-v${v.node}-darwin-arm64.tar.xz";
-            hash = "sha256-HWC3A/5dfnBySJvoGH9DDxoJWmWMMeXh4oEzGlhz+sM=";
+            hash = "sha256-YjnUz5LYZEh+yM02FQOPe2fn9Yt3shzS8J6p+9aAZf4=";
           };
         };
         kache = {
           x86_64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-x86_64-unknown-linux-musl.tar.gz";
-            hash = "sha256-3+ExKbuSpWVrL7keoG2sCPRhZNSIGV20LRVWLWcm3OY=";
+            hash = "sha256-Y1S7dkFL5o+PkGIGyHwTlOW3n968s6nTHiJU3frcKCA=";
           };
           aarch64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-unknown-linux-musl.tar.gz";
-            hash = "sha256-9TgKWpshXGdeorPejoFKoLKuIttAeh1z6BxmKSJf3Xg=";
+            hash = "sha256-fIsOcYsEDybDWkNe7h298urUKvhSmxO+fKzJf1vI3sQ=";
           };
           aarch64-darwin = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-apple-darwin.tar.gz";
-            hash = "sha256-ZQWdQZDb8slZqz4B16MUfrvHxk0/P6gdH91ZbizVIaU=";
+            hash = "sha256-GUaUMOTH8ai8xWHCjBX9SH0ytR68Yski1x7n3iHwYPA=";
           };
         };
-        # npm is one tarball for every platform: node 24.18.1 bundles npm
-        # 11.16.0, and .moon/toolchains.yml pins 11.19.0.
+        # npm is one tarball for every platform: node 24.21.0 bundles npm
+        # 11.19.0, and .moon/toolchains.yml pins 11.19.1.
         npm = {
           url = "https://registry.npmjs.org/npm/-/npm-${v.npm}.tgz";
-          hash = "sha256-Mel3D33HERmlhQk1OyeRdVeq8KybXvGgRl7n2OxnrnU=";
+          hash = "sha256-n1i/8BYEyxsUAI/vFNzrFNg2pJIl5FxsLjfeO+PnB/A=";
         };
         # Stub SDK for the Linux -> darwin cross link (candle metal pulls
         # Metal/Foundation). Platform-independent content.
