@@ -22,6 +22,13 @@ opt-level = 3
 # Ship-grade optimization is `dist`.
 [profile.release]
 
+# Profiling profile: release speed with enough debuginfo for heaptrack/dhat to
+# attribute allocation sites (`ops/scripts/profile-mem.sh`). Dist builds keep
+# the normal release profile.
+[profile.profiling]
+inherits = "release"
+debug = 1
+
 # Ship profile: thin-LTO + single codegen unit. Used only for release artifacts.
 [profile.dist]
 inherits = "release"

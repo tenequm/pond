@@ -51,6 +51,12 @@ pub struct Store {
     /// data-projection scan and hydration to `take_rows`. `ArcSwap` so a
     /// version-bump rebuild swaps it under concurrent searches.
     rowmap: ArcSwapOption<RowMetaSet>,
+    /// The map [`Store::sync_rowmap_oracle`] last handed the sync planner. Kept
+    /// out of `rowmap` on purpose - a trailing map must never hydrate searches -
+    /// and read back only to write the sync cursor, so a contended run persists
+    /// the watermarks it actually planned against and a run whose chain was
+    /// rejected persists nothing.
+    sync_oracle_map: ArcSwapOption<RowMetaSet>,
     /// Resident embedder for inline embed-at-ingest. `None` keeps ingest
     /// writing null vectors (tests, search-only stores); the CLI write paths
     /// attach one via [`Store::with_embedder`]. Lazy, so a store that never
@@ -60,6 +66,12 @@ pub struct Store {
     /// model batch within one flush. Lets the CLI keep its progress line
     /// moving through the otherwise-opaque commit phase.
     ingest_embed_progress: Option<IngestEmbedProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageStoreProbe {
+    pub row_count: usize,
+    pub oldest_messages: Vec<(u64, String)>,
 }
 
 /// One ingest host's slice of a shared store (see
@@ -337,6 +349,7 @@ impl Store {
         Ok(Self {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
+            sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
         })
@@ -378,6 +391,7 @@ impl Store {
         Ok(Self {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
+            sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
         })
@@ -400,6 +414,7 @@ impl Store {
             )
             .await?,
             rowmap: ArcSwapOption::empty(),
+            sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
         })
@@ -1921,7 +1936,7 @@ impl Store {
 
     /// Stable filesystem-safe cache key: same store URL -> same key, so sibling
     /// pond processes share one map file and distinct stores never collide.
-    fn store_key(&self) -> String {
+    pub fn store_key(&self) -> String {
         crate::substrate::store_key(self.handle.location())
     }
 
@@ -2000,33 +2015,55 @@ impl Store {
     /// when a sibling holds the build lock. A trailing watermark can only make
     /// sync re-examine rows appended since that map's version.
     pub async fn sync_rowmap_oracle(&self, cache_dir: &Path) -> Result<RowmapOracle> {
-        match self.ensure_rowmap_inner(cache_dir).await? {
-            RowmapEnsure::Current => Ok(RowmapOracle(self.rowmap_snapshot())),
+        let oracle = match self.ensure_rowmap_inner(cache_dir).await? {
+            RowmapEnsure::Current => RowmapOracle(self.rowmap_snapshot()),
             RowmapEnsure::Contended => {
-                // A resident map was validated against this store when this
-                // process installed it, so it is the cheaper baseline and needs
-                // no re-probe. `serve --with-sync` is always in this case: its
-                // prewarm refresh is the sibling holding the lock.
-                if let Some(resident) = self.rowmap_snapshot() {
-                    return Ok(RowmapOracle(Some(resident)));
-                }
-                let Some(set) = self.open_cached_rowmap(cache_dir).await else {
-                    return Ok(RowmapOracle(None));
-                };
-                if !self.rowmap_matches_store(&set, Coverage::Trailing).await? {
-                    tracing::warn!(
-                        store = self.store_key(),
-                        "cached rowmap describes a different store at this path; ignoring it"
+                let oracle = self.trailing_rowmap_oracle(cache_dir).await?;
+                if let Some(set) = oracle.0.as_ref() {
+                    tracing::info!(
+                        version = set.version(),
+                        "sync proceeds against a trailing oracle after rowmap build-lock contention"
                     );
-                    return Ok(RowmapOracle(None));
                 }
-                tracing::info!(
-                    version = set.version(),
-                    "sync proceeds against a trailing oracle after rowmap build-lock contention"
-                );
-                Ok(RowmapOracle(Some(set)))
+                oracle
             }
+        };
+        self.sync_oracle_map.store(oracle.0.clone());
+        Ok(oracle)
+    }
+
+    /// The map the last [`Self::sync_rowmap_oracle`] call planned against: this
+    /// process's resident map once one exists, else the trailing map that call
+    /// settled for. `None` when it found nothing to trust - the signal to leave
+    /// the sync cursor alone rather than seed it from a chain the planner
+    /// itself rejected.
+    pub fn sync_oracle_snapshot(&self) -> Option<Arc<RowMetaSet>> {
+        self.rowmap_snapshot()
+            .or_else(|| self.sync_oracle_map.load_full())
+    }
+
+    /// The best trailing map this host can offer without building one: this
+    /// process's resident map, else the newest valid cached chain. The seam
+    /// [`Self::sync_rowmap_oracle`] falls back to after losing the build lock.
+    async fn trailing_rowmap_oracle(&self, cache_dir: &Path) -> Result<RowmapOracle> {
+        // A resident map was validated against this store when this process
+        // installed it, so it is the cheaper baseline and needs no re-probe.
+        // `serve --with-sync` is always in this case: its prewarm refresh is
+        // the sibling holding the lock.
+        if let Some(resident) = self.rowmap_snapshot() {
+            return Ok(RowmapOracle(Some(resident)));
         }
+        let Some(set) = self.open_cached_rowmap(cache_dir).await else {
+            return Ok(RowmapOracle(None));
+        };
+        if !self.rowmap_matches_store(&set, Coverage::Trailing).await? {
+            tracing::warn!(
+                store = self.store_key(),
+                "cached rowmap describes a different store at this path; ignoring it"
+            );
+            return Ok(RowmapOracle(None));
+        }
+        Ok(RowmapOracle(Some(set)))
     }
 
     /// Open the newest locally cached rowmap chain regardless of the store's
@@ -2665,6 +2702,30 @@ impl Store {
             .version)
     }
 
+    pub async fn message_store_probe(&self) -> Result<MessageStoreProbe> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let row_count = dataset.count_rows(None).await?;
+        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        scanner.with_row_id();
+        scanner.project(&["id"])?;
+        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut oldest_messages = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let rowids = uint64(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                if let Some(message_id) = string(&batch, "id", row)? {
+                    oldest_messages.push((rowids.value(row), message_id));
+                }
+            }
+        }
+        Ok(MessageStoreProbe {
+            row_count,
+            oldest_messages,
+        })
+    }
+
     /// Scan the hydration columns with row ids into a `Vec`, the input to
     /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
     /// scattered per-hit take it replaces; `search_text` dominates the bytes.
@@ -2732,34 +2793,20 @@ impl Store {
         if set.is_empty() {
             return Ok(true);
         }
-        if coverage == Coverage::Complete {
-            let dataset = self.handle.dataset(Table::Messages).await?;
-            if set.len() != dataset.count_rows(None).await? {
-                return Ok(false);
-            }
+        let probe = self.message_store_probe().await?;
+        if coverage == Coverage::Complete && set.len() != probe.row_count {
+            return Ok(false);
         }
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
-        scanner.with_row_id();
-        scanner.project(&["id"])?;
-        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
-        let mut stream = scanner.try_into_stream().await?;
         let mut known = 0usize;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            let rowids = uint64(&batch, "_rowid")?;
-            for row in 0..batch.num_rows() {
-                let Some(message_id) = string(&batch, "id", row)? else {
-                    continue;
-                };
-                match set.lookup(rowids.value(row)) {
-                    Some((_, cached)) if cached != message_id => return Ok(false),
-                    Some(_) => known += 1,
-                    // Unknown is not proof on its own - a row appended after the
-                    // map was built is unknown too - but the store's OLDEST rows
-                    // predate any chain built from it, so a map that knows none
-                    // of them did not come from this store.
-                    None => {}
-                }
+        for (row_id, message_id) in probe.oldest_messages {
+            match set.lookup(row_id) {
+                Some((_, cached)) if cached != message_id => return Ok(false),
+                Some(_) => known += 1,
+                // Unknown is not proof on its own - a row appended after the
+                // map was built is unknown too - but the store's OLDEST rows
+                // predate any chain built from it, so a map that knows none
+                // of them did not come from this store.
+                None => {}
             }
         }
         // Zero rows scanned lands here too: a non-empty map against a store with
@@ -5934,11 +5981,15 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
     })
 }
 
-/// [`SkipOracle`](crate::adapter::SkipOracle) over a row-meta map. Sync normally
-/// uses the resident current map; during build-lock contention it can use a
-/// validated, nonresident trailing map. Rows appended after a trailing map are
-/// absent, so they are re-examined rather than skipped. A `None` map (no cached
-/// chain, or a failed build) yields no watermark and re-reads every source.
+/// [`SkipOracle`](crate::adapter::SkipOracle) over a row-meta map: `pond sync`
+/// reads each session's stored max message timestamp from memory, so the
+/// staleness check costs zero S3 (the map is rebuilt from the store, so the
+/// check stays deterministic). Sync normally uses the resident current map;
+/// during build-lock contention it can use a validated, nonresident trailing
+/// map. Rows appended after a trailing map are absent, so they are re-examined
+/// rather than skipped. A `None` map (no cached chain, or a failed build) yields
+/// no watermark and re-reads every source, unless the CLI substitutes a
+/// store-validated persisted cursor for it.
 pub struct RowmapOracle(pub Option<Arc<RowMetaSet>>);
 
 impl crate::adapter::SkipOracle for RowmapOracle {

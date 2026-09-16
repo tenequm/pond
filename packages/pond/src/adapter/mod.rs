@@ -277,11 +277,10 @@ pub type PlanFuture<'a> = std::pin::Pin<
 >;
 
 /// Store-side freshness watermark: the max message timestamp (micros) pond
-/// already holds for a session. Backed by the resident row-meta map (zero S3 -
-/// see [`crate::rowmap`]), which is itself rebuilt from the store, so the check
-/// is deterministic with no local cursor to desync. `None` means pond has never
-/// seen the session, or the resident map is behind the store - either way the
-/// caller re-reads.
+/// already holds for a session. The resident row-meta map is preferred (zero
+/// S3 - see [`crate::rowmap`]); a store-validated persisted cursor can cover a
+/// process restart while another process builds that map. `None` makes the
+/// caller re-read.
 ///
 /// The skip is sound because pond and every source are append-only: a session's
 /// max message timestamp only advances as it gains messages. The one residual is
