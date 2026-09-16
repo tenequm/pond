@@ -5400,7 +5400,7 @@ pub(crate) fn empty_reader(
 
 pub(crate) struct MessageBatchRow<'a> {
     pub message: &'a Message,
-    pond_stamp: Option<&'static Value>,
+    pub pond_stamp: Option<&'static Value>,
     pub source_agent: &'a str,
     pub project: &'a str,
     pub search_text: Option<&'a str>,
@@ -5655,10 +5655,18 @@ impl Serialize for StampedMessageOptions<'_> {
     {
         let mut map = serializer.serialize_map(Some(self.options.len() + 1))?;
         let mut wrote_stamp = false;
+        // `ProviderOptions` is a BTreeMap, so this walks keys in sorted order
+        // and emits the stamp at its sorted position. The position itself is
+        // not load-bearing (jsonb re-sorts on parse), but skipping an existing
+        // `pond` key is: it makes a duplicate key structurally impossible even
+        // if a caller ever hands us options the ingest strip did not clear.
         for (key, value) in self.options {
-            if !wrote_stamp && key.as_str() > "pond" {
+            if !wrote_stamp && key.as_str() >= "pond" {
                 map.serialize_entry("pond", self.pond_stamp)?;
                 wrote_stamp = true;
+                if key.as_str() == "pond" {
+                    continue;
+                }
             }
             map.serialize_entry(key, value)?;
         }
@@ -7101,6 +7109,11 @@ mod tests {
         Ok(())
     }
 
+    /// Pins that buffering shares one stamp instead of cloning it per message,
+    /// and that encoding still produces the bytes the old clone-and-insert path
+    /// produced. It does NOT pin the serializer's key placement: both sides go
+    /// through `json_bytes`, and jsonb sorts object keys on parse, so the
+    /// emitted text order is normalized away before the comparison.
     #[tokio::test]
     async fn buffered_messages_share_the_host_stamp_until_encoding() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
