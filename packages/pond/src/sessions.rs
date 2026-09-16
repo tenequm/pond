@@ -8560,6 +8560,57 @@ mod tests {
         Ok(())
     }
 
+    /// The sync cursor is written from `sync_oracle_snapshot`, not from the
+    /// oracle the planner returned, so its preference order is what decides
+    /// which map reaches disk: a resident map whenever one exists, else the
+    /// trailing map the planner settled for, else nothing.
+    #[tokio::test]
+    async fn sync_oracle_snapshot_prefers_a_resident_map_over_the_planned_one() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (builder, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+        builder.ensure_rowmap(&cache).await?;
+        ingest_events(&builder, conversational_events("session-after-chain", 1)).await?;
+
+        let reader = Store::open_local(temp.path()).await?;
+        assert!(
+            reader.sync_oracle_snapshot().is_none(),
+            "a store that has planned nothing offers the cursor nothing",
+        );
+
+        let lock = hold_rowmap_lock(&builder, &cache)?;
+        let oracle = reader.sync_rowmap_oracle(&cache).await?;
+        drop(lock);
+
+        assert!(
+            reader.rowmap_snapshot().is_none(),
+            "a trailing map is never installed as resident",
+        );
+        let planned = reader
+            .sync_oracle_snapshot()
+            .expect("the trailing map the planner used stays readable at persist time");
+        assert!(!planned.is_empty());
+        assert!(Arc::ptr_eq(
+            &planned,
+            oracle
+                .0
+                .as_ref()
+                .expect("contention found a trailing chain"),
+        ));
+
+        reader.ensure_rowmap(&cache).await?;
+        let resident = reader.rowmap_snapshot().expect("the build installs one");
+        assert!(
+            Arc::ptr_eq(
+                &reader.sync_oracle_snapshot().expect("still some map"),
+                &resident,
+            ),
+            "a resident map installed after planning outranks the trailing one",
+        );
+        Ok(())
+    }
+
     /// `serve --with-sync` contends with its own prewarm refresh, so the map it
     /// already holds is the baseline that must survive - reaching past it to
     /// disk loses it whenever the lock holder has purged the chain.
