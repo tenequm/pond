@@ -65,6 +65,12 @@ skills-lock.json
 # stats appear inline in the benchmark report. Regenerate via `pond status`.
 /docs/researches/embeddings/snapshot.txt
 
+# Profiling traces from ops/scripts/profile-mem.sh. Both tools write to the CWD,
+# which the script sets to the repo root; left untracked they also make
+# mem-gate.sh stamp every appended baseline row `<sha>-dirty`.
+/heaptrack.*.zst
+/dhat-heap.json
+
 # moon local cache (rebuilt on demand; never commit)
 /.moon/cache/
 # generated from vcs.hooks in workspace.yml on every moon run
