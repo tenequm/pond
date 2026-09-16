@@ -45,6 +45,21 @@ Status 2026-09-16: plan committed to main; B2/B3/B4 launched as parallel
 worktree agents; Phase 0 done (below) - B1 demoted to a cheap bound, B5 added
 from Phase 0's bonus finding; track A starting.
 
+Status 2026-09-16 (campaign close-out): every PR in the #245 lane is merged -
+twelve in all (#250, #254, #253, #251, #249, #255, #244, #252, #259, #260,
+#256, #262), the last wave being #252 (`6c2d09d`, bounded ingest flush
+memory), #259 (`3b6c609`, sync cursor oracle preference order pinned), #260
+(`03d2a46`, cold rowmap build in a bounded chunk window) and #256
+(`f253629`, stops the per-message options stamp clones). Still in flight:
+#258 (bench-gate extensions) on `feat/bench-gate-extensions`. The memory
+ceiling plus supervised self-restart for `mcp`/`serve` moved to follow-up
+issue #266; the allocator-trim half of that old either/or item already
+shipped in #249. The closing measurement sweep is designed and pending
+execution once #258 merges: the mem gate on both sides, `moon run
+repo:bench-gate` on both sides, and read latency on an unoptimized store
+ingested under #252 - all built on rustc 1.98.1. Its numbers land in a
+follow-up commit on this branch. Refs #245.
+
 ### Phase 0 - zero-code experiment (DONE 2026-09-16, hypothesis not confirmed)
 
 On deployment B (pond 0.17.3, s3+https Hetzner store, 19,461 sessions /
@@ -123,8 +138,52 @@ producing the before row retroactively.
 
 ### Later - structural fixes (measured first, then designed)
 
+Measured 2026-09-16 (large-profile heaptrack/dhat attribution; synthesis and
+per-trace reports in the orchestrator archive, gate rows on PR #253): the
+rowmap cold build is a 497 MiB transient for a 4.56 MiB mmap product (160 MiB
+un-reserved entries spine, 138.6 MiB of 6M per-row Strings, 121.8 MiB in-RAM
+serialization blob, 45.8 MiB distinct_sorted scratch); the mcp query loop has
+NO leak (live heap flat at ~5 B/iter) - the RSS floor is build residue; ingest
+peak is 1358 MiB of which 2.9% is payload (491 MiB per-message options.pond
+stamp deep-clones, 155.6 MiB dense all-null embedding buffer). Follow-ups cut
+from this: B6 streaming rowmap build (PR #255, tiers 1-2 landed), B7 ingest
+stamp sharing (PR #256; its null-embedding omission was reverted - lance
+binary-copy compaction corrupts partial fragments). The residual backlog
+(B6 tier 3, the 155.6 MiB embedding term via #252 chunk budgeting, B8
+part_rows double-hold, B9 search fan-out churn) is consolidated in issue
+#257 - no further items tracked here.
+
+Merged 2026-09-16: #250, #254, #253 (this lane), #251, #255. The #251
+merge composed its trailing-oracle fallback with #254's persisted cursor
+(new Store::sync_oracle_map records the map the planner used; adversarial
+review approved). Sharpest residual edge: a foreign-but-prefix-sharing
+chain passing Coverage::Trailing validation now feeds a durable cursor -
+self-heals on the next messages-changing sync, and usable_sync_cursor
+re-validates identity on read. Also merged: #249 (glibc trim; polish
+narrowed the cfg gate to target_env = gnu and added an unconditional
+post-prewarm trim). Then, after #244 (Rust 1.98, kache k31): #252 (flush
+budget + 772 B/row vector-width rider; the mem-gate row understates it ~4x
+because mem_bench's ingest_batched skips the byte budget - wiring goes into
+#258), #259 (test-only oracle-order pin), #260 (B6 tier 3: streaming build
++ row-id-ordered scan plan with verified-disjoint live ranges and a counted
+fallback, rowmap_scan_fallbacks(); sorted fragments alone proven
+insufficient; a store compacted while disordered keeps the fallback
+forever - tracked in #257). Open: #256 (refresh reconciling the stamp
+collision with #252), #258 (bench-lane scenarios, record-only, plus the
+ingest_batched budget fix and a partial-embed rowmap scenario). CI note:
+windows-verify died repo-wide on 2026-09-16 ~17:30Z (kache k27 prefix
+outgrew the runner disk); #244 resolved it by rotating prefixes to k31 (see
+docs/plans/2609-16-ci-nix-toolchain-revamp.md). The #245 closing sweep
+must build BOTH sides (44886ce baseline and final main) under 1.98, run
+both the mem gate and the read/write `moon run repo:bench-gate` (never run
+for these storage-path PRs), check read latency on a store ingested under
+#252 and not optimized (messages 1->9 fragments at 200k messages), and
+re-record mem-gate baseline rows on 1.98 in one commit.
+
 - Streaming rowmap build (#61 names the blocker: dict indexes borrow into
   `entries`; own the dict keys up front). Target peak ~400 MB. 1-2 weeks.
+  -> superseded by measurement: B6/PR #255 landed tiers 1-2 from main; the
+  497->~110-150 MiB path is tier 3 (design in the B6 report).
 - Shared daemon + thin stdio shim per session. Architectural; sequenced last -
   B1-B4 shrink what each per-session process costs, which may soften it.
 - `oom_score_adj` documentation/drop-in (+200 confirmed correct on two
