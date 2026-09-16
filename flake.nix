@@ -55,12 +55,12 @@
         rcodesign = "0.29.0";
         gh = "2.100.0";
         macosSdk = "15.5";
-        moon = "2.5.4";
+        moon = "2.5.5";
         protoc = "36.1";
         uv = "0.12.13";
         node = "24.21.0";
         npm = "11.19.1";
-        kache = "0.21.0";
+        kache = "0.22.0";
       };
 
       v = toolVersions;
@@ -70,15 +70,15 @@
         moon = {
           x86_64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-x86_64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-uqbwzaj+nXUT/+uykIz9lSiIxmZZt5XaAqFO8hVutcc=";
+            hash = "sha256-85cFeiLIj/nksopKL78B2Z9Nmk815aQmNCVan1Ccy9Y=";
           };
           aarch64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-Up4z5tyBKw3oJA+mNpg6Z2UFzCZtNGM3H/+tk6EfVMY=";
+            hash = "sha256-OdVeiHdGdxgdGvNWbEzNKZTNLZ2BmfzzDcLW3vwFrHg=";
           };
           aarch64-darwin = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-apple-darwin.tar.xz";
-            hash = "sha256-xOD0H0P4BTO+QSCReFjKaOHWUGM3XeAIiII0LkU2aGc=";
+            hash = "sha256-yQljcRtwYJ2jmMG+juNrTPL2FnxexT9IbYvZuqVupXg=";
           };
         };
         protoc = {
@@ -126,15 +126,15 @@
         kache = {
           x86_64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-x86_64-unknown-linux-musl.tar.gz";
-            hash = "sha256-Y1S7dkFL5o+PkGIGyHwTlOW3n968s6nTHiJU3frcKCA=";
+            hash = "sha256-XjBmx+LyeSz0o2XSs66fUHeozSDSFjm5QiibIm5kkoo=";
           };
           aarch64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-unknown-linux-musl.tar.gz";
-            hash = "sha256-fIsOcYsEDybDWkNe7h298urUKvhSmxO+fKzJf1vI3sQ=";
+            hash = "sha256-XJXOGfXhJ39J/bdj9OiVlPL6FqrY5A+FkkgHvJs3+Xc=";
           };
           aarch64-darwin = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-apple-darwin.tar.gz";
-            hash = "sha256-GUaUMOTH8ai8xWHCjBX9SH0ytR68Yski1x7n3iHwYPA=";
+            hash = "sha256-WUg2Nyyr1K1qc4iPtBiWr1yT8W3uqMGwXATAaqnwoQI=";
           };
         };
         # npm is one tarball for every platform. node bundles an older npm than
