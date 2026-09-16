@@ -15,10 +15,13 @@
 # high-water mark, so two scenarios in one process cannot be told apart.
 #
 # --check compares peak_rss_kb and peak_heap_bytes only, and only for the
-# scenarios NOT listed in RECORD_ONLY below. The latency, throughput, retention
-# and fragment fields are ungated everywhere: phase 1 accumulates their spread
-# across runs, phase 2 derives thresholds from the median/IQR of what landed
-# here.
+# scenarios NOT listed in RECORD_ONLY below. The one exception is
+# scan_fallbacks, judged on every scenario that reports it: it is a count of
+# cold rowmap builds that fell off the streaming path, so any increase over the
+# committed row fails even in record-only mode. The latency, throughput,
+# retention and fragment fields are ungated everywhere: phase 1 accumulates
+# their spread across runs, phase 2 derives thresholds from the median/IQR of
+# what landed here.
 #
 #   ops/scripts/mem-gate.sh                     # ci corpus, all scenarios
 #   ops/scripts/mem-gate.sh --profile large     # 1M+ message corpus
@@ -35,7 +38,7 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --profile=*) PROFILE="${1#*=}"; shift ;;
     --check) CHECK=1; shift ;;
-    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -48,9 +51,8 @@ SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-q
 # ingest-throughput's) is far wider than any regression worth catching - a
 # threshold here would only teach people to ignore the gate. Phase 2 promotes a
 # scenario by deleting it from this list once its committed rows say what
-# "normal" is. rowmap-build-cold-partial-embed is here for the same reason, but
-# still gates in both modes: the bench itself exits nonzero if the cold build
-# falls back off the streaming path.
+# "normal" is. rowmap-build-cold-partial-embed is here for its memory numbers
+# only - its scan_fallbacks count is judged above like every other scenario's.
 #
 # `-` and not `:-`, so `RECORD_ONLY=` on the command line means "gate every
 # scenario" - the way to rehearse a promotion before editing this line.
@@ -151,6 +153,11 @@ baseline, profile, tmp, pct = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.a
 scenarios, host = sys.argv[5].split(), sys.argv[6]
 record_only = set(sys.argv[7].split())
 METRICS = ("peak_rss_kb", "peak_heap_bytes")
+# Judged on every scenario, record-only included, and as an absolute count
+# rather than a percentage: a cold rowmap build that stops streaming is a
+# cliff (it re-encodes the whole corpus through the sorting build), and the
+# scenarios that report it exist to catch exactly that.
+COUNTERS = ("scan_fallbacks",)
 try:
     rows = [json.loads(line) for line in open(baseline) if line.strip()]
 except FileNotFoundError:
@@ -168,6 +175,15 @@ for scenario in scenarios:
         and r.get("host") == host
     ]
     print(f"\n[{scenario}] {profile} on {host}")
+    for key in COUNTERS:
+        now = fresh.get(key)
+        before = same[-1].get(key) if same else None
+        if not isinstance(now, int) or not isinstance(before, int):
+            continue
+        verdict = "FAIL" if now > before else "ok"
+        if now > before:
+            failed = True
+        print(f"  {verdict:<4} {key:<18} {before:>14} -> {now:<14}")
     if scenario in record_only:
         # Printed with its delta, never judged: this scenario is accumulating
         # spread, and the delta is what phase 2 reads to decide it has enough.

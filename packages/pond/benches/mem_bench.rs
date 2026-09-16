@@ -17,13 +17,15 @@
 //! | `ingest-throughput`   | N synthetic sessions into a fresh store         | write throughput drift (record-only) |
 //! | `serve-sync-retention`| serve-like prewarm + sync, then a settling pause | a map or buffer pinned after sync ends |
 //! | `sync-under-contention`| sync while the rowmap build lock is held       | the trailing-oracle path's cost |
-//! | `rowmap-build-cold-partial-embed` | cold build after scattered embed windows | a fall back off the streaming build (fails the run) |
+//! | `rowmap-build-cold-partial-embed` | cold build after scattered embed windows | a cold build that stops streaming (`scan_fallbacks`) |
 //!
 //! The last five are RECORD-ONLY: they run in the gate and append rows, but
-//! `mem-gate.sh --check` judges none of their numbers - peak RSS and peak heap
-//! included - because the script's `RECORD_ONLY` list carves them out. Phase 1
-//! gathers the spread; phase 2 derives a threshold from the committed rows'
-//! median/IQR and promotes a scenario by dropping it from that list.
+//! `mem-gate.sh --check` judges none of their *memory* numbers - peak RSS and
+//! peak heap included - because the script's `RECORD_ONLY` list carves them
+//! out. Phase 1 gathers the spread; phase 2 derives a threshold from the
+//! committed rows' median/IQR and promotes a scenario by dropping it from that
+//! list. `scan_fallbacks` is exempt from all of that: it is a count, not a
+//! measurement, and the gate fails on any increase.
 //!
 //! Heap numbers need `--features mem-probe` (the counting allocator); without
 //! it the row still carries wall time and the scenario detail, with null memory
@@ -1023,26 +1025,34 @@ async fn scenario_serve_sync_retention(corpus: &Corpus) -> Result<(Readings, Val
     ))
 }
 
-/// Every Nth corpus fragment gets an embed window in the partial-embed
-/// scenario, so the rewritten fragments are spread across the whole store.
+/// Every Nth fragment gets an embed window in the partial-embed scenario, so
+/// the rewritten fragments are spread across the whole store.
 const PARTIAL_EMBED_FRAGMENT_STRIDE: usize = 5;
+
+/// Rows per `merge_update`, mirroring `embed::DEFAULT_SORT_WINDOW` - the size
+/// `EmbedWorker::drain_window` actually writes in.
+const PARTIAL_EMBED_WINDOW: usize = 2048;
 
 /// Record-only cold build over a partially embedded store: the shape that took
 /// the unordered fallback before #260. An embed pass writes one
 /// `merge_update` per window (`embed.rs` `drain_window`), and each rewrite
 /// appends a fragment holding *lower* row ids than the fragments after it. So
-/// the setup embeds the first half of every Nth fragment, each as its own
-/// window, then the measured region is a cold `ensure_rowmap`.
+/// the setup embeds a window at the head of every Nth fragment, each as its own
+/// `merge_update`, then the measured region is a cold `ensure_rowmap`.
 ///
 /// The cached corpus is compacted into one `messages` fragment, where only the
 /// ends can be rewritten without splitting its live ids, so the setup ingests
 /// the profile's sessions into a fresh store instead: one fragment per
 /// production flush, the layout a store has before its first compaction.
 ///
-/// Fails loudly if `rowmap_scan_fallbacks()` moves: a change that loses the
-/// fragment-order plan would otherwise just look like a slower row. One
-/// `merge_update` spanning several fragments is out of scope on purpose: its
-/// live ids interleave, no plan exists for it, and that fallback is by design.
+/// `scan_fallbacks` is the row's assertion, and it is the gate that judges it
+/// (`mem-gate.sh --check` fails on any increase over the committed row) because
+/// whether this shape is plannable at all depends on the store's size:
+/// `merge_update` returns the rewritten rows in row-id order on a small store
+/// but not on a large one (measured on this corpus: ordered at 120k rows,
+/// scrambled at 160k), and a fragment whose own live ids do not ascend has no
+/// plan by construction. So the ci row records a streamed build and the large
+/// row records the fallback, and either one moving the wrong way fails.
 async fn scenario_rowmap_build_cold_partial_embed(profile: Profile) -> Result<(Probe, Value)> {
     let scratch = tempfile::tempdir().context("scratch store dir")?;
     let cache = tempfile::tempdir().context("scratch rowmap cache")?;
@@ -1068,7 +1078,8 @@ async fn scenario_rowmap_build_cold_partial_embed(profile: Profile) -> Result<(P
         let (mut windows, mut embedded_rows, mut first_row) = (0usize, 0usize, 0usize);
         for (ordinal, rows) in fragment_rows.iter().enumerate() {
             if ordinal % PARTIAL_EMBED_FRAGMENT_STRIDE == 0 && *rows > 1 {
-                let window: Vec<EmbeddedMessage> = (first_row..first_row + rows / 2)
+                let span = PARTIAL_EMBED_WINDOW.min(*rows);
+                let window: Vec<EmbeddedMessage> = (first_row..first_row + span)
                     .map(|row| {
                         let session = session_id(row / messages);
                         EmbeddedMessage {
@@ -1103,12 +1114,7 @@ async fn scenario_rowmap_build_cold_partial_embed(profile: Profile) -> Result<(P
     let probe = Probe::begin();
     store.ensure_rowmap(cache.path()).await?;
     let fallbacks = rowmap_scan_fallbacks() - fallbacks_before;
-    if fallbacks != 0 {
-        bail!(
-            "rowmap-build-cold-partial-embed fell back off the streaming build {fallbacks} time(s); \
-             the fragment-order plan no longer covers a windowed embed backfill"
-        );
-    }
+    // Whichever path ran, the map it published has to describe the whole store.
     let entries = store.rowmap_snapshot().map_or(0, |set| set.len());
     if entries != messages_in_store {
         bail!("rowmap holds {entries} entries for {messages_in_store} messages");
@@ -1297,6 +1303,9 @@ async fn main() -> Result<()> {
         "latency_p95_ms": detail.get("latency_p95_ms").cloned(),
         "latency_max_ms": detail.get("latency_max_ms").cloned(),
         "throughput_rows_per_s": detail.get("throughput_rows_per_s").cloned(),
+        // Judged by `mem-gate.sh --check` on every scenario, record-only ones
+        // included: a cold build that stops streaming is a cliff, not a drift.
+        "scan_fallbacks": detail.get("scan_fallbacks").cloned(),
         "frag_count": detail.get("frag_count").cloned(),
         "data_file_bytes": detail.get("data_file_bytes").cloned(),
         "detail": detail,
