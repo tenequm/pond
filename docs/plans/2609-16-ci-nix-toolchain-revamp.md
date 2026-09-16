@@ -2,7 +2,7 @@
 
 Date: 2026-09-16. Owner: tenequm. Status: in flight - see the phase table in §4
 for where each phase sits. Phases 1-3 are in PR #264, phase 4 in PR #262, and
-phase 5's repo half is in the PR stacked on #262; phase 5's ops half - the
+phase 5's repo half is in PR #265 (stacked on #262); phase 5's ops half - the
 stripped runner image and the /nix store volume - has to be deployed before any
 of it can go green, and phase 6 is untouched.
 Companion: the runner and cluster side (image, store volume, cold-start tuning,
@@ -252,7 +252,7 @@ The rationale and trust analysis live with the ops-side plan.
 | 2 | kache 0.22.0 (rides the rust-1.98 PR) | none (hygiene; k31 stays) | PR #264 |
 | 3 | moon 2.5.5; `moon ci` for build-and-test; versionless toolchains + `rust: {}` + `/flake.lock` input | hit-path 10-15s shrinks; OS-keyed hashes unblock remote reads for devs | PR #264, minus node/npm - they stay pinned until the devshell supplies them |
 | 4 | Flake toolchain + `toolVersions` + Windows text-extraction + parity check; `.envrc` | single pin source; local UX/AX wins immediately | PR #262 |
-| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in the PR stacked on #262; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache is read-only so far, pushing deferred |
+| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in PR #265, stacked on #262; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache is read-only so far, pushing deferred |
 | 6 | Local kache preserve-incremental; moon `localReadOnly` + shared worktree cache | dep-compile hits locally; agents reuse CI results | not started |
 
 Phases 1-3 are independent of Nix entirely. Phase 5 is the only one touching
