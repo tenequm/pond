@@ -40,7 +40,7 @@ use pond::{
     PROTOCOL_VERSION,
     adapter::{
         Adapter, AdapterYield, AdapterYieldStream, DiscoverFuture, SkipOracle, SkipReason,
-        is_session_fresh,
+        extract_self_str, is_session_fresh,
     },
     config::SearchConfig,
     embed::LazyEmbedder,
@@ -106,9 +106,6 @@ mod memprobe {
     impl RssSampler {
         pub fn start(_interval: Duration) -> Self {
             Self
-        }
-        pub fn current_kb(&self) -> u64 {
-            0
         }
         pub fn finish(self) -> u64 {
             0
@@ -247,7 +244,7 @@ fn session_events(index: usize, messages: usize) -> Vec<IngestEvent> {
         parent_message_id: None,
         source_agent: "claude-code".to_owned(),
         created_at: created,
-        project: pond::adapter::extract_str(&json!({"x": "/tmp/membench"}), "x").unwrap(),
+        project: extract_self_str(&Value::String("/tmp/membench".to_owned())).unwrap(),
         options: ProviderOptions::new(),
     }));
     for m in 0..messages {
@@ -269,7 +266,7 @@ fn session_events(index: usize, messages: usize) -> Vec<IngestEvent> {
             provenance: Provenance::Conversational,
             options: ProviderOptions::new(),
             kind: PartKind::Text {
-                text: pond::adapter::extract_str(&json!({ "x": text }), "x"),
+                text: extract_self_str(&Value::String(text)),
             },
         };
         events.push(IngestEvent::Message(message));
@@ -477,7 +474,6 @@ impl Probe {
 
     fn finish(self) -> Readings {
         let wall_ms = self.started.elapsed().as_millis() as u64;
-        let end_rss_kb = self.sampler.current_kb();
         let sampled_peak_kb = self.sampler.finish();
         let heap = memprobe::heap_stats();
         let rss = memprobe::rss();
@@ -497,10 +493,7 @@ impl Probe {
             }
             .filter(|kb| *kb > 0),
             vm_hwm_kb: rss.map(|r| r.vm_hwm_kb),
-            end_rss_kb: rss
-                .map(|r| r.vm_rss_kb)
-                .or(Some(end_rss_kb))
-                .filter(|kb| *kb > 0),
+            end_rss_kb: rss.map(|r| r.vm_rss_kb).filter(|kb| *kb > 0),
             rss_anon_end_kb: rss.map(|r| r.rss_anon_kb),
             ru_maxrss_kb,
             hwm_reset: self.hwm_reset,
@@ -553,14 +546,14 @@ fn retained_bytes() -> Option<f64> {
     memprobe::rss().map(|r| (r.vm_rss_kb * 1024) as f64)
 }
 
-async fn scenario_sync_noop(corpus: &Corpus, probe: &mut Option<Probe>) -> Result<Value> {
+async fn scenario_sync_noop(corpus: &Corpus) -> Result<(Probe, Value)> {
     let store = corpus.open().await?;
     let cache = tempfile::tempdir().context("scratch rowmap cache")?;
     let adapter = SyntheticAdapter {
         sessions: corpus.profile.sessions,
         messages: corpus.profile.messages,
     };
-    *probe = Some(Probe::begin());
+    let probe = Probe::begin();
     // The oracle build is part of the measured region on purpose: `pond sync`
     // pays for it before reading a single source, and the full rowmap rebuild
     // is the prime suspect behind the 3.8 GB no-op spike (plan, Phase 0).
@@ -579,16 +572,19 @@ async fn scenario_sync_noop(corpus: &Corpus, probe: &mut Option<Probe>) -> Resul
             corpus.dir.display(),
         );
     }
-    Ok(json!({
-        "sessions": corpus.profile.sessions,
-        "messages_per_session": corpus.profile.messages,
-        "oracle_present": oracle.0.is_some(),
-        "inserted": summary.inserted,
-        "matched": summary.matched,
-    }))
+    Ok((
+        probe,
+        json!({
+            "sessions": corpus.profile.sessions,
+            "messages_per_session": corpus.profile.messages,
+            "oracle_present": oracle.0.is_some(),
+            "inserted": summary.inserted,
+            "matched": summary.matched,
+        }),
+    ))
 }
 
-async fn scenario_sync_incremental(corpus: &Corpus, probe: &mut Option<Probe>) -> Result<Value> {
+async fn scenario_sync_incremental(corpus: &Corpus) -> Result<(Probe, Value)> {
     let scratch = corpus.copy_to_temp()?;
     let store = Store::open_local(scratch.path()).await?;
     let cache = tempfile::tempdir().context("scratch rowmap cache")?;
@@ -598,7 +594,7 @@ async fn scenario_sync_incremental(corpus: &Corpus, probe: &mut Option<Probe>) -
         sessions: corpus.profile.sessions + 1,
         messages: corpus.profile.messages,
     };
-    *probe = Some(Probe::begin());
+    let probe = Probe::begin();
     store.ensure_rowmap(cache.path()).await?;
     let oracle = RowmapOracle(store.rowmap_snapshot());
     let summary =
@@ -611,31 +607,33 @@ async fn scenario_sync_incremental(corpus: &Corpus, probe: &mut Option<Probe>) -
         index_fold_row_threshold: 0,
     };
     store.optimize_indices(None, &policy).await?;
-    Ok(json!({
-        "sessions": corpus.profile.sessions + 1,
-        "messages_per_session": corpus.profile.messages,
-        "inserted": summary.inserted,
-        "matched": summary.matched,
-    }))
+    Ok((
+        probe,
+        json!({
+            "sessions": corpus.profile.sessions + 1,
+            "messages_per_session": corpus.profile.messages,
+            "inserted": summary.inserted,
+            "matched": summary.matched,
+        }),
+    ))
 }
 
-async fn scenario_rowmap_build_cold(corpus: &Corpus, probe: &mut Option<Probe>) -> Result<Value> {
+async fn scenario_rowmap_build_cold(corpus: &Corpus) -> Result<(Probe, Value)> {
     let store = corpus.open().await?;
     let cache = tempfile::tempdir().context("scratch rowmap cache")?;
-    *probe = Some(Probe::begin());
+    let probe = Probe::begin();
     store.ensure_rowmap(cache.path()).await?;
     let entries = store.rowmap_snapshot().map_or(0, |set| set.len());
-    Ok(json!({
-        "rowmap_entries": entries,
-        "sessions": corpus.profile.sessions,
-    }))
+    Ok((
+        probe,
+        json!({
+            "rowmap_entries": entries,
+            "sessions": corpus.profile.sessions,
+        }),
+    ))
 }
 
-async fn scenario_mcp_query_growth(
-    corpus: &Corpus,
-    iterations: usize,
-    probe: &mut Option<Probe>,
-) -> Result<Value> {
+async fn scenario_mcp_query_growth(corpus: &Corpus, iterations: usize) -> Result<(Probe, Value)> {
     let store = corpus.open().await?;
     let cache = tempfile::tempdir().context("scratch rowmap cache")?;
     // `pond mcp` builds the rowmap at startup; the ratchet under measurement is
@@ -646,7 +644,7 @@ async fn scenario_mcp_query_growth(
     let sessions = corpus.profile.sessions;
     let messages = corpus.profile.messages;
 
-    *probe = Some(Probe::begin());
+    let probe = Probe::begin();
     let mut retained: Vec<f64> = Vec::with_capacity(iterations);
     for i in 0..iterations {
         let request = SearchRequest {
@@ -688,14 +686,26 @@ async fn scenario_mcp_query_growth(
             bail!("get_message failed: {error:?}");
         }
 
-        // Mirror the MCP tool: `Tables` is rebuilt per call (the dataset
-        // freshness gates), the query runs read-only on a fresh SessionContext.
-        let tables = Tables {
-            sessions: Some(store.dataset(Table::Sessions).await?),
-            messages: Some(store.dataset(Table::Messages).await?),
-            parts: Some(store.dataset(Table::Parts).await?),
-        };
+        // Mirror the MCP tool (transport.rs `pond_sql`): `Tables` is rebuilt per
+        // call (the dataset freshness gates), only the tables the query names
+        // are opened, and the query runs read-only on a fresh SessionContext.
+        // Opening all three would charge the row for `parts.lance` retention the
+        // real path never pays.
         let query = SQL_QUERIES[i % SQL_QUERIES.len()];
+        let tables = Tables {
+            sessions: match sql::mentions_table(query, "sessions") {
+                true => Some(store.dataset(Table::Sessions).await?),
+                false => None,
+            },
+            messages: match sql::mentions_table(query, "messages") {
+                true => Some(store.dataset(Table::Messages).await?),
+                false => None,
+            },
+            parts: match sql::mentions_table(query, "parts") {
+                true => Some(store.dataset(Table::Parts).await?),
+                false => None,
+            },
+        };
         sql::run(&tables, query, Mode::Inline, sql::DEFAULT_INLINE_ROWS, None)
             .await
             .map_err(|error| anyhow::anyhow!("sql {query:?} failed: {error:?}"))?;
@@ -708,24 +718,34 @@ async fn scenario_mcp_query_growth(
     // The first iterations pay one-off warmup (index pages, DataFusion
     // metadata); the ratchet is what the steady state keeps adding.
     let warmup = (iterations / 4).max(1).min(retained.len());
-    let steady = &retained[warmup.min(retained.len())..];
-    Ok(json!({
-        "iterations": iterations,
-        "warmup_iterations": warmup,
-        "retained_series_bytes": retained.iter().map(|v| *v as u64).collect::<Vec<_>>(),
-        "growth_slope_bytes_per_iter": slope_per_iter(steady).round() as i64,
-    }))
+    let steady = &retained[warmup..];
+    Ok((
+        probe,
+        json!({
+            "iterations": iterations,
+            "warmup_iterations": warmup,
+            "retained_series_bytes": retained.iter().map(|v| *v as u64).collect::<Vec<_>>(),
+            "growth_slope_bytes_per_iter": slope_per_iter(steady).round() as i64,
+        }),
+    ))
 }
 
-async fn scenario_ingest_large_session(steps: usize, probe: &mut Option<Probe>) -> Result<Value> {
+async fn scenario_ingest_large_session(steps: usize) -> Result<(Probe, Value)> {
     let temp = tempfile::tempdir().context("scratch store dir")?;
     let store = Store::open_local(temp.path()).await?;
-    *probe = Some(Probe::begin());
     // One session with `steps` messages: the flush batch is bounded by session
     // count, not bytes (#229), so a single huge session is the worst shape.
-    ingest_batched(&store, std::iter::once(session_events(0, steps))).await?;
+    // Generated before the probe starts, like the cached corpus is: `steps` is
+    // up to 200k, and counting the generator's own allocations would swamp the
+    // ingest peak this row exists to measure.
+    let events = session_events(0, steps);
+    let probe = Probe::begin();
+    ingest_batched(&store, std::iter::once(events)).await?;
     let (_, messages, _) = store.row_counts().await?;
-    Ok(json!({ "steps": steps, "messages_written": messages }))
+    Ok((
+        probe,
+        json!({ "steps": steps, "messages_written": messages }),
+    ))
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -748,34 +768,30 @@ async fn main() -> Result<()> {
 
     let iterations = args.iterations.unwrap_or(profile.iterations);
     let steps = args.steps.unwrap_or(profile.steps);
-    let mut probe: Option<Probe> = None;
-    let detail = match scenario.as_str() {
+    let (probe, detail) = match scenario.as_str() {
         "sync-noop-local" => {
             corpus.require_ready()?;
-            scenario_sync_noop(&corpus, &mut probe).await?
+            scenario_sync_noop(&corpus).await?
         }
         "sync-incremental" => {
             corpus.require_ready()?;
-            scenario_sync_incremental(&corpus, &mut probe).await?
+            scenario_sync_incremental(&corpus).await?
         }
         "rowmap-build-cold" => {
             corpus.require_ready()?;
-            scenario_rowmap_build_cold(&corpus, &mut probe).await?
+            scenario_rowmap_build_cold(&corpus).await?
         }
         "mcp-query-growth" => {
             corpus.require_ready()?;
-            scenario_mcp_query_growth(&corpus, iterations, &mut probe).await?
+            scenario_mcp_query_growth(&corpus, iterations).await?
         }
-        "ingest-large-session" => scenario_ingest_large_session(steps, &mut probe).await?,
+        "ingest-large-session" => scenario_ingest_large_session(steps).await?,
         other => bail!(
             "unknown scenario {other:?}; expected sync-noop-local|sync-incremental|\
              rowmap-build-cold|mcp-query-growth|ingest-large-session"
         ),
     };
-    let readings = probe
-        .take()
-        .context("scenario never started its probe")?
-        .finish();
+    let readings = probe.finish();
 
     let row = json!({
         "scenario": scenario,

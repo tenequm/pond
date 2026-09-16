@@ -9,7 +9,10 @@
 //!   * RSS (Linux): `VmRSS`/`VmHWM`/`RssAnon` from `/proc/self/status`, plus
 //!     `ru_maxrss` via `getrusage` everywhere else. The heap-vs-RSS gap IS the
 //!     allocator-retention signal (#61: ~636 MiB freed-but-retained).
-//!   * a 200 ms sampler, so a scenario can tell one spike from monotonic growth.
+//!   * a 200 ms sampler, so a peak is caught even between explicit reads.
+//!
+//! Counting every allocation costs three atomic RMWs per `alloc`, so wall time
+//! measured under `mem-probe` is not comparable to an uninstrumented run.
 //!
 //! macOS `phys_footprint` probes stay in `benches/serve_mem_bench.rs` for now;
 //! docs/plans/2609-16-memory-instrumentation.md moves them here in hardening.
@@ -236,12 +239,11 @@ pub fn ru_maxrss_kb() -> Option<u64> {
     None
 }
 
-/// Background `VmRSS` sampler. Keeps the running max and the full series, so a
-/// scenario can report a peak AND show whether the curve is a spike or a ramp.
+/// Background `VmRSS` sampler, keeping the running max. It backstops `VmHWM`
+/// where the kernel watermark is unavailable; the sampler itself allocates, so
+/// it deliberately keeps no per-sample series.
 pub struct RssSampler {
     peak_kb: Arc<AtomicU64>,
-    current_kb: Arc<AtomicU64>,
-    series: Arc<std::sync::Mutex<Vec<u64>>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -250,24 +252,13 @@ impl RssSampler {
     #[must_use]
     pub fn start(interval: Duration) -> Self {
         let peak_kb = Arc::new(AtomicU64::new(0));
-        let current_kb = Arc::new(AtomicU64::new(0));
-        let series = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
-            let (peak, current, series, stop) = (
-                Arc::clone(&peak_kb),
-                Arc::clone(&current_kb),
-                Arc::clone(&series),
-                Arc::clone(&stop),
-            );
+            let (peak, stop) = (Arc::clone(&peak_kb), Arc::clone(&stop));
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     if let Some(kb) = current_rss_kb() {
-                        current.store(kb, Ordering::Relaxed);
                         peak.fetch_max(kb, Ordering::Relaxed);
-                        if let Ok(mut series) = series.lock() {
-                            series.push(kb);
-                        }
                     }
                     thread::sleep(interval);
                 }
@@ -275,27 +266,9 @@ impl RssSampler {
         };
         Self {
             peak_kb,
-            current_kb,
-            series,
             stop,
             handle: Some(handle),
         }
-    }
-
-    #[must_use]
-    pub fn current_kb(&self) -> u64 {
-        self.current_kb.load(Ordering::Relaxed)
-    }
-
-    #[must_use]
-    pub fn peak_kb(&self) -> u64 {
-        self.peak_kb.load(Ordering::Relaxed)
-    }
-
-    /// Every sample taken so far, oldest first.
-    #[must_use]
-    pub fn series(&self) -> Vec<u64> {
-        self.series.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Stop the thread and return the peak.
