@@ -69,9 +69,13 @@ tasks:
     inputs:
       - 'packages/pond/src/**/*'
       - 'packages/pond/benches/mem_bench.rs'
+      - 'packages/pond/build.rs'
       - 'packages/pond/Cargo.toml'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # A toolchain bump changes codegen and with it what the row measures; omit
+      # it and moon replays a cached pass over a different compiler.
+      - 'rust-toolchain.toml'
       - 'ops/scripts/mem-gate.sh'
       - 'docs/benchmarks/mem-gate-baseline.jsonl'
     options:

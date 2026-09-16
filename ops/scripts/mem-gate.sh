@@ -71,14 +71,15 @@ echo "binary: $BENCH_BIN"
 echo "--- corpus ---"
 "$BENCH_BIN" --prepare --profile "$PROFILE"
 
-# A dirty tree means the measured binary may not match the named commit; the
-# baseline this script appends to never affects the binary, so exclude it.
-COMMIT="$(git rev-parse --short HEAD)"
-if [ -n "$(git status --porcelain -- ":!$BASELINE")" ]; then COMMIT="$COMMIT-dirty"; fi
-DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 HOST_TAG="${MEM_GATE_HOST:-$(uname -s)-$(uname -m)}"
 
+# Only append mode stamps a row, so only it needs the commit tag. A dirty tree
+# means the measured binary may not match the named commit; the baseline this
+# script appends to never affects the binary, so exclude it.
 if [ "$CHECK" = 0 ]; then
+  COMMIT="$(git rev-parse --short HEAD)"
+  if [ -n "$(git status --porcelain -- ":!$BASELINE")" ]; then COMMIT="$COMMIT-dirty"; fi
+  DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   mkdir -p "$(dirname "$BASELINE")"
   touch "$BASELINE"
 fi
@@ -124,10 +125,10 @@ done
 
 if [ "$CHECK" = 1 ]; then
   echo "--- check vs committed baseline (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
-  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" <<'EOF'
+  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" <<'EOF'
 import json, os, sys
 baseline, profile, tmp, pct = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
-scenarios = sys.argv[5].split()
+scenarios, host = sys.argv[5].split(), sys.argv[6]
 METRICS = ("peak_rss_kb", "peak_heap_bytes")
 try:
     rows = [json.loads(line) for line in open(baseline) if line.strip()]
@@ -136,10 +137,18 @@ except FileNotFoundError:
 failed = False
 for scenario in scenarios:
     fresh = json.load(open(os.path.join(tmp, scenario + ".json")))
-    same = [r for r in rows if r.get("scenario") == scenario and r.get("profile") == profile]
-    print(f"\n[{scenario}] {profile}")
+    # Host-scoped: peak RSS is a property of the machine as much as the code, so
+    # a row from another box is not a threshold this one can be held to.
+    same = [
+        r
+        for r in rows
+        if r.get("scenario") == scenario
+        and r.get("profile") == profile
+        and r.get("host") == host
+    ]
+    print(f"\n[{scenario}] {profile} on {host}")
     if not same:
-        print("  FAIL: no committed baseline row - run ops/scripts/mem-gate.sh locally and commit the baseline")
+        print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
         failed = True
         continue
     prev = same[-1]

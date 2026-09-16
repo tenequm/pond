@@ -15,8 +15,14 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 SCENARIO="${1:-}"
-TOOL="${2:-heaptrack}"
-shift $(( $# > 2 ? 2 : $# ))
+[ $# -gt 0 ] && shift
+# The tool is optional and positional, so only a bare second word is one - a
+# flag there means the tool was omitted (`<scenario> --profile large`).
+TOOL=heaptrack
+case "${1:-}" in
+  -*|'') ;;
+  *) TOOL="$1"; shift ;;
+esac
 CORPUS_PROFILE=ci
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -27,7 +33,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$SCENARIO" ]; then
-  sed -n '2,15p' "$0"
+  sed -n '2,13p' "$0"
   exit 2
 fi
 
