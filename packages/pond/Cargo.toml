@@ -98,6 +98,9 @@ comfy-table = "7"
 # fail inside cliclack prompts, so cancellation flows through the same
 # `outro_cancel` path as Esc instead of killing the process in raw mode.
 ctrlc = "3"
+# Allocation-site heap profiling for the `dhat-heap` feature (`mem_bench` under
+# `ops/scripts/profile-mem.sh`). Optional: never compiled in a normal build.
+dhat = { version = "0.3.3", optional = true }
 human-panic = { version = "2", default-features = false }
 # Embedding stack for `intfloat/multilingual-e5-small`: candle XLM-RoBERTa
 # FP16 on Metal (macOS) / CUDA (`--features cuda`) / CPU. `LazyEmbedder`
@@ -226,6 +229,13 @@ windows-launcher = []
 # per query. Never enabled for release builds; `read_iops`/`read_bytes` are
 # tracked without it, only the per-request path list needs `test-util`.
 io-trace = ["lance-io/test-util"]
+# Memory instrumentation for `mem_bench` / `ops/scripts/mem-gate.sh` (#245):
+# counting global allocator + RSS probes in `src/memprobe.rs`. Off in every
+# shipped build - the allocator item only exists under this feature.
+mem-probe = []
+# Allocation-site attribution for the same scenarios (`profile-mem.sh <s> dhat`).
+# Mutually exclusive with mem-probe: both install a #[global_allocator].
+dhat-heap = ["dep:dhat"]
 
 # Windows application manifest, embedded by build.rs. Not gated to a Windows
 # host: build-dependency cfgs select on the HOST, while the manifest is a
@@ -325,6 +335,10 @@ harness = false
 
 [[bench]]
 name = "fmindex_probe"
+harness = false
+
+[[bench]]
+name = "mem_bench"
 harness = false
 
 [lints.rust]

@@ -48,6 +48,8 @@ mod sql;
 mod store_concurrency;
 #[path = "integration/sync.rs"]
 mod sync;
+#[path = "integration/sync_cursor.rs"]
+mod sync_cursor;
 #[path = "integration/transport_http.rs"]
 mod transport_http;
 #[path = "integration/transport_mcp.rs"]

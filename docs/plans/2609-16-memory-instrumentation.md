@@ -29,23 +29,64 @@ run on a memory number. That is how the regressions reached 0.17.x releases.
 A key attribution lead found while writing this plan: `cap_serve_io_buffer`
 (`main.rs`) caps Lance's `LANCE_DEFAULT_IO_BUFFER_SIZE` (default 2 GiB) to
 256 MiB **only in serve/mcp**; `sync`/`copy` deliberately keep the default.
-That exactly predicts deployment B's 3.8 GB no-op sync against a fast local
+That seemed to predict deployment B's 3.8 GB no-op sync against a fast local
 Lance dir vs deployment C's 243 MB no-op sync against the same store accessed
-remotely (the network throttles readahead; local IO fills it).
+remotely. **Phase 0 tested it (results below): not confirmed as the dominant
+factor** - the cap trims the warm-path peak ~16% (207 -> 173 MB) and even the
+cold full re-read peaks at 738 MB, nowhere near 3.8 GB. The prime suspects
+for the spike are now (a) a full rowmap rebuild (`collect_row_metas`
+materializing all ~3.84M `RowMetaEntry` in one Vec) fired because the cached
+chain was invalid or lock-contended at that moment, and (b) allocator
+behavior under the extreme memory pressure the host was already in.
 
 ## 2. Phases and tracks
 
-### Phase 0 - zero-code experiment (operator, minutes)
+Status 2026-09-16: plan committed to main; B2/B3/B4 launched as parallel
+worktree agents; Phase 0 done (below) - B1 demoted to a cheap bound, B5 added
+from Phase 0's bonus finding; track A starting.
 
-On deployment B, which reproduces the spike on every run:
+### Phase 0 - zero-code experiment (DONE 2026-09-16, hypothesis not confirmed)
+
+On deployment B (pond 0.17.3, s3+https Hetzner store, 19,461 sessions /
+3,842,164 messages, the host with the 3.8 GB no-op sync on 09-15):
 
 ```sh
-LANCE_DEFAULT_IO_BUFFER_SIZE=268435456 /usr/bin/time -v pond sync -q --no-wait 2>&1 | grep Maximum
+LANCE_DEFAULT_IO_BUFFER_SIZE=268435456 /usr/bin/time -v pond sync --no-wait
 ```
 
-If peak RSS collapses (~4 GB -> hundreds of MB), fix B1 is confirmed as a
-config-level bound. If it does not move, B1's premise dies before any code is
-written. Result feeds B1's launch decision.
+| # | Path | IO buffer cap | Wall | Peak RSS | FS inputs |
+|---|---|---|---|---|---|
+| 1 control, cold | `first sync from this host` full re-read; +0 sessions, +3 msgs | none (Lance default) | 74.4 s | **738 MB** | 115,912 |
+| 2 capped, warm | normal incremental; +0/+0 | 256 MiB | 7.2 s | **173 MB** | 136 |
+| 3 control, warm | normal incremental; +0/+1 | none (Lance default) | 16.5 s | **207 MB** | 47,896 |
+
+Verdict:
+
+1. The cap is not the fix for the 3.8 GB spike: ~16% (~34 MB) off the matched
+   warm pair. Still worth shipping as a bound (B1), but it does not close
+   #245's sync item.
+2. The 3.8 GB no-op spike does not reproduce on a healthy host - even the
+   cold full re-read peaked at 738 MB over 74 s, vs ~3.8 GB anon within 8 s
+   of process start on 09-15. Whatever produced it needs a condition absent
+   in these runs; prime suspects: (a) full rowmap rebuild
+   (`collect_row_metas`, `sessions.rs:2622`), (b) allocator behavior under
+   already-extreme memory pressure (swap 0 free for hours).
+3. Bonus finding, caught live: run 1 took the `first sync from this host`
+   full re-read path on a host that had completed a normal sync 3 minutes
+   earlier. Mechanism: `extend_rowmap_coordinated` returns `Ok(None)` on
+   build-lock contention (silently), `RowmapOracle::is_empty()` is then
+   true, and `main.rs:4833` misreports it as a first sync and re-reads every
+   source. This is why the post-OOM restart loop is so expensive - and it
+   fires on ordinary lock contention too. Fix is B5.
+4. Live ratchet datapoint: `pond serve` on this host grew 439 MB ->
+   2.07-2.3 GB RSS in ~100 min of ordinary operation (sync-every-5, no heavy
+   queries) - the retained-floor behavior in #245.
+
+Next discriminating experiment (operator, when convenient): heaptrack on the
+**cold** path - `heaptrack pond sync --no-wait` after renaming the rowmap
+chain out of `~/.cache/pond` - which forces the `collect_row_metas` full
+rebuild, i.e. suspect (a). Full run log: deployment B operator notes,
+2026-09-16 ~10:30-10:45 UTC.
 
 ### Track A - instrumentation core (1-2 days)
 
@@ -65,13 +106,16 @@ to hardening (section 5) so fixes are not blocked on gate plumbing.
 
 | # | Branch | Fix | Verified by | Merge gate |
 |---|---|---|---|---|
-| B1 | `fix/sync-io-buffer` | bound the sync/copy scan readahead (extend the io-buffer cap to sync, config-overridable) | Phase 0 measurement on deployment B | field number; merge when green |
+| B1 | `fix/sync-io-buffer` | extend the io-buffer cap to sync/copy (small change, config-overridable) - a bound, not the spike fix | Phase 0 already measured it: ~16% off warm-path peak (207 -> 173 MB); bounds worst-case scanner buffering on larger stores | merge when green; does NOT close #245's sync item |
 | B2 | `fix/sync-cursor-persist` | persist the sync cursor for `serve --with-sync` so a kill does not schedule a full re-read (`syncstate.rs` is the seam) | `first sync from this host` marker gone from the journal after restart | field/journal; merge when green |
 | B3 | `fix/sync-flush-byte-budget` | #229: byte budget (~32-64 MB) on the buffered flush batch + chunked encode/append in `messages_batches`; partial flush is already idempotent | `ingest-large-session` + `sync-incremental` before/after rows | **blocked on track A rows** |
 | B4 | `fix/linux-alloc-retention` | glibc retention on Linux (gnu builds): `malloc_trim(0)` after sync/rowmap peaks and/or `MALLOC_ARENA_MAX` guidance; `cfg(linux)` only - #61 proved allocator swaps regress macOS | `mcp-query-growth` + `rowmap-build-cold` retained-bytes before/after | **blocked on track A rows** |
+| B5 | `fix/rowmap-oracle-fallback` | on rowmap build-lock contention, fall back to the newest stale chain as a trailing oracle instead of an empty one, so `main.rs` stops misreporting a first sync and re-reading every source (Phase 0 verdict 3) | no `first sync from this host` full re-reads on a host with a warm chain (journal over several days, outside genuine first syncs) | field/journal; merge when green - confirmed live, cheapest high-impact change |
 
-B1+B2 alone likely turn deployment B from "21 OOM kills in 9 days" into
-"stable"; they merge on field evidence without waiting for track A.
+B2+B5 kill the full-re-read amplifier (the two independent triggers: lost
+cursor and empty-oracle fallback); with B1 as the cheap bound they likely
+turn deployment B from "21 OOM kills in 9 days" into "stable". All three
+merge on field evidence without waiting for track A.
 
 "Before" rows are never lost by this parallelism: once `mem_bench` lands, the
 pre-fix commit is checked out into a pool worktree and the scenario runs there,
@@ -181,11 +225,13 @@ comments.
 - Track A: `mem-gate.sh` produces a full baseline row on the `ci` corpus; each
   #245 pathology has a scenario that visibly exhibits it on pre-fix HEAD
   (rowmap transient, sync spike shape, mcp slope > 0).
-- B1: deployment B's no-op sync peak drops to the same order as deployment C's
-  (hundreds of MB, not GB).
+- B1: already field-measured in Phase 0 (~16% warm-path); acceptance is the
+  bound being in place for sync/copy with the escape hatch documented.
 - B2: a killed/restarted `serve --with-sync` resumes from the cursor (no
   `first sync from this host` full re-read).
 - B3/B4: before/after rows show the intended reduction with no equivalence or
   throughput regression (`write_bench` guards the write path).
+- B5: several days of journal show no spurious `first sync from this host`
+  re-reads outside genuine first syncs.
 - Deployment B's OOM cadence is the ultimate metric: target zero pond OOM
-  kills over a 7-day window after B1+B2 deploy.
+  kills over a 7-day window after B1+B2+B5 deploy.
