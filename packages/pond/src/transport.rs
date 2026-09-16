@@ -23,6 +23,9 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub embedder: Arc<LazyEmbedder>,
     pub search: SearchConfig,
+    /// Set by [`ActivityGuard`] when a request finishes, cleared by
+    /// [`AppState::take_completed_activity`]. Shared by every clone, so the
+    /// periodic task in `main` sees the requests both transports served.
     activity: Arc<AtomicBool>,
 }
 
@@ -36,10 +39,16 @@ impl AppState {
         }
     }
 
+    /// Hold the returned guard for the body of a request; dropping it - on the
+    /// response path or on a cancelled future, both of which leave allocator
+    /// residue behind - records that this process had work to do.
     fn track_activity(&self) -> ActivityGuard {
         ActivityGuard(Arc::clone(&self.activity))
     }
 
+    /// Whether a request completed since the last call, clearing the flag.
+    /// The periodic allocator trim reads it so a server nobody is querying
+    /// stops paying for an arena walk every interval.
     pub fn take_completed_activity(&self) -> bool {
         self.activity.swap(false, Ordering::AcqRel)
     }

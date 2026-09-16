@@ -1182,6 +1182,11 @@ fn spawn_prewarm(state: AppState) {
                 tracing::warn!(%error, "prewarm: failed; first query will pay the cold load");
             }
         }
+        // Startup is this process's largest transient (the cold rowmap build,
+        // then the index warms that run after it) and a server that nobody
+        // queries would otherwise hold all of it: the periodic trim below is
+        // armed by completed requests, so an idle process never reaches it.
+        pond::memory::trim_allocator();
         loop {
             tokio::time::sleep(ROWMAP_REFRESH_INTERVAL).await;
             if let Err(error) = store.ensure_rowmap(&cache_dir).await {

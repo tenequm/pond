@@ -327,6 +327,48 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, HeaderMap,
     (status, headers, serde_json::from_slice(&bytes).unwrap())
 }
 
+/// The periodic allocator trim in `spawn_prewarm` only fires when a request
+/// completed since the previous interval, so two properties have to hold or
+/// the trim silently stops happening (or starts happening on an idle server,
+/// paying for a glibc arena walk every 30 s for nothing): every request path
+/// arms the flag, including one that answers with an error, and taking it
+/// clears it. Neither is visible in RSS, so nothing else would catch a handler
+/// that lost its guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_requests_arm_the_periodic_allocator_trim() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let state = empty_state(&temp).await?;
+    let app = http::router(
+        state.clone(),
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+
+    assert!(
+        !state.take_completed_activity(),
+        "a process that has served nothing is idle"
+    );
+
+    // Not-found is still work done: the handler allocated to answer it.
+    let (status, _, _) = post(
+        &app,
+        "/v1/get-session",
+        &json!({"protocol_version": PROTOCOL_VERSION, "session_id": "absent"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        state.take_completed_activity(),
+        "a completed request arms the next trim"
+    );
+    assert!(
+        !state.take_completed_activity(),
+        "taking the flag disarms it: an interval with no request must not trim"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_and_get_round_trip() -> anyhow::Result<()> {
     let (_temp, store, app) = router().await?;

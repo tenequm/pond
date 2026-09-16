@@ -182,7 +182,7 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
     let state = synthetic_state(&temp).await?;
 
     let (server_transport, client_transport) = tokio::io::duplex(8192);
-    let server = PondMcp::new(state);
+    let server = PondMcp::new(state.clone());
     let server_handle = tokio::spawn(async move {
         server.serve(server_transport).await?.waiting().await?;
         anyhow::Ok(())
@@ -321,6 +321,14 @@ async fn mcp_tools_round_trip_with_size_caps_and_error_mapping() -> anyhow::Resu
         .expect("tool error data is an object");
     assert_eq!(data.get("pond_code"), Some(&json!("not_found")));
     assert_eq!(data.get("retryable"), Some(&json!(false)));
+
+    // The served tools above are what arms the periodic allocator trim in
+    // `spawn_prewarm`; an MCP tool that lost its activity guard would leave a
+    // long-lived `pond mcp` never trimming, with nothing else to notice.
+    assert!(
+        state.take_completed_activity(),
+        "MCP tool calls record completed activity"
+    );
 
     client.cancel().await?;
     server_handle.await??;
