@@ -30,7 +30,17 @@ endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
 # Per-job and schema-tagged: nothing is shared across build shapes anyway (the
 # rustc flags differ per unit), the bootstrap's bulk `--pull --all` pulls the
-# whole prefix so the prefix must hold only this job's artifacts, and the k27
-# tag (kache 0.15.0's CACHE_KEY_VERSION) keeps the next schema rotation a
-# sibling directory instead of a subtree - rotation IS the remote GC.
-prefix = "kache/pond/windows-verify/k27"
+# whole prefix so the prefix must hold only this job's artifacts, and the k-tag
+# keeps the next rotation a sibling directory instead of a subtree - rotation IS
+# the remote GC.
+#
+# k28 is a DISK rotation, not a schema bump: kache is still v0.15.0 (key schema
+# 27) and the sibling windows-dist/linux-dist prefixes stay on k27. k27 had
+# grown to 3062 artifacts by 2026-09-16, and `--pull --all` materialized them
+# as `Store: 143.5 GiB / 40.0 GiB (359%)` with `Dedup: 0.0% savings` on a 150 GB
+# D: - leaving nothing for target/, so every run that actually compiled died
+# with `There is not enough space on the disk. (os error 112)`. The store cap is
+# the wrong lever (the bulk pull ignores it); the prefix size is the budget.
+# This tag is now ahead of kache's CACHE_KEY_VERSION, so the next key-schema
+# bump takes the next FREE tag here (k29), not the version number.
+prefix = "kache/pond/windows-verify/k28"

@@ -163,7 +163,9 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k27
+          # Asserted equal to the `prefix` in .github/kache/windows-verify.toml,
+          # which carries why this leg is a tag ahead of its siblings.
+          s3-prefix: kache/pond/windows-verify/k28
           # verify only, never windows-dist: a restored harness has unresolved
           # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
           # of link time here; not worth it on the leg whose output ships.
