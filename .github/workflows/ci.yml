@@ -104,7 +104,9 @@ jobs:
           PROFILE: ${{ steps.devshell.outputs.profile }}
         run: |
           set -euo pipefail
-          if [ -z "$PROFILE" ] || [ ! -e "$PROFILE" ] || [ -z "$NIX_CACHE_SIGNING_KEY" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+          if [ -z "$PROFILE" ] || [ ! -e "$PROFILE" ] \
+             || [ -z "$NIX_CACHE_SIGNING_KEY" ] \
+             || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
             echo "::warning::binary-cache push skipped: no devshell profile, or the signing key / S3 credential is missing"
             exit 0
           fi
@@ -117,9 +119,11 @@ jobs:
           # Nix takes a signing key as a file path and nothing else, so write one
           # into the pod's own scratch, 0600, and remove it on the way out. The
           # `tr` guards against a trailing newline in the secret, which would
-          # make the key unparseable; the value never reaches the log.
+          # make the key unparseable; the value never reaches the log. INT/TERM
+          # as well as EXIT: a job cancelled mid-upload signals the shell, and
+          # bash runs no EXIT trap when a signal kills it.
           key="$RUNNER_TEMP/pond-nix-cache.key"
-          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
+          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT INT TERM
           (umask 077; printf '%s' "$NIX_CACHE_SIGNING_KEY" | tr -d '\n' > "$key")
 
           # `secret-key` is a store setting, so each path is signed as it is
