@@ -1,8 +1,9 @@
 //! Per-host sync coordination: the single-flight lock that keeps a manual
 //! `pond sync` and the scheduled one from running concurrently against the
 //! same store, the persisted freshness cursor, and the last-sync record that
-//! `pond status` reports. Local-process coordination only - cross-host writers stay
-//! pure OCC on the Lance store; nothing here ever touches store bytes.
+//! `pond status` reports. Local-process coordination only - cross-host writers
+//! stay pure OCC on the Lance store; nothing here ever touches store bytes.
+//! Bin-only module: every artifact here is CLI-surface state.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -150,15 +151,8 @@ fn try_acquire_sync_lock_in(dir: &Path, store_key: &str) -> Result<SyncLockState
                 pid: std::process::id(),
                 started_at: Utc::now(),
             };
-            // Use temp + rename so a concurrent reader never sees a partial
-            // write (same pattern as write_last_sync_in). Best-effort: the
-            // lock itself is the flock, not the holder bytes.
-            if let Ok(bytes) = serde_json::to_vec(&holder) {
-                let tmp = holder_path.with_extension("json.tmp");
-                if std::fs::write(&tmp, &bytes).is_ok() {
-                    let _ = std::fs::rename(&tmp, &holder_path);
-                }
-            }
+            // Best-effort: the lock itself is the flock, not the holder bytes.
+            let _ = write_json_atomic(dir, &holder_path, &holder);
             Ok(SyncLockState::Acquired(SyncLockGuard { file, holder_path }))
         }
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -203,6 +197,12 @@ pub(crate) enum SyncOutcome {
     Error,
 }
 
+/// The resident row-meta map's per-session watermarks, spilled to disk so a
+/// restarted sync can still skip fresh sessions while another process owns the
+/// map build. The three leading fields are lineage, not payload: the store must
+/// be the same one and no older than the store these watermarks were read from,
+/// or a watermark could outrun what that store actually holds and silently drop
+/// messages (`usable_sync_cursor`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SyncCursor {
     pub messages_version: u64,
@@ -232,13 +232,19 @@ pub(crate) fn write_sync_cursor(store_key: &str, cursor: &SyncCursor) {
 }
 
 fn write_sync_cursor_in(dir: &Path, store_key: &str, cursor: &SyncCursor) -> Result<()> {
+    write_json_atomic(dir, &sync_cursor_path(dir, store_key), cursor)
+}
+
+/// Temp + rename so a concurrent reader never sees a half-write. Every record
+/// in this dir is read by a sibling process (`pond status`, a restarted sync),
+/// so none of them may land in pieces.
+fn write_json_atomic<T: Serialize>(dir: &Path, path: &Path, value: &T) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = sync_cursor_path(dir, store_key);
-    let bytes = serde_json::to_vec_pretty(cursor).context("serialize sync cursor")?;
+    let bytes = serde_json::to_vec_pretty(value)
+        .with_context(|| format!("serialize {}", path.display()))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("failed to install {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("failed to install {}", path.display()))?;
     Ok(())
 }
 
@@ -277,15 +283,7 @@ pub(crate) fn write_last_sync(store_key: &str, record: &LastSyncRecord) {
 }
 
 fn write_last_sync_in(dir: &Path, store_key: &str, record: &LastSyncRecord) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = last_sync_path(dir, store_key);
-    let bytes = serde_json::to_vec_pretty(record).context("serialize last-sync record")?;
-    // Temp + rename so a concurrent `pond status` never reads a half-write.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("failed to install {}", path.display()))?;
-    Ok(())
+    write_json_atomic(dir, &last_sync_path(dir, store_key), record)
 }
 
 pub(crate) fn read_last_sync(store_key: &str) -> Option<LastSyncRecord> {
@@ -370,6 +368,40 @@ mod tests {
                 .with_extension("json.tmp")
                 .exists()
         );
+    }
+
+    #[test]
+    fn sync_cursor_gates_freshness_on_its_watermarks() {
+        let cursor = SyncCursor {
+            messages_version: 3,
+            row_count: 1,
+            oldest_messages: Vec::new(),
+            watermarks: BTreeMap::from([("session-a".to_owned(), 1_700_000_000_000_000)]),
+        };
+
+        // The seam rule, not the getter: fresh iff the source has nothing newer.
+        assert!(pond::adapter::is_session_fresh(
+            &cursor,
+            "session-a",
+            Some(1_700_000_000_000_000)
+        ));
+        assert!(!pond::adapter::is_session_fresh(
+            &cursor,
+            "session-a",
+            Some(1_700_000_000_000_001)
+        ));
+        // A session the cursor never saw is never fresh.
+        assert!(!pond::adapter::is_session_fresh(
+            &cursor,
+            "session-b",
+            Some(1)
+        ));
+
+        assert!(!pond::adapter::SkipOracle::is_empty(&cursor));
+        assert!(pond::adapter::SkipOracle::is_empty(&SyncCursor {
+            watermarks: BTreeMap::new(),
+            ..cursor
+        }));
     }
 }
 
