@@ -166,7 +166,7 @@ impl RowMetaMap {
         // Per session: message count plus the max message timestamp - the
         // watermark the sync skip oracle compares against the source's latest
         // message timestamp (spec.md#adapters; deterministic, rebuilt from the
-        // store, no local cursor).
+        // store).
         let mut session_agg: HashMap<&str, (u32, i64)> = HashMap::new();
         for entry in &entries {
             let agg = session_agg

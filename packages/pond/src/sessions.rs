@@ -1921,7 +1921,7 @@ impl Store {
 
     /// Stable filesystem-safe cache key: same store URL -> same key, so sibling
     /// pond processes share one map file and distinct stores never collide.
-    fn store_key(&self) -> String {
+    pub fn store_key(&self) -> String {
         crate::substrate::store_key(self.handle.location())
     }
 

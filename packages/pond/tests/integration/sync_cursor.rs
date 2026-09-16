@@ -182,6 +182,21 @@ fn serve_restart_uses_persisted_cursor_when_rowmap_is_busy() {
     let rowmap_lock =
         File::create(cache.join(format!("rowmetamap-{store_key}.lock"))).expect("rowmap lock file");
     rowmap_lock.lock().expect("hold rowmap build lock");
+
+    // A no-op sync proves only that nothing was re-inserted, which an idempotent
+    // full re-read also achieves. The preview resolves the same oracle and
+    // reports the gate's verdict, so it is what proves the session was SKIPPED.
+    let preview = sandbox_command(&temp)
+        .args(["sync", "--dry-run"])
+        .output()
+        .expect("preview with the rowmap busy");
+    let preview_out = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        preview.status.success() && preview_out.contains("up to date"),
+        "the persisted cursor must mark the ingested session fresh:\n{preview_out}{}",
+        String::from_utf8_lossy(&preview.stderr),
+    );
+
     let logs = run_one_serve_sync(&temp);
     assert!(
         logs.contains("in-serve sync complete")
@@ -212,6 +227,7 @@ async fn rebuilt_store_rejects_and_replaces_the_old_cursor() {
     let cursor_path = state_dir(&temp).join(format!("sync-cursor-{store_key}.json"));
     std::fs::remove_dir_all(temp.path().join("store")).expect("replace store");
     let cache = temp.path().join("cache").join("pond");
+    std::fs::create_dir_all(&cache).expect("cache directory");
     let rowmap_lock =
         File::create(cache.join(format!("rowmetamap-{store_key}.lock"))).expect("rowmap lock file");
     rowmap_lock.lock().expect("hold rowmap build lock");
