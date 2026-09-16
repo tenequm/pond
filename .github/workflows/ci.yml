@@ -93,6 +93,21 @@ jobs:
       # flake check only evaluates - nothing above ever fetches a tarball. This
       # is the step that proves the rendered sha256/URLs and autoPatchelfHook.
       - run: nix run .#pond -- --version
+      # The Windows leg has no Nix and reads the same pins as TEXT, so the
+      # literals in flake.nix (plus rust-toolchain.toml's channel, which is not
+      # repeated there) must equal what the flake evaluates to. This is what
+      # replaces the "bumped in lockstep, never alone" comments: a pin edited in
+      # one place and not the other fails here instead of silently building CI
+      # on two toolchains.
+      - name: toolVersions text extraction matches the evaluated attrset
+        run: |
+          set -euo pipefail
+          nix eval --json .#lib.toolVersions | jq -S . > evaluated.json
+          {
+            sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/rust \1/p' rust-toolchain.toml
+            sed -n '/toolVersions = {/,/^      };/s/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\)[[:space:]]*=[[:space:]]*"\([^"]*\)";.*/\1 \2/p' flake.nix
+          } | jq -Rn '[inputs | split(" ") | {(.[0]): .[1]}] | add' | jq -S . > extracted.json
+          diff -u evaluated.json extracted.json
 
   # Windows runs as TWO jobs, deliberately. One serial job cost 46 min warm
   # (20.7 test + 23.8 dist). Split, they start together on separate hosted
