@@ -2138,7 +2138,6 @@ impl Store {
             // no full store re-read.
             (Some((_, set)), Some(entries)) => {
                 let mut merged = set.merged_entries();
-                merged.reserve(entries.len());
                 merged.extend(entries);
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
                 RowMetaMap::build(&path, version, merged)?;
