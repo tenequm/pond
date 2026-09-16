@@ -18,7 +18,7 @@ use lance::deps::arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
 use lance::deps::arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Int32Array,
     LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
-    TimestampMicrosecondArray, UInt64Array,
+    TimestampMicrosecondArray, UInt64Array, new_null_array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance::deps::datafusion::error::DataFusionError;
@@ -5435,6 +5435,14 @@ fn embedding_update_schema() -> Arc<Schema> {
 /// are null in both. Returned aligned to `vectors` for [`messages_chunk`].
 fn embedding_columns(vectors: &[Option<Vec<f32>>]) -> Result<(ArrayRef, ArrayRef)> {
     let dim = embedding_dim();
+    // The common case (no embedder, or every row already present) is all-null:
+    // build both columns with one bulk allocation instead of dim per-row appends.
+    if vectors.iter().all(Option::is_none) {
+        return Ok((
+            new_null_array(&embedding_vector_type(), vectors.len()),
+            new_null_array(&DataType::Utf8, vectors.len()),
+        ));
+    }
     let mut builder = FixedSizeListBuilder::new(
         Float16Builder::with_capacity(vectors.len() * dim),
         dim as i32,
@@ -5681,19 +5689,6 @@ pub(crate) fn messages_batches(
     vectors: &[Option<Vec<f32>>],
 ) -> Result<Vec<RecordBatch>> {
     debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
-    let includes_embeddings = vectors.iter().any(Option::is_some);
-    let schema = if includes_embeddings {
-        message_schema()
-    } else {
-        let schema = message_schema();
-        let fields = schema
-            .fields()
-            .iter()
-            .filter(|field| !matches!(field.name().as_str(), "vector" | "embedding_model"))
-            .cloned()
-            .collect::<Vec<_>>();
-        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
-    };
     let options = rows
         .iter()
         .map(message_options_bytes)
@@ -5722,8 +5717,6 @@ pub(crate) fn messages_batches(
                 &rows[range.clone()],
                 &options[range.clone()],
                 &vectors[range],
-                schema.clone(),
-                includes_embeddings,
             )
         })
         .collect()
@@ -5733,55 +5726,59 @@ fn messages_chunk(
     rows: &[MessageBatchRow<'_>],
     options: &[Vec<u8>],
     vectors: &[Option<Vec<f32>>],
-    schema: Arc<Schema>,
-    includes_embeddings: bool,
 ) -> Result<RecordBatch> {
-    let mut columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.message.session_id())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter().map(|row| row.message.id()).collect::<Vec<_>>(),
-        )),
-        Arc::new(
-            TimestampMicrosecondArray::from(
+    let schema = message_schema();
+    let (vector_column, embedding_model) = embedding_columns(vectors)?;
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
                 rows.iter()
-                    .map(|row| micros(row.message.timestamp()))
+                    .map(|row| row.message.session_id())
                     .collect::<Vec<_>>(),
-            )
-            .with_timezone("UTC"),
-        ),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.message.role().as_str())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter().map(|row| row.source_agent).collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter().map(|row| row.project).collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.message.system_content())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
-        )),
-    ];
-    if includes_embeddings {
-        let (vector_column, embedding_model) = embedding_columns(vectors)?;
-        columns.push(vector_column);
-        columns.push(embedding_model);
-    }
-    columns.push(Arc::new(LargeBinaryArray::from_iter_values(
-        options.iter().map(Vec::as_slice),
-    )));
-    RecordBatch::try_new(schema, columns).context("failed to build message batch")
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.message.id()).collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                TimestampMicrosecondArray::from(
+                    rows.iter()
+                        .map(|row| micros(row.message.timestamp()))
+                        .collect::<Vec<_>>(),
+                )
+                .with_timezone("UTC"),
+            ),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.message.role().as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.source_agent).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.project).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.message.system_content())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
+            )),
+            // `vector` / `embedding_model` carry the inline embedding when one
+            // was produced for the row, null otherwise (embedder disabled, or a
+            // non-embeddable row); `pond optimize` fills any remaining nulls
+            // (spec.md#session-embed-from-canonical).
+            vector_column,
+            embedding_model,
+            Arc::new(LargeBinaryArray::from_iter_values(
+                options.iter().map(Vec::as_slice),
+            )),
+        ],
+    )
+    .context("failed to build message batch")
 }
 
 pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
@@ -7154,47 +7151,6 @@ mod tests {
             expected.insert("pond".to_owned(), stamp.clone());
         }
         assert_eq!(encoded, json_bytes(&expected)?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn all_null_embedding_columns_are_omitted_and_read_as_nulls() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let store = Store::open_local(temp.path()).await?;
-        let message = Message::User {
-            id: "message-1".to_owned(),
-            session_id: "all-null-vectors".to_owned(),
-            timestamp: Utc::now(),
-            options: ProviderOptions::new(),
-        };
-        let row = MessageBatchRow {
-            message: &message,
-            pond_stamp: None,
-            source_agent: "claude-code",
-            project: "/tmp/pond",
-            search_text: None,
-        };
-        let batches = messages_batches(&[row], &[None])?;
-        assert!(batches[0].column_by_name("vector").is_none());
-        assert!(batches[0].column_by_name("embedding_model").is_none());
-
-        store
-            .handle
-            .append_batches(Table::Messages, batches)
-            .await?;
-        let stored = store
-            .handle
-            .scan_batch(Table::Messages, None, &["vector", "embedding_model"])
-            .await?;
-        assert_eq!(stored.num_rows(), 1);
-        assert_eq!(stored.column_by_name("vector").unwrap().null_count(), 1);
-        assert_eq!(
-            stored
-                .column_by_name("embedding_model")
-                .unwrap()
-                .null_count(),
-            1
-        );
         Ok(())
     }
 
