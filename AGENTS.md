@@ -18,6 +18,15 @@
 - Format: `cargo fmt --check` (use `cargo fmt` to fix)
 - Lockfile is enforced in CI with `--locked`; locally, plain commands are fine. If `Cargo.lock` changes unexpectedly, `git status` will show it.
 
+## moon (the task runner CI runs)
+
+- CI runs `moon ci <targets>` for the test leg and `moon run <target>` for the release legs. Locally, `moon run pond:lint pond:test` reproduces the gate; `moon ci` needs a diff base and is not what you want on a dirty tree.
+- **Set `MOON_OUTPUT_STYLE=buffer-only-failure`.** moon streams every task's output by default, which buries the one failure in thousands of lines of passing output. `buffer-only-failure` prints nothing for a task that passes and the full buffered output for one that fails. Pair it with `--summary` for the per-task pass/fail/cached table.
+- **Read the report, don't re-run the suite.** Every run writes `.moon/cache/runReport.json` (and `moon ci` writes `.moon/cache/ciReport.json`) with each action's status, duration, and cache verdict. Parse that to answer "what failed / what was cached" instead of running tasks again. They are overwritten by the next run, so copy one out if it matters.
+- `moon mcp` exposes the project/task graph as an MCP server - use it to ask what a target actually runs, what it depends on, and what its inputs are, rather than reading the YAML and guessing at inheritance.
+- Toolchain versions are NOT in `.moon/toolchains.yml` (it is deliberately versionless - moon resolves node/npm/rust from PATH). `/flake.lock` is a declared input of the Rust file groups, so a toolchain bump invalidates the task hashes.
+- `packages/openclaw-pond` and `packages/pi-pond` have an `install` task with a `condition` check: it skips `npm ci` when `node_modules/.moon-install-stamp` still matches `package-lock.json`. Delete the stamp to force a reinstall.
+
 ## Tests
 
 > **PLACEMENT RULE - read before writing any test.** A test lives next to the code it exercises. If it tests one module's behavior - even when it goes through a `Store` or handler call - it is a UNIT test and belongs in `#[cfg(test)] mod tests` at the bottom of that `src/...` file. `tests/integration/` is ONLY for genuine cross-module integration: multiple subsystems wired end to end (e.g. ingest -> search -> get over a fixture corpus). A `Store`-level, single-module, or pure-helper test in `tests/integration/` is in the WRONG place - move it to `src/`. When in doubt, default to a unit test in `src/`.

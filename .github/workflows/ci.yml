@@ -65,8 +65,24 @@ jobs:
       # plugin suites run here too - they cost seconds next to the Rust build,
       # and moon provisions their node/uv itself, so they need nothing from the
       # bootstrap.
+      #
+      # `moon ci`, not `moon run`: it drops targets that the changed files do
+      # not affect BEFORE hashing them, so a Rust-only PR never pays the two
+      # uncached `npm ci` installs that dominate today's cache-hit path. The
+      # explicit target list still applies - `moon ci` filters it, it does not
+      # widen it. Requires the fetch-depth: 0 checkout above; moon resolves the
+      # merge base from full history and mis-detects on a shallow clone.
+      #
+      # dist-build and windows-dist deliberately stay on `moon run`: under
+      # affected-only filtering a release commit that touches no declared input
+      # would build nothing and publish nothing.
+      #
+      # Base revision is moon's own detection (the ci_env crate): the PR base
+      # ref for a pull_request, HEAD~1 for a push to main. Accepted as-is -
+      # every merge into main here is a squash, so a push is one commit. A
+      # multi-commit push would under-select, and the fix is MOON_BASE.
       - run: >
-          moon run
+          moon ci
           repo:check-changelog
           pond:check-package pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
@@ -284,11 +300,22 @@ jobs:
       - name: Build release zip
         run: moon run repo:build-dist-msvc
         env:
-          # moon aborts remote-cache uploads still queued 60s after a task ends
-          # (BACKGROUND_FLUSH_TIMEOUT, a hard-coded const), which this ~76 MB
-          # artifact never beat - so the task never cached. This takes the inline
-          # branch added in v2.5.0, awaiting the upload instead; keep the moon
-          # pin at or above that.
+          # Makes moon upload this task's ~76 MB artifact to the remote cache
+          # INLINE instead of in a background task it may abandon at shutdown
+          # (crates/cache-storage/src/storage.rs: `in_background =
+          # !is_daemon_env()`). The variable is really moon's own "you are
+          # inside the daemon process" signal, borrowed here for that one
+          # effect; its only other consequence is that moon skips caching
+          # subprocess output (crates/process/src/command.rs), which costs
+          # nothing on a task that runs once.
+          #
+          # The original reason - a hard 60s abort that a 76 MB upload never
+          # beat - no longer holds: BACKGROUND_FLUSH_TIMEOUT is 300s as of moon
+          # 2.5.2 and stragglers are only dropped past that. Kept anyway until
+          # a release proves the background path lands the blob, because the
+          # failure mode is silent (the leg simply never caches) and only shows
+          # up as a slow release. Drop it and watch one release if you want the
+          # simplification.
           MOON_DAEMON_RUNNING: "1"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

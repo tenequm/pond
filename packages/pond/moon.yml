@@ -20,6 +20,11 @@ fileGroups:
     - '/Cargo.toml'
     - '/Cargo.lock'
     - '/rust-toolchain.toml'
+    # The toolchain versions left .moon/toolchains.yml when it went versionless,
+    # so the flake lock is now the only file in the tree that moves when the
+    # compiler, node or protoc does. Without it here a toolchain bump would
+    # silently replay results built by the previous toolchain.
+    - '/flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
     # the old ones - lint-msvc and test-msvc are exactly the tasks that carry

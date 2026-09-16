@@ -24,6 +24,12 @@ hasher:
   ignorePatterns:
     - '.claude/**/*'
     - '.agents/**/*'
+  # 'accuracy' parses every declared lockfile into the task hash; pond's
+  # Cargo.lock is ~800 crates and gets parsed once per task. 'performance'
+  # hashes the lockfile as a plain file instead, so a dependency change still
+  # invalidates every task that declares it - which they all do, through the
+  # shared `sources` fileGroup - for none of the parse cost.
+  optimization: 'performance'
 
 remote:
   # Enabled per-context via MOON_REMOTE_HOST (unset = remote cache off).

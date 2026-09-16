@@ -17,8 +17,20 @@ tasks:
   # real artifact is node_modules/, which a fresh CI checkout never has - a hit
   # would skip `npm ci` and leave the dependents with no tsc and no vitest,
   # which is precisely how this suite failed before it was wired up.
+  #
+  # The moon v2.4 `condition` check is the safe form of that skip: it asks the
+  # filesystem instead of a hash. `npm ci` wipes node_modules/ before it
+  # installs, so a stamp INSIDE node_modules/ that still matches
+  # package-lock.json can only mean this tree was installed from this lockfile.
+  # A condition check skips the task only when it exits 0, so every doubt - no
+  # node_modules/, a changed lockfile, no `cmp` on the machine - runs the
+  # install as before. This is what stops agents and warm runners reinstalling
+  # node_modules on every invocation.
   install:
-    command: 'npm ci'
+    script: 'npm ci && cp package-lock.json node_modules/.moon-install-stamp'
+    checks:
+      - check: 'condition'
+        script: 'cmp -s package-lock.json node_modules/.moon-install-stamp'
     inputs:
       - 'package.json'
       - 'package-lock.json'

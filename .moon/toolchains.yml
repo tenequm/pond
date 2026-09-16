@@ -1,26 +1,28 @@
-# Toolchains moon provisions itself, through proto, on first use of a task that
-# needs them. This is what lets the plugin suites run on a bare CI runner
-# without the bootstrap hand-installing node or uv: the runner only supplies
-# moon, and moon supplies the rest.
+# Which toolchains moon knows about - deliberately WITHOUT versions.
 #
-# The Rust toolchain is deliberately absent. rust-toolchain.toml pins it and
-# the bootstrap materializes that pin with rustup; declaring `rust` here would
-# be a second pin resolving against a different source.
+# With no `version` key, proto downloads nothing and moon resolves the tool from
+# PATH. That is what we want now that the environment supplies every tool: the
+# CI bootstrap installs them and the dev shell puts them on PATH, so a version
+# here would be a second pin resolving against a different source and the two
+# would drift.
 #
-# Versions are exact for the same reason every other tool in this repo is
-# pinned exactly (protoc, moon, kache): a floating '24' silently changes what
-# CI ran between two builds of the same commit. Each is the latest of its line
-# as resolved by proto.
-javascript: {}
-
-node:
-  version: '24.21.0'
-
-npm:
-  version: '11.19.1'
+# `rust` is declared for its side effect on hashing, not to provision anything.
+# moon's task fingerprint carries no OS, architecture or libc on its own
+# (crates/task-hasher), which is why `test` and `test-msvc` had to be separate
+# tasks in the first place. A declared rust toolchain puts the host triple into
+# every task hash, so a macOS dev or agent reading CI's remote cache can no
+# longer be handed a Linux-built result for a task that looks identical.
+#
 # No python/uv toolchains. `unstable_python` provisions cleanly, but proto's uv
 # plugin does not: it writes the version metadata and then fails to locate a
 # binary it never unpacked (proto::locate::missing_executable), on the CI runner
 # and once locally. uv is pinned in the CI bootstrap instead, and hermes-pond
-# runs on the system toolchain. Worth revisiting when those plugins leave
-# `unstable_` - the intent is for this file to own that too.
+# runs on the system toolchain. Versionless `unstable_python`/`unstable_uv` is
+# untested - revisit together, when those plugins leave `unstable_`.
+javascript: {}
+
+node: {}
+
+npm: {}
+
+rust: {}
