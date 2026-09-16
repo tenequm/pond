@@ -20,4 +20,4 @@ region = "nbg1"
 # prefix starts empty: the first release build after the rotation is the cold
 # one (~76 min), which is why it gets a forced prewarm dispatch before the
 # next release PR merges.
-prefix = "kache/pond/windows-dist/k27"
+prefix = "kache/pond/windows-dist/k31"
