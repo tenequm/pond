@@ -1,17 +1,29 @@
-# Which toolchains moon knows about - deliberately WITHOUT versions.
+# Which toolchains moon knows about, and which of them it must provision.
 #
-# With no `version` key, proto downloads nothing and moon resolves the tool from
-# PATH. That is what we want now that the environment supplies every tool: the
-# CI bootstrap installs them and the dev shell puts them on PATH, so a version
-# here would be a second pin resolving against a different source and the two
-# would drift.
+# A toolchain with no `version` key downloads nothing: proto is skipped
+# entirely (`skip SetupToolchain(...)`) and moon resolves the tool from PATH.
+# A toolchain WITH one is provisioned through proto on first use.
 #
-# `rust` is declared for its side effect on hashing, not to provision anything.
-# moon's task fingerprint carries no OS, architecture or libc on its own
-# (crates/task-hasher), which is why `test` and `test-msvc` had to be separate
-# tasks in the first place. A declared rust toolchain puts the host triple into
-# every task hash, so a macOS dev or agent reading CI's remote cache can no
-# longer be handed a Linux-built result for a task that looks identical.
+# `rust` is versionless and declared for its side effect on hashing, not to
+# provision anything: rust-toolchain.toml is the pin and the CI bootstrap
+# materializes it with rustup, so a version here would be a second pin against
+# a different source. What the declaration buys is the host triple in every
+# task hash - moon's own fingerprint carries no OS, architecture or libc
+# (crates/task-hasher), which is why `test` and `test-msvc` have to be separate
+# tasks at all. With it, a macOS dev or agent reading CI's remote cache can no
+# longer be served a Linux-built result for a task that looks identical.
+#
+# `node` and `npm` keep exact versions, and MUST until the dev shell lands.
+# Nothing installs node on the pond-ci runner - the bootstrap says so
+# explicitly - so moon provisioning it through proto is the only reason the
+# plugin suites run there at all. Versionless was tried and failed exactly
+# this way: `proto::detect::failed - Failed to detect an applicable version to
+# run npm with`. These two go versionless in the same change that puts node on
+# PATH, not before.
+#
+# Versions are exact for the same reason every other tool in this repo is
+# pinned exactly (protoc, moon, kache): a floating '24' silently changes what
+# CI ran between two builds of the same commit.
 #
 # No python/uv toolchains. `unstable_python` provisions cleanly, but proto's uv
 # plugin does not: it writes the version metadata and then fails to locate a
@@ -21,8 +33,10 @@
 # untested - revisit together, when those plugins leave `unstable_`.
 javascript: {}
 
-node: {}
+node:
+  version: '24.21.0'
 
-npm: {}
+npm:
+  version: '11.19.1'
 
 rust: {}
