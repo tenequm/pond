@@ -1948,11 +1948,11 @@ impl Store {
     /// Max delta segments before the chain is compacted into a fresh base.
     const MAX_ROWMAP_DELTAS: usize = 16;
 
-    /// Columns the resident meta map is built from. All three readers over this
-    /// list - [`row_meta_entry`] for the sorting fallback and the delta scan,
-    /// [`RowMetaColumns`] for the streaming full scan - MUST project the same
-    /// set in the same order, so a column added for one of them only would
-    /// silently corrupt the others.
+    /// Columns the resident meta map is built from. All three scans over this
+    /// list - the sorting fallback and the delta scan, both reading through
+    /// [`row_meta_entry`], and the streaming full scan reading through
+    /// [`RowMetaColumns`] - MUST project the same set in the same order, so a
+    /// column added for one of them only would silently corrupt the others.
     const ROW_META_COLUMNS: [&str; 7] = [
         "session_id",
         "id",
@@ -2238,8 +2238,9 @@ impl Store {
             // No chain, or a reclaimed base / deletion since it: full scan -> base.
             _ => {
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
-                // Streamed straight into the segment; only a scan that is not
-                // row_id-ordered falls back to collecting the corpus first.
+                // Streamed straight into the segment; only a store with no
+                // fragment order that yields ascending row ids falls back to
+                // collecting the corpus first.
                 if !self.build_rowmap_from_scan(&path, version).await? {
                     let entries = self.collect_row_metas().await?;
                     RowMetaMap::build(&path, version, entries)?;
@@ -8839,23 +8840,61 @@ mod tests {
     /// buffering one (`row_meta_entry`) project the same columns out of the same
     /// batches, so they must encode byte-identical segments. Nothing else pins
     /// the two readers against each other.
+    ///
+    /// A null `search_text` is the one column where the two spell their handling
+    /// differently (`is_null` -> `""` against `unwrap_or_default()`), so the
+    /// fixture has to reach it - and the assertion below keeps it reaching it.
     #[tokio::test]
     async fn scan_build_and_collect_build_encode_the_same_bytes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        // Several sessions, projects and a bare tool call (null `search_text`),
-        // across two fragments.
+        // Several sessions and projects across two fragments, plus a message
+        // whose only part is a tool call - the shape that writes a null
+        // `search_text` (a message with no part at all is not written).
         let (store, _keys) = store_with_messages(&temp, 40).await?;
         ingest_extra_fragment(&store, "second", 5).await?;
         ingest_events(
             &store,
-            vec![IngestEvent::Message(Message::Assistant {
-                id: "msg-toolcall".to_owned(),
-                session_id: "session-0".to_owned(),
-                timestamp: Utc::now(),
-                options: ProviderOptions::new(),
-            })],
+            vec![
+                IngestEvent::Session(synthetic_session("session-toolonly")),
+                IngestEvent::Message(Message::Assistant {
+                    id: "msg-toolcall".to_owned(),
+                    session_id: "session-toolonly".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-toolonly".to_owned(),
+                    id: "msg-toolcall-part".to_owned(),
+                    message_id: "msg-toolcall".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::ToolCall {
+                        call_id: Some(Extracted::from_test_value("call-0".to_owned())),
+                        name: Some(Extracted::from_test_value("Bash".to_owned())),
+                        params: serde_json::json!({"command": "ls"}),
+                        provider_executed: false,
+                    },
+                }),
+            ],
         )
         .await?;
+
+        let mut scanner = store.handle.scanner(Table::Messages, None).await?;
+        scanner.project(&["search_text"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut nulls = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let column = string_column(&batch, "search_text")?;
+            nulls += (0..batch.num_rows())
+                .filter(|row| column.is_null(*row))
+                .count();
+        }
+        assert!(
+            nulls > 0,
+            "the fixture must reach the null-search_text branch of both readers",
+        );
 
         let out = temp.path().join("out");
         std::fs::create_dir_all(&out)?;

@@ -172,7 +172,16 @@ pub struct UnorderedRows {
 
 /// Cold base builds that could not stream and re-encoded through the buffering
 /// [`RowMetaMap::build`] instead. Process-lifetime, monotonic, `Relaxed` - a
-/// counter, not a synchronization point.
+/// counter, not a synchronization point. Private so the only way to move it is
+/// [`note_rowmap_scan_fallback`].
+static ROWMAP_SCAN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one cold build that fell back off the streaming path.
+pub(crate) fn note_rowmap_scan_fallback() {
+    ROWMAP_SCAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cold-build fallbacks so far this process.
 ///
 /// The streaming encoder needs ascending `row_id`s, and a Lance scan only
 /// delivers them when a fragment order exists that produces them (see
@@ -183,14 +192,6 @@ pub struct UnorderedRows {
 /// `tracing::warn!` marked, invisible to CI and to the memory gate. Counting it
 /// lets the bench lane read the number across a scenario and fail on a
 /// regression into the slow path.
-pub static ROWMAP_SCAN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-
-/// Record one cold build that fell back off the streaming path.
-pub fn note_rowmap_scan_fallback() {
-    ROWMAP_SCAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Cold-build fallbacks so far this process.
 pub fn rowmap_scan_fallbacks() -> u64 {
     ROWMAP_SCAN_FALLBACKS.load(Ordering::Relaxed)
 }
