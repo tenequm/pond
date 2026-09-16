@@ -2138,6 +2138,7 @@ impl Store {
             // no full store re-read.
             (Some((_, set)), Some(entries)) => {
                 let mut merged = set.merged_entries();
+                merged.reserve(entries.len());
                 merged.extend(entries);
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
                 RowMetaMap::build(&path, version, merged)?;
@@ -2620,11 +2621,12 @@ impl Store {
     /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
     /// scattered per-hit take it replaces; `search_text` dominates the bytes.
     pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
+        let row_count = self.handle.count_rows(Table::Messages).await?;
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
         scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(row_count);
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let rowids = uint64(&batch, "_rowid")?;
