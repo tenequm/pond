@@ -104,10 +104,15 @@ jobs:
           PROFILE: ${{ steps.devshell.outputs.profile }}
         run: |
           set -euo pipefail
-          if [ -z "$PROFILE" ] || [ -z "$NIX_CACHE_SIGNING_KEY" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
+          if [ -z "$PROFILE" ] || [ ! -e "$PROFILE" ] || [ -z "$NIX_CACHE_SIGNING_KEY" ] || [ -z "$AWS_ACCESS_KEY_ID" ]; then
             echo "::warning::binary-cache push skipped: no devshell profile, or the signing key / S3 credential is missing"
             exit 0
           fi
+
+          # Resolve the profile's symlink chain to the store path it points at.
+          # A profile lives outside /nix/store, and nix reads an argument that is
+          # not a store path as a flake reference - which this is not.
+          closure=$(readlink -f "$PROFILE")
 
           # Nix takes a signing key as a file path and nothing else, so write one
           # into the pod's own scratch, 0600, and remove it on the way out. The
@@ -127,8 +132,8 @@ jobs:
           # Warm runs are a fast no-op: nix queries the cache first and uploads
           # only the paths it does not already hold, so this costs one narinfo
           # lookup per path unless the toolchain actually moved.
-          if nix --extra-experimental-features nix-command copy --to "$store" "$PROFILE"; then
-            echo "pushed the devshell closure: $PROFILE"
+          if nix --extra-experimental-features nix-command copy --to "$store" "$closure"; then
+            echo "pushed the devshell closure: $closure"
           else
             echo "::warning::binary-cache push failed - the cache is a cold-start optimization, so this does not fail the build. Check that the runner's nix has s3:// support (\`nix store info --store 's3://pond-nix-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1'\`, plan section 3) and that the credential still has write access."
           fi
