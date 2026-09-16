@@ -183,8 +183,8 @@ mod ingest_handler {
     /// substreams to amortize per-commit cost. 100 is the value validated in
     /// `benches/ingest_bench.rs` against the measured profile (substream
     /// flushes were 78-88% of wall time at batch=1; ~25x fewer commits at
-    /// batch=100 closes most of that gap). Memory bound: ~N x (avg events
-    /// per session) staged in RAM, ~tens of MB at this scale.
+    /// batch=100 closes most of that gap). The byte budget in
+    /// `IngestValidator` is the independent memory bound.
     const ADAPTER_FLUSH_BATCH: usize = 100;
 
     /// Drain `adapter.events()` into `store`, accumulating an [`IngestSummary`]
@@ -381,13 +381,11 @@ mod ingest_handler {
                     summary.add_outcomes(&push_outcomes);
                     index += 1;
 
-                    // Drain the batch periodically. The validator's
-                    // `pending_substreams()` count grows by one each time we
-                    // close a substream; once it hits the batch threshold we
-                    // commit them in one parallel 3-table merge_insert.
-                    if validator.pending_substreams() >= ADAPTER_FLUSH_BATCH {
+                    if validator.pending_substreams() >= ADAPTER_FLUSH_BATCH
+                        || validator.byte_budget_reached()
+                    {
                         on_event(SyncEvent::Flushing {
-                            pending: validator.pending_substreams(),
+                            pending: validator.pending_substreams().max(1),
                         });
                         let flush_start = std::time::Instant::now();
                         let (flush_outcomes, flush_counts) = validator.flush(store).await?;
@@ -622,6 +620,10 @@ mod ingest_handler {
         for (index, event) in events.into_iter().enumerate() {
             let mut chunk = validator.push(store, index, event).await?;
             outcomes.append(&mut chunk);
+            if validator.byte_budget_reached() {
+                let (mut flushed, _counts) = validator.flush(store).await?;
+                outcomes.append(&mut flushed);
+            }
         }
         // HTTP wire path keeps using per-row outcomes for `IngestResult`;
         // the batch counts are CLI-only.

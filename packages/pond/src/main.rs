@@ -4471,8 +4471,9 @@ async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
     if !messages_changed && syncstate::sync_cursor_exists(store_key) {
         return;
     }
-    // Exactly the map this run planned against: a watermark that outran the
-    // store would drop messages, and a run whose chain the planner rejected has
+    // The freshest store-validated map on hand - the one this run planned
+    // against, or a newer resident one installed since: a watermark that outran
+    // the store would drop messages, and a run whose chain the planner rejected has
     // nothing to say, so it leaves the old cursor alone rather than guessing. A
     // trailing map is store-validated and can only be behind, which costs
     // re-reads and never correctness - so the contended run this cursor exists
