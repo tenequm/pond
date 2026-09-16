@@ -23,6 +23,17 @@ runs:
         # flake EVALUATION cache cannot help us: it is keyed on the git
         # fingerprint, so every commit misses it. A profile hit skips evaluation
         # entirely - measured at ~0.1 s against ~30 s for a cold eval.
+        # Without the node's /nix store volume the static nix silently falls
+        # back to a chroot store under $HOME ("warning: '/nix/var/nix' does not
+        # exist"), substitutes a few hundred paths into it, and then dies on the
+        # first real build with `executing '/nix/store/...-bash': No such file or
+        # directory` - because in a chroot store that path is only valid inside
+        # the chroot. Say what is actually wrong, before spending the download.
+        if [ ! -d /nix/var/nix ] || [ ! -w /nix/store ]; then
+          echo "::error::/nix is not a writable native store on this runner (need /nix/var/nix present and /nix/store writable by the runner user). Deploy the pond-runner image and the /nix store volume - see docs/plans/2609-16-ci-nix-toolchain-revamp.md phase 5." >&2
+          exit 1
+        fi
+
         key=$(sha256sum flake.nix flake.lock rust-toolchain.toml | sha256sum | cut -c1-32)
         profile="/nix/var/nix/profiles/pond-dev-$key"
 
