@@ -24,6 +24,7 @@
 #   ops/scripts/mem-gate.sh --profile large     # 1M+ message corpus
 #   ops/scripts/mem-gate.sh --check             # gate vs committed baseline
 #   SCENARIOS="rowmap-build-cold" ops/scripts/mem-gate.sh
+#   RECORD_ONLY= ops/scripts/mem-gate.sh --check   # rehearse phase 2: gate all
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -34,7 +35,7 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --profile=*) PROFILE="${1#*=}"; shift ;;
     --check) CHECK=1; shift ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -48,7 +49,10 @@ SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-q
 # threshold here would only teach people to ignore the gate. Phase 2 promotes a
 # scenario by deleting it from this list once its committed rows say what
 # "normal" is.
-RECORD_ONLY="${RECORD_ONLY:-search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
+#
+# `-` and not `:-`, so `RECORD_ONLY=` on the command line means "gate every
+# scenario" - the way to rehearse a promotion before editing this line.
+RECORD_ONLY="${RECORD_ONLY-search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -163,11 +167,16 @@ for scenario in scenarios:
     ]
     print(f"\n[{scenario}] {profile} on {host}")
     if scenario in record_only:
-        # Printed, never judged: this scenario is accumulating spread.
+        # Printed with its delta, never judged: this scenario is accumulating
+        # spread, and the delta is what phase 2 reads to decide it has enough.
+        prev = same[-1] if same else {}
         for key in METRICS:
-            now = fresh.get(key)
-            before = same[-1].get(key) if same else None
-            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {now:<14} (record-only)")
+            now, before = fresh.get(key), prev.get(key)
+            comparable = (
+                isinstance(now, (int, float)) and isinstance(before, (int, float)) and before > 0
+            )
+            delta = f"{(now - before) / before * 100:+.1f}%" if comparable else "n/a"
+            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {now:<14} {delta:>7}  (record-only)")
         continue
     if not same:
         print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
