@@ -429,8 +429,8 @@ struct StoreArgs {
         help = CONFIG_FILE_HELP
     )]
     config: Option<PathBuf>,
-    /// Directory holding pond's per-host state: the sync lock, the last-sync
-    /// record, and the scheduler log. Must be absolute. The argument form of
+    /// Directory holding pond's per-host state: the sync lock, sync cursor,
+    /// last-sync record, and scheduler log. Must be absolute. The argument form of
     /// `XDG_STATE_HOME`; hidden because the scheduler bakes it into a task
     /// rather than anyone typing it.
     #[arg(long = "state-dir", global = true, hide = true, value_name = "PATH")]
@@ -4179,6 +4179,7 @@ pub(crate) async fn run_sync(
         loaded,
         config_file,
         Some(storage),
+        &store_key,
         &invocation,
         json,
         &mut report,
@@ -4306,11 +4307,15 @@ async fn in_serve_sync_once(
         config,
         config_file,
         &invocation,
+        &store_key,
         SyncSink::Serve,
         &mut report,
         &flush_hud,
     )
     .await;
+    if outcome.is_ok() {
+        persist_sync_cursor(store, &store_key, report.ingest.messages_inserted_total > 0).await;
+    }
     let duration = started.elapsed();
     syncstate::write_last_sync(
         &store_key,
@@ -4345,6 +4350,7 @@ async fn run_sync_stages(
     loaded: &Config,
     config_file: &Path,
     storage_path: Option<StorageUrl>,
+    store_key: &str,
     invocation: &SyncInvocation,
     json: bool,
     report: &mut SyncReport,
@@ -4395,16 +4401,61 @@ async fn run_sync_stages(
         }
     }
 
-    run_sync_pipeline(
+    let outcome = run_sync_pipeline(
         &store,
         loaded,
         config_file,
         invocation,
+        store_key,
         SyncSink::Cli { json },
         report,
         &flush_hud,
     )
-    .await
+    .await;
+    if outcome.is_ok() {
+        persist_sync_cursor(&store, store_key, report.ingest.messages_inserted_total > 0).await;
+    }
+    outcome
+}
+
+async fn usable_sync_cursor(store: &Store, store_key: &str) -> Option<syncstate::SyncCursor> {
+    let cursor = syncstate::read_sync_cursor(store_key)?;
+    let current_version = store.messages_version().await.ok()?;
+    let probe = store.message_store_probe().await.ok()?;
+    if cursor.messages_version <= current_version
+        && cursor.row_count <= probe.row_count
+        && cursor.oldest_messages == probe.oldest_messages
+    {
+        return Some(cursor);
+    }
+    tracing::warn!(
+        store = store_key,
+        "sync cursor describes a different store; discarding it"
+    );
+    syncstate::remove_sync_cursor(store_key);
+    None
+}
+
+async fn persist_sync_cursor(store: &Store, store_key: &str, messages_changed: bool) {
+    if !messages_changed && syncstate::sync_cursor_exists(store_key) {
+        return;
+    }
+    let Some(rowmap) = store.rowmap_snapshot() else {
+        return;
+    };
+    let Ok(probe) = store.message_store_probe().await else {
+        tracing::warn!(store = store_key, "failed to inspect store for sync cursor");
+        return;
+    };
+    syncstate::write_sync_cursor(
+        store_key,
+        &syncstate::SyncCursor {
+            messages_version: rowmap.version(),
+            row_count: rowmap.len(),
+            oldest_messages: probe.oldest_messages,
+            watermarks: rowmap.session_watermarks(),
+        },
+    );
 }
 
 /// The store-agnostic sync core, shared by the `pond sync` verb (which opens
@@ -4419,6 +4470,7 @@ async fn run_sync_pipeline(
     loaded: &Config,
     config_file: &Path,
     invocation: &SyncInvocation,
+    store_key: &str,
     sink: SyncSink,
     report: &mut SyncReport,
     flush_hud: &Arc<FlushHud>,
@@ -4429,6 +4481,7 @@ async fn run_sync_pipeline(
         loaded,
         config_file,
         invocation,
+        store_key,
         flush_hud,
         report,
         sink,
@@ -5137,11 +5190,13 @@ fn brief_duration(duration: Duration) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_import_stage(
     store: &Store,
     loaded: &Config,
     config_file: &Path,
     invocation: &SyncInvocation,
+    store_key: &str,
     flush_hud: &Arc<FlushHud>,
     report: &mut SyncReport,
     sink: SyncSink,
@@ -5184,6 +5239,7 @@ async fn run_import_stage(
     // watermark that mtime can never re-read past (spec.md#session-movement-complete).
     let noop = pond::adapter::NoopOracle;
     let rowmap_oracle;
+    let cursor;
     let oracle: &dyn pond::adapter::SkipOracle = if invocation.verify {
         output_err(&pond::output::paint(
             "import: --verify: re-reading every source body, bypassing the freshness skip",
@@ -5191,13 +5247,21 @@ async fn run_import_stage(
         ))?;
         &noop
     } else {
-        // Freshness key from the resident meta map: a cold sync builds it with one
-        // sequential scan, a warm sync delta-extends it - never the per-manifest
-        // version-resolution storm that throttled remote syncs to a stall. A
-        // missing/stale map yields no key, so the session simply re-reads (safe).
+        // A cold sync builds the resident map with one sequential scan, while a
+        // warm sync delta-extends it - never the per-manifest version-resolution
+        // storm that throttled remote syncs to a stall. If another local process
+        // owns that build, the store-validated cursor covers the restart gap.
         ensure_rowmap_with_spinner(store, quiet).await;
         rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
-        &rowmap_oracle
+        if rowmap_oracle.0.is_none() {
+            cursor = usable_sync_cursor(store, store_key).await;
+            cursor
+                .as_ref()
+                .map(|cursor| cursor as &dyn pond::adapter::SkipOracle)
+                .unwrap_or(&rowmap_oracle)
+        } else {
+            &rowmap_oracle
+        }
     };
     // Set expectations up front on the one run that is genuinely long: a first
     // sync reads (and, with embedding enabled, embeds) the full history.

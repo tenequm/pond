@@ -1,10 +1,10 @@
 //! Per-host sync coordination: the single-flight lock that keeps a manual
 //! `pond sync` and the scheduled one from running concurrently against the
-//! same store, and the last-sync record `pond status` reports. Local-process
-//! coordination only - cross-host writers stay pure OCC on the Lance store;
-//! nothing here ever touches store bytes. Bin-only module: both artifacts are
-//! CLI-surface state.
+//! same store, the persisted freshness cursor, and the last-sync record that
+//! `pond status` reports. Local-process coordination only - cross-host writers stay
+//! pure OCC on the Lance store; nothing here ever touches store bytes.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -53,7 +53,8 @@ pub(crate) fn state_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".pond-state"))
 }
 
-/// The directory where the scheduler log, sync lock, and last-sync record live.
+/// The directory where the scheduler log, sync lock, sync cursor, and last-sync
+/// record live.
 ///
 /// On all platforms, `XDG_STATE_HOME/pond` when `XDG_STATE_HOME` is set - except
 /// on Windows, where the per-app `\pond` suffix is omitted because `state_root()`
@@ -202,6 +203,67 @@ pub(crate) enum SyncOutcome {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncCursor {
+    pub messages_version: u64,
+    pub row_count: usize,
+    pub oldest_messages: Vec<(u64, String)>,
+    pub watermarks: BTreeMap<String, i64>,
+}
+
+impl pond::adapter::SkipOracle for SyncCursor {
+    fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+        self.watermarks.get(session_id).copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.watermarks.is_empty()
+    }
+}
+
+fn sync_cursor_path(dir: &Path, store_key: &str) -> PathBuf {
+    dir.join(format!("sync-cursor-{store_key}.json"))
+}
+
+pub(crate) fn write_sync_cursor(store_key: &str, cursor: &SyncCursor) {
+    if let Err(error) = write_sync_cursor_in(&pond_state_dir(), store_key, cursor) {
+        tracing::warn!(%error, "failed to write sync cursor");
+    }
+}
+
+fn write_sync_cursor_in(dir: &Path, store_key: &str, cursor: &SyncCursor) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = sync_cursor_path(dir, store_key);
+    let bytes = serde_json::to_vec_pretty(cursor).context("serialize sync cursor")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to install {}", path.display()))?;
+    Ok(())
+}
+
+pub(crate) fn read_sync_cursor(store_key: &str) -> Option<SyncCursor> {
+    read_sync_cursor_in(&pond_state_dir(), store_key)
+}
+
+pub(crate) fn sync_cursor_exists(store_key: &str) -> bool {
+    sync_cursor_path(&pond_state_dir(), store_key).is_file()
+}
+
+pub(crate) fn remove_sync_cursor(store_key: &str) {
+    let path = sync_cursor_path(&pond_state_dir(), store_key);
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%error, path = %path.display(), "failed to remove stale sync cursor");
+    }
+}
+
+fn read_sync_cursor_in(dir: &Path, store_key: &str) -> Option<SyncCursor> {
+    let text = std::fs::read_to_string(sync_cursor_path(dir, store_key)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 fn last_sync_path(dir: &Path, store_key: &str) -> PathBuf {
     dir.join(format!("last-sync-{store_key}.json"))
 }
@@ -284,6 +346,30 @@ mod tests {
         assert_eq!(read.sessions_inserted, 3);
         assert_eq!(read.outcome, SyncOutcome::Error);
         assert_eq!(read.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn sync_cursor_round_trips_and_is_keyed_by_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cursor = SyncCursor {
+            messages_version: 17,
+            row_count: 2,
+            oldest_messages: vec![(3, "message-a".to_owned())],
+            watermarks: BTreeMap::from([
+                ("session-a".to_owned(), 1_700_000_000_000_000),
+                ("session-b".to_owned(), 1_700_000_000_000_100),
+            ]),
+        };
+
+        assert!(read_sync_cursor_in(dir.path(), "store-a").is_none());
+        write_sync_cursor_in(dir.path(), "store-a", &cursor).unwrap();
+        assert_eq!(read_sync_cursor_in(dir.path(), "store-a"), Some(cursor));
+        assert!(read_sync_cursor_in(dir.path(), "store-b").is_none());
+        assert!(
+            !sync_cursor_path(dir.path(), "store-a")
+                .with_extension("json.tmp")
+                .exists()
+        );
     }
 }
 

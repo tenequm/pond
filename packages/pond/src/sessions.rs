@@ -62,6 +62,12 @@ pub struct Store {
     ingest_embed_progress: Option<IngestEmbedProgress>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageStoreProbe {
+    pub row_count: usize,
+    pub oldest_messages: Vec<(u64, String)>,
+}
+
 /// One ingest host's slice of a shared store (see
 /// [`Store::ingest_host_activity`]). `hostname: None` groups rows carrying
 /// no host stamp.
@@ -2616,6 +2622,30 @@ impl Store {
             .version)
     }
 
+    pub async fn message_store_probe(&self) -> Result<MessageStoreProbe> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let row_count = dataset.count_rows(None).await?;
+        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        scanner.with_row_id();
+        scanner.project(&["id"])?;
+        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut oldest_messages = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let rowids = uint64(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                if let Some(message_id) = string(&batch, "id", row)? {
+                    oldest_messages.push((rowids.value(row), message_id));
+                }
+            }
+        }
+        Ok(MessageStoreProbe {
+            row_count,
+            oldest_messages,
+        })
+    }
+
     /// Scan the hydration columns with row ids into a `Vec`, the input to
     /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
     /// scattered per-hit take it replaces; `search_text` dominates the bytes.
@@ -2683,32 +2713,20 @@ impl Store {
         if set.is_empty() {
             return Ok(true);
         }
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        if coverage == Coverage::Complete && set.len() != dataset.count_rows(None).await? {
+        let probe = self.message_store_probe().await?;
+        if coverage == Coverage::Complete && set.len() != probe.row_count {
             return Ok(false);
         }
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
-        scanner.with_row_id();
-        scanner.project(&["id"])?;
-        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
-        let mut stream = scanner.try_into_stream().await?;
         let mut known = 0usize;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            let rowids = uint64(&batch, "_rowid")?;
-            for row in 0..batch.num_rows() {
-                let Some(message_id) = string(&batch, "id", row)? else {
-                    continue;
-                };
-                match set.lookup(rowids.value(row)) {
-                    Some((_, cached)) if cached != message_id => return Ok(false),
-                    Some(_) => known += 1,
-                    // Unknown is not proof on its own - a row appended after the
-                    // map was built is unknown too - but the store's OLDEST rows
-                    // predate any chain built from it, so a map that knows none
-                    // of them did not come from this store.
-                    None => {}
-                }
+        for (row_id, message_id) in probe.oldest_messages {
+            match set.lookup(row_id) {
+                Some((_, cached)) if cached != message_id => return Ok(false),
+                Some(_) => known += 1,
+                // Unknown is not proof on its own - a row appended after the
+                // map was built is unknown too - but the store's OLDEST rows
+                // predate any chain built from it, so a map that knows none
+                // of them did not come from this store.
+                None => {}
             }
         }
         // Zero rows scanned lands here too: a non-empty map against a store with
@@ -5886,9 +5904,8 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
 /// [`SkipOracle`](crate::adapter::SkipOracle) over the resident row-meta map:
 /// `pond sync` reads each session's stored max message timestamp from memory, so
 /// the staleness check costs zero S3 (the map is rebuilt from the store, so the
-/// check stays deterministic with no local cursor). A `None` map (never
-/// prewarmed, or the build failed) yields no watermark, so every source
-/// re-reads - safe, just slower.
+/// check stays deterministic). A `None` map yields no watermark; the CLI may
+/// substitute a store-validated persisted cursor during a concurrent build.
 pub struct RowmapOracle(pub Option<Arc<RowMetaSet>>);
 
 impl crate::adapter::SkipOracle for RowmapOracle {

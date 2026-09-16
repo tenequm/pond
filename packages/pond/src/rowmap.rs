@@ -569,6 +569,15 @@ impl RowMetaMap {
         Some(self.session_entries()[idx].max_ts_micros)
     }
 
+    fn session_watermarks(&self) -> impl Iterator<Item = (&str, i64)> {
+        self.session_entries().iter().map(|entry| {
+            (
+                self.blob_str(entry.sid_off, entry.sid_len),
+                entry.max_ts_micros,
+            )
+        })
+    }
+
     /// Index into `session_entries` for `session_id` - the shared binary
     /// search behind every per-session accessor.
     fn session_index(&self, session_id: &str) -> Option<usize> {
@@ -835,6 +844,22 @@ impl RowMetaSet {
             .iter()
             .filter_map(|seg| seg.lookup_max_ts(session_id))
             .max()
+    }
+
+    pub fn session_watermarks(&self) -> std::collections::BTreeMap<String, i64> {
+        let mut watermarks: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        for (session_id, timestamp) in self
+            .segments
+            .iter()
+            .flat_map(RowMetaMap::session_watermarks)
+        {
+            watermarks
+                .entry(session_id.to_owned())
+                .and_modify(|stored| *stored = (*stored).max(timestamp))
+                .or_insert(timestamp);
+        }
+        watermarks
     }
 
     /// Resolve a message id to its session id, newest segment first (recent
