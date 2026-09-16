@@ -252,7 +252,7 @@ The rationale and trust analysis live with the ops-side plan.
 | 2 | kache 0.22.0 (rides the rust-1.98 PR) | none (hygiene; k31 stays) | PR #264 |
 | 3 | moon 2.5.5; `moon ci` for build-and-test; versionless toolchains + `rust: {}` + `/flake.lock` input | hit-path 10-15s shrinks; OS-keyed hashes unblock remote reads for devs | PR #264, minus node/npm - they stay pinned until the devshell supplies them |
 | 4 | Flake toolchain + `toolVersions` + Windows text-extraction + parity check; `.envrc` | single pin source; local UX/AX wins immediately | PR #262 |
-| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in PR #265, stacked on #262; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache is read-only so far, pushing deferred |
+| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in PR #265, stacked on #262; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache push stacked on top |
 | 6 | Local kache preserve-incremental; moon `localReadOnly` + shared worktree cache | dep-compile hits locally; agents reuse CI results | not started |
 
 Phases 1-3 are independent of Nix entirely. Phase 5 is the only one touching
@@ -279,8 +279,17 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
 - The binary cache is wired for READ only, in three places a rotation has to
   edit together: the flake's `nixConfig`, explicit flags on the pond-ci nix
   invocation (nixConfig is ignored for an untrusted user), and `flake-check`'s
-  `install-nix-action` `extra_nix_config`. Pushing needs a signing key on
-  main-branch jobs (2.8 point 2) and is deferred to its own change.
+  `install-nix-action` `extra_nix_config`. **Pushing is its own change, stacked
+  on that one**: a last step in `build-and-test`, gated on a push to `main`
+  (2.8 point 2), `nix copy`s the devshell profile's closure to the bucket and
+  signs each path on the way up with a key file written from
+  `NIX_CACHE_SIGNING_KEY` into the pod's scratch. Non-fatal by design - the
+  cache is a cold-start optimization, so a failed push warns instead of
+  reddening the build - and only `build-and-test` pushes: it is the one pond-ci
+  job that runs on every main push, and the release jobs of that same push would
+  re-upload the identical closure. The devshell action grew a `profile` output
+  for it, so the push copies the profile the job actually entered rather than
+  re-deriving the key.
 - 2.2's one-time `/ci-cache` cleanup is enforced, not assumed: the action fails
   the job if a rustup proxy is still sitting in `$CARGO_HOME/bin`, with the
   remedy in the error. `/ci-cache/proto` is explicitly NOT part of that cleanup

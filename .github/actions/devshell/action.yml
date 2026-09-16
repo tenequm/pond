@@ -8,10 +8,18 @@ description: >
   is now the single source of truth for every tool (plan 2609-16 2.1/2.2).
   The /ci-cache exports that bootstrap also owned survive here - they are cache
   locations, not tools, and the PVC is still what makes a warm pod warm.
+outputs:
+  profile:
+    description: >
+      The `/nix/var/nix/profiles/pond-dev-$key` this job entered. Its closure is
+      the toolchain, so a later step can `nix copy` it to the binary cache
+      without re-deriving the key or re-evaluating the flake (plan 2.7).
+    value: ${{ steps.enter.outputs.profile }}
 runs:
   using: composite
   steps:
     - name: Enter the nix devshell
+      id: enter
       shell: bash
       run: |
         set -euo pipefail
@@ -63,6 +71,9 @@ runs:
           # next job on this node takes the branch above.
           "${nix[@]}" print-dev-env --json --profile "$profile" .# > "$json"
         fi
+        # Announced only once the profile exists, so a job whose entry failed
+        # advertises no path for the cache-push step to copy.
+        echo "profile=$profile" >> "$GITHUB_OUTPUT"
 
         # jq is not guaranteed on the stripped runner image, and this runs
         # before the devshell (which does ship jq) is on PATH. Resolve it from
