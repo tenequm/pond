@@ -20,10 +20,15 @@ fileGroups:
     - 'Cargo.toml'
     - 'Cargo.lock'
     - 'rust-toolchain.toml'
-    # The Rust toolchain is versionless in .moon/toolchains.yml, so nothing in
-    # the moon config moves when the compiler, protoc or zig does - the flake
-    # lock is the only file in the tree that does. Without it here a toolchain
-    # bump would silently replay results built by the previous toolchain.
+    # Declared for what it is about to pin, not for what it pins today. The
+    # flake supplies only the `nix develop` cmake/protobuf/pkg-config; CI's
+    # compiler comes from rust-toolchain.toml (above), its protoc from the
+    # bootstrap's PROTOC_VERSION, and zig from the pond-runner image - none of
+    # which move this lock. So the gap it reads as closing, a toolchain bump
+    # replaying results built by the previous toolchain, is still open for
+    # protoc and zig. Here because the nix-toolchain phase makes the claim true
+    # and this way that lands as one edit; three commits in the repo's life, so
+    # the invalidation costs ~nothing meanwhile.
     - 'flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
@@ -98,8 +103,9 @@ tasks:
 
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
   # cross-compiled. It is a separate task for the same reason `test-msvc` is
-  # separate from `test`: moon's fingerprint carries no OS, so a shared task
-  # would hit the hash this one already cached and ship nothing.
+  # separate from `test`: moon's own fingerprint carries no OS, so a shared task
+  # would hit the hash this one already cached and ship nothing. `rust: {}` now
+  # adds the host triple on top; the separate task is still what guarantees it.
   #
   # Machine cross-compile on the pond-ci runner (no docker/buildkit): needs the
   # pond-runner image toolchain (zig 0.16 + cargo-zigbuild + macOS SDK via

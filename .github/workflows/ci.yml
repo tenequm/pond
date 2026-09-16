@@ -120,10 +120,12 @@ jobs:
   #
   # windows-verify runs moon's `pond:test-msvc`, never `pond:test`: the task
   # fingerprint carries command/args/deps/env/inputs/outputs but no OS or
-  # architecture (crates/task-hasher/src/task_fingerprint.rs), so sharing one
-  # task would hit the hash the Linux runner already stored and go green without
-  # compiling a line here. The differing command is what keeps them apart, and
-  # the remote cache is what lets a prose-only commit skip the leg entirely.
+  # architecture of its own (crates/task-hasher/src/task_fingerprint.rs), so
+  # sharing one task would hit the hash the Linux runner already stored and go
+  # green without compiling a line here. `rust: {}` in .moon/toolchains.yml now
+  # folds the host triple in as well, but the differing command is what has kept
+  # them apart and still does, and the remote cache is what lets a prose-only
+  # commit skip the leg entirely.
   # windows-dist runs `repo:build-dist-msvc` for the same two reasons: its own
   # task so the OS-less fingerprint cannot collide with `repo:build-dist`, and a
   # moon task so it is cacheable at all.
@@ -192,9 +194,10 @@ jobs:
       # measured the lock-filtered enumeration (one sequential LIST per lock
       # crate, 126.8 s measured against the shared prefix), and that number did
       # its job - it sized round two in favor of `--pull --all` on a per-job
-      # prefix. The bootstrap's warm-up step now reports the same Plan: count
-      # and elapsed time from the pull that actually runs, so re-adding a
-      # lock-filtered dry run would buy nothing and cost ~2 min per run.
+      # prefix. Re-adding it would still buy nothing and cost ~2 min per run.
+      # What the warm pull reports has shrunk since: it is detached now, so the
+      # `Plan:` count reaches the log only if the pull gets that far, and no step
+      # times it. `kache stats` in the diagnostics below is the surviving number.
 
       # moon replays the hash main already stored when a diff touches none of a
       # task's declared inputs, which is every CI-only change - so a run whose

@@ -31,6 +31,7 @@ bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
 # Per-job and schema-tagged, same reasoning as windows-verify.toml. k31 is
-# kache 0.21.0's CACHE_KEY_VERSION - both legs bumped together, never one.
+# kache's CACHE_KEY_VERSION, unchanged from 0.17.0 through 0.22.0 - both legs
+# bumped together, never one.
 # The old shared kache/pond prefix is left in place as the revert window.
 prefix = "kache/pond/linux-dist/k31"

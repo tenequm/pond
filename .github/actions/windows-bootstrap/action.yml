@@ -210,13 +210,19 @@ runs:
         # and only adds the reflink-restore write fix and a GC-responsive daemon.
         version: v0.22.0
         manifest-key: ${{ inputs.manifest-key }}
-        # Above kache 0.21's 5%-of-disk default because the cap MUST stay above
-        # the remote prefix, while still leaving room for target/ and CARGO_HOME.
+        # Above kache's 5%-of-disk default because the cap MUST stay above the
+        # remote prefix, while still leaving room for target/ and CARGO_HOME.
         # `sync --pull --all` materializes the whole prefix locally, and a
         # cap under it makes the store evict mid-run - measured 2026-08-26 at a
         # 27.5 GiB prefix against the old 20GiB cap (138%), 13 failed transfers
-        # and demand re-fetches during the build. D: holds ~147 GB total; the
-        # warm-pull timer forces a prefix rotation long before 40GiB binds.
+        # and demand re-fetches during the build. D: holds ~147 GB total.
+        #
+        # Rotation is what keeps the prefix under the cap: rotate when it passes
+        # about twice the working set (1538 artifacts / 45 s on 2026-08-24 grew
+        # to 1925 / 156 s by 2026-08-26 - entry count lags the byte growth, and
+        # by 2026-09 the pull was ~650 s). The warm pull no longer times itself
+        # now that it runs detached, so read the size off `kache stats` in the
+        # diagnostics step instead.
         max-size: 40GiB
         # ~3 min of link time on unchanged sources; the trade is unresolved
         # .pdb paths on a restored harness. Revert this line alone if job time

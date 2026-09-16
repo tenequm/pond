@@ -26,9 +26,12 @@ hasher:
     - '.agents/**/*'
   # 'accuracy' parses every declared lockfile into the task hash; pond's
   # Cargo.lock is ~800 crates and gets parsed once per task. 'performance'
-  # hashes the lockfile as a plain file instead, so a dependency change still
-  # invalidates every task that declares it - which they all do, through the
-  # shared `sources` fileGroup - for none of the parse cost.
+  # skips that parse and hashes manifest version ranges instead. A dependency
+  # change still invalidates, but for a different reason than before: the
+  # lockfiles are declared FILE inputs - Cargo.lock through the shared `sources`
+  # fileGroup, package-lock.json on every plugin task - and a file input is
+  # hashed by content under either setting. The rule that follows: a task that
+  # omits its lockfile from `inputs` now silently survives a dependency bump.
   optimization: 'performance'
 
 remote:
