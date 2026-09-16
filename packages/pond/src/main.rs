@@ -4774,8 +4774,7 @@ async fn run_sync_dry_run(
     } else {
         // The same freshness map a real sync would use, so the preview
         // matches what sync would actually skip.
-        ensure_rowmap_with_spinner(&store, false).await;
-        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+        rowmap_oracle = sync_rowmap_oracle_with_spinner(&store, false).await;
         &rowmap_oracle
     };
     /// Why this adapter could not be counted. An adapter that cannot read
@@ -4991,10 +4990,14 @@ async fn wait_for_sync_lock(
     }
 }
 
-/// `ensure_rowmap` with a live spinner. On a fresh host against a populated
-/// remote store this is a one-time full scan of the messages table - the
-/// silent minutes-long "hang" of a first sync before it had a face.
-async fn ensure_rowmap_with_spinner(store: &Store, quiet: bool) {
+/// Build or select the sync rowmap oracle with a live spinner. On a fresh host
+/// against a populated remote store this is a one-time full scan of the
+/// messages table - the silent minutes-long "hang" of a first sync before it
+/// had a face.
+async fn sync_rowmap_oracle_with_spinner(
+    store: &Store,
+    quiet: bool,
+) -> pond::sessions::RowmapOracle {
     let started = std::time::Instant::now();
     let spinner = if quiet {
         ProgressBar::hidden()
@@ -5008,11 +5011,16 @@ async fn ensure_rowmap_with_spinner(store: &Store, quiet: bool) {
         .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
-    if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
-        tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
-    }
+    let rowmap = match store.sync_rowmap_oracle(&default_cache_dir()).await {
+        Ok(rowmap) => rowmap,
+        Err(error) => {
+            tracing::warn!(%error, "rowmap build for sync oracle skipped; re-reading all sources");
+            pond::sessions::RowmapOracle(None)
+        }
+    };
     spinner.finish_and_clear();
     tracing::debug!(target: "pond::perf", stage = "ensure_rowmap", elapsed_ms = started.elapsed().as_millis() as u64, "sync stage");
+    rowmap
 }
 
 /// Shared slot connecting the store's inline-embed progress callback to
@@ -5194,9 +5202,9 @@ async fn run_import_stage(
         // Freshness key from the resident meta map: a cold sync builds it with one
         // sequential scan, a warm sync delta-extends it - never the per-manifest
         // version-resolution storm that throttled remote syncs to a stall. A
-        // missing/stale map yields no key, so the session simply re-reads (safe).
-        ensure_rowmap_with_spinner(store, quiet).await;
-        rowmap_oracle = pond::sessions::RowmapOracle(store.rowmap_snapshot());
+        // contended build uses a validated trailing map, which can only widen
+        // work; any session absent from that map simply re-reads (safe).
+        rowmap_oracle = sync_rowmap_oracle_with_spinner(store, quiet).await;
         &rowmap_oracle
     };
     // Set expectations up front on the one run that is genuinely long: a first

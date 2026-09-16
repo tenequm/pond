@@ -321,6 +321,12 @@ enum Coverage {
     Trailing,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowmapEnsure {
+    Current,
+    Contended,
+}
+
 impl Store {
     /// Open against a local filesystem URL or a remote one for which the
     /// caller has no extra options to pass (env vars suffice). CLI verbs
@@ -1943,11 +1949,16 @@ impl Store {
     /// store compaction - all under a build `flock` so N local processes don't
     /// rescan the store at once.
     pub async fn ensure_rowmap(&self, cache_dir: &Path) -> Result<()> {
+        self.ensure_rowmap_inner(cache_dir).await?;
+        Ok(())
+    }
+
+    async fn ensure_rowmap_inner(&self, cache_dir: &Path) -> Result<RowmapEnsure> {
         let version = self.messages_version().await?;
         if let Some(current) = self.rowmap.load_full()
             && current.version() == version
         {
-            return Ok(());
+            return Ok(RowmapEnsure::Current);
         }
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
@@ -1962,7 +1973,7 @@ impl Store {
             if self.rowmap_matches_store(&set, Coverage::Complete).await? {
                 self.rowmap.store(Some(Arc::new(set)));
                 Self::sweep_stale_rowmaps(cache_dir, &store_key, chain.base_version);
-                return Ok(());
+                return Ok(RowmapEnsure::Current);
             }
             // Fall through to the build below, which purges under the lock. NOT
             // purged here: this runs unlocked, and unlinking by prefix while a
@@ -1979,8 +1990,36 @@ impl Store {
             .await?
         {
             self.rowmap.store(Some(Arc::new(set)));
+            return Ok(RowmapEnsure::Current);
         }
-        Ok(())
+        Ok(RowmapEnsure::Contended)
+    }
+
+    /// Build the current rowmap for a sync oracle, or use the newest valid
+    /// trailing chain when a sibling holds the build lock. A trailing watermark
+    /// can only make sync re-examine rows appended since that chain's version.
+    pub async fn sync_rowmap_oracle(&self, cache_dir: &Path) -> Result<RowmapOracle> {
+        match self.ensure_rowmap_inner(cache_dir).await? {
+            RowmapEnsure::Current => Ok(RowmapOracle(self.rowmap_snapshot())),
+            RowmapEnsure::Contended => {
+                let Some(set) = self.open_cached_rowmap(cache_dir).await else {
+                    return Ok(RowmapOracle(None));
+                };
+                if !self.rowmap_matches_store(&set, Coverage::Trailing).await? {
+                    tracing::warn!(
+                        store = self.store_key(),
+                        "cached rowmap describes a different store at this path; ignoring it"
+                    );
+                    return Ok(RowmapOracle(None));
+                }
+                let version = set.version();
+                tracing::info!(
+                    version,
+                    "sync proceeds against a trailing oracle at version {version} after rowmap build-lock contention"
+                );
+                Ok(RowmapOracle(Some(set)))
+            }
+        }
     }
 
     /// Open the newest locally cached rowmap chain regardless of the store's
@@ -2683,9 +2722,11 @@ impl Store {
         if set.is_empty() {
             return Ok(true);
         }
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        if coverage == Coverage::Complete && set.len() != dataset.count_rows(None).await? {
-            return Ok(false);
+        if coverage == Coverage::Complete {
+            let dataset = self.handle.dataset(Table::Messages).await?;
+            if set.len() != dataset.count_rows(None).await? {
+                return Ok(false);
+            }
         }
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
@@ -5883,12 +5924,11 @@ pub(crate) fn session_from_batch(batch: &RecordBatch, row: usize) -> Result<Sess
     })
 }
 
-/// [`SkipOracle`](crate::adapter::SkipOracle) over the resident row-meta map:
-/// `pond sync` reads each session's stored max message timestamp from memory, so
-/// the staleness check costs zero S3 (the map is rebuilt from the store, so the
-/// check stays deterministic with no local cursor). A `None` map (never
-/// prewarmed, or the build failed) yields no watermark, so every source
-/// re-reads - safe, just slower.
+/// [`SkipOracle`](crate::adapter::SkipOracle) over a row-meta map. Sync normally
+/// uses the resident current map; during build-lock contention it can use a
+/// validated, nonresident trailing map. Rows appended after a trailing map are
+/// absent, so they are re-examined rather than skipped. A `None` map (no cached
+/// chain, or a failed build) yields no watermark and re-reads every source.
 pub struct RowmapOracle(pub Option<Arc<RowMetaSet>>);
 
 impl crate::adapter::SkipOracle for RowmapOracle {
@@ -6256,7 +6296,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        adapter::Extracted,
+        adapter::{Extracted, SkipOracle, is_session_fresh},
         handlers::ingest_events,
         wire::{FileData, Message, Part, PartKind, ProviderOptions, Session},
     };
@@ -7556,6 +7596,13 @@ mod tests {
         store_with_messages_at_threshold(temp, count, VECTOR_INDEX_ACTIVATION_ROWS).await
     }
 
+    fn hold_rowmap_lock(store: &Store, cache: &Path) -> anyhow::Result<std::fs::File> {
+        let path = cache.join(format!("rowmetamap-{}.lock", store.store_key()));
+        let lock = std::fs::File::create(path)?;
+        lock.try_lock()?;
+        Ok(lock)
+    }
+
     /// Same as [`store_with_messages`] but tests optimize with a custom
     /// IVF_SQ activation threshold.
     async fn store_with_messages_at_threshold(
@@ -8418,6 +8465,123 @@ mod tests {
         builder.ensure_rowmap(&cache).await?;
         reader.load_rowmap_if_present(&cache).await?;
         assert!(reader.rowmap_snapshot().is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_rowmap_oracle_uses_an_existing_chain_when_contended() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (builder, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+        builder.ensure_rowmap(&cache).await?;
+        let chain_version = builder.messages_version().await?;
+
+        ingest_events(&builder, conversational_events("session-after-chain", 1)).await?;
+        assert!(builder.messages_version().await? > chain_version);
+
+        let _lock = hold_rowmap_lock(&builder, &cache)?;
+        let reader = Store::open_local(temp.path()).await?;
+        let oracle = reader.sync_rowmap_oracle(&cache).await?;
+
+        assert!(
+            !oracle.is_empty(),
+            "contention must not look like first sync"
+        );
+        assert!(
+            oracle.session_max_ts("session-0").is_some(),
+            "the trailing chain remains an incremental baseline",
+        );
+        assert_eq!(
+            oracle.session_max_ts("session-after-chain"),
+            None,
+            "rows newer than the chain stay pending",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_rowmap_oracle_without_any_chain_stays_empty() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache)?;
+        let _lock = hold_rowmap_lock(&store, &cache)?;
+        let oracle = store.sync_rowmap_oracle(&cache).await?;
+
+        assert!(
+            oracle.is_empty(),
+            "a genuine first sync still reads in full"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_rowmap_oracle_never_skips_rows_newer_than_its_chain() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let cache = temp.path().join("cache");
+        let session = synthetic_session("growing-session");
+        store
+            .upsert_sessions(std::slice::from_ref(&session))
+            .await?;
+
+        let first_timestamp = DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap();
+        let first = Message::User {
+            id: "before-chain".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: first_timestamp,
+            options: ProviderOptions::new(),
+        };
+        store
+            .upsert_messages(
+                &session,
+                &[MessageWrite {
+                    message: &first,
+                    parts: &[],
+                    search_text: Some("before"),
+                }],
+            )
+            .await?;
+        store.ensure_rowmap(&cache).await?;
+
+        let newer_timestamp = DateTime::from_timestamp_micros(1_700_000_001_000_000).unwrap();
+        let newer = Message::User {
+            id: "after-chain".to_owned(),
+            session_id: session.id.clone(),
+            timestamp: newer_timestamp,
+            options: ProviderOptions::new(),
+        };
+        store
+            .upsert_messages(
+                &session,
+                &[MessageWrite {
+                    message: &newer,
+                    parts: &[],
+                    search_text: Some("after"),
+                }],
+            )
+            .await?;
+
+        let _lock = hold_rowmap_lock(&store, &cache)?;
+        let reader = Store::open_local(temp.path()).await?;
+        let oracle = reader.sync_rowmap_oracle(&cache).await?;
+
+        assert!(
+            is_session_fresh(
+                &oracle,
+                &session.id,
+                Some(first_timestamp.timestamp_micros()),
+            ),
+            "unchanged source rows remain skippable",
+        );
+        assert!(
+            !is_session_fresh(
+                &oracle,
+                &session.id,
+                Some(newer_timestamp.timestamp_micros()),
+            ),
+            "a trailing watermark must re-examine newer source rows",
+        );
         Ok(())
     }
 
