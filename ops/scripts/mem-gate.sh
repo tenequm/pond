@@ -14,10 +14,11 @@
 # One scenario per process invocation: peak RSS is a process-lifetime
 # high-water mark, so two scenarios in one process cannot be told apart.
 #
-# --check compares peak_rss_kb and peak_heap_bytes only. The latency,
-# throughput, retention and fragment fields the newer scenarios record are
-# deliberately ungated: phase 1 accumulates their spread across runs, phase 2
-# derives thresholds from the median/IQR of what landed here.
+# --check compares peak_rss_kb and peak_heap_bytes only, and only for the
+# scenarios NOT listed in RECORD_ONLY below. The latency, throughput, retention
+# and fragment fields are ungated everywhere: phase 1 accumulates their spread
+# across runs, phase 2 derives thresholds from the median/IQR of what landed
+# here.
 #
 #   ops/scripts/mem-gate.sh                     # ci corpus, all scenarios
 #   ops/scripts/mem-gate.sh --profile large     # 1M+ message corpus
@@ -33,13 +34,21 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --profile=*) PROFILE="${1#*=}"; shift ;;
     --check) CHECK=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
 BASELINE="docs/benchmarks/mem-gate-baseline.jsonl"
 SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
+# Scenarios that RUN and get a row, but whose numbers gate nothing yet. Their
+# peaks are dominated by a few MiB of transient buffers, so run-to-run spread
+# (measured: 39% on sync-under-contention's peak heap, 16% on
+# ingest-throughput's) is far wider than any regression worth catching - a
+# threshold here would only teach people to ignore the gate. Phase 2 promotes a
+# scenario by deleting it from this list once its committed rows say what
+# "normal" is.
+RECORD_ONLY="${RECORD_ONLY:-search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -130,10 +139,11 @@ done
 
 if [ "$CHECK" = 1 ]; then
   echo "--- check vs committed baseline (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
-  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" <<'EOF'
+  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" "$RECORD_ONLY" <<'EOF'
 import json, os, sys
 baseline, profile, tmp, pct = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 scenarios, host = sys.argv[5].split(), sys.argv[6]
+record_only = set(sys.argv[7].split())
 METRICS = ("peak_rss_kb", "peak_heap_bytes")
 try:
     rows = [json.loads(line) for line in open(baseline) if line.strip()]
@@ -152,6 +162,13 @@ for scenario in scenarios:
         and r.get("host") == host
     ]
     print(f"\n[{scenario}] {profile} on {host}")
+    if scenario in record_only:
+        # Printed, never judged: this scenario is accumulating spread.
+        for key in METRICS:
+            now = fresh.get(key)
+            before = same[-1].get(key) if same else None
+            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {now:<14} (record-only)")
+        continue
     if not same:
         print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
         failed = True
