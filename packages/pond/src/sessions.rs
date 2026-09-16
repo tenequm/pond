@@ -6802,6 +6802,104 @@ mod tests {
         Ok(())
     }
 
+    /// The chunk cut carries the fixed vector width too, not just the flush
+    /// trigger: `messages_chunk` pays a dense `embedding_dim()` slot per row
+    /// however light the text columns are. These rows are small enough that
+    /// their text alone would fit in one chunk many times over, so only the
+    /// counted vector width can force the split.
+    #[test]
+    fn messages_batch_from_cuts_on_the_fixed_vector_width() -> anyhow::Result<()> {
+        const ROWS: usize = 50_000;
+
+        let session = synthetic_session("vector-width-chunking");
+        let messages: Vec<Message> = (0..ROWS)
+            .map(|index| padded_message(&session.id, &format!("message-{index}"), 0))
+            .collect();
+        let rows: Vec<MessageBatchRow<'_>> = messages
+            .iter()
+            .map(|message| MessageBatchRow {
+                message,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            })
+            .collect();
+        let vectors = vec![None; rows.len()];
+
+        let (end, batch) = messages_batch_from(&rows, &vectors, 0)?;
+        assert!(end < ROWS, "{ROWS} rows must not fit one chunk, got {end}");
+        assert_eq!(batch.num_rows(), end);
+        assert!(
+            end * message_row_fixed_bytes() > INGEST_FLUSH_BYTE_BUDGET / 2,
+            "the vector width must be what fills the chunk, got {end} rows",
+        );
+        Ok(())
+    }
+
+    /// Every byte charged to `buffered_bytes` must be discharged by the flush
+    /// that writes the row it was charged for. A missing subtraction leaks the
+    /// budget upward until ingest flushes on every event; a missing addition
+    /// trips the underflow assert inside `flush`.
+    #[tokio::test]
+    async fn flush_discharges_every_buffered_byte() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut validator = IngestValidator::default();
+        for (index, event) in conversational_events("byte-accounting", 8)
+            .into_iter()
+            .enumerate()
+        {
+            validator.push(&store, index, event).await?;
+        }
+        assert!(validator.buffered_bytes > 0);
+
+        // Mid-stream: the still-open session row and the in-flight message stay
+        // charged, everything the flush wrote does not.
+        validator.flush(&store).await?;
+        assert!(validator.buffered_bytes > 0);
+
+        validator.finish(&store).await?;
+        assert_eq!(validator.buffered_bytes, 0);
+        Ok(())
+    }
+
+    /// A partial flush writes its message rows under the stored labels but no
+    /// session row, so the relabel it detects belongs to the substream's close,
+    /// not to both.
+    #[tokio::test]
+    async fn partial_flush_counts_a_relabel_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let stored = synthetic_session("relabel-partial-flush");
+        let mut seed = IngestValidator::default();
+        seed.push(&store, 0, IngestEvent::Session(stored.clone()))
+            .await?;
+        seed.finish(&store).await?;
+
+        let mut relabeled = stored.clone();
+        relabeled.source_agent = "codex".to_owned();
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(relabeled.clone()))
+            .await?;
+        for (index, id) in ["message-1", "message-2"].into_iter().enumerate() {
+            validator
+                .push(
+                    &store,
+                    index + 1,
+                    IngestEvent::Message(large_message(&relabeled.id, id)),
+                )
+                .await?;
+        }
+        assert!(validator.byte_budget_reached());
+
+        let (_, partial) = validator.flush(&store).await?;
+        let (_, tail) = validator.finish(&store).await?;
+        assert_eq!(partial.relabeled_sessions, 0);
+        assert_eq!(tail.relabeled_sessions, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn resync_after_partial_flush_does_not_duplicate_rows() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
