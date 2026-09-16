@@ -592,7 +592,7 @@ The parse face's contract on output:
 
 ##### `adapter-integrity-event-ordering`
 
-For each session: the Session first, then each Message immediately followed by its Parts in order, before the next Message. pond core computes a message's indexed text at the message boundary without buffering across messages - the transition off a Part stream is the signal the message is complete.
+For each session: the Session first, then each Message immediately followed by its Parts in order, before the next Message. pond core computes a message's indexed text at the message boundary without buffering across messages - the transition off a Part stream is the signal the message is complete. Core MAY flush a completed prefix of a large in-flight session to keep ingest memory bounded, but MUST write the session row only after the substream closes so the freshness signal cannot outrun its message and part rows.
 
 ##### `adapter-integrity-no-silent-drops`
 
