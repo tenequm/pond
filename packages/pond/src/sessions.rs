@@ -1995,13 +1995,21 @@ impl Store {
         Ok(RowmapEnsure::Contended)
     }
 
-    /// Build the current rowmap for a sync oracle, or use the newest valid
-    /// trailing chain when a sibling holds the build lock. A trailing watermark
-    /// can only make sync re-examine rows appended since that chain's version.
+    /// Build the current rowmap for a sync oracle, or fall back to a trailing
+    /// map - this process's resident one, else the newest valid cached chain -
+    /// when a sibling holds the build lock. A trailing watermark can only make
+    /// sync re-examine rows appended since that map's version.
     pub async fn sync_rowmap_oracle(&self, cache_dir: &Path) -> Result<RowmapOracle> {
         match self.ensure_rowmap_inner(cache_dir).await? {
             RowmapEnsure::Current => Ok(RowmapOracle(self.rowmap_snapshot())),
             RowmapEnsure::Contended => {
+                // A resident map was validated against this store when this
+                // process installed it, so it is the cheaper baseline and needs
+                // no re-probe. `serve --with-sync` is always in this case: its
+                // prewarm refresh is the sibling holding the lock.
+                if let Some(resident) = self.rowmap_snapshot() {
+                    return Ok(RowmapOracle(Some(resident)));
+                }
                 let Some(set) = self.open_cached_rowmap(cache_dir).await else {
                     return Ok(RowmapOracle(None));
                 };
@@ -2012,10 +2020,9 @@ impl Store {
                     );
                     return Ok(RowmapOracle(None));
                 }
-                let version = set.version();
                 tracing::info!(
-                    version,
-                    "sync proceeds against a trailing oracle at version {version} after rowmap build-lock contention"
+                    version = set.version(),
+                    "sync proceeds against a trailing oracle after rowmap build-lock contention"
                 );
                 Ok(RowmapOracle(Some(set)))
             }
@@ -2023,10 +2030,11 @@ impl Store {
     }
 
     /// Open the newest locally cached rowmap chain regardless of the store's
-    /// current version, without installing it. Read-only estimate seam for
-    /// `pond status`: the chain is as-of this host's last sync - exactly the
-    /// baseline "pending since then" wants. Never assigned to `self.rowmap`:
-    /// searches must not hydrate from a possibly-stale map.
+    /// current version, without installing it. The trailing baseline for
+    /// `pond status`'s estimate and for [`Self::sync_rowmap_oracle`] on a host
+    /// with no resident map: the chain is as-of this host's last sync - exactly
+    /// the baseline "pending since then" wants. Never assigned to
+    /// `self.rowmap`: searches must not hydrate from a possibly-stale map.
     ///
     /// Deliberately version-agnostic - a trailing chain is the right baseline
     /// here - so the only thing checked is that the chain is not a *previous
@@ -2034,11 +2042,13 @@ impl Store {
     /// reporting every source fresh and nothing pending: the same lie `pond
     /// sync` used to tell, on a surface nobody thinks to distrust.
     ///
-    /// Only the row-count half of [`Self::rowmap_matches_store`] applies here.
-    /// This is the one caller documented as costing no remote scan, and a count
-    /// is a manifest read rather than a data read. It catches the
-    /// emptied-and-rebuilt case outright; a same-size foreign store would slip
-    /// through, and an estimate is the one place that is tolerable.
+    /// This does only the row-count half of [`Self::rowmap_matches_store`], so
+    /// `pond status` keeps its documented no-scan cost: a count is a manifest
+    /// read rather than a data read. It catches the emptied-and-rebuilt case
+    /// outright; a same-size foreign store would slip through, which an
+    /// estimate can tolerate and a sync skip cannot - so
+    /// [`Self::sync_rowmap_oracle`] runs the identity probe itself before
+    /// trusting what this returns.
     pub async fn open_cached_rowmap(&self, cache_dir: &Path) -> Option<Arc<RowMetaSet>> {
         let chain = discover_chain(cache_dir, &self.store_key())?;
         let set = RowMetaSet::open(&chain).ok()?;
@@ -8495,6 +8505,36 @@ mod tests {
             oracle.session_max_ts("session-after-chain"),
             None,
             "rows newer than the chain stay pending",
+        );
+        Ok(())
+    }
+
+    /// `serve --with-sync` contends with its own prewarm refresh, so the map it
+    /// already holds is the baseline that must survive - reaching past it to
+    /// disk loses it whenever the lock holder has purged the chain.
+    #[tokio::test]
+    async fn sync_rowmap_oracle_keeps_its_resident_map_when_contended() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+        assert!(store.rowmap_snapshot().is_some());
+
+        ingest_events(&store, conversational_events("session-after-chain", 1)).await?;
+        std::fs::remove_dir_all(&cache)?;
+        std::fs::create_dir_all(&cache)?;
+
+        let _lock = hold_rowmap_lock(&store, &cache)?;
+        let oracle = store.sync_rowmap_oracle(&cache).await?;
+
+        assert!(
+            oracle.session_max_ts("session-0").is_some(),
+            "the resident map stays the baseline with no chain left on disk",
+        );
+        assert_eq!(
+            oracle.session_max_ts("session-after-chain"),
+            None,
+            "rows newer than the resident map stay pending",
         );
         Ok(())
     }
