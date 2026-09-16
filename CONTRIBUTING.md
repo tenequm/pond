@@ -4,7 +4,7 @@ Issues and pull requests are welcome. For anything larger than a bug fix, commen
 
 ## Adding an adapter
 
-The most wanted contribution. The full playbook is [`.agents/skills/add-adapter/SKILL.md`](.agents/skills/add-adapter/SKILL.md) - loadable as the `/add-adapter` skill in Claude Code, readable as a document by anyone. The short form:
+The most wanted contribution. The full playbook is [`skills/add-adapter/SKILL.md`](skills/add-adapter/SKILL.md) - loadable as the `/add-adapter` skill in Claude Code or Codex once [kasetto](https://github.com/pivoshenko/kasetto) installs it (`kst sync`), readable as a document by anyone. The short form:
 
 - One self-contained PR: spec doc (`docs/adapters/<source_agent>.md` with the filled decision table), fixture, adapter, tests.
 - The conformance fixture is a sandboxed self-capture of the agent (run it under a throwaway `HOME`), verified against [`packages/pond/tests/fixtures/README.md`](packages/pond/tests/fixtures/README.md). No vendored or real-home data.

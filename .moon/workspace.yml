@@ -16,10 +16,14 @@ vcs:
   hooks:
     pre-commit:
       - './.github/hooks/pre-commit'
+    # Installs agent skills (gitignored) in fresh checkouts and worktrees; a
+    # no-op without kasetto.
+    post-checkout:
+      - 'command -v kst >/dev/null 2>&1 && kst sync -q --color never || true'
   sync: true
 
-# .claude/ and .agents/ hold local Claude Code settings and skill symlinks that
-# point outside the repo; moon's vcs walk follows them, so exclude from hashing.
+# .claude/ and .agents/ hold local agent settings and kasetto-installed skills;
+# keep them out of hashing.
 hasher:
   ignorePatterns:
     - '.claude/**/*'

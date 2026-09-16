@@ -23,18 +23,10 @@ Thumbs.db
 .secrets*
 tmp/
 .mcp.json
-# Local agent state stays ignored; only the repo-native add-adapter skill is
-# committed (git never descends into ignored dirs, hence the unignore cascade).
-.agents/*
-!.agents/skills/
-.agents/skills/*
-!.agents/skills/add-adapter/
-*/**/.agents/
-/.claude/*
-!/.claude/skills/
-/.claude/skills/*
-!/.claude/skills/add-adapter
-skills-lock.json
+# Local agent state stays ignored. Skills are installed here by kasetto from
+# kasetto.yaml; the repo's own skills live in skills/.
+.agents/
+/.claude/
 /packages/pond/benches/corpus/
 
 # AGENTS.md is the canonical, tracked instructions file; CLAUDE.md is a local

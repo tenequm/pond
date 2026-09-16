@@ -340,7 +340,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 
 Issues and pull requests are welcome. The most useful contributions right now:
 
-- An adapter for a harness pond does not read yet. The playbook is the [`add-adapter` skill](.agents/skills/add-adapter/SKILL.md); the PR expectations are in [CONTRIBUTING.md](CONTRIBUTING.md).
+- An adapter for a harness pond does not read yet. The playbook is the [`add-adapter` skill](skills/add-adapter/SKILL.md); the PR expectations are in [CONTRIBUTING.md](CONTRIBUTING.md).
 - Spec feedback on [`docs/spec.md`](docs/spec.md).
 - Pointers to additional reference schemas or session samples worth documenting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
