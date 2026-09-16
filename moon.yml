@@ -49,7 +49,7 @@ tasks:
   # Memory gate (#245, track A): one mem_bench scenario per process, appending
   # to docs/benchmarks/mem-gate-baseline.jsonl and printing the delta vs the
   # previous run. Local-only in v1 - no thresholds, not in CI. Pass flags
-  # through: `moon run mem-gate -- --profile large`.
+  # through: `moon run repo:mem-gate -- --profile large`.
   mem-gate:
     command: 'bash ops/scripts/mem-gate.sh'
     toolchains: 'system'
@@ -58,7 +58,7 @@ tasks:
       outputStyle: stream
 
   # Allocation-site attribution for one mem_bench scenario:
-  # `moon run profile-mem -- <scenario> [heaptrack|dhat]`.
+  # `moon run repo:profile-mem -- <scenario> [heaptrack|dhat]`.
   profile-mem:
     command: 'bash ops/scripts/profile-mem.sh'
     toolchains: 'system'
