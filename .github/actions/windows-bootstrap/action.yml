@@ -50,8 +50,9 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        # Keep in lockstep with `protoc` in flake.nix's toolVersions - the
-        # flake-check job fails when this text and the flake disagree.
+        # Keep in lockstep with `protoc` in flake.nix's toolVersions, by hand:
+        # flake-check's parity step reads flake.nix and rust-toolchain.toml
+        # only, so a bump left behind in this file fails nothing.
         $v = '36.1'
         Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
         Expand-Archive protoc.zip -DestinationPath C:\protoc

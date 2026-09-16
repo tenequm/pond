@@ -1,6 +1,6 @@
 # CI and dev toolchain revamp: the flake as the single tool source
 
-Date: 2026-09-16. Owner: tenequm. Status: in flight - see the phase table in §4
+Date: 2026-09-16. Owner: tenequm. Status: in flight - see the phase table in 4
 for where each phase sits. Phases 1-3 are in PR #264, phase 4 in PR #262, and
 phase 5's repo half is in PR #265 (stacked on #262); phase 5's ops half - the
 stripped runner image and the /nix store volume - has to be deployed before any
@@ -276,13 +276,21 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   binstalls a prebuilt binary that needs no Rust, and its degraded source-build
   path now fails loudly on pond's pin rather than silently using a second
   toolchain.
-- The binary cache is wired for READ only (flake `nixConfig` plus explicit flags
-  on the CI nix invocation, since nixConfig is ignored for an untrusted user).
-  Pushing needs a signing key on main-branch jobs (2.8 point 2) and is deferred
-  to its own change.
+- The binary cache is wired for READ only, in three places a rotation has to
+  edit together: the flake's `nixConfig`, explicit flags on the pond-ci nix
+  invocation (nixConfig is ignored for an untrusted user), and `flake-check`'s
+  `install-nix-action` `extra_nix_config`. Pushing needs a signing key on
+  main-branch jobs (2.8 point 2) and is deferred to its own change.
 - 2.2's one-time `/ci-cache` cleanup is enforced, not assumed: the action fails
   the job if a rustup proxy is still sitting in `$CARGO_HOME/bin`, with the
   remedy in the error. `/ci-cache/proto` is explicitly NOT part of that cleanup
   any more, per the `PROTO_HOME` note above.
 - 2.1's "keep clang/libclang (bindgen)" is dropped: `bindgen` is not in
   `Cargo.lock`, so `LIBCLANG_PATH` pointed at a closure nothing used.
+- **Open, ops side: nothing prunes the devshell profiles.** Each key is its own
+  `/nix/var/nix/profiles/pond-dev-$key`, i.e. its own permanent GC root with a
+  single generation, so `nix-collect-garbage -d` frees none of them and every
+  edit to flake.nix, flake.lock or rust-toolchain.toml pins another full
+  toolchain closure on the node's store volume. A reaper belongs with the /nix
+  volume (age-based over `pond-dev-*`), and it cannot use mtime as read: the hit
+  path never touches the profile it reuses, so the hottest key looks the oldest.

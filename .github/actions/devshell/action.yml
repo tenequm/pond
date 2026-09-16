@@ -17,12 +17,6 @@ runs:
         set -euo pipefail
         cd "$GITHUB_WORKSPACE"
 
-        # The devShell derivation depends on exactly these three files (it must
-        # not reference `self` or the source tree - see the comment above
-        # mkDevShell in flake.nix), so their hash is a sound profile key. The
-        # flake EVALUATION cache cannot help us: it is keyed on the git
-        # fingerprint, so every commit misses it. A profile hit skips evaluation
-        # entirely - measured at ~0.1 s against ~30 s for a cold eval.
         # Without the node's /nix store volume the static nix silently falls
         # back to a chroot store under $HOME ("warning: '/nix/var/nix' does not
         # exist"), substitutes a few hundred paths into it, and then dies on the
@@ -34,6 +28,14 @@ runs:
           exit 1
         fi
 
+        # The devShell derivation depends on exactly these three files (it must
+        # not reference `self` or the source tree - see the comment above
+        # mkDevShell in flake.nix), so their hash is a sound profile key. The
+        # flake EVALUATION cache cannot help us: it is keyed on the git
+        # fingerprint, so every commit misses it. A profile hit skips evaluation
+        # entirely - measured at ~0.1 s against ~30 s for a cold eval.
+        # Each distinct key is its own profile and its own permanent GC root:
+        # pruning old pond-dev-* is the ops side's job (plan 2609-16 phase 5).
         key=$(sha256sum flake.nix flake.lock rust-toolchain.toml | sha256sum | cut -c1-32)
         profile="/nix/var/nix/profiles/pond-dev-$key"
 
@@ -69,7 +71,11 @@ runs:
         if command -v jq >/dev/null 2>&1; then
           jq=(jq)
         else
-          jq=("${nix[@]}" run --inputs-from . nixpkgs#jq --)
+          # Resolved once, not per use: the array below is expanded twice, and
+          # `nix run` would re-resolve nixpkgs#jq each time - on the hit path
+          # whose whole point is skipping evaluation. `.bin` because plain
+          # `nixpkgs#jq` realizes bin AND man, i.e. two output paths.
+          jq=("$("${nix[@]}" build --inputs-from . --no-link --print-out-paths nixpkgs#jq.bin)/bin/jq")
         fi
 
         # Uppercase-initial names only: every lowercase key in the dump is a
@@ -91,7 +97,9 @@ runs:
 
         # GITHUB_PATH prepends in file order, so the shell's entries win over
         # the image's while git, the runner's node and docker stay reachable.
-        "${jq[@]}" -r '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' >> "$GITHUB_PATH"
+        # -e, not just -r: without it a missing PATH key writes the literal
+        # "null" and the job dies ten steps later on `rustc: not found`.
+        "${jq[@]}" -er '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' >> "$GITHUB_PATH"
 
         # The cache locations the deleted bootstrap also exported. RUSTUP_HOME
         # is gone with rustup itself; PROTO_HOME stays only because
@@ -121,8 +129,11 @@ runs:
         # moon's rust plugin prepends $CARGO_HOME/bin to PATH
         # (toolchains/rust/src/tier2.rs), so a rustup proxy left behind by the
         # old bootstrap would silently shadow this shell's rustc and build the
-        # release with a different compiler. Fail here instead.
-        for proxy in rustc cargo rustup; do
+        # release with a different compiler. Fail here instead. One proxy per
+        # component, so the rustfmt/clippy ones count too: `cargo fmt` and
+        # `cargo clippy` resolve cargo-fmt/cargo-clippy off PATH like any
+        # subcommand, and those proxies now point at a rustup that is gone.
+        for proxy in rustc cargo rustup rustfmt cargo-fmt cargo-clippy clippy-driver; do
           if [ -e "$CARGO_HOME/bin/$proxy" ]; then
             echo "::error::$CARGO_HOME/bin/$proxy is a leftover rustup proxy and would shadow the devshell toolchain. Delete /ci-cache/{rustup,bin} and the rustup proxies in /ci-cache/cargo/bin (keep the registry cache) on the runner PVC." >&2
             exit 1
@@ -141,3 +152,8 @@ runs:
         rcodesign --version
         gh --version
         xz --version | head -1
+        # Not optional extras: uv runs hermes-pond's suite, python3 patches the
+        # darwin SDK load command in the dist build, jq reads cargo metadata.
+        uv --version
+        python3 --version
+        jq --version

@@ -113,11 +113,11 @@ tasks:
 
       # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
       # cold-start net for a fresh /ci-cache. The remote is no longer written
-      # here - it lives in .github/kache/linux-dist.toml, which the bootstrap
-      # selects through KACHE_CONFIG, so the wrapper and any daemon kache spawns
-      # for itself both resolve it from a file they can re-read. The old stub
-      # named no bucket and leaned on the job's KACHE_S3_* env, which kache
-      # strips from a daemon spawn. Push on EXIT, not after success: crates
+      # here - it lives in .github/kache/linux-dist.toml, which
+      # .github/actions/devshell selects through KACHE_CONFIG, so the wrapper and
+      # any daemon kache spawns for itself both resolve it from a file they can
+      # re-read. The old stub named no bucket and leaned on the job's
+      # KACHE_S3_* env, which kache strips from a daemon spawn. Push on EXIT, not after success: crates
       # compiled before a failure still warm the retry.
       # --all: one paginated LIST of the per-job prefix instead of one LIST
       # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
