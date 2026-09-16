@@ -1214,6 +1214,79 @@ mod tests {
         );
     }
 
+    /// A deliberately awkward corpus for the byte-compat guards: three blocks
+    /// with a partial last one, duplicate-key runs (session, project, agent,
+    /// role) whose lengths are coprime with `BLOCK_ROWS` so runs straddle every
+    /// block boundary, empty and non-ASCII `search_text`, and dictionary values
+    /// whose first-seen order differs from their lexical order. Returned in
+    /// ascending `row_id` order - the streaming build's required input order.
+    fn compat_fixture() -> Vec<RowMetaEntry> {
+        let roles = ["user", "assistant", "system"];
+        let projects = ["/z/last", "/a/first", "/m/middle"];
+        let agents = ["opencode", "claude-code", "codex"];
+        (0..(BLOCK_ROWS as u64 * 2 + 37))
+            .map(|i| {
+                let text = match i % 11 {
+                    0 => String::new(),
+                    3 => format!("ünïcode ✓ body {i}"),
+                    _ => format!("message body {i} with some repeated filler filler filler"),
+                };
+                RowMetaEntry {
+                    row_id: i * 3 + 1,
+                    session_id: format!("sess-{:04}", i / 7),
+                    message_id: format!("msg-{i:08}"),
+                    role: roles[(i % 3) as usize].to_owned(),
+                    project: projects[(i / 5 % 3) as usize].to_owned(),
+                    source_agent: agents[(i / 13 % 3) as usize].to_owned(),
+                    timestamp_micros: 1_700_000_000_000_000 + (i as i64 % 97) * 1_000,
+                    search_text: text,
+                }
+            })
+            .collect()
+    }
+
+    fn digest(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).unwrap();
+        format!("{:x}", Sha256::digest(&bytes))
+    }
+
+    /// The published layout is a compatibility surface: a map built by one pond
+    /// is opened by another (and by an older binary still running). This pins
+    /// the exact bytes `compat_fixture` encodes to, so a refactor of the build
+    /// path - the chunked scan window, a reordered pass, a different scratch
+    /// structure - cannot silently change what lands on disk.
+    ///
+    /// A zstd upgrade that changes its output for the same input is the one
+    /// legitimate way to break this. Recompute the digest then (and only then),
+    /// and treat it as a format revision.
+    #[test]
+    fn build_output_is_byte_stable() {
+        const EXPECTED: &str = "0f103bfcf49fdb9f1f3e5c697ec64557cd63d5e516fa939daed0b0b4a13949de";
+        let dir = tempfile::tempdir().unwrap();
+        let sorted = compat_fixture();
+
+        let from_sorted = dir.path().join("sorted.rmm");
+        RowMetaMap::build(&from_sorted, 42, sorted.clone()).unwrap();
+
+        // Same rows, scrambled: the build sorts by row_id, so the bytes must not
+        // depend on the caller's order.
+        let mut scrambled = sorted;
+        let len = scrambled.len();
+        for i in 0..len / 2 {
+            scrambled.swap(i, len - 1 - i * 2 % len);
+        }
+        let from_scrambled = dir.path().join("scrambled.rmm");
+        RowMetaMap::build(&from_scrambled, 42, scrambled).unwrap();
+
+        assert_eq!(
+            digest(&from_sorted),
+            digest(&from_scrambled),
+            "input order must not change the encoded bytes"
+        );
+        assert_eq!(digest(&from_sorted), EXPECTED, "on-disk rowmap bytes moved");
+    }
+
     #[test]
     fn empty_map_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
