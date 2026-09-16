@@ -32,7 +32,10 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config, embed,
-    rowmap::{RowMetaEntry, RowMetaMap, RowMetaSet, discover_chain},
+    rowmap::{
+        RowMetaBuilder, RowMetaEntry, RowMetaMap, RowMetaRef, RowMetaSet, UnorderedRows,
+        discover_chain,
+    },
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
@@ -2145,9 +2148,13 @@ impl Store {
             }
             // No chain, or a reclaimed base / deletion since it: full scan -> base.
             _ => {
-                let entries = self.collect_row_metas().await?;
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
-                RowMetaMap::build(&path, version, entries)?;
+                // Streamed straight into the segment; only a scan that is not
+                // row_id-ordered falls back to collecting the corpus first.
+                if !self.build_rowmap_from_scan(&path, version).await? {
+                    let entries = self.collect_row_metas().await?;
+                    RowMetaMap::build(&path, version, entries)?;
+                }
                 version
             }
         };
@@ -2616,9 +2623,49 @@ impl Store {
             .version)
     }
 
+    /// Scan the hydration columns with row ids straight into a segment file at
+    /// `path`, folding each batch into the encoder and dropping it - the whole
+    /// corpus never exists in memory at once, only the open block and the
+    /// dictionaries. One large sequential scan, same as `collect_row_metas`.
+    ///
+    /// `Ok(false)` means the scan handed the builder a row that went backwards
+    /// in `row_id`, which the streaming encoder cannot absorb (the block holding
+    /// the earlier rows is already compressed and gone). Nothing was published;
+    /// the caller re-encodes through the sorting `RowMetaMap::build`.
+    async fn build_rowmap_from_scan(&self, path: &Path, version: u64) -> Result<bool> {
+        let row_count = self.handle.count_rows(Table::Messages).await?;
+        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        scanner.with_row_id();
+        scanner.project(&Self::ROW_META_COLUMNS)?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut builder = RowMetaBuilder::new(path, version, row_count)?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let columns = RowMetaColumns::new(&batch)?;
+            for row in 0..batch.num_rows() {
+                if let Err(error) = builder.push(columns.row(row)?) {
+                    return match error.downcast_ref::<UnorderedRows>() {
+                        Some(unordered) => {
+                            tracing::warn!(
+                                %unordered,
+                                "row meta scan is not row_id-ordered; rebuilding from a sorted collect"
+                            );
+                            Ok(false)
+                        }
+                        None => Err(error),
+                    };
+                }
+            }
+        }
+        builder.finish()?;
+        Ok(true)
+    }
+
     /// Scan the hydration columns with row ids into a `Vec`, the input to
-    /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
-    /// scattered per-hit take it replaces; `search_text` dominates the bytes.
+    /// `RowMetaMap::build`. The sorting fallback for `build_rowmap_from_scan`
+    /// (and the oracle the map-vs-scan tests compare against); `search_text`
+    /// dominates the bytes, so this holds the whole corpus and the streaming
+    /// path above is what a cold build normally takes.
     pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
         let row_count = self.handle.count_rows(Table::Messages).await?;
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
@@ -5900,6 +5947,75 @@ impl crate::adapter::SkipOracle for RowmapOracle {
     fn is_empty(&self) -> bool {
         self.0.as_ref().is_none_or(|set| set.is_empty())
     }
+}
+
+/// The row-meta columns of one scan batch, resolved once per batch instead of
+/// once per row: `column_by_name` is a linear walk of the schema, and a cold
+/// build looks these up for every row in the store. Rows are handed to the
+/// encoder as borrows into the batch, so the pass allocates nothing per row.
+struct RowMetaColumns<'a> {
+    row_ids: &'a UInt64Array,
+    session_id: &'a StringArray,
+    message_id: &'a StringArray,
+    role: &'a StringArray,
+    project: &'a StringArray,
+    source_agent: &'a StringArray,
+    timestamp: &'a TimestampMicrosecondArray,
+    search_text: &'a StringArray,
+}
+
+impl<'a> RowMetaColumns<'a> {
+    fn new(batch: &'a RecordBatch) -> Result<Self> {
+        Ok(Self {
+            row_ids: uint64(batch, "_rowid")?,
+            session_id: string_column(batch, "session_id")?,
+            message_id: string_column(batch, "id")?,
+            role: string_column(batch, "role")?,
+            project: string_column(batch, "project")?,
+            source_agent: string_column(batch, "source_agent")?,
+            timestamp: batch
+                .column_by_name("timestamp")
+                .context("missing column timestamp")?
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("column timestamp is not timestamp_micros")?,
+            search_text: string_column(batch, "search_text")?,
+        })
+    }
+
+    fn row(&self, row: usize) -> Result<RowMetaRef<'a>> {
+        Ok(RowMetaRef {
+            row_id: self.row_ids.value(row),
+            session_id: required_str(self.session_id, row, "session_id")?,
+            message_id: required_str(self.message_id, row, "message id")?,
+            role: required_str(self.role, row, "role")?,
+            project: required_str(self.project, row, "project")?,
+            source_agent: required_str(self.source_agent, row, "source_agent")?,
+            timestamp_micros: self.timestamp.value(row),
+            // Nullable in the schema: a bare tool call carries no text.
+            search_text: if self.search_text.is_null(row) {
+                ""
+            } else {
+                self.search_text.value(row)
+            },
+        })
+    }
+}
+
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .with_context(|| format!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .with_context(|| format!("column {name} is not Utf8"))
+}
+
+fn required_str<'a>(array: &'a StringArray, row: usize, name: &str) -> Result<&'a str> {
+    if array.is_null(row) {
+        anyhow::bail!("{name} is null");
+    }
+    Ok(array.value(row))
 }
 
 fn row_meta_entry(batch: &RecordBatch, row_id: u64, row: usize) -> Result<RowMetaEntry> {

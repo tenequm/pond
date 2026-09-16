@@ -22,11 +22,12 @@
 //! dict value bytes. Each session entry also carries its max message timestamp,
 //! the watermark the `pond sync` skip oracle compares against the source.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
@@ -106,6 +107,49 @@ pub struct RowMetaEntry {
     pub search_text: String,
 }
 
+impl RowMetaEntry {
+    /// Borrow this row for [`RowMetaBuilder::push`].
+    fn as_row(&self) -> RowMetaRef<'_> {
+        RowMetaRef {
+            row_id: self.row_id,
+            session_id: &self.session_id,
+            message_id: &self.message_id,
+            role: &self.role,
+            project: &self.project,
+            source_agent: &self.source_agent,
+            timestamp_micros: self.timestamp_micros,
+            search_text: &self.search_text,
+        }
+    }
+}
+
+/// Borrowed input row for [`RowMetaBuilder::push`] - [`RowMetaEntry`]'s fields
+/// without the six owned strings, so a scan batch or an mmap'd segment feeds the
+/// builder without allocating a row at a time.
+pub struct RowMetaRef<'a> {
+    pub row_id: u64,
+    pub session_id: &'a str,
+    pub message_id: &'a str,
+    pub role: &'a str,
+    pub project: &'a str,
+    pub source_agent: &'a str,
+    pub timestamp_micros: i64,
+    pub search_text: &'a str,
+}
+
+/// Rows reached [`RowMetaBuilder::push`] out of `row_id` order. The builder
+/// encodes rows in arrival order (records are binary-searched, so that order is
+/// the file's), and it has already dropped the text of every block it closed -
+/// so it cannot reorder after the fact. Callers streaming from a source whose
+/// order is not guaranteed catch this and fall back to the buffering
+/// [`RowMetaMap::build`], which sorts first.
+#[derive(Debug, thiserror::Error)]
+#[error("row meta rows arrived out of row_id order ({previous} then {current})")]
+pub struct UnorderedRows {
+    pub previous: u64,
+    pub current: u64,
+}
+
 /// Borrowed view of one row's meta. The dictionary-encoded fields borrow the
 /// mmap; `search_text` is owned (decompressed from its block).
 pub struct RowMeta<'a> {
@@ -160,178 +204,17 @@ impl RowMetaMap {
         cache_dir.join(format!("rowmetamap-{store_key}-d{version}.rmm"))
     }
 
+    /// Encode `entries` into a segment at `path`. Buffering entry point: the
+    /// whole corpus is already owned here, so it sorts and replays into
+    /// [`RowMetaBuilder`]. A caller that can stream rows in `row_id` order
+    /// should drive the builder directly and never materialize this `Vec`.
     pub fn build(path: &Path, version: u64, mut entries: Vec<RowMetaEntry>) -> Result<()> {
         entries.sort_unstable_by_key(|entry| entry.row_id);
-
-        // Per session: message count plus the max message timestamp - the
-        // watermark the sync skip oracle compares against the source's latest
-        // message timestamp (spec.md#adapters; deterministic, rebuilt from the
-        // store, no local cursor).
-        let mut session_agg: HashMap<&str, (u32, i64)> = HashMap::new();
+        let mut builder = RowMetaBuilder::new(path, version, entries.len())?;
         for entry in &entries {
-            let agg = session_agg
-                .entry(entry.session_id.as_str())
-                .or_insert((0, i64::MIN));
-            agg.0 += 1;
-            agg.1 = agg.1.max(entry.timestamp_micros);
+            builder.push(entry.as_row())?;
         }
-        let mut sessions: Vec<(&str, u32, i64)> = session_agg
-            .into_iter()
-            .map(|(sid, (count, max_ts))| (sid, count, max_ts))
-            .collect();
-        sessions.sort_unstable_by(|left, right| left.0.cmp(right.0));
-        let session_index = index_of(sessions.iter().map(|(value, _, _)| *value));
-
-        let projects = distinct_sorted(entries.iter().map(|entry| entry.project.as_str()));
-        let project_index = index_of(projects.iter().copied());
-        let agents = distinct_sorted(entries.iter().map(|entry| entry.source_agent.as_str()));
-        let agent_index = index_of(agents.iter().copied());
-        let roles = distinct_sorted(entries.iter().map(|entry| entry.role.as_str()));
-        let role_index = index_of(roles.iter().copied());
-
-        let block_count = entries.len().div_ceil(BLOCK_ROWS);
-        let blob_offset = (size_of::<Header>()
-            + entries.len() * size_of::<Record>()
-            + sessions.len() * size_of::<SessionEntry>()
-            + (projects.len() + agents.len() + roles.len()) * size_of::<DictEntry>()
-            + block_count * size_of::<BlockEntry>()) as u64;
-        let header = Header {
-            magic: MAGIC,
-            version,
-            count: entries.len() as u64,
-            session_count: sessions.len() as u64,
-            project_count: projects.len() as u64,
-            agent_count: agents.len() as u64,
-            role_count: roles.len() as u64,
-            block_count: block_count as u64,
-            blob_offset,
-        };
-
-        // Unique temp name per builder (pid + nonce): two processes prewarming
-        // the same store+version must not share one temp inode, or the second's
-        // create would mutate the file the first is mapping.
-        let tmp = path.with_extension(format!(
-            "tmp-{}-{:016x}",
-            std::process::id(),
-            fastrand::u64(..)
-        ));
-        // Serialization runs with the temp already open, so its failures reclaim
-        // the temp here. The rename stays outside: a build that could not publish
-        // must leave one for `sweep_orphan_temps` (`rowmap_purge_probe` pins it).
-        let stream = || -> Result<()> {
-            let file = File::create(&tmp)
-                .with_context(|| format!("create row meta map temp {}", tmp.display()))?;
-            // 1 MiB: the row pass issues nine small writes per row, so the default
-            // 8 KiB buffer would flush thousands of times on a real corpus.
-            let mut writer = BufWriter::with_capacity(1 << 20, file);
-            writer.seek(SeekFrom::Start(blob_offset))?;
-            let mut blob_len = 0u64;
-
-            // Compressed search_text blocks first; spans record each row's
-            // offset+length within its decompressed block. `plain` is reused so
-            // each chunk regrows a warm buffer instead of allocating from zero.
-            let mut block_entries = Vec::with_capacity(block_count);
-            let mut spans: Vec<(u32, u32)> = Vec::with_capacity(entries.len());
-            let mut plain: Vec<u8> = Vec::new();
-            for chunk in entries.chunks(BLOCK_ROWS) {
-                plain.clear();
-                for entry in chunk {
-                    let off = u32::try_from(plain.len()).context("block too large")?;
-                    let len =
-                        u32::try_from(entry.search_text.len()).context("search_text too long")?;
-                    plain.extend_from_slice(entry.search_text.as_bytes());
-                    spans.push((off, len));
-                }
-                let compressed =
-                    zstd::bulk::compress(&plain, ZSTD_LEVEL).context("zstd compress")?;
-                block_entries.push(BlockEntry {
-                    comp_off: blob_len,
-                    comp_len: u32::try_from(compressed.len())
-                        .context("compressed block too large")?,
-                    decomp_len: u32::try_from(plain.len()).context("block too large")?,
-                });
-                writer.write_all(&compressed)?;
-                blob_len += compressed.len() as u64;
-            }
-
-            let mut records = Vec::with_capacity(entries.len());
-            for (entry, (text_off, text_len)) in entries.iter().zip(&spans) {
-                let blob_off = blob_len;
-                writer.write_all(&entry.timestamp_micros.to_le_bytes())?;
-                writer.write_all(&session_index[entry.session_id.as_str()].to_le_bytes())?;
-                writer.write_all(&project_index[entry.project.as_str()].to_le_bytes())?;
-                writer.write_all(&agent_index[entry.source_agent.as_str()].to_le_bytes())?;
-                writer.write_all(&role_index[entry.role.as_str()].to_le_bytes())?;
-                let mid_len =
-                    u32::try_from(entry.message_id.len()).context("message_id too long")?;
-                writer.write_all(&mid_len.to_le_bytes())?;
-                writer.write_all(&text_off.to_le_bytes())?;
-                writer.write_all(&text_len.to_le_bytes())?;
-                writer.write_all(entry.message_id.as_bytes())?;
-                blob_len += ROW_HEADER_LEN as u64 + u64::from(mid_len);
-                records.push(Record {
-                    row_id: entry.row_id,
-                    blob_off,
-                });
-            }
-
-            let session_entries = sessions
-                .iter()
-                .map(|(sid, count, max_ts_micros)| {
-                    let off = blob_len;
-                    writer.write_all(sid.as_bytes())?;
-                    let sid_len = u32::try_from(sid.len()).context("session_id too long")?;
-                    blob_len += u64::from(sid_len);
-                    Ok(SessionEntry {
-                        sid_off: off,
-                        max_ts_micros: *max_ts_micros,
-                        sid_len,
-                        count: *count,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let project_entries = write_dict_entries(&mut writer, &mut blob_len, &projects)?;
-            let agent_entries = write_dict_entries(&mut writer, &mut blob_len, &agents)?;
-            let role_entries = write_dict_entries(&mut writer, &mut blob_len, &roles)?;
-
-            // The row pass hand-sums ROW_HEADER_LEN across nine writes, so a field
-            // added there would silently shift every offset already recorded.
-            #[cfg(debug_assertions)]
-            {
-                writer.flush()?;
-                debug_assert_eq!(
-                    writer.stream_position()?,
-                    blob_offset + blob_len,
-                    "rowmap blob accounting desynced from the bytes actually written",
-                );
-            }
-
-            writer.seek(SeekFrom::Start(0))?;
-            writer.write_all(bytemuck::bytes_of(&header))?;
-            writer.write_all(bytemuck::cast_slice(&records))?;
-            writer.write_all(bytemuck::cast_slice(&session_entries))?;
-            writer.write_all(bytemuck::cast_slice(&project_entries))?;
-            writer.write_all(bytemuck::cast_slice(&agent_entries))?;
-            writer.write_all(bytemuck::cast_slice(&role_entries))?;
-            writer.write_all(bytemuck::cast_slice(&block_entries))?;
-            // Closed before the rename publishes it - this module never renames a
-            // path it still holds a handle to (see `sweep_stale_rowmaps` on why
-            // Windows file semantics are load-bearing here).
-            let file = writer
-                .into_inner()
-                .map_err(|err| err.into_error())
-                .context("flush row meta map temp")?;
-            file.sync_all()?;
-            drop(file);
-            Ok(())
-        };
-        if let Err(error) = stream() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename row meta map into place {}", path.display()))?;
-        Ok(())
+        builder.finish()
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -682,6 +565,402 @@ impl RowMetaMap {
     }
 }
 
+/// Streaming encoder for one segment file: rows go in one at a time, in
+/// ascending `row_id` order, and the segment is published by [`Self::finish`].
+///
+/// The point is what it does *not* hold. A row's `search_text` is appended to
+/// the open block's plaintext and forgotten; every `BLOCK_ROWS` rows that block
+/// is compressed out to a staging temp and the plaintext buffer is reused. The
+/// row's blob header goes to a second staging temp as it arrives. So the live
+/// set is one block of text plus the dictionaries, not the corpus - the caller
+/// can drop each scan batch as soon as it has been pushed.
+///
+/// Two staging temps rather than one file, because the layout is
+/// `blocks | rows | session bytes | dict bytes` and the region before the blob
+/// is sized by counts only the completed pass knows: the blob cannot be written
+/// at its final offset until the last row has been seen. `finish` computes the
+/// fixed region, copies the blocks extent in, then replays the staged rows.
+///
+/// Dictionary ids are handed out in first-seen order while streaming and
+/// remapped to the file's lexical order during that replay - the on-disk bytes
+/// are identical to what the buffering path encodes for the same rows.
+pub struct RowMetaBuilder {
+    target: PathBuf,
+    /// Temp the finished segment is written to, then renamed from.
+    tmp: PathBuf,
+    version: u64,
+    blocks: Staging,
+    rows: Staging,
+    block_entries: Vec<BlockEntry>,
+    /// Compressed bytes staged so far - the blob offset of the next block.
+    blocks_len: u64,
+    /// Plaintext of the block currently being filled.
+    plain: Vec<u8>,
+    /// Rows in the open block.
+    pending: usize,
+    /// Staged row-header bytes so far - each row's offset within the row region.
+    rows_len: u64,
+    /// `blob_off` is row-region-relative until `finish` learns the blocks extent
+    /// and shifts every record by it.
+    records: Vec<Record>,
+    sessions: Interner,
+    /// `(message count, max timestamp)` per session, indexed by first-seen id.
+    /// The max is the watermark the sync skip oracle compares against the
+    /// source's latest message timestamp (spec.md#adapters; deterministic,
+    /// rebuilt from the store, no local cursor).
+    session_aggs: Vec<(u32, i64)>,
+    projects: Interner,
+    agents: Interner,
+    roles: Interner,
+    last_row_id: Option<u64>,
+}
+
+impl RowMetaBuilder {
+    /// `expected_rows` sizes the record spine up front; it is a hint, and a
+    /// stream that runs longer or shorter still encodes correctly.
+    pub fn new(path: &Path, version: u64, expected_rows: usize) -> Result<Self> {
+        // Unique temp names per builder (pid + nonce): two processes prewarming
+        // the same store+version must not share one temp inode, or the second's
+        // create would mutate the file the first is mapping. All three carry the
+        // `.tmp-` shape `is_orphan_temp` reclaims by, so a crash mid-build
+        // leaves nothing a later `sweep_orphan_temps` cannot clean.
+        let stamp = format!("tmp-{}-{:016x}", std::process::id(), fastrand::u64(..));
+        Ok(Self {
+            target: path.to_path_buf(),
+            tmp: path.with_extension(&stamp),
+            version,
+            blocks: Staging::create(path.with_extension(format!("{stamp}-blocks")))?,
+            rows: Staging::create(path.with_extension(format!("{stamp}-rows")))?,
+            block_entries: Vec::with_capacity(expected_rows.div_ceil(BLOCK_ROWS)),
+            blocks_len: 0,
+            plain: Vec::new(),
+            pending: 0,
+            rows_len: 0,
+            records: Vec::with_capacity(expected_rows),
+            sessions: Interner::default(),
+            session_aggs: Vec::new(),
+            projects: Interner::default(),
+            agents: Interner::default(),
+            roles: Interner::default(),
+            last_row_id: None,
+        })
+    }
+
+    /// Fold one row in. Returns [`UnorderedRows`] if `row` goes backwards -
+    /// nothing is recoverable at that point, so the caller re-encodes through
+    /// the sorting [`RowMetaMap::build`].
+    pub fn push(&mut self, row: RowMetaRef<'_>) -> Result<()> {
+        if let Some(previous) = self.last_row_id
+            && row.row_id < previous
+        {
+            return Err(UnorderedRows {
+                previous,
+                current: row.row_id,
+            }
+            .into());
+        }
+        self.last_row_id = Some(row.row_id);
+
+        let text_off = u32::try_from(self.plain.len()).context("block too large")?;
+        let text_len = u32::try_from(row.search_text.len()).context("search_text too long")?;
+        self.plain.extend_from_slice(row.search_text.as_bytes());
+
+        let session = self.sessions.intern(row.session_id);
+        // Ids are handed out densely in first-seen order, so a newly interned
+        // session is always exactly one past the aggregates seen so far.
+        if session as usize == self.session_aggs.len() {
+            self.session_aggs.push((0, i64::MIN));
+        }
+        let agg = &mut self.session_aggs[session as usize];
+        agg.0 += 1;
+        agg.1 = agg.1.max(row.timestamp_micros);
+
+        let mid_len = u32::try_from(row.message_id.len()).context("message_id too long")?;
+        let mut header = [0u8; ROW_HEADER_LEN];
+        header[0..8].copy_from_slice(&row.timestamp_micros.to_le_bytes());
+        header[8..12].copy_from_slice(&session.to_le_bytes());
+        header[12..16].copy_from_slice(&self.projects.intern(row.project).to_le_bytes());
+        header[16..20].copy_from_slice(&self.agents.intern(row.source_agent).to_le_bytes());
+        header[20..24].copy_from_slice(&self.roles.intern(row.role).to_le_bytes());
+        header[24..28].copy_from_slice(&mid_len.to_le_bytes());
+        header[28..32].copy_from_slice(&text_off.to_le_bytes());
+        header[32..36].copy_from_slice(&text_len.to_le_bytes());
+        let writer = self.rows.writer()?;
+        writer.write_all(&header)?;
+        writer.write_all(row.message_id.as_bytes())?;
+
+        self.records.push(Record {
+            row_id: row.row_id,
+            blob_off: self.rows_len,
+        });
+        self.rows_len += ROW_HEADER_LEN as u64 + u64::from(mid_len);
+
+        self.pending += 1;
+        if self.pending == BLOCK_ROWS {
+            self.seal_block()?;
+        }
+        Ok(())
+    }
+
+    /// Compress the open block out to the staging temp and drop its plaintext.
+    fn seal_block(&mut self) -> Result<()> {
+        if self.pending == 0 {
+            return Ok(());
+        }
+        let compressed = zstd::bulk::compress(&self.plain, ZSTD_LEVEL).context("zstd compress")?;
+        self.block_entries.push(BlockEntry {
+            comp_off: self.blocks_len,
+            comp_len: u32::try_from(compressed.len()).context("compressed block too large")?,
+            decomp_len: u32::try_from(self.plain.len()).context("block too large")?,
+        });
+        self.blocks.writer()?.write_all(&compressed)?;
+        self.blocks_len += compressed.len() as u64;
+        // Reused, not freed: the next block regrows a warm buffer.
+        self.plain.clear();
+        self.pending = 0;
+        Ok(())
+    }
+
+    /// Assemble the segment and rename it into place.
+    pub fn finish(mut self) -> Result<()> {
+        self.seal_block()?;
+
+        let (sessions, session_remap) = std::mem::take(&mut self.sessions).into_sorted();
+        let (projects, project_remap) = std::mem::take(&mut self.projects).into_sorted();
+        let (agents, agent_remap) = std::mem::take(&mut self.agents).into_sorted();
+        let (roles, role_remap) = std::mem::take(&mut self.roles).into_sorted();
+        // Aggregates follow their session into the file's lexical order.
+        let mut session_aggs = vec![(0u32, i64::MIN); sessions.len()];
+        for (first_seen, agg) in self.session_aggs.iter().enumerate() {
+            session_aggs[session_remap[first_seen] as usize] = *agg;
+        }
+
+        let count = self.records.len();
+        let blob_offset = (size_of::<Header>()
+            + count * size_of::<Record>()
+            + sessions.len() * size_of::<SessionEntry>()
+            + (projects.len() + agents.len() + roles.len()) * size_of::<DictEntry>()
+            + self.block_entries.len() * size_of::<BlockEntry>()) as u64;
+        let header = Header {
+            magic: MAGIC,
+            version: self.version,
+            count: count as u64,
+            session_count: sessions.len() as u64,
+            project_count: projects.len() as u64,
+            agent_count: agents.len() as u64,
+            role_count: roles.len() as u64,
+            block_count: self.block_entries.len() as u64,
+            blob_offset,
+        };
+        // The blocks extent lands first in the blob, so every staged row offset
+        // shifts past it.
+        for record in &mut self.records {
+            record.blob_off += self.blocks_len;
+        }
+
+        // A failure below drops `segment` and reclaims the temp with it. The
+        // rename stays outside: a build that could not publish must leave one for
+        // `sweep_orphan_temps` (`rowmap_purge_probe` pins it).
+        let mut segment = Staging::create(self.tmp.clone())?;
+        let mut blob_len = self.blocks_len;
+        {
+            let writer = segment.writer()?;
+            writer.seek(SeekFrom::Start(blob_offset))?;
+
+            let mut staged_blocks = self.blocks.rewind()?;
+            let copied = std::io::copy(&mut staged_blocks, writer)?;
+            ensure!(
+                copied == self.blocks_len,
+                "row meta map block staging is {copied} bytes, expected {}",
+                self.blocks_len
+            );
+
+            // Replay the staged rows, remapping first-seen dictionary ids to
+            // their lexical index. Everything else about a staged row is already
+            // in its final form, so this is a copy with four `u32` patches.
+            let mut staged_rows = BufReader::with_capacity(1 << 20, self.rows.rewind()?);
+            let mut row_header = [0u8; ROW_HEADER_LEN];
+            let mut message_id = Vec::new();
+            for _ in 0..count {
+                staged_rows.read_exact(&mut row_header)?;
+                remap_id(&mut row_header, 8, &session_remap)?;
+                remap_id(&mut row_header, 12, &project_remap)?;
+                remap_id(&mut row_header, 16, &agent_remap)?;
+                remap_id(&mut row_header, 20, &role_remap)?;
+                let mid_len = read_u32(&row_header, 24).context("staged row header truncated")?;
+                message_id.resize(mid_len, 0);
+                staged_rows.read_exact(&mut message_id)?;
+                writer.write_all(&row_header)?;
+                writer.write_all(&message_id)?;
+                blob_len += ROW_HEADER_LEN as u64 + mid_len as u64;
+            }
+        }
+
+        let writer = segment.writer()?;
+        let session_entries = sessions
+            .iter()
+            .zip(&session_aggs)
+            .map(|(sid, (count, max_ts_micros))| {
+                let off = blob_len;
+                writer.write_all(sid.as_bytes())?;
+                let sid_len = u32::try_from(sid.len()).context("session_id too long")?;
+                blob_len += u64::from(sid_len);
+                Ok(SessionEntry {
+                    sid_off: off,
+                    max_ts_micros: *max_ts_micros,
+                    sid_len,
+                    count: *count,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let project_entries = write_dict_entries(writer, &mut blob_len, &projects)?;
+        let agent_entries = write_dict_entries(writer, &mut blob_len, &agents)?;
+        let role_entries = write_dict_entries(writer, &mut blob_len, &roles)?;
+
+        // The row replay hand-sums ROW_HEADER_LEN, so a field added to the row
+        // header would silently shift every offset already recorded.
+        #[cfg(debug_assertions)]
+        {
+            writer.flush()?;
+            debug_assert_eq!(
+                writer.stream_position()?,
+                blob_offset + blob_len,
+                "rowmap blob accounting desynced from the bytes actually written",
+            );
+        }
+
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(bytemuck::bytes_of(&header))?;
+        writer.write_all(bytemuck::cast_slice(&self.records))?;
+        writer.write_all(bytemuck::cast_slice(&session_entries))?;
+        writer.write_all(bytemuck::cast_slice(&project_entries))?;
+        writer.write_all(bytemuck::cast_slice(&agent_entries))?;
+        writer.write_all(bytemuck::cast_slice(&role_entries))?;
+        writer.write_all(bytemuck::cast_slice(&self.block_entries))?;
+        // Closed before the rename publishes it - this module never renames a
+        // path it still holds a handle to (see `sweep_stale_rowmaps` on why
+        // Windows file semantics are load-bearing here).
+        let tmp = segment.publish()?;
+        std::fs::rename(&tmp, &self.target)
+            .with_context(|| format!("rename row meta map into place {}", self.target.display()))?;
+        Ok(())
+    }
+}
+
+/// A build temp: streamed into, read back once, and reclaimed on drop unless
+/// [`Self::publish`] hands it over.
+struct Staging {
+    path: PathBuf,
+    writer: Option<BufWriter<File>>,
+}
+
+impl Staging {
+    fn create(path: PathBuf) -> Result<Self> {
+        // Read access too: the staging extents are streamed out and then read
+        // back through the same handle by `rewind`.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .with_context(|| format!("create row meta map temp {}", path.display()))?;
+        Ok(Self {
+            path,
+            // 1 MiB: the row pass issues two small writes per row, so the default
+            // 8 KiB buffer would flush thousands of times on a real corpus.
+            writer: Some(BufWriter::with_capacity(1 << 20, file)),
+        })
+    }
+
+    fn writer(&mut self) -> Result<&mut BufWriter<File>> {
+        self.writer
+            .as_mut()
+            .context("row meta map temp is already closed")
+    }
+
+    /// Close the writer and hand back the file positioned to be read from the
+    /// start. The path stays owned, so dropping the `Staging` still reclaims it.
+    fn rewind(&mut self) -> Result<File> {
+        let mut file = self.take_file()?;
+        file.seek(SeekFrom::Start(0))?;
+        Ok(file)
+    }
+
+    /// Flush, fsync, close, and give up ownership of the path: the caller is
+    /// publishing the file, so drop must no longer reclaim it.
+    fn publish(&mut self) -> Result<PathBuf> {
+        let file = self.take_file()?;
+        file.sync_all()?;
+        drop(file);
+        Ok(std::mem::take(&mut self.path))
+    }
+
+    fn take_file(&mut self) -> Result<File> {
+        self.writer
+            .take()
+            .context("row meta map temp is already closed")?
+            .into_inner()
+            .map_err(|err| err.into_error())
+            .context("flush row meta map temp")
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // Closed before the unlink: Windows refuses to delete an open file.
+        self.writer.take();
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// First-seen dictionary interner: one owned copy per distinct value, dense
+/// `u32` ids in arrival order, remapped to the file's lexical order at the end.
+/// Scratch is proportional to cardinality, not to rows.
+#[derive(Default)]
+struct Interner {
+    ids: HashMap<Arc<str>, u32>,
+    values: Vec<Arc<str>>,
+}
+
+impl Interner {
+    fn intern(&mut self, value: &str) -> u32 {
+        if let Some(id) = self.ids.get(value) {
+            return *id;
+        }
+        let value: Arc<str> = Arc::from(value);
+        let id = self.values.len() as u32;
+        self.values.push(Arc::clone(&value));
+        self.ids.insert(value, id);
+        id
+    }
+
+    /// `(values in lexical order, first-seen id -> lexical index)`.
+    fn into_sorted(self) -> (Vec<Arc<str>>, Vec<u32>) {
+        let mut order: Vec<u32> = (0..self.values.len() as u32).collect();
+        order.sort_unstable_by(|left, right| {
+            self.values[*left as usize].cmp(&self.values[*right as usize])
+        });
+        let mut remap = vec![0u32; self.values.len()];
+        let mut values = Vec::with_capacity(self.values.len());
+        for (index, first_seen) in order.into_iter().enumerate() {
+            remap[first_seen as usize] = index as u32;
+            values.push(Arc::clone(&self.values[first_seen as usize]));
+        }
+        (values, remap)
+    }
+}
+
+/// Rewrite the `u32` at `at` in a staged row header through `remap`.
+fn remap_id(header: &mut [u8; ROW_HEADER_LEN], at: usize, remap: &[u32]) -> Result<()> {
+    let id = read_u32(header, at).context("staged row header truncated")?;
+    let mapped = remap.get(id).context("staged dictionary id out of range")?;
+    header[at..at + 4].copy_from_slice(&mapped.to_le_bytes());
+    Ok(())
+}
+
 /// The on-disk LSM chain for a store: the highest-version base plus every
 /// delta layered above it, ascending.
 pub struct ChainPaths {
@@ -913,21 +1192,10 @@ impl RowMetaSet {
     }
 }
 
-fn distinct_sorted<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
-    values.collect::<BTreeSet<_>>().into_iter().collect()
-}
-
-fn index_of<'a>(values: impl Iterator<Item = &'a str>) -> HashMap<&'a str, u32> {
-    values
-        .enumerate()
-        .map(|(index, value)| (value, index as u32))
-        .collect()
-}
-
 fn write_dict_entries(
     writer: &mut impl Write,
     blob_len: &mut u64,
-    values: &[&str],
+    values: &[Arc<str>],
 ) -> Result<Vec<DictEntry>> {
     values
         .iter()
@@ -1285,6 +1553,72 @@ mod tests {
             "input order must not change the encoded bytes"
         );
         assert_eq!(digest(&from_sorted), EXPECTED, "on-disk rowmap bytes moved");
+    }
+
+    /// The streaming path must encode exactly what the buffering path does, and
+    /// must not care where the caller's chunk boundaries fall. The fixture's
+    /// duplicate-key runs are 5, 7 and 13 rows long, so every chunk size below
+    /// splits some run - including in the middle of a session and across the
+    /// 256-row block boundary - and dictionary values are first seen in one
+    /// chunk and reused in the next.
+    #[test]
+    fn chunked_pushes_match_the_buffered_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = compat_fixture();
+        let buffered = dir.path().join("buffered.rmm");
+        RowMetaMap::build(&buffered, 42, rows.clone()).unwrap();
+        let expected = digest(&buffered);
+
+        for chunk in [1usize, 5, 7, 64, 255, 256, 257, 300, 1000] {
+            let path = dir.path().join(format!("chunked-{chunk}.rmm"));
+            let mut builder = RowMetaBuilder::new(&path, 42, rows.len()).unwrap();
+            for batch in rows.chunks(chunk) {
+                // Owned per chunk and dropped at the end of the iteration: a
+                // batch the builder still needed would fail here, not silently
+                // work because the caller kept the corpus alive.
+                let batch: Vec<RowMetaEntry> = batch.to_vec();
+                for entry in &batch {
+                    builder.push(entry.as_row()).unwrap();
+                }
+            }
+            builder.finish().unwrap();
+            assert_eq!(
+                digest(&path),
+                expected,
+                "chunk size {chunk} changed the bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_order_rows_are_rejected_and_leave_no_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = RowMetaMap::path_for(dir.path(), "ooo", 1);
+        let rows = [
+            entry(10, "sess-a", "m10", 1, "ten"),
+            entry(9, "sess-a", "m9", 2, "nine"),
+        ];
+        let mut builder = RowMetaBuilder::new(&path, 1, rows.len()).unwrap();
+        builder.push(rows[0].as_row()).unwrap();
+        let error = builder
+            .push(rows[1].as_row())
+            .expect_err("row 9 after row 10");
+        assert!(
+            error.downcast_ref::<UnorderedRows>().is_some(),
+            "callers key their scan fallback off this type: {error}"
+        );
+        drop(builder);
+
+        assert!(!path.exists(), "an abandoned build publishes nothing");
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an abandoned builder must reclaim its staging temps: {leftovers:?}"
+        );
     }
 
     #[test]
