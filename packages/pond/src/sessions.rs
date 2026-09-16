@@ -18,7 +18,7 @@ use lance::deps::arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
 use lance::deps::arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Int32Array,
     LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchIterator, StringArray,
-    TimestampMicrosecondArray, UInt64Array, new_null_array,
+    TimestampMicrosecondArray, UInt64Array,
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance::deps::datafusion::error::DataFusionError;
@@ -26,7 +26,7 @@ use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned, ser::SerializeMap};
 use serde_json::Value;
 use tokio_stream::{Stream, StreamExt};
 
@@ -38,7 +38,10 @@ use crate::{
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
         TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
-    wire::{FileData, Message, Part, PartKind, Role, SUMMARY_PART_TYPES, Session, SessionFrom},
+    wire::{
+        FileData, Message, Part, PartKind, ProviderOptions, Role, SUMMARY_PART_TYPES, Session,
+        SessionFrom,
+    },
 };
 use url::Url;
 
@@ -1239,6 +1242,7 @@ impl Store {
             .flat_map(|substream| {
                 substream.messages.iter().map(|buffered| MessageBatchRow {
                     message: &buffered.message,
+                    pond_stamp: buffered.pond_stamp,
                     source_agent: &substream.session.source_agent,
                     project: &substream.session.project,
                     search_text: buffered.search_text.as_deref(),
@@ -1333,6 +1337,7 @@ impl Store {
             .iter()
             .map(|write| MessageBatchRow {
                 message: write.message,
+                pond_stamp: None,
                 source_agent: &session.source_agent,
                 project: &session.project,
                 search_text: write.search_text,
@@ -4043,6 +4048,7 @@ struct BufferedSession {
 struct BufferedMessage {
     index: usize,
     message: Message,
+    pond_stamp: Option<&'static Value>,
     parts: Vec<BufferedPart>,
     search_text: Option<String>,
 }
@@ -4293,20 +4299,13 @@ impl IngestValidator {
         // and restamped at ingest so neither adapters nor wire clients can
         // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
         // never restamps stored rows.
-        match ingest_host_stamp() {
-            Some(stamp) => {
-                message
-                    .options_mut()
-                    .insert("pond".to_owned(), stamp.clone());
-            }
-            None => {
-                message.options_mut().remove("pond");
-            }
-        }
+        message.options_mut().remove("pond");
+        let pond_stamp = ingest_host_stamp();
         self.flush_current_message();
         self.current_message = Some(BufferedMessage {
             index,
             message,
+            pond_stamp,
             parts: Vec::new(),
             search_text: None,
         });
@@ -5401,6 +5400,7 @@ pub(crate) fn empty_reader(
 
 pub(crate) struct MessageBatchRow<'a> {
     pub message: &'a Message,
+    pond_stamp: Option<&'static Value>,
     pub source_agent: &'a str,
     pub project: &'a str,
     pub search_text: Option<&'a str>,
@@ -5435,14 +5435,6 @@ fn embedding_update_schema() -> Arc<Schema> {
 /// are null in both. Returned aligned to `vectors` for [`messages_chunk`].
 fn embedding_columns(vectors: &[Option<Vec<f32>>]) -> Result<(ArrayRef, ArrayRef)> {
     let dim = embedding_dim();
-    // The common case (no embedder, or every row already present) is all-null:
-    // build both columns with one bulk allocation instead of dim per-row appends.
-    if vectors.iter().all(Option::is_none) {
-        return Ok((
-            new_null_array(&embedding_vector_type(), vectors.len()),
-            new_null_array(&DataType::Utf8, vectors.len()),
-        ));
-    }
     let mut builder = FixedSizeListBuilder::new(
         Float16Builder::with_capacity(vectors.len() * dim),
         dim as i32,
@@ -5643,6 +5635,45 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
+struct StampedMessageOptions<'a> {
+    options: &'a ProviderOptions,
+    pond_stamp: &'a Value,
+}
+
+impl Serialize for StampedMessageOptions<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.options.len() + 1))?;
+        let mut wrote_stamp = false;
+        for (key, value) in self.options {
+            if !wrote_stamp && key.as_str() > "pond" {
+                map.serialize_entry("pond", self.pond_stamp)?;
+                wrote_stamp = true;
+            }
+            map.serialize_entry(key, value)?;
+        }
+        if !wrote_stamp {
+            map.serialize_entry("pond", self.pond_stamp)?;
+        }
+        map.end()
+    }
+}
+
+fn message_options_bytes(row: &MessageBatchRow<'_>) -> Result<Vec<u8>> {
+    match row.pond_stamp {
+        Some(pond_stamp) => {
+            debug_assert!(!row.message.options().contains_key("pond"));
+            json_bytes(&StampedMessageOptions {
+                options: row.message.options(),
+                pond_stamp,
+            })
+        }
+        None => json_bytes(row.message.options()),
+    }
+}
+
 /// `vectors` is aligned to `rows` (same length): `Some` carries the inline
 /// embedding for that row, `None` writes a null `vector`/`embedding_model`.
 pub(crate) fn messages_batches(
@@ -5650,9 +5681,22 @@ pub(crate) fn messages_batches(
     vectors: &[Option<Vec<f32>>],
 ) -> Result<Vec<RecordBatch>> {
     debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
+    let includes_embeddings = vectors.iter().any(Option::is_some);
+    let schema = if includes_embeddings {
+        message_schema()
+    } else {
+        let schema = message_schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .filter(|field| !matches!(field.name().as_str(), "vector" | "embedding_model"))
+            .cloned()
+            .collect::<Vec<_>>();
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+    };
     let options = rows
         .iter()
-        .map(|row| json_bytes(row.message.options()))
+        .map(message_options_bytes)
         .collect::<Result<Vec<_>>>()?;
     let mut cells = Vec::with_capacity(rows.len());
     for (row, encoded) in rows.iter().zip(&options) {
@@ -5678,6 +5722,8 @@ pub(crate) fn messages_batches(
                 &rows[range.clone()],
                 &options[range.clone()],
                 &vectors[range],
+                schema.clone(),
+                includes_embeddings,
             )
         })
         .collect()
@@ -5687,59 +5733,55 @@ fn messages_chunk(
     rows: &[MessageBatchRow<'_>],
     options: &[Vec<u8>],
     vectors: &[Option<Vec<f32>>],
+    schema: Arc<Schema>,
+    includes_embeddings: bool,
 ) -> Result<RecordBatch> {
-    let schema = message_schema();
-    let (vector_column, embedding_model) = embedding_columns(vectors)?;
-    RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(
+    let mut columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.message.session_id())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.message.id()).collect::<Vec<_>>(),
+        )),
+        Arc::new(
+            TimestampMicrosecondArray::from(
                 rows.iter()
-                    .map(|row| row.message.session_id())
+                    .map(|row| micros(row.message.timestamp()))
                     .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.message.id()).collect::<Vec<_>>(),
-            )),
-            Arc::new(
-                TimestampMicrosecondArray::from(
-                    rows.iter()
-                        .map(|row| micros(row.message.timestamp()))
-                        .collect::<Vec<_>>(),
-                )
-                .with_timezone("UTC"),
-            ),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.message.role().as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.source_agent).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.project).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.message.system_content())
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
-            )),
-            // `vector` / `embedding_model` carry the inline embedding when one
-            // was produced for the row, null otherwise (embedder disabled, or a
-            // non-embeddable row); `pond optimize` fills any remaining nulls
-            // (spec.md#session-embed-from-canonical).
-            vector_column,
-            embedding_model,
-            Arc::new(LargeBinaryArray::from_iter_values(
-                options.iter().map(Vec::as_slice),
-            )),
-        ],
-    )
-    .context("failed to build message batch")
+            )
+            .with_timezone("UTC"),
+        ),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.message.role().as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.source_agent).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.project).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.message.system_content())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter().map(|row| row.search_text).collect::<Vec<_>>(),
+        )),
+    ];
+    if includes_embeddings {
+        let (vector_column, embedding_model) = embedding_columns(vectors)?;
+        columns.push(vector_column);
+        columns.push(embedding_model);
+    }
+    columns.push(Arc::new(LargeBinaryArray::from_iter_values(
+        options.iter().map(Vec::as_slice),
+    )));
+    RecordBatch::try_new(schema, columns).context("failed to build message batch")
 }
 
 pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
@@ -6399,6 +6441,7 @@ mod tests {
         };
         let row = MessageBatchRow {
             message: &message,
+            pond_stamp: None,
             source_agent: "claude-code",
             project: "/tmp",
             search_text: None,
@@ -7058,6 +7101,100 @@ mod tests {
         assert_eq!(sessions, 1, "session committed");
         assert_eq!(messages, 1, "only the first message committed");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn buffered_messages_share_the_host_stamp_until_encoding() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("shared-host-stamp");
+        let message = |id: &str| Message::User {
+            id: id.to_owned(),
+            session_id: session.id.clone(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::from([
+                ("alpha".to_owned(), json!(1)),
+                ("zulu".to_owned(), json!(2)),
+                ("pond".to_owned(), json!({"spoofed": true})),
+            ]),
+        };
+
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(message("message-1")))
+            .await?;
+        validator
+            .push(&store, 2, IngestEvent::Message(message("message-2")))
+            .await?;
+
+        let first = &validator.messages[0];
+        let second = validator.current_message.as_ref().unwrap();
+        assert!(!first.message.options().contains_key("pond"));
+        assert!(!second.message.options().contains_key("pond"));
+        match (first.pond_stamp, second.pond_stamp) {
+            (Some(first), Some(second)) => assert!(std::ptr::eq(first, second)),
+            (None, None) => {}
+            stamps => panic!("buffered messages disagree on host stamp: {stamps:?}"),
+        }
+
+        let row = MessageBatchRow {
+            message: &first.message,
+            pond_stamp: first.pond_stamp,
+            source_agent: "claude-code",
+            project: "/tmp/pond",
+            search_text: None,
+        };
+        let encoded = message_options_bytes(&row)?;
+        let mut expected = first.message.options().clone();
+        if let Some(stamp) = first.pond_stamp {
+            expected.insert("pond".to_owned(), stamp.clone());
+        }
+        assert_eq!(encoded, json_bytes(&expected)?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_null_embedding_columns_are_omitted_and_read_as_nulls() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let message = Message::User {
+            id: "message-1".to_owned(),
+            session_id: "all-null-vectors".to_owned(),
+            timestamp: Utc::now(),
+            options: ProviderOptions::new(),
+        };
+        let row = MessageBatchRow {
+            message: &message,
+            pond_stamp: None,
+            source_agent: "claude-code",
+            project: "/tmp/pond",
+            search_text: None,
+        };
+        let batches = messages_batches(&[row], &[None])?;
+        assert!(batches[0].column_by_name("vector").is_none());
+        assert!(batches[0].column_by_name("embedding_model").is_none());
+
+        store
+            .handle
+            .append_batches(Table::Messages, batches)
+            .await?;
+        let stored = store
+            .handle
+            .scan_batch(Table::Messages, None, &["vector", "embedding_model"])
+            .await?;
+        assert_eq!(stored.num_rows(), 1);
+        assert_eq!(stored.column_by_name("vector").unwrap().null_count(), 1);
+        assert_eq!(
+            stored
+                .column_by_name("embedding_model")
+                .unwrap()
+                .null_count(),
+            1
+        );
         Ok(())
     }
 
