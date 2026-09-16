@@ -1167,9 +1167,10 @@ const ROWMAP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// serving starts immediately and a failure is logged, not fatal. After warming,
 /// the task stays alive refreshing the resident meta map so a long-running
 /// server tracks new data instead of decaying to the take_rows fallback.
-fn spawn_prewarm(store: Arc<Store>) {
+fn spawn_prewarm(state: AppState) {
     let cache_dir = default_cache_dir();
     tokio::spawn(async move {
+        let store = &state.store;
         let started = std::time::Instant::now();
         tracing::info!("prewarm: warming search indices");
         match store.prewarm(&cache_dir).await {
@@ -1181,12 +1182,20 @@ fn spawn_prewarm(store: Arc<Store>) {
                 tracing::warn!(%error, "prewarm: failed; first query will pay the cold load");
             }
         }
+        // Startup is this process's largest transient (the cold rowmap build,
+        // then the index warms that run after it) and a server that nobody
+        // queries would otherwise hold all of it: the periodic trim below is
+        // armed by completed requests, so an idle process never reaches it.
+        pond::memory::trim_allocator();
         loop {
             tokio::time::sleep(ROWMAP_REFRESH_INTERVAL).await;
             if let Err(error) = store.ensure_rowmap(&cache_dir).await {
                 tracing::debug!(%error, "rowmap refresh skipped");
             }
             store.prune_index_cache(&cache_dir).await;
+            if state.take_completed_activity() {
+                pond::memory::trim_allocator();
+            }
         }
     });
 }
@@ -1610,12 +1619,8 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 opened
             });
-            let state = AppState {
-                store,
-                embedder,
-                search: config.search.clone(),
-            };
-            spawn_prewarm(state.store.clone());
+            let state = AppState::new(store, embedder, config.search.clone());
+            spawn_prewarm(state.clone());
             // `--with-sync`: fold the periodic sync into this process, reusing
             // the store + embedder above (no separate child cold-loading a
             // second ~500 MB model). The loop logs to tracing only; stdout is
@@ -1655,13 +1660,9 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 opened
             });
-            spawn_prewarm(store.clone());
-            transport::mcp::serve_stdio(AppState {
-                store,
-                embedder,
-                search: config.search.clone(),
-            })
-            .await?;
+            let state = AppState::new(store, embedder, config.search.clone());
+            spawn_prewarm(state.clone());
+            transport::mcp::serve_stdio(state).await?;
         }
         Command::Search {
             query,
@@ -4470,8 +4471,9 @@ async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
     if !messages_changed && syncstate::sync_cursor_exists(store_key) {
         return;
     }
-    // Exactly the map this run planned against: a watermark that outran the
-    // store would drop messages, and a run whose chain the planner rejected has
+    // The freshest store-validated map on hand - the one this run planned
+    // against, or a newer resident one installed since: a watermark that outran
+    // the store would drop messages, and a run whose chain the planner rejected has
     // nothing to say, so it leaves the old cursor alone rather than guessing. A
     // trailing map is store-validated and can only be behind, which costs
     // re-reads and never correctness - so the contended run this cursor exists
@@ -4624,6 +4626,7 @@ async fn run_sync_pipeline(
         render_sync_summary(store).await?;
     }
     tracing::debug!(target: "pond::perf", stage = "render_summary", elapsed_ms = summary_started.elapsed().as_millis() as u64, "sync stage");
+    pond::memory::trim_allocator();
     Ok(())
 }
 

@@ -6,7 +6,7 @@ name = "pond-db"
 version = "0.17.3"
 edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
-rust-version = "1.95"
+rust-version = "1.98"
 license = "Apache-2.0"
 description = "Lossless storage and search for sessions from any AI agent client"
 repository = "https://github.com/tenequm/pond"
@@ -342,8 +342,8 @@ name = "mem_bench"
 harness = false
 
 [lints.rust]
-# `deny` not `forbid` so candle's mmap-based safetensors loader (an inherently
-# unsafe FFI to memmap2) can be opted into per-call. See src/embed.rs.
+# `deny` not `forbid` so candle's mmap loader and narrow platform FFI can be
+# opted into per-call. See src/embed.rs and src/memory.rs.
 unsafe_code = "deny"
 unreachable_pub = "warn"
 

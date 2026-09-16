@@ -13,6 +13,7 @@ use arrow_select::filter::filter_record_batch;
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
 use lance::Dataset;
+use lance::dataset::rowids::load_row_id_sequence;
 use lance::dataset::{AutoCleanupParams, ProjectionRequest, WriteMode, WriteParams};
 use lance::deps::arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
 use lance::deps::arrow_array::{
@@ -24,6 +25,7 @@ use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
+use lance::table::format::Fragment;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -32,7 +34,10 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config, embed,
-    rowmap::{RowMetaEntry, RowMetaMap, RowMetaSet, discover_chain},
+    rowmap::{
+        RowMetaBuilder, RowMetaEntry, RowMetaMap, RowMetaRef, RowMetaSet, UnorderedRows,
+        discover_chain,
+    },
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
@@ -1115,9 +1120,9 @@ impl Store {
     ///      `SourceDedupeBehavior::FirstSeen` in `substrate::merge_insert`
     ///      (invariant 17): this layer's job is preserving substream merge
     ///      semantics, not policing the PK uniqueness Lance handles itself.
-    ///   3. Builds one combined `RecordBatch` per table (sessions, messages,
-    ///      parts) across every valid substream.
-    ///   4. Commits messages + parts first, then sessions. The session row is
+    ///   3. Encodes and appends messages in byte-bounded chunks while keeping
+    ///      the table's append routing intact.
+    ///   4. Commits messages + parts first, then finalized sessions. The session row is
     ///      the freshness-bearing row; writing it last makes a partial
     ///      non-atomic flush re-ingest and heal (spec.md#session-movement-complete).
     ///   5. Composes per-session [`RowOutcome`]s in original substream order.
@@ -1157,13 +1162,18 @@ impl Store {
                         "session re-submitted in one batch under different labels; \
                          keeping the first occurrence's and merging the rows under them"
                     );
-                    counts.relabeled_sessions += 1;
+                    if substream.session_index.is_some() {
+                        counts.relabeled_sessions += 1;
+                    }
                 }
                 // Same session, same metadata: merge messages. Dedup message
                 // ids defensively (within one batch, the validator's seen
                 // sets are per-substream so cross-substream dups can happen
                 // legally if both files re-emit the same row).
                 let existing = &mut merged[existing_idx];
+                if existing.session_index.is_none() {
+                    existing.session_index = substream.session_index;
+                }
                 let mut seen: std::collections::HashSet<String> = existing
                     .messages
                     .iter()
@@ -1234,7 +1244,9 @@ impl Store {
                 );
                 substream.session.source_agent = existing.source_agent.clone();
                 substream.session.project = existing.project.clone();
-                counts.relabeled_sessions += 1;
+                if substream.session_index.is_some() {
+                    counts.relabeled_sessions += 1;
+                }
             }
         }
 
@@ -1248,6 +1260,7 @@ impl Store {
         // id, and merge makes the loser's row a no-op instead of a duplicate.
         let sessions_owned: Vec<Session> = writeable
             .iter()
+            .filter(|substream| substream.session_index.is_some())
             .map(|substream| &substream.session)
             .filter(|session| !existing_sessions.contains_key(&session.id))
             .cloned()
@@ -1298,22 +1311,29 @@ impl Store {
             .embed_message_rows(&message_rows, &existing_message_pks)
             .await?;
 
-        let message_stream = tokio_stream::iter(
-            messages_batches(&message_rows, &message_vectors)?
-                .into_iter()
-                .map(Ok::<_, DataFusionError>),
-        );
         let part_stream = tokio_stream::iter(
             parts_batches(&part_rows)?
                 .into_iter()
                 .map(Ok::<_, DataFusionError>),
         );
+        let append_messages = async {
+            let mut appended = 0usize;
+            let mut start = 0usize;
+            while start < message_rows.len() {
+                let (end, batch) = messages_batch_from(&message_rows, &message_vectors, start)?;
+                appended += self
+                    .append_filtered(
+                        Table::Messages,
+                        tokio_stream::iter([Ok::<_, DataFusionError>(batch)]),
+                        Self::message_keep(existing_message_pks.clone()),
+                    )
+                    .await?;
+                start = end;
+            }
+            Ok::<_, anyhow::Error>(appended)
+        };
         let (_messages_appended, _parts_appended) = tokio::try_join!(
-            self.append_filtered(
-                Table::Messages,
-                message_stream,
-                Self::message_keep(existing_message_pks.clone()),
-            ),
+            append_messages,
             self.append_filtered(
                 Table::Parts,
                 part_stream,
@@ -1359,8 +1379,13 @@ impl Store {
                 search_text: write.search_text,
             })
             .collect::<Vec<_>>();
-        let batches = messages_batches(&rows, &vec![None; rows.len()])?;
-        merge_insert_chunks(&self.handle, Table::Messages, batches).await?;
+        let vectors = vec![None; rows.len()];
+        let mut start = 0usize;
+        while start < rows.len() {
+            let (end, batch) = messages_batch_from(&rows, &vectors, start)?;
+            merge_insert_chunks(&self.handle, Table::Messages, vec![batch]).await?;
+            start = end;
+        }
         Ok(())
     }
 
@@ -1943,10 +1968,11 @@ impl Store {
     /// Max delta segments before the chain is compacted into a fresh base.
     const MAX_ROWMAP_DELTAS: usize = 16;
 
-    /// Columns the resident meta map is built from. The full scan and the delta
-    /// scan MUST project the same set in the same order - both feed
-    /// [`row_meta_entry`], so a column added to one only would silently corrupt
-    /// delta hydration.
+    /// Columns the resident meta map is built from. All three scans over this
+    /// list - the sorting fallback and the delta scan, both reading through
+    /// [`row_meta_entry`], and the streaming full scan reading through
+    /// [`RowMetaColumns`] - MUST project the same set in the same order, so a
+    /// column added for one of them only would silently corrupt the others.
     const ROW_META_COLUMNS: [&str; 7] = [
         "session_id",
         "id",
@@ -2223,17 +2249,22 @@ impl Store {
             // (read locally from their mmaps) plus this delta into a fresh base -
             // no full store re-read.
             (Some((_, set)), Some(entries)) => {
-                let mut merged = set.merged_entries();
-                merged.extend(entries);
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
-                RowMetaMap::build(&path, version, merged)?;
+                // Merged out of the segments' mappings row by row, so compaction
+                // never rebuilds the corpus as owned entries.
+                set.compact_into(&path, version, entries)?;
                 version
             }
             // No chain, or a reclaimed base / deletion since it: full scan -> base.
             _ => {
-                let entries = self.collect_row_metas().await?;
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
-                RowMetaMap::build(&path, version, entries)?;
+                // Streamed straight into the segment; only a store with no
+                // fragment order that yields ascending row ids falls back to
+                // collecting the corpus first.
+                if !self.build_rowmap_from_scan(&path, version).await? {
+                    let entries = self.collect_row_metas().await?;
+                    RowMetaMap::build(&path, version, entries)?;
+                }
                 version
             }
         };
@@ -2242,6 +2273,7 @@ impl Store {
             discover_chain(cache_dir, store_key).context("rowmap chain missing after build")?;
         let set = RowMetaSet::open(&chain)?;
         Self::sweep_stale_rowmaps(cache_dir, store_key, base_version);
+        crate::memory::trim_allocator();
         Ok(Some(set))
     }
 
@@ -2702,6 +2734,134 @@ impl Store {
             .version)
     }
 
+    /// Scan the hydration columns with row ids straight into a segment file at
+    /// `path`, folding each batch into the encoder and dropping it - the whole
+    /// corpus never exists in memory at once, only the open block and the
+    /// dictionaries. One large sequential scan, same as `collect_row_metas`.
+    ///
+    /// The scan is driven by an explicit fragment list, ordered so it yields
+    /// ascending `row_id` - see [`Self::ascending_row_id_fragments`], which is
+    /// also the guard: `Ok(false)` means no such order exists and nothing was
+    /// published, so the caller re-encodes through the sorting
+    /// `RowMetaMap::build`. That decision is made from fragment metadata before
+    /// a single data page is read, so the fallback does not pay for a scan it
+    /// throws away.
+    async fn build_rowmap_from_scan(&self, path: &Path, version: u64) -> Result<bool> {
+        // One dataset handle for the plan, the row count and the scan: a
+        // re-`latest()` between them could plan against a manifest the scan no
+        // longer reads.
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let Some(fragments) = Self::ascending_row_id_fragments(&dataset).await? else {
+            crate::rowmap::note_rowmap_scan_fallback();
+            tracing::warn!(
+                store = %self.handle.location(),
+                "no fragment order yields ascending row ids; rebuilding the row meta map from a sorted collect"
+            );
+            return Ok(false);
+        };
+        let mut builder = RowMetaBuilder::new(path, version, dataset.count_rows(None).await?)?;
+        // `with_fragments(vec![])` is not "scan nothing" - an empty store has no
+        // rows to fold in at all.
+        if !fragments.is_empty() {
+            let mut scanner = dataset.scan();
+            scanner.with_fragments(fragments);
+            scanner.with_row_id();
+            scanner.project(&Self::ROW_META_COLUMNS)?;
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let columns = RowMetaColumns::new(&batch)?;
+                for row in 0..batch.num_rows() {
+                    if let Err(error) = builder.push(columns.row(row)?) {
+                        return match error.downcast_ref::<UnorderedRows>() {
+                            // The plan said this could not happen, so it is a
+                            // bug in the plan rather than a store shape - but a
+                            // wrong map is worse than a slow build, so it still
+                            // falls back (dropping `builder` here reclaims both
+                            // staging temps before the caller rescans).
+                            Some(unordered) => {
+                                crate::rowmap::note_rowmap_scan_fallback();
+                                tracing::warn!(
+                                    %unordered,
+                                    "row meta scan went backwards despite an ascending fragment plan; rebuilding from a sorted collect"
+                                );
+                                Ok(false)
+                            }
+                            None => Err(error),
+                        };
+                    }
+                }
+            }
+        }
+        builder.finish()?;
+        Ok(true)
+    }
+
+    /// `messages` fragments ordered so that scanning them in sequence yields
+    /// strictly ascending `row_id`, or `None` when no such order exists.
+    ///
+    /// Lance's ordered scan yields *fragment* order, which is not row-id order:
+    /// `Operation::Update` appends its rewritten fragments at the end while
+    /// preserving their stable row ids, so a single `write_embeddings`
+    /// `merge_update` over an older fragment leaves the newest fragment holding
+    /// the *lowest* ids. Sorting by each fragment's first live row id undoes
+    /// exactly that, at the cost of a manifest read.
+    ///
+    /// It does not always suffice, and both counterexamples are reachable from
+    /// pond's own writes:
+    ///
+    /// - a `merge_update` whose window covers a scattered set of rows produces
+    ///   one new fragment whose live ids interleave with several older
+    ///   fragments' (measured: a new fragment holding `[0, 1, 8, 9]` beside
+    ///   fragments holding `[2, 3]`, `[4..7]` and `[10, 11]`);
+    /// - compaction preserves the scan order it read, so compacting a store
+    ///   that was already out of order bakes a non-ascending sequence into a
+    ///   *single* fragment, where no fragment order can help.
+    ///
+    /// So this reports rather than assumes: every fragment's own live ids must
+    /// ascend, and the sorted fragments' live ranges must be disjoint. Deleted
+    /// rows are excluded because a partial-fragment rewrite tombstones the rows
+    /// it moved, leaving raw sequences that overlap where the live ones do not.
+    ///
+    /// Cost is metadata only - the row id sequences are run-length segments
+    /// Lance caches per fragment, plus one small read per fragment that carries
+    /// a deletion file - so a `None` here costs far less than the scan it
+    /// avoids starting.
+    async fn ascending_row_id_fragments(dataset: &Dataset) -> Result<Option<Vec<Fragment>>> {
+        let mut plan: Vec<(u64, u64, Fragment)> = Vec::new();
+        for fragment in dataset.get_fragments() {
+            let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+            let deleted = fragment.get_deletion_vector().await?;
+            let (mut first, mut last) = (None, None);
+            for (offset, row_id) in sequence.iter().enumerate() {
+                let offset = u32::try_from(offset).context("fragment row offset overflow")?;
+                if deleted
+                    .as_ref()
+                    .is_some_and(|deleted| deleted.contains(offset))
+                {
+                    continue;
+                }
+                if last.is_some_and(|previous| previous >= row_id) {
+                    return Ok(None);
+                }
+                first.get_or_insert(row_id);
+                last = Some(row_id);
+            }
+            // A fragment whose rows are all deleted contributes nothing and
+            // would otherwise sort as an empty range.
+            if let (Some(first), Some(last)) = (first, last) {
+                plan.push((first, last, fragment.metadata().clone()));
+            }
+        }
+        plan.sort_unstable_by_key(|(first, _, _)| *first);
+        if plan.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+            return Ok(None);
+        }
+        Ok(Some(
+            plan.into_iter().map(|(_, _, fragment)| fragment).collect(),
+        ))
+    }
+
     pub async fn message_store_probe(&self) -> Result<MessageStoreProbe> {
         let dataset = self.handle.dataset(Table::Messages).await?;
         let row_count = dataset.count_rows(None).await?;
@@ -2727,14 +2887,17 @@ impl Store {
     }
 
     /// Scan the hydration columns with row ids into a `Vec`, the input to
-    /// `RowMetaMap::build`. One large sequential scan (few big reads), unlike the
-    /// scattered per-hit take it replaces; `search_text` dominates the bytes.
+    /// `RowMetaMap::build`. The sorting fallback for `build_rowmap_from_scan`
+    /// (and the oracle the map-vs-scan tests compare against); `search_text`
+    /// dominates the bytes, so this holds the whole corpus and the streaming
+    /// path above is what a cold build normally takes.
     pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
+        let row_count = self.handle.count_rows(Table::Messages).await?;
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
         scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(row_count);
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let rowids = uint64(&batch, "_rowid")?;
@@ -4135,6 +4298,7 @@ pub struct RowError {
 struct BufferedSession {
     index: usize,
     session: Session,
+    bytes: usize,
 }
 
 #[derive(Debug)]
@@ -4143,30 +4307,44 @@ struct BufferedMessage {
     message: Message,
     parts: Vec<BufferedPart>,
     search_text: Option<String>,
+    bytes: usize,
 }
 
 #[derive(Debug)]
 struct BufferedPart {
     index: usize,
     part: Part,
+    bytes: usize,
+}
+
+/// Caps buffered source bytes at 32 MiB, trading occasional extra commits for
+/// a bounded version of the roughly 10x transient amplification measured in #229.
+pub(crate) const INGEST_FLUSH_BYTE_BUDGET: usize = 32 << 20;
+
+/// Bytes a buffered message row costs downstream on top of its own payload:
+/// `embedding_columns` materializes a dense `embedding_dim()` x f16 slot per
+/// row plus an `embedding_model` offset even when every vector is null (the
+/// embedder-less ingest case), so the source JSON is not a complete proxy for
+/// what a flush allocates. Counting it keeps that buffer bounded by the flush
+/// window instead of letting it grow with the whole batch.
+fn message_row_fixed_bytes() -> usize {
+    embedding_dim() * size_of::<half::f16>() + size_of::<i32>()
 }
 
 /// State machine that turns the `events: Vec<IngestEvent>` array into a
-/// flat `Vec<RowOutcome>` matching the array's index space. Buffers a whole
-/// session substream so `merge_insert` runs once per substream (three
-/// batches: sessions, messages, parts). A validation error on a single event
-/// drops *that event* (one [`OutcomeStatus::Error`] outcome) and the substream
-/// continues; only Session-level invariants (immutable source_agent / project
-/// on re-write) drop the whole substream (spec.md#adapter-integrity-event-ordering).
+/// flat `Vec<RowOutcome>` matching the array's index space. A validation error
+/// on a single event drops *that event* (one [`OutcomeStatus::Error`] outcome)
+/// and the substream continues; only Session-level invariants (immutable
+/// source_agent / project on re-write) drop the whole substream
+/// (spec.md#adapter-integrity-event-ordering).
 ///
 /// Writes are batched at flush time. As complete substreams arrive (a new
 /// `Session` event closes out the current one), they accumulate in
 /// `completed` rather than each one calling `merge_insert` immediately.
-/// The caller drains the buffer via [`Self::flush`] / [`Self::finish`],
-/// at which point one batched 3-parallel-merge-insert covers all pending
-/// substreams. This is the load-bearing perf change: per-substream commit
-/// overhead dominated the ingest profile (see `benches/ingest_bench.rs`),
-/// and amortizing it across N sessions cuts wall time materially.
+/// The caller drains the buffer via [`Self::flush`] / [`Self::finish`]. A flush
+/// may also write complete messages from the current substream while retaining
+/// its session row until close. Completed substreams remain batched because
+/// per-substream commit overhead dominates the ingest profile.
 #[derive(Debug, Default)]
 pub struct IngestValidator {
     session: Option<BufferedSession>,
@@ -4184,14 +4362,16 @@ pub struct IngestValidator {
     /// rows haven't been written yet. Flushed in batched mode by
     /// [`Self::flush`].
     completed: Vec<CompletedSubstream>,
+    buffered_bytes: usize,
 }
 
 /// One closed substream ready for the batched flush path.
 #[derive(Debug)]
 struct CompletedSubstream {
-    session_index: usize,
+    session_index: Option<usize>,
     session: Session,
     messages: Vec<BufferedMessage>,
+    bytes: usize,
 }
 
 /// Ingest host provenance (`options.pond`, spec.md#model-pond-options),
@@ -4227,12 +4407,29 @@ impl IngestValidator {
         &mut self,
         store: &Store,
         index: usize,
-        event: IngestEvent,
+        mut event: IngestEvent,
     ) -> Result<Vec<RowOutcome>> {
+        if let IngestEvent::Message(message) = &mut event {
+            // `options.pond` is core-owned (spec.md#model-pond-options): stripped
+            // and restamped at ingest so neither adapters nor wire clients can
+            // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
+            // never restamps stored rows.
+            match ingest_host_stamp() {
+                Some(stamp) => {
+                    message
+                        .options_mut()
+                        .insert("pond".to_owned(), stamp.clone());
+                }
+                None => {
+                    message.options_mut().remove("pond");
+                }
+            }
+        }
+        let bytes = json_size(&event)?;
         match event {
-            IngestEvent::Session(session) => self.push_session(store, index, session).await,
-            IngestEvent::Message(message) => Ok(self.push_message(index, message)),
-            IngestEvent::Part(part) => Ok(self.push_part(index, part)),
+            IngestEvent::Session(session) => self.push_session(store, index, session, bytes).await,
+            IngestEvent::Message(message) => Ok(self.push_message(index, message, bytes)),
+            IngestEvent::Part(part) => Ok(self.push_part(index, part, bytes)),
         }
     }
 
@@ -4245,17 +4442,38 @@ impl IngestValidator {
         self.flush(store).await
     }
 
-    /// Drain every completed substream into batched 3-parallel-merge_insert
-    /// writes. Caller invokes this periodically (every N completed
-    /// substreams) to keep memory bounded; in adapter-driven sync that
-    /// happens via the BATCH_SIZE check in `ingest_adapter`. The current
-    /// in-flight substream stays buffered - close it explicitly via
-    /// [`Self::finish`] or by feeding the next Session event.
+    /// Drain completed substreams plus complete messages from the in-flight
+    /// substream. Its session row stays buffered until the substream closes so
+    /// the freshness signal never outruns durable message and part rows.
     pub async fn flush(&mut self, store: &Store) -> Result<(Vec<RowOutcome>, BatchCounts)> {
-        if self.completed.is_empty() {
+        if self.completed.is_empty() && self.messages.is_empty() {
             return Ok((Vec::new(), BatchCounts::default()));
         }
-        let completed = std::mem::take(&mut self.completed);
+        let mut completed = std::mem::take(&mut self.completed);
+        if !self.messages.is_empty() {
+            let session = &self
+                .session
+                .as_ref()
+                .context("validator has complete messages without a session")?
+                .session;
+            let messages = std::mem::take(&mut self.messages);
+            completed.push(CompletedSubstream {
+                session_index: None,
+                session: session.clone(),
+                bytes: messages.iter().map(|message| message.bytes).sum(),
+                messages,
+            });
+        }
+        // Every buffered byte is charged once, against the same stored figure
+        // it was added under, so this is the sole subtraction site. The session
+        // row of a partial flush stays buffered and so stays charged.
+        let flushed_bytes: usize = completed.iter().map(|substream| substream.bytes).sum();
+        debug_assert!(
+            self.buffered_bytes >= flushed_bytes,
+            "buffered byte accounting underflowed: {} buffered, {flushed_bytes} flushed",
+            self.buffered_bytes,
+        );
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(flushed_bytes);
         store.upsert_session_batch(completed).await
     }
 
@@ -4265,11 +4483,19 @@ impl IngestValidator {
         self.completed.len()
     }
 
+    /// True when the byte bound is crossed and at least one complete message
+    /// or substream can be written without violating event ordering.
+    pub fn byte_budget_reached(&self) -> bool {
+        self.buffered_bytes >= INGEST_FLUSH_BYTE_BUDGET
+            && (!self.completed.is_empty() || !self.messages.is_empty())
+    }
+
     async fn push_session(
         &mut self,
         _store: &Store,
         index: usize,
         mut session: Session,
+        bytes: usize,
     ) -> Result<Vec<RowOutcome>> {
         // Close out the current substream (if any) - move it to the pending
         // buffer instead of writing immediately. The actual write happens
@@ -4319,7 +4545,12 @@ impl IngestValidator {
 
         self.seen_message_ids.clear();
         self.seen_part_keys.clear();
-        self.session = Some(BufferedSession { index, session });
+        self.buffered_bytes += bytes;
+        self.session = Some(BufferedSession {
+            index,
+            session,
+            bytes,
+        });
         Ok(Vec::new())
     }
 
@@ -4328,21 +4559,24 @@ impl IngestValidator {
         let Some(BufferedSession {
             index: session_index,
             session,
+            bytes: session_bytes,
         }) = self.session.take()
         else {
             return;
         };
         let messages = std::mem::take(&mut self.messages);
+        let bytes = session_bytes + messages.iter().map(|message| message.bytes).sum::<usize>();
         self.seen_message_ids.clear();
         self.seen_part_keys.clear();
         self.completed.push(CompletedSubstream {
-            session_index,
+            session_index: Some(session_index),
             session,
             messages,
+            bytes,
         });
     }
 
-    fn push_message(&mut self, index: usize, mut message: Message) -> Vec<RowOutcome> {
+    fn push_message(&mut self, index: usize, message: Message, bytes: usize) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
             Value::String(message.session_id().to_owned()),
             Value::String(message.id().to_owned()),
@@ -4387,31 +4621,20 @@ impl IngestValidator {
                 DROP_REASON_DUPLICATE_MESSAGE_ID,
             )];
         }
-        // `options.pond` is core-owned (spec.md#model-pond-options): stripped
-        // and restamped at ingest so neither adapters nor wire clients can
-        // spoof provenance. Matched rows are merge_insert no-ops, so re-ingest
-        // never restamps stored rows.
-        match ingest_host_stamp() {
-            Some(stamp) => {
-                message
-                    .options_mut()
-                    .insert("pond".to_owned(), stamp.clone());
-            }
-            None => {
-                message.options_mut().remove("pond");
-            }
-        }
         self.flush_current_message();
+        let bytes = bytes + message_row_fixed_bytes();
+        self.buffered_bytes += bytes;
         self.current_message = Some(BufferedMessage {
             index,
             message,
             parts: Vec::new(),
             search_text: None,
+            bytes,
         });
         Vec::new()
     }
 
-    fn push_part(&mut self, index: usize, part: Part) -> Vec<RowOutcome> {
+    fn push_part(&mut self, index: usize, part: Part, bytes: usize) -> Vec<RowOutcome> {
         let pk = Value::Array(vec![
             Value::String(part.session_id.clone()),
             Value::String(part.message_id.clone()),
@@ -4474,7 +4697,8 @@ impl IngestValidator {
                 DROP_REASON_DUPLICATE_PART_KEY,
             )];
         }
-        self.current_parts.push(BufferedPart { index, part });
+        self.buffered_bytes += bytes;
+        self.current_parts.push(BufferedPart { index, part, bytes });
         Vec::new()
     }
 
@@ -4488,6 +4712,9 @@ impl IngestValidator {
             canonical_parts.push(part.part.clone());
         }
         buffered.search_text = search_text(&buffered.message, &canonical_parts);
+        let derived_bytes = buffered.search_text.as_deref().map_or(0, str::len);
+        buffered.bytes += parts.iter().map(|part| part.bytes).sum::<usize>() + derived_bytes;
+        self.buffered_bytes += derived_bytes;
         buffered.parts = parts;
         self.messages.push(buffered);
     }
@@ -4521,7 +4748,7 @@ fn error_outcome(
 /// Also accumulates the per-table totals into `counts` so the CLI summary
 /// gets the same truth without re-walking the outcomes.
 fn success_outcomes_for_substream(
-    session_index: usize,
+    session_index: Option<usize>,
     session: &Session,
     messages: &[BufferedMessage],
     existing_sessions: &std::collections::HashMap<String, Session>,
@@ -4529,23 +4756,23 @@ fn success_outcomes_for_substream(
     existing_part_pks: &HashSet<(String, String, String)>,
     counts: &mut BatchCounts,
 ) -> Vec<RowOutcome> {
-    let session_was_present = existing_sessions.contains_key(&session.id);
-    let session_status = if session_was_present {
-        counts.sessions_matched += 1;
-        UpsertStatus::Matched
-    } else {
-        counts.sessions_inserted += 1;
-        UpsertStatus::Inserted
-    };
-
-    let mut outcomes = Vec::with_capacity(1 + messages.len());
-    outcomes.push(success_outcome(
-        session_index,
-        "session",
-        Value::String(session.id.clone()),
-        session_status,
-        false,
-    ));
+    let mut outcomes = Vec::with_capacity(usize::from(session_index.is_some()) + messages.len());
+    if let Some(session_index) = session_index {
+        let session_status = if existing_sessions.contains_key(&session.id) {
+            counts.sessions_matched += 1;
+            UpsertStatus::Matched
+        } else {
+            counts.sessions_inserted += 1;
+            UpsertStatus::Inserted
+        };
+        outcomes.push(success_outcome(
+            session_index,
+            "session",
+            Value::String(session.id.clone()),
+            session_status,
+            false,
+        ));
+    }
     for buffered in messages {
         let key = (
             buffered.message.session_id().to_owned(),
@@ -5530,7 +5757,7 @@ fn embedding_update_schema() -> Arc<Schema> {
 
 /// The `messages` `vector` + `embedding_model` columns for an inline-embed
 /// batch: `Some` rows carry the embedding and the current model id, `None` rows
-/// are null in both. Returned aligned to `vectors` for [`messages_chunk`].
+/// are null in both. Returned aligned to `vectors` for [`messages_batch_from`].
 fn embedding_columns(vectors: &[Option<Vec<f32>>]) -> Result<(ArrayRef, ArrayRef)> {
     let dim = embedding_dim();
     // The common case (no embedder, or every row already present) is all-null:
@@ -5612,10 +5839,12 @@ pub(crate) fn embedding_update_batch(rows: &[EmbeddedMessage]) -> Result<RecordB
     .context("failed to build embedding update batch")
 }
 
-/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a flush batch
-/// is split before the running total of its text columns reaches this, and a
-/// single cell at or above it is rejected rather than left to panic inside
-/// `StringArray::from` (spec.md#adapter-bounded-values).
+/// The runtime backstop against Arrow's 2 GiB `i32` offset wall: a `sessions` or
+/// `parts` batch is split before the running total of its text columns reaches
+/// this, and a single cell at or above it is rejected rather than left to panic
+/// inside `StringArray::from` (spec.md#adapter-bounded-values). `messages` cuts
+/// on the far smaller [`INGEST_FLUSH_BYTE_BUDGET`] in [`messages_batch_from`]
+/// and so clears this wall by construction.
 const COLUMN_BYTE_BUDGET: usize = 1 << 30;
 
 /// Contiguous row ranges whose summed text-column byte cost each stays within
@@ -5741,19 +5970,29 @@ fn sessions_chunk(sessions: &[Session], options: &[Vec<u8>]) -> Result<RecordBat
     .context("failed to build session batch")
 }
 
+/// One `messages` batch covering `rows[start..end]`, returned with that `end`
+/// so the caller can walk a long row set without ever holding two chunks alive.
 /// `vectors` is aligned to `rows` (same length): `Some` carries the inline
 /// embedding for that row, `None` writes a null `vector`/`embedding_model`.
-pub(crate) fn messages_batches(
+///
+/// The cut is `INGEST_FLUSH_BYTE_BUDGET` over the row's text columns plus
+/// [`message_row_fixed_bytes`] - the dense vector slot `messages_chunk` pays per
+/// row even when every vector is null, which is what makes an unchunked batch
+/// expensive. `guard_cell` still rejects a single cell at Arrow's `i32` wall;
+/// below that, a row wider than the whole budget takes a chunk of its own rather
+/// than stalling, so `end > start` whenever `start < rows.len()`.
+fn messages_batch_from(
     rows: &[MessageBatchRow<'_>],
     vectors: &[Option<Vec<f32>>],
-) -> Result<Vec<RecordBatch>> {
+    start: usize,
+) -> Result<(usize, RecordBatch)> {
     debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
-    let options = rows
-        .iter()
-        .map(|row| json_bytes(row.message.options()))
-        .collect::<Result<Vec<_>>>()?;
-    let mut cells = Vec::with_capacity(rows.len());
-    for (row, encoded) in rows.iter().zip(&options) {
+    let mut options = Vec::new();
+    let mut running = 0usize;
+    let mut end = start;
+    while end < rows.len() {
+        let row = &rows[end];
+        let encoded = json_bytes(row.message.options())?;
         let columns = [
             row.message.session_id().len(),
             row.message.id().len(),
@@ -5767,18 +6006,16 @@ pub(crate) fn messages_batches(
         for bytes in columns {
             guard_cell("messages", row.message.id(), bytes)?;
         }
-        cells.push(columns.iter().sum());
+        let row_bytes = columns.iter().sum::<usize>() + message_row_fixed_bytes();
+        if running + row_bytes > INGEST_FLUSH_BYTE_BUDGET && end > start {
+            break;
+        }
+        running += row_bytes;
+        options.push(encoded);
+        end += 1;
     }
-    chunk_ranges(&cells)
-        .into_iter()
-        .map(|range| {
-            messages_chunk(
-                &rows[range.clone()],
-                &options[range.clone()],
-                &vectors[range],
-            )
-        })
-        .collect()
+    let batch = messages_chunk(&rows[start..end], &options, &vectors[start..end])?;
+    Ok((end, batch))
 }
 
 fn messages_chunk(
@@ -5786,6 +6023,7 @@ fn messages_chunk(
     options: &[Vec<u8>],
     vectors: &[Option<Vec<f32>>],
 ) -> Result<RecordBatch> {
+    debug_assert_eq!(rows.len(), vectors.len(), "vectors must align with rows");
     let schema = message_schema();
     let (vector_column, embedding_model) = embedding_columns(vectors)?;
     RecordBatch::try_new(
@@ -6000,6 +6238,75 @@ impl crate::adapter::SkipOracle for RowmapOracle {
     fn is_empty(&self) -> bool {
         self.0.as_ref().is_none_or(|set| set.is_empty())
     }
+}
+
+/// The row-meta columns of one scan batch, resolved once per batch instead of
+/// once per row: `column_by_name` is a linear walk of the schema, and a cold
+/// build looks these up for every row in the store. Rows are handed to the
+/// encoder as borrows into the batch, so the pass allocates nothing per row.
+struct RowMetaColumns<'a> {
+    row_ids: &'a UInt64Array,
+    session_id: &'a StringArray,
+    message_id: &'a StringArray,
+    role: &'a StringArray,
+    project: &'a StringArray,
+    source_agent: &'a StringArray,
+    timestamp: &'a TimestampMicrosecondArray,
+    search_text: &'a StringArray,
+}
+
+impl<'a> RowMetaColumns<'a> {
+    fn new(batch: &'a RecordBatch) -> Result<Self> {
+        Ok(Self {
+            row_ids: uint64(batch, "_rowid")?,
+            session_id: string_column(batch, "session_id")?,
+            message_id: string_column(batch, "id")?,
+            role: string_column(batch, "role")?,
+            project: string_column(batch, "project")?,
+            source_agent: string_column(batch, "source_agent")?,
+            timestamp: batch
+                .column_by_name("timestamp")
+                .context("missing column timestamp")?
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("column timestamp is not timestamp_micros")?,
+            search_text: string_column(batch, "search_text")?,
+        })
+    }
+
+    fn row(&self, row: usize) -> Result<RowMetaRef<'a>> {
+        Ok(RowMetaRef {
+            row_id: self.row_ids.value(row),
+            session_id: required_str(self.session_id, row, "session_id")?,
+            message_id: required_str(self.message_id, row, "message id")?,
+            role: required_str(self.role, row, "role")?,
+            project: required_str(self.project, row, "project")?,
+            source_agent: required_str(self.source_agent, row, "source_agent")?,
+            timestamp_micros: self.timestamp.value(row),
+            // Nullable in the schema: a bare tool call carries no text.
+            search_text: if self.search_text.is_null(row) {
+                ""
+            } else {
+                self.search_text.value(row)
+            },
+        })
+    }
+}
+
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .with_context(|| format!("missing column {name}"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .with_context(|| format!("column {name} is not Utf8"))
+}
+
+fn required_str<'a>(array: &'a StringArray, row: usize, name: &str) -> Result<&'a str> {
+    if array.is_null(row) {
+        anyhow::bail!("{name} is null");
+    }
+    Ok(array.value(row))
 }
 
 fn row_meta_entry(batch: &RecordBatch, row_id: u64, row: usize) -> Result<RowMetaEntry> {
@@ -6257,6 +6564,26 @@ fn micros(timestamp: DateTime<Utc>) -> i64 {
     timestamp.timestamp_micros()
 }
 
+#[derive(Default)]
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_size<T: Serialize>(value: &T) -> Result<usize> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value).context("failed to measure JSON value")?;
+    Ok(counter.0)
+}
+
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     // Write JSONB bytes (not plain UTF-8 JSON text) so the on-disk encoding
     // matches the `lance.json` extension contract. Lance's compact path
@@ -6375,6 +6702,21 @@ mod tests {
             project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
             options: ProviderOptions::new(),
         }
+    }
+
+    fn padded_message(session_id: &str, id: &str, payload_bytes: usize) -> Message {
+        let mut options = ProviderOptions::new();
+        options.insert("payload".to_owned(), json!("x".repeat(payload_bytes)));
+        Message::User {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            timestamp: Utc::now(),
+            options,
+        }
+    }
+
+    fn large_message(session_id: &str, id: &str) -> Message {
+        padded_message(session_id, id, INGEST_FLUSH_BYTE_BUDGET / 2 + 1024)
     }
 
     /// Counts the texts handed to the backend so a test can assert how many rows
@@ -6504,14 +6846,14 @@ mod tests {
             project: "/tmp",
             search_text: None,
         };
-        let batches = messages_batches(&[row], &[None])?;
+        let (_, batch) = messages_batch_from(&[row], &[None], 0)?;
         store
             .handle
-            .append_batches(Table::Messages, batches.clone())
+            .append_batches(Table::Messages, vec![batch.clone()])
             .await?;
         store
             .handle
-            .append_batches(Table::Messages, batches)
+            .append_batches(Table::Messages, vec![batch])
             .await?;
         assert_eq!(
             duplicates(&store, Table::Messages).await?,
@@ -6674,6 +7016,245 @@ mod tests {
             chunk_ranges(&[10, COLUMN_BYTE_BUDGET + 1, 10]),
             vec![0..1, 1..2, 2..3],
         );
+    }
+
+    #[tokio::test]
+    async fn byte_budget_flushes_complete_messages_from_an_in_flight_session() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("large-partial-flush");
+        let mut validator = IngestValidator::default();
+        let first = large_message(&session.id, "message-1");
+        let second = large_message(&session.id, "message-2");
+
+        let rows = [
+            MessageBatchRow {
+                message: &first,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            },
+            MessageBatchRow {
+                message: &second,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            },
+        ];
+        let (end, first_batch) = messages_batch_from(&rows, &[None, None], 0)?;
+        assert_eq!(end, 1);
+        assert_eq!(first_batch.num_rows(), 1);
+        drop(first_batch);
+
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+        validator
+            .push(&store, 1, IngestEvent::Message(first))
+            .await?;
+        validator
+            .push(&store, 2, IngestEvent::Message(second))
+            .await?;
+
+        assert!(validator.byte_budget_reached());
+        let (outcomes, counts) = validator.flush(&store).await?;
+        assert_eq!(counts.sessions_inserted, 0);
+        assert_eq!(counts.messages_inserted_total, 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].kind, "message");
+        assert_eq!(store.row_counts().await?, (0, 1, 0));
+
+        let (_, final_counts) = validator.finish(&store).await?;
+        assert_eq!(final_counts.sessions_inserted, 1);
+        assert_eq!(final_counts.messages_inserted_total, 1);
+        let mut summary = IngestSummary::default();
+        summary.add_batch(&counts);
+        summary.add_batch(&final_counts);
+        assert_eq!(summary.sessions_inserted, 1);
+        assert_eq!(summary.messages_inserted_total, 2);
+        assert_eq!(store.row_counts().await?, (1, 2, 0));
+        Ok(())
+    }
+
+    /// A batch of modest messages allocates a dense all-null vector slot per row
+    /// that `json_size` cannot see, so the source bytes alone are not a complete
+    /// flush-size proxy. Here the JSON stays well under the budget while the
+    /// counted vector width is what trips the flush.
+    #[tokio::test]
+    async fn byte_budget_counts_the_fixed_vector_width_per_message() -> anyhow::Result<()> {
+        const PAYLOAD_BYTES: usize = 512;
+
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("vector-width-budget");
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(session.clone()))
+            .await?;
+
+        let probe = padded_message(&session.id, "probe", PAYLOAD_BYTES);
+        let per_message = json_size(&IngestEvent::Message(probe))? + message_row_fixed_bytes();
+        let count = INGEST_FLUSH_BYTE_BUDGET.div_ceil(per_message);
+        for index in 0..count {
+            let message = padded_message(&session.id, &format!("message-{index}"), PAYLOAD_BYTES);
+            validator
+                .push(&store, index + 1, IngestEvent::Message(message))
+                .await?;
+        }
+
+        assert!(validator.byte_budget_reached());
+        let source_bytes = validator.buffered_bytes - count * message_row_fixed_bytes();
+        assert!(
+            source_bytes < INGEST_FLUSH_BYTE_BUDGET,
+            "source bytes alone ({source_bytes}) must stay under the budget"
+        );
+
+        let (_, counts) = validator.flush(&store).await?;
+        assert_eq!(counts.messages_inserted_total, count - 1);
+        Ok(())
+    }
+
+    /// The chunk cut carries the fixed vector width too, not just the flush
+    /// trigger: `messages_chunk` pays a dense `embedding_dim()` slot per row
+    /// however light the text columns are. These rows are small enough that
+    /// their text alone would fit in one chunk many times over, so only the
+    /// counted vector width can force the split.
+    #[test]
+    fn messages_batch_from_cuts_on_the_fixed_vector_width() -> anyhow::Result<()> {
+        const ROWS: usize = 50_000;
+
+        let session = synthetic_session("vector-width-chunking");
+        let messages: Vec<Message> = (0..ROWS)
+            .map(|index| padded_message(&session.id, &format!("message-{index}"), 0))
+            .collect();
+        let rows: Vec<MessageBatchRow<'_>> = messages
+            .iter()
+            .map(|message| MessageBatchRow {
+                message,
+                source_agent: &session.source_agent,
+                project: &session.project,
+                search_text: None,
+            })
+            .collect();
+        let vectors = vec![None; rows.len()];
+
+        let (end, batch) = messages_batch_from(&rows, &vectors, 0)?;
+        assert!(end < ROWS, "{ROWS} rows must not fit one chunk, got {end}");
+        assert_eq!(batch.num_rows(), end);
+        assert!(
+            end * message_row_fixed_bytes() > INGEST_FLUSH_BYTE_BUDGET / 2,
+            "the vector width must be what fills the chunk, got {end} rows",
+        );
+        Ok(())
+    }
+
+    /// Every byte charged to `buffered_bytes` must be discharged by the flush
+    /// that writes the row it was charged for. A missing subtraction leaks the
+    /// budget upward until ingest flushes on every event; a missing addition
+    /// trips the underflow assert inside `flush`.
+    #[tokio::test]
+    async fn flush_discharges_every_buffered_byte() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut validator = IngestValidator::default();
+        for (index, event) in conversational_events("byte-accounting", 8)
+            .into_iter()
+            .enumerate()
+        {
+            validator.push(&store, index, event).await?;
+        }
+        assert!(validator.buffered_bytes > 0);
+
+        // Mid-stream: the still-open session row and the in-flight message stay
+        // charged, everything the flush wrote does not.
+        validator.flush(&store).await?;
+        assert!(validator.buffered_bytes > 0);
+
+        validator.finish(&store).await?;
+        assert_eq!(validator.buffered_bytes, 0);
+        Ok(())
+    }
+
+    /// A partial flush writes its message rows under the stored labels but no
+    /// session row, so the relabel it detects belongs to the substream's close,
+    /// not to both.
+    #[tokio::test]
+    async fn partial_flush_counts_a_relabel_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let stored = synthetic_session("relabel-partial-flush");
+        let mut seed = IngestValidator::default();
+        seed.push(&store, 0, IngestEvent::Session(stored.clone()))
+            .await?;
+        seed.finish(&store).await?;
+
+        let mut relabeled = stored.clone();
+        relabeled.source_agent = "codex".to_owned();
+        let mut validator = IngestValidator::default();
+        validator
+            .push(&store, 0, IngestEvent::Session(relabeled.clone()))
+            .await?;
+        for (index, id) in ["message-1", "message-2"].into_iter().enumerate() {
+            validator
+                .push(
+                    &store,
+                    index + 1,
+                    IngestEvent::Message(large_message(&relabeled.id, id)),
+                )
+                .await?;
+        }
+        assert!(validator.byte_budget_reached());
+
+        let (_, partial) = validator.flush(&store).await?;
+        let (_, tail) = validator.finish(&store).await?;
+        assert_eq!(partial.relabeled_sessions, 0);
+        assert_eq!(tail.relabeled_sessions, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resync_after_partial_flush_does_not_duplicate_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session = synthetic_session("large-partial-resync");
+
+        for pass in 0..2 {
+            let mut validator = IngestValidator::default();
+            validator
+                .push(&store, 0, IngestEvent::Session(session.clone()))
+                .await?;
+            validator
+                .push(
+                    &store,
+                    1,
+                    IngestEvent::Message(large_message(&session.id, "message-1")),
+                )
+                .await?;
+            validator
+                .push(
+                    &store,
+                    2,
+                    IngestEvent::Message(large_message(&session.id, "message-2")),
+                )
+                .await?;
+            assert!(validator.byte_budget_reached());
+
+            let (_, partial) = validator.flush(&store).await?;
+            let (_, final_counts) = validator.finish(&store).await?;
+            if pass == 0 {
+                assert_eq!(partial.messages_inserted_total, 1);
+                assert_eq!(final_counts.sessions_inserted, 1);
+                assert_eq!(final_counts.messages_inserted_total, 1);
+            } else {
+                assert_eq!(partial.messages_matched_total, 1);
+                assert_eq!(final_counts.sessions_matched, 1);
+                assert_eq!(final_counts.messages_matched_total, 1);
+            }
+        }
+
+        assert_eq!(store.row_counts().await?, (1, 2, 0));
+        Ok(())
     }
 
     #[tokio::test]
@@ -8509,6 +9090,281 @@ mod tests {
         Ok(())
     }
 
+    fn rowmap_digest(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(path).expect("segment"))
+        )
+    }
+
+    /// Ingest one more session's worth of messages as its own Lance fragment.
+    async fn ingest_extra_fragment(
+        store: &Store,
+        tag: &str,
+        messages: usize,
+    ) -> anyhow::Result<Vec<MessageKey>> {
+        let session_id = format!("session-{tag}");
+        let mut events = vec![IngestEvent::Session(Session {
+            id: session_id.clone(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: Extracted::from_test_value(format!("/proj/{tag}")),
+            options: ProviderOptions::new(),
+        })];
+        let mut keys = Vec::with_capacity(messages);
+        for i in 0..messages {
+            let message_id = format!("msg-{tag}-{i}");
+            events.push(IngestEvent::Message(Message::User {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                timestamp: Utc::now(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(IngestEvent::Part(Part {
+                session_id: session_id.clone(),
+                id: format!("{message_id}-part"),
+                message_id: message_id.clone(),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(format!("extra body {tag} {i}"))),
+                },
+            }));
+            keys.push(MessageKey {
+                session_id: session_id.clone(),
+                message_id,
+            });
+        }
+        ingest_events(store, events).await?;
+        Ok(keys)
+    }
+
+    /// Build the same store both ways and return `(streaming used, digests)`.
+    async fn build_both_ways(store: &Store, dir: &Path) -> anyhow::Result<(bool, String, String)> {
+        let streamed = dir.join("streamed.rmm");
+        let used = store.build_rowmap_from_scan(&streamed, 1).await?;
+        let collected = dir.join("collected.rmm");
+        RowMetaMap::build(&collected, 1, store.collect_row_metas().await?)?;
+        let streamed_digest = if used {
+            rowmap_digest(&streamed)
+        } else {
+            String::new()
+        };
+        Ok((used, streamed_digest, rowmap_digest(&collected)))
+    }
+
+    /// A `write_embeddings` backfill is a `merge_update`, and Lance appends the
+    /// rewritten fragments at the *end* of the fragment list while preserving
+    /// their stable row ids. A partially backfilled multi-fragment store
+    /// therefore scans as `[8, 0, 1, ..., 7]` in fragment order - the ordinary
+    /// shape of an in-progress or interrupted `pond optimize` embed pass, and
+    /// exactly the cold-build case the streaming encoder exists for. The scan
+    /// has to be planned in row-id order, not fragment order.
+    #[tokio::test]
+    async fn streaming_rowmap_build_survives_a_partial_embed_backfill() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 8).await?;
+        ingest_extra_fragment(&store, "late", 1).await?;
+        // Only the first fragment's rows: the second stays un-embedded, so its
+        // fragment is untouched and ends up *before* the rewritten one.
+        store.write_embeddings(&embedded(&keys)).await?;
+
+        let dataset = store.handle.dataset(Table::Messages).await?;
+        assert!(
+            dataset.get_fragments().len() > 1,
+            "the probe needs a multi-fragment store",
+        );
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let (used, streamed, collected) = build_both_ways(&store, &out).await?;
+        assert!(
+            used,
+            "a partially backfilled store must still take the streaming path",
+        );
+        assert_eq!(
+            streamed, collected,
+            "the streaming build and the sorting build must encode the same bytes",
+        );
+
+        // And the map actually resolves every row of both fragments.
+        let map = RowMetaMap::open(&out.join("streamed.rmm"))?;
+        assert_eq!(map.len(), 9);
+        for meta in store.collect_row_metas().await? {
+            assert_eq!(
+                map.lookup(meta.row_id),
+                Some((meta.session_id.as_str(), meta.message_id.as_str())),
+                "row {} resolves",
+                meta.row_id,
+            );
+        }
+        Ok(())
+    }
+
+    /// The cross-path guard: the streaming reader (`RowMetaColumns`) and the
+    /// buffering one (`row_meta_entry`) project the same columns out of the same
+    /// batches, so they must encode byte-identical segments. Nothing else pins
+    /// the two readers against each other.
+    ///
+    /// A null `search_text` is the one column where the two spell their handling
+    /// differently (`is_null` -> `""` against `unwrap_or_default()`), so the
+    /// fixture has to reach it - and the assertion below keeps it reaching it.
+    #[tokio::test]
+    async fn scan_build_and_collect_build_encode_the_same_bytes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        // Several sessions and projects across two fragments, plus a message
+        // whose only part is a tool call - the shape that writes a null
+        // `search_text` (a message with no part at all is not written).
+        let (store, _keys) = store_with_messages(&temp, 40).await?;
+        ingest_extra_fragment(&store, "second", 5).await?;
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(synthetic_session("session-toolonly")),
+                IngestEvent::Message(Message::Assistant {
+                    id: "msg-toolcall".to_owned(),
+                    session_id: "session-toolonly".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-toolonly".to_owned(),
+                    id: "msg-toolcall-part".to_owned(),
+                    message_id: "msg-toolcall".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::ToolCall {
+                        call_id: Some(Extracted::from_test_value("call-0".to_owned())),
+                        name: Some(Extracted::from_test_value("Bash".to_owned())),
+                        params: serde_json::json!({"command": "ls"}),
+                        provider_executed: false,
+                    },
+                }),
+            ],
+        )
+        .await?;
+
+        let mut scanner = store.handle.scanner(Table::Messages, None).await?;
+        scanner.project(&["search_text"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut nulls = 0usize;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let column = string_column(&batch, "search_text")?;
+            nulls += (0..batch.num_rows())
+                .filter(|row| column.is_null(*row))
+                .count();
+        }
+        assert!(
+            nulls > 0,
+            "the fixture must reach the null-search_text branch of both readers",
+        );
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let (used, streamed, collected) = build_both_ways(&store, &out).await?;
+        assert!(used, "an append-only store scans in row-id order");
+        assert_eq!(
+            streamed, collected,
+            "the two row-meta readers must encode the same segment",
+        );
+        Ok(())
+    }
+
+    /// Sorting fragments is not always enough, and the fallback must stay cheap
+    /// and *countable*: one `merge_update` over a scattered set of rows leaves a
+    /// new fragment whose live row ids interleave with several older fragments',
+    /// which no fragment order can straighten out. The build must notice from
+    /// the manifest - before reading a data page - and hand over to the sorting
+    /// build, bumping the counter the memory gate watches.
+    #[tokio::test]
+    async fn interleaved_fragment_row_ids_fall_back_and_are_counted() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut keys = Vec::new();
+        for tag in ["a", "b", "c"] {
+            keys.extend(ingest_extra_fragment(&store, tag, 4).await?);
+        }
+        // Rows 0-1 (first fragment) and 8-9 (third) in one merge_update: the
+        // rewritten fragment holds `[0, 1, 8, 9]`, straddling the second.
+        let mut scattered = embedded(&keys[0..2]);
+        scattered.extend(embedded(&keys[8..10]));
+        store.write_embeddings(&scattered).await?;
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let before = crate::rowmap::rowmap_scan_fallbacks();
+        let streamed = out.join("streamed.rmm");
+        assert!(
+            !store.build_rowmap_from_scan(&streamed, 1).await?,
+            "interleaved live row ids have no ascending fragment order",
+        );
+        assert!(
+            crate::rowmap::rowmap_scan_fallbacks() > before,
+            "the fallback must be countable, not only logged",
+        );
+        assert!(
+            !streamed.exists(),
+            "a build that fell back publishes nothing",
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&out)?
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the fallback must reclaim its staging temps before the caller rescans: {leftovers:?}",
+        );
+
+        // The sorting path still produces a correct map for this store.
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache)?;
+        store.ensure_rowmap(&cache).await?;
+        let set = store.rowmap_snapshot().context("map installed")?;
+        assert_eq!(set.len(), 12);
+        Ok(())
+    }
+
+    /// The other shape sorting cannot fix: compaction rewrites fragments in the
+    /// order it read them, so compacting a store that was already out of order
+    /// bakes a backwards row-id sequence into a *single* fragment. Permanent
+    /// until the next reorder, and the reason the fallback stays.
+    #[tokio::test]
+    async fn compaction_can_bake_a_backwards_row_id_order_into_one_fragment() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 8).await?;
+        ingest_extra_fragment(&store, "late", 1).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?;
+
+        let dataset = store.handle.dataset(Table::Messages).await?;
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "compaction folded the store into one fragment",
+        );
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let before = crate::rowmap::rowmap_scan_fallbacks();
+        assert!(
+            !store
+                .build_rowmap_from_scan(&out.join("streamed.rmm"), 1)
+                .await?,
+            "one fragment holding descending row ids cannot be reordered",
+        );
+        assert!(crate::rowmap::rowmap_scan_fallbacks() > before);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn load_rowmap_if_present_installs_published_chain_without_building() -> anyhow::Result<()>
     {
@@ -8556,6 +9412,57 @@ mod tests {
             oracle.session_max_ts("session-after-chain"),
             None,
             "rows newer than the chain stay pending",
+        );
+        Ok(())
+    }
+
+    /// The sync cursor is written from `sync_oracle_snapshot`, not from the
+    /// oracle the planner returned, so its preference order is what decides
+    /// which map reaches disk: a resident map whenever one exists, else the
+    /// trailing map the planner settled for, else nothing.
+    #[tokio::test]
+    async fn sync_oracle_snapshot_prefers_a_resident_map_over_the_planned_one() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (builder, _keys) = store_with_messages(&temp, 6).await?;
+        let cache = temp.path().join("cache");
+        builder.ensure_rowmap(&cache).await?;
+        ingest_events(&builder, conversational_events("session-after-chain", 1)).await?;
+
+        let reader = Store::open_local(temp.path()).await?;
+        assert!(
+            reader.sync_oracle_snapshot().is_none(),
+            "a store that has planned nothing offers the cursor nothing",
+        );
+
+        let lock = hold_rowmap_lock(&builder, &cache)?;
+        let oracle = reader.sync_rowmap_oracle(&cache).await?;
+        drop(lock);
+
+        assert!(
+            reader.rowmap_snapshot().is_none(),
+            "a trailing map is never installed as resident",
+        );
+        let planned = reader
+            .sync_oracle_snapshot()
+            .expect("the trailing map the planner used stays readable at persist time");
+        assert!(!planned.is_empty());
+        assert!(Arc::ptr_eq(
+            &planned,
+            oracle
+                .0
+                .as_ref()
+                .expect("contention found a trailing chain"),
+        ));
+
+        reader.ensure_rowmap(&cache).await?;
+        let resident = reader.rowmap_snapshot().expect("the build installs one");
+        assert!(
+            Arc::ptr_eq(
+                &reader.sync_oracle_snapshot().expect("still some map"),
+                &resident,
+            ),
+            "a resident map installed after planning outranks the trailing one",
         );
         Ok(())
     }

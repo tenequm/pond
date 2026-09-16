@@ -7,7 +7,10 @@
 //! exposes `pond_search` / `pond_get_session` / `pond_get_message` plus
 //! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::{config::SearchConfig, embed::LazyEmbedder, sessions::Store};
 
@@ -20,6 +23,43 @@ pub struct AppState {
     pub store: Arc<Store>,
     pub embedder: Arc<LazyEmbedder>,
     pub search: SearchConfig,
+    /// Set by [`ActivityGuard`] when a request finishes, cleared by
+    /// [`AppState::take_completed_activity`]. Shared by every clone, so the
+    /// periodic task in `main` sees the requests both transports served.
+    activity: Arc<AtomicBool>,
+}
+
+impl AppState {
+    pub fn new(store: Arc<Store>, embedder: Arc<LazyEmbedder>, search: SearchConfig) -> Self {
+        Self {
+            store,
+            embedder,
+            search,
+            activity: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Hold the returned guard for the body of a request; dropping it - on the
+    /// response path or on a cancelled future, both of which leave allocator
+    /// residue behind - records that this process had work to do.
+    fn track_activity(&self) -> ActivityGuard {
+        ActivityGuard(Arc::clone(&self.activity))
+    }
+
+    /// Whether a request completed since the last call, clearing the flag.
+    /// The periodic allocator trim reads it so a server nobody is querying
+    /// stops paying for an arena walk every interval.
+    pub fn take_completed_activity(&self) -> bool {
+        self.activity.swap(false, Ordering::AcqRel)
+    }
+}
+
+struct ActivityGuard(Arc<AtomicBool>);
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 pub mod http {
@@ -228,6 +268,7 @@ pub mod http {
         State(state): State<AppState>,
         Json(mut request): Json<SearchRequest>,
     ) -> Response {
+        let _activity = state.track_activity();
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_search(&state.store, &state.embedder, request, &state.search).await;
         let status = match &envelope {
@@ -241,6 +282,7 @@ pub mod http {
         State(state): State<AppState>,
         Json(mut request): Json<GetSessionRequest>,
     ) -> Response {
+        let _activity = state.track_activity();
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_get_session(&state.store, request).await;
         let status = match &envelope {
@@ -254,6 +296,7 @@ pub mod http {
         State(state): State<AppState>,
         Json(mut request): Json<GetMessageRequest>,
     ) -> Response {
+        let _activity = state.track_activity();
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_get_message(&state.store, request).await;
         let status = match &envelope {
@@ -267,6 +310,7 @@ pub mod http {
         State(state): State<AppState>,
         Json(mut request): Json<IngestRequest>,
     ) -> Response {
+        let _activity = state.track_activity();
         request.namespace.get_or_insert_with(default_namespace);
         let envelope = pond_ingest(&state.store, request).await;
         // Per-row errors in `results[]` are not request-level failures, so
@@ -946,6 +990,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSearchParams>,
         ) -> Result<CallToolResult, ErrorData> {
+            let _activity = self.state.track_activity();
             let Some(mode) = parse_search_mode(params.mode.as_deref()) else {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "unknown mode {:?}; use \"vector\" or \"fts\"",
@@ -1018,6 +1063,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpGetSessionParams>,
         ) -> Result<CallToolResult, ErrorData> {
+            let _activity = self.state.track_activity();
             let first_page =
                 params.after_message_id.is_none() && params.before_message_id.is_none();
             let request = GetSessionRequest {
@@ -1069,6 +1115,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpGetMessageParams>,
         ) -> Result<CallToolResult, ErrorData> {
+            let _activity = self.state.track_activity();
             let request = GetMessageRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
@@ -1106,6 +1153,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSqlParams>,
         ) -> Result<CallToolResult, ErrorData> {
+            let _activity = self.state.track_activity();
             let mode = match params.format.as_deref() {
                 None | Some("text") => sql::Mode::Inline,
                 Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
@@ -1295,6 +1343,7 @@ Examples (4 patterns the agent should recognize):
             request: ReadResourceRequestParams,
             context: RequestContext<RoleServer>,
         ) -> Result<ReadResourceResponse, ErrorData> {
+            let _activity = self.state.track_activity();
             // The schema docs are the same for every caller; stats and exports
             // are this store's data, which no shared cache may hand to another.
             let (mut result, scope) = match request.uri.as_str() {
@@ -1706,11 +1755,11 @@ Examples (4 patterns the agent should recognize):
             use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
             let temp = tempfile::TempDir::new()?;
-            let server = PondMcp::new(AppState {
-                store: Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
-                embedder: Arc::new(crate::embed::LazyEmbedder::candle()),
-                search: crate::config::SearchConfig::default(),
-            });
+            let server = PondMcp::new(AppState::new(
+                Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
+                Arc::new(crate::embed::LazyEmbedder::candle()),
+                crate::config::SearchConfig::default(),
+            ));
             let (client_io, server_io) = tokio::io::duplex(64 * 1024);
             let server_task = tokio::spawn(async move {
                 server.serve(server_io).await?.waiting().await?;

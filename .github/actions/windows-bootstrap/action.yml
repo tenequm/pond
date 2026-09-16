@@ -51,7 +51,7 @@ runs:
       run: |
         $ErrorActionPreference = 'Stop'
         # Keep in lockstep with PROTOC_VERSION in .github/actions/bootstrap.
-        $v = '35.1'
+        $v = '36.1'
         Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$v/protoc-$v-win64.zip" -OutFile protoc.zip
         Expand-Archive protoc.zip -DestinationPath C:\protoc
         "C:\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -73,7 +73,7 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $v = '2.5.1'
+        $v = '2.5.4'
         Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
         Expand-Archive moon.zip -DestinationPath C:\moon
         $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
@@ -131,7 +131,7 @@ runs:
         cargo --version
 
     # The remote settings live in a committed file, not in this job's env,
-    # because a daemon cannot watch an environment: 0.15.0 strips
+    # because a daemon cannot watch an environment: kache strips
     # KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
     # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) and keeps
     # KACHE_CONFIG. Exported BEFORE kache-action so the daemon it starts, every
@@ -170,8 +170,7 @@ runs:
     # Hetzner bucket the dist build uses - no ceiling, no GitHub storage
     # billing, keys portable across branches and runners.
     #
-    # Pinned to main, NOT the v1 tag: v1 predates Windows support and fails
-    # outright with "Unsupported platform: win32-x64".
+    # Pinned to an immutable commit so a mutable action tag cannot change CI.
     #
     # Accepted limitation: kache is a RUSTC_WRAPPER, so it caches rustc units
     # but not build-script EXECUTION - aws-lc-sys under cmake, plus ring,
@@ -179,7 +178,7 @@ runs:
     #
     # Its post step is `success() || failure()`, so a red run still saves, which
     # matters because Windows iteration means a test failing after a long compile.
-    - uses: kunobi-ninja/kache-action@a257c055543c2840700a9bbca8f9c3094a421b1b # main @ 2026-06-19
+    - uses: kunobi-ninja/kache-action@d71ab254aa8c20bdfa2dc38856611f5e78678cc6 # main @ 2026-09-14
       with:
         s3-bucket: ttq
         s3-endpoint: https://nbg1.your-objectstorage.com
@@ -195,15 +194,15 @@ runs:
         # run time, so an upstream cache-key bump invalidates the store with no
         # commit here. 0.14.0's bump cost a 138 min run against 9.5 min warm.
         # Bumped in lockstep with the Linux KACHE_VERSION and the k-tag in the
-        # prefixes, never alone. 0.15.0 strips the remote env from daemons it
+        # prefixes, never alone. kache strips the remote env from daemons it
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
-        # what the bump buys is key schema 27, whose schema 25 predecessor
-        # could under-key (module-body swaps, include_dir renames).
-        version: v0.15.0
+        # what the bump buys is key schema 31; schema 25 could under-key
+        # module-body swaps and include_dir renames.
+        version: v0.21.0
         manifest-key: ${{ inputs.manifest-key }}
-        # Below kache's 50GiB default because the runner disk is shared with
-        # target/ and CARGO_HOME, but the cap MUST stay above the remote prefix
-        # size: `sync --pull --all` materializes the whole prefix locally, and a
+        # Above kache 0.21's 5%-of-disk default because the cap MUST stay above
+        # the remote prefix, while still leaving room for target/ and CARGO_HOME.
+        # `sync --pull --all` materializes the whole prefix locally, and a
         # cap under it makes the store evict mid-run - measured 2026-08-26 at a
         # 27.5 GiB prefix against the old 20GiB cap (138%), 13 failed transfers
         # and demand re-fetches during the build. D: holds ~147 GB total; the
@@ -293,7 +292,7 @@ runs:
     # (the creep that actually hurts: 1538 artifacts / 45 s on 2026-08-24 grew
     # to 1925 / 156 s by 2026-08-26 - entry count alone lags the byte growth).
     #
-    # --allow-partial because 0.15.0 exits non-zero on any failed transfer.
+    # --allow-partial because kache exits non-zero on any failed transfer.
     # The trailing `exit 0` is the composite-action stand-in for
     # continue-on-error: a warm-up failure must degrade to demand fetches
     # during the build, never redden a job that would compile through fine.
