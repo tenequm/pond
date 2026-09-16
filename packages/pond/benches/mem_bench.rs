@@ -14,15 +14,15 @@
 //! | `mcp-query-growth`    | N iterations of search + get + sql              | the per-query ratchet |
 //! | `ingest-large-session`| one session, many messages (#229 shape)         | flush-batch byte scaling |
 //! | `search-query-latency`| warmup, then N timed FTS searches               | query latency drift (record-only) |
-//! | `ingest-throughput`   | N cached-corpus sessions into a fresh store     | write throughput drift (record-only) |
-//! | `serve-sync-retention`| serve-like prewarm + sync, settled to quiescence| a map or buffer pinned after sync ends |
+//! | `ingest-throughput`   | N synthetic sessions into a fresh store         | write throughput drift (record-only) |
+//! | `serve-sync-retention`| serve-like prewarm + sync, then a settling pause | a map or buffer pinned after sync ends |
 //! | `sync-under-contention`| sync while the rowmap build lock is held       | the trailing-oracle path's cost |
 //!
-//! The last four are RECORD-ONLY: their latency/throughput/retention numbers
-//! carry no threshold yet (phase 1 accumulates spread, phase 2 derives limits
-//! from median/IQR). `mem-gate.sh --check` still compares their peak RSS and
-//! peak heap like any other scenario - that is the memory gate, not a latency
-//! gate.
+//! The last four are RECORD-ONLY: they run in the gate and append rows, but
+//! `mem-gate.sh --check` judges none of their numbers - peak RSS and peak heap
+//! included - because the script's `RECORD_ONLY` list carves them out. Phase 1
+//! gathers the spread; phase 2 derives a threshold from the committed rows'
+//! median/IQR and promotes a scenario by dropping it from that list.
 //!
 //! Heap numbers need `--features mem-probe` (the counting allocator); without
 //! it the row still carries wall time and the scenario detail, with null memory
@@ -779,12 +779,20 @@ async fn scenario_ingest_large_session(steps: usize) -> Result<(Readings, Value)
     drop(store);
     let readings = probe.finish();
 
-    let store = Store::open_local(temp.path()).await?;
-    let fragments = fragment_stats(&store).await?;
+    // Best effort: the measurement is already in hand, so a manifest that will
+    // not reopen costs the row its fragment fields (they stay null, like on
+    // every scenario that never produces them) rather than the whole row.
     if let Value::Object(map) = &mut detail {
-        map.insert("frag_count".to_owned(), fragments.total_count.into());
-        map.insert("data_file_bytes".to_owned(), fragments.total_bytes.into());
-        map.insert("fragments".to_owned(), fragments.per_table);
+        match fragment_stats(temp.path()).await {
+            Ok(fragments) => {
+                map.insert("frag_count".to_owned(), fragments.total_count.into());
+                map.insert("data_file_bytes".to_owned(), fragments.total_bytes.into());
+                map.insert("fragments".to_owned(), fragments.per_table);
+            }
+            Err(error) => {
+                map.insert("fragments_error".to_owned(), error.to_string().into());
+            }
+        }
     }
     Ok((readings, detail))
 }
@@ -799,7 +807,8 @@ struct FragmentStats {
     per_table: Value,
 }
 
-async fn fragment_stats(store: &Store) -> Result<FragmentStats> {
+async fn fragment_stats(store_dir: &Path) -> Result<FragmentStats> {
+    let store = Store::open_local(store_dir).await?;
     let mut per_table = serde_json::Map::new();
     let mut total_count = 0u64;
     let mut total_bytes = 0u64;
@@ -902,12 +911,15 @@ async fn scenario_search_query_latency(
     ))
 }
 
-/// Record-only ingest throughput: the cached corpus's first `sessions` sessions
-/// replayed into a fresh store through the production batched path. Rows are
-/// generated before the probe starts, like every other ingest scenario, so the
-/// rate measures writing rather than generating.
-async fn scenario_ingest_throughput(corpus: &Corpus, sessions: usize) -> Result<(Readings, Value)> {
-    let messages = corpus.profile.messages;
+/// Record-only ingest throughput: the profile's first N synthetic sessions -
+/// the same ones the corpus generator emits, regenerated rather than read back,
+/// so this scenario needs no prepared corpus - replayed into a fresh store
+/// through the production batched path. Events are built before the probe
+/// starts, like every other ingest scenario, and the rate's denominator is the
+/// ingest call alone: neither the generator nor the closing count is in it,
+/// though both are inside the measured region and so in the row's peaks.
+async fn scenario_ingest_throughput(profile: Profile) -> Result<(Readings, Value)> {
+    let (sessions, messages) = (profile.throughput_sessions, profile.messages);
     let corpus_sessions: Vec<Vec<IngestEvent>> = (0..sessions)
         .map(|index| session_events(index, messages))
         .collect();
@@ -915,12 +927,14 @@ async fn scenario_ingest_throughput(corpus: &Corpus, sessions: usize) -> Result<
     let store = Store::open_local(temp.path()).await?;
 
     let probe = Probe::begin();
+    let started = Instant::now();
     ingest_batched(&store, corpus_sessions).await?;
+    let ingest = started.elapsed();
     let (sessions_written, messages_written, parts_written) = store.row_counts().await?;
     let readings = probe.finish();
 
     let rows = (sessions_written + messages_written + parts_written) as f64;
-    let seconds = (readings.wall_ms.max(1) as f64) / 1000.0;
+    let seconds = ingest.as_secs_f64().max(f64::EPSILON);
     Ok((
         readings,
         json!({
@@ -929,6 +943,9 @@ async fn scenario_ingest_throughput(corpus: &Corpus, sessions: usize) -> Result<
             "sessions_written": sessions_written,
             "messages_written": messages_written,
             "parts_written": parts_written,
+            // The denominator, on the record: `wall_ms` also carries the row
+            // count, so the rate cannot be re-derived from the row without it.
+            "ingest_ms": ingest.as_millis() as u64,
             "throughput_rows_per_s": (rows / seconds).round() as u64,
             "throughput_messages_per_s": (messages_written as f64 / seconds).round() as u64,
         }),
@@ -975,8 +992,16 @@ async fn scenario_serve_sync_retention(corpus: &Corpus) -> Result<(Readings, Val
     // Everything the sync itself owned goes away here; what the STORE still
     // holds is the measurement.
     drop(oracle);
+    // Sampled either side of the pause, because the pause is a fixed duration
+    // rather than a convergence test: a delta at zero is the evidence it was
+    // long enough, and a growing one is how a change that keeps allocating
+    // after `sync` returns announces itself instead of hiding in the noise.
+    let settle_start_heap = memprobe::heap_stats().map(|h| h.live_bytes);
     tokio::time::sleep(RETENTION_SETTLE).await;
     let readings = probe.finish();
+    let settle_heap_delta_bytes = settle_start_heap
+        .zip(readings.heap_end_bytes)
+        .map(|(before, after)| after as i64 - before as i64);
 
     Ok((
         readings,
@@ -991,6 +1016,7 @@ async fn scenario_serve_sync_retention(corpus: &Corpus) -> Result<(Readings, Val
             "sync_oracle_retained": store.sync_oracle_snapshot().is_some(),
             "rowmap_entries": store.rowmap_snapshot().map_or(0, |set| set.len()),
             "settle_ms": RETENTION_SETTLE.as_millis() as u64,
+            "settle_heap_delta_bytes": settle_heap_delta_bytes,
         }),
     ))
 }
@@ -1120,10 +1146,9 @@ async fn main() -> Result<()> {
                 .await?,
             )
         }
-        "ingest-throughput" => {
-            corpus.require_ready()?;
-            scenario_ingest_throughput(&corpus, profile.throughput_sessions).await?
-        }
+        // No `require_ready`: this one regenerates its sessions rather than
+        // reading the cached corpus back.
+        "ingest-throughput" => scenario_ingest_throughput(profile).await?,
         "serve-sync-retention" => {
             corpus.require_ready()?;
             scenario_serve_sync_retention(&corpus).await?
