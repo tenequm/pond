@@ -14,6 +14,11 @@
 # One scenario per process invocation: peak RSS is a process-lifetime
 # high-water mark, so two scenarios in one process cannot be told apart.
 #
+# --check compares peak_rss_kb and peak_heap_bytes only. The latency,
+# throughput, retention and fragment fields the newer scenarios record are
+# deliberately ungated: phase 1 accumulates their spread across runs, phase 2
+# derives thresholds from the median/IQR of what landed here.
+#
 #   ops/scripts/mem-gate.sh                     # ci corpus, all scenarios
 #   ops/scripts/mem-gate.sh --profile large     # 1M+ message corpus
 #   ops/scripts/mem-gate.sh --check             # gate vs committed baseline
@@ -34,7 +39,7 @@ while [ $# -gt 0 ]; do
 done
 
 BASELINE="docs/benchmarks/mem-gate-baseline.jsonl"
-SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session}"
+SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
