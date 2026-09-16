@@ -46,15 +46,18 @@
       #               satisfy the build; neither is load-bearing for output.
       #   pkg-config  the pkg-config crate is in the tree via libsqlite3-sys.
       #
-      # The Rust toolchain is deliberately NOT pinned here: rust-toolchain.toml
-      # already pins it and rustup honors that on both a dev machine and CI. A
-      # second pin in this flake would be a second source of truth that drifts.
+      #   rustup      the Rust toolchain is deliberately NOT pinned here:
+      #               rust-toolchain.toml already pins it, and a second pin in
+      #               this flake would be a second source of truth that drifts.
+      #               rustup's cargo/rustc proxies read that file, so a Nix-only
+      #               machine gets the pinned toolchain, not its system rustc.
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
             cmake
             protobuf
             pkg-config
+            rustup
           ];
         };
       });
