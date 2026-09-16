@@ -13,6 +13,7 @@ use arrow_select::filter::filter_record_batch;
 use async_stream::try_stream;
 use chrono::{DateTime, TimeZone, Utc};
 use lance::Dataset;
+use lance::dataset::rowids::load_row_id_sequence;
 use lance::dataset::{AutoCleanupParams, ProjectionRequest, WriteMode, WriteParams};
 use lance::deps::arrow_array::builder::{FixedSizeListBuilder, Float16Builder};
 use lance::deps::arrow_array::{
@@ -24,6 +25,7 @@ use lance::deps::arrow_schema::{DataType, Field, Schema, TimeUnit};
 use lance::deps::datafusion::error::DataFusionError;
 use lance::deps::datafusion::physical_plan::SendableRecordBatchStream;
 use lance::index::DatasetIndexExt;
+use lance::table::format::Fragment;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1925,10 +1927,11 @@ impl Store {
     /// Max delta segments before the chain is compacted into a fresh base.
     const MAX_ROWMAP_DELTAS: usize = 16;
 
-    /// Columns the resident meta map is built from. The full scan and the delta
-    /// scan MUST project the same set in the same order - both feed
-    /// [`row_meta_entry`], so a column added to one only would silently corrupt
-    /// delta hydration.
+    /// Columns the resident meta map is built from. All three readers over this
+    /// list - [`row_meta_entry`] for the sorting fallback and the delta scan,
+    /// [`RowMetaColumns`] for the streaming full scan - MUST project the same
+    /// set in the same order, so a column added for one of them only would
+    /// silently corrupt the others.
     const ROW_META_COLUMNS: [&str; 7] = [
         "session_id",
         "id",
@@ -2628,37 +2631,127 @@ impl Store {
     /// corpus never exists in memory at once, only the open block and the
     /// dictionaries. One large sequential scan, same as `collect_row_metas`.
     ///
-    /// `Ok(false)` means the scan handed the builder a row that went backwards
-    /// in `row_id`, which the streaming encoder cannot absorb (the block holding
-    /// the earlier rows is already compressed and gone). Nothing was published;
-    /// the caller re-encodes through the sorting `RowMetaMap::build`.
+    /// The scan is driven by an explicit fragment list, ordered so it yields
+    /// ascending `row_id` - see [`Self::ascending_row_id_fragments`], which is
+    /// also the guard: `Ok(false)` means no such order exists and nothing was
+    /// published, so the caller re-encodes through the sorting
+    /// `RowMetaMap::build`. That decision is made from fragment metadata before
+    /// a single data page is read, so the fallback does not pay for a scan it
+    /// throws away.
     async fn build_rowmap_from_scan(&self, path: &Path, version: u64) -> Result<bool> {
-        let row_count = self.handle.count_rows(Table::Messages).await?;
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
-        scanner.with_row_id();
-        scanner.project(&Self::ROW_META_COLUMNS)?;
-        let mut stream = scanner.try_into_stream().await?;
-        let mut builder = RowMetaBuilder::new(path, version, row_count)?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            let columns = RowMetaColumns::new(&batch)?;
-            for row in 0..batch.num_rows() {
-                if let Err(error) = builder.push(columns.row(row)?) {
-                    return match error.downcast_ref::<UnorderedRows>() {
-                        Some(unordered) => {
-                            tracing::warn!(
-                                %unordered,
-                                "row meta scan is not row_id-ordered; rebuilding from a sorted collect"
-                            );
-                            Ok(false)
-                        }
-                        None => Err(error),
-                    };
+        // One dataset handle for the plan, the row count and the scan: a
+        // re-`latest()` between them could plan against a manifest the scan no
+        // longer reads.
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let Some(fragments) = Self::ascending_row_id_fragments(&dataset).await? else {
+            crate::rowmap::note_rowmap_scan_fallback();
+            tracing::warn!(
+                store = %self.handle.location(),
+                "no fragment order yields ascending row ids; rebuilding the row meta map from a sorted collect"
+            );
+            return Ok(false);
+        };
+        let mut builder = RowMetaBuilder::new(path, version, dataset.count_rows(None).await?)?;
+        // `with_fragments(vec![])` is not "scan nothing" - an empty store has no
+        // rows to fold in at all.
+        if !fragments.is_empty() {
+            let mut scanner = dataset.scan();
+            scanner.with_fragments(fragments);
+            scanner.with_row_id();
+            scanner.project(&Self::ROW_META_COLUMNS)?;
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let columns = RowMetaColumns::new(&batch)?;
+                for row in 0..batch.num_rows() {
+                    if let Err(error) = builder.push(columns.row(row)?) {
+                        return match error.downcast_ref::<UnorderedRows>() {
+                            // The plan said this could not happen, so it is a
+                            // bug in the plan rather than a store shape - but a
+                            // wrong map is worse than a slow build, so it still
+                            // falls back (dropping `builder` here reclaims both
+                            // staging temps before the caller rescans).
+                            Some(unordered) => {
+                                crate::rowmap::note_rowmap_scan_fallback();
+                                tracing::warn!(
+                                    %unordered,
+                                    "row meta scan went backwards despite an ascending fragment plan; rebuilding from a sorted collect"
+                                );
+                                Ok(false)
+                            }
+                            None => Err(error),
+                        };
+                    }
                 }
             }
         }
         builder.finish()?;
         Ok(true)
+    }
+
+    /// `messages` fragments ordered so that scanning them in sequence yields
+    /// strictly ascending `row_id`, or `None` when no such order exists.
+    ///
+    /// Lance's ordered scan yields *fragment* order, which is not row-id order:
+    /// `Operation::Update` appends its rewritten fragments at the end while
+    /// preserving their stable row ids, so a single `write_embeddings`
+    /// `merge_update` over an older fragment leaves the newest fragment holding
+    /// the *lowest* ids. Sorting by each fragment's first live row id undoes
+    /// exactly that, at the cost of a manifest read.
+    ///
+    /// It does not always suffice, and both counterexamples are reachable from
+    /// pond's own writes:
+    ///
+    /// - a `merge_update` whose window covers a scattered set of rows produces
+    ///   one new fragment whose live ids interleave with several older
+    ///   fragments' (measured: a new fragment holding `[0, 1, 8, 9]` beside
+    ///   fragments holding `[2, 3]`, `[4..7]` and `[10, 11]`);
+    /// - compaction preserves the scan order it read, so compacting a store
+    ///   that was already out of order bakes a non-ascending sequence into a
+    ///   *single* fragment, where no fragment order can help.
+    ///
+    /// So this reports rather than assumes: every fragment's own live ids must
+    /// ascend, and the sorted fragments' live ranges must be disjoint. Deleted
+    /// rows are excluded because a partial-fragment rewrite tombstones the rows
+    /// it moved, leaving raw sequences that overlap where the live ones do not.
+    ///
+    /// Cost is metadata only - the row id sequences are run-length segments
+    /// Lance caches per fragment, plus one small read per fragment that carries
+    /// a deletion file - so a `None` here costs far less than the scan it
+    /// avoids starting.
+    async fn ascending_row_id_fragments(dataset: &Dataset) -> Result<Option<Vec<Fragment>>> {
+        let mut plan: Vec<(u64, u64, Fragment)> = Vec::new();
+        for fragment in dataset.get_fragments() {
+            let sequence = load_row_id_sequence(dataset, fragment.metadata()).await?;
+            let deleted = fragment.get_deletion_vector().await?;
+            let (mut first, mut last) = (None, None);
+            for (offset, row_id) in sequence.iter().enumerate() {
+                let offset = u32::try_from(offset).context("fragment row offset overflow")?;
+                if deleted
+                    .as_ref()
+                    .is_some_and(|deleted| deleted.contains(offset))
+                {
+                    continue;
+                }
+                if last.is_some_and(|previous| previous >= row_id) {
+                    return Ok(None);
+                }
+                first.get_or_insert(row_id);
+                last = Some(row_id);
+            }
+            // A fragment whose rows are all deleted contributes nothing and
+            // would otherwise sort as an empty range.
+            if let (Some(first), Some(last)) = (first, last) {
+                plan.push((first, last, fragment.metadata().clone()));
+            }
+        }
+        plan.sort_unstable_by_key(|(first, _, _)| *first);
+        if plan.windows(2).any(|pair| pair[0].1 >= pair[1].0) {
+            return Ok(None);
+        }
+        Ok(Some(
+            plan.into_iter().map(|(_, _, fragment)| fragment).collect(),
+        ))
     }
 
     /// Scan the hydration columns with row ids into a `Vec`, the input to
@@ -8515,6 +8608,243 @@ mod tests {
         // authoritative backlog - never derived from FTS num_docs.
         assert_eq!(full.backlog, 0);
         assert_eq!(full.backlog, store.embed_backlog_count().await?);
+        Ok(())
+    }
+
+    fn rowmap_digest(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(path).expect("segment"))
+        )
+    }
+
+    /// Ingest one more session's worth of messages as its own Lance fragment.
+    async fn ingest_extra_fragment(
+        store: &Store,
+        tag: &str,
+        messages: usize,
+    ) -> anyhow::Result<Vec<MessageKey>> {
+        let session_id = format!("session-{tag}");
+        let mut events = vec![IngestEvent::Session(Session {
+            id: session_id.clone(),
+            parent_session_id: None,
+            parent_message_id: None,
+            source_agent: "claude-code".to_owned(),
+            created_at: Utc::now(),
+            project: Extracted::from_test_value(format!("/proj/{tag}")),
+            options: ProviderOptions::new(),
+        })];
+        let mut keys = Vec::with_capacity(messages);
+        for i in 0..messages {
+            let message_id = format!("msg-{tag}-{i}");
+            events.push(IngestEvent::Message(Message::User {
+                id: message_id.clone(),
+                session_id: session_id.clone(),
+                timestamp: Utc::now(),
+                options: ProviderOptions::new(),
+            }));
+            events.push(IngestEvent::Part(Part {
+                session_id: session_id.clone(),
+                id: format!("{message_id}-part"),
+                message_id: message_id.clone(),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::Text {
+                    text: Some(Extracted::from_test_value(format!("extra body {tag} {i}"))),
+                },
+            }));
+            keys.push(MessageKey {
+                session_id: session_id.clone(),
+                message_id,
+            });
+        }
+        ingest_events(store, events).await?;
+        Ok(keys)
+    }
+
+    /// Build the same store both ways and return `(streaming used, digests)`.
+    async fn build_both_ways(store: &Store, dir: &Path) -> anyhow::Result<(bool, String, String)> {
+        let streamed = dir.join("streamed.rmm");
+        let used = store.build_rowmap_from_scan(&streamed, 1).await?;
+        let collected = dir.join("collected.rmm");
+        RowMetaMap::build(&collected, 1, store.collect_row_metas().await?)?;
+        let streamed_digest = if used {
+            rowmap_digest(&streamed)
+        } else {
+            String::new()
+        };
+        Ok((used, streamed_digest, rowmap_digest(&collected)))
+    }
+
+    /// A `write_embeddings` backfill is a `merge_update`, and Lance appends the
+    /// rewritten fragments at the *end* of the fragment list while preserving
+    /// their stable row ids. A partially backfilled multi-fragment store
+    /// therefore scans as `[8, 0, 1, ..., 7]` in fragment order - the ordinary
+    /// shape of an in-progress or interrupted `pond optimize` embed pass, and
+    /// exactly the cold-build case the streaming encoder exists for. The scan
+    /// has to be planned in row-id order, not fragment order.
+    #[tokio::test]
+    async fn streaming_rowmap_build_survives_a_partial_embed_backfill() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 8).await?;
+        ingest_extra_fragment(&store, "late", 1).await?;
+        // Only the first fragment's rows: the second stays un-embedded, so its
+        // fragment is untouched and ends up *before* the rewritten one.
+        store.write_embeddings(&embedded(&keys)).await?;
+
+        let dataset = store.handle.dataset(Table::Messages).await?;
+        assert!(
+            dataset.get_fragments().len() > 1,
+            "the probe needs a multi-fragment store",
+        );
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let (used, streamed, collected) = build_both_ways(&store, &out).await?;
+        assert!(
+            used,
+            "a partially backfilled store must still take the streaming path",
+        );
+        assert_eq!(
+            streamed, collected,
+            "the streaming build and the sorting build must encode the same bytes",
+        );
+
+        // And the map actually resolves every row of both fragments.
+        let map = RowMetaMap::open(&out.join("streamed.rmm"))?;
+        assert_eq!(map.len(), 9);
+        for meta in store.collect_row_metas().await? {
+            assert_eq!(
+                map.lookup(meta.row_id),
+                Some((meta.session_id.as_str(), meta.message_id.as_str())),
+                "row {} resolves",
+                meta.row_id,
+            );
+        }
+        Ok(())
+    }
+
+    /// The cross-path guard: the streaming reader (`RowMetaColumns`) and the
+    /// buffering one (`row_meta_entry`) project the same columns out of the same
+    /// batches, so they must encode byte-identical segments. Nothing else pins
+    /// the two readers against each other.
+    #[tokio::test]
+    async fn scan_build_and_collect_build_encode_the_same_bytes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        // Several sessions, projects and a bare tool call (null `search_text`),
+        // across two fragments.
+        let (store, _keys) = store_with_messages(&temp, 40).await?;
+        ingest_extra_fragment(&store, "second", 5).await?;
+        ingest_events(
+            &store,
+            vec![IngestEvent::Message(Message::Assistant {
+                id: "msg-toolcall".to_owned(),
+                session_id: "session-0".to_owned(),
+                timestamp: Utc::now(),
+                options: ProviderOptions::new(),
+            })],
+        )
+        .await?;
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let (used, streamed, collected) = build_both_ways(&store, &out).await?;
+        assert!(used, "an append-only store scans in row-id order");
+        assert_eq!(
+            streamed, collected,
+            "the two row-meta readers must encode the same segment",
+        );
+        Ok(())
+    }
+
+    /// Sorting fragments is not always enough, and the fallback must stay cheap
+    /// and *countable*: one `merge_update` over a scattered set of rows leaves a
+    /// new fragment whose live row ids interleave with several older fragments',
+    /// which no fragment order can straighten out. The build must notice from
+    /// the manifest - before reading a data page - and hand over to the sorting
+    /// build, bumping the counter the memory gate watches.
+    #[tokio::test]
+    async fn interleaved_fragment_row_ids_fall_back_and_are_counted() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut keys = Vec::new();
+        for tag in ["a", "b", "c"] {
+            keys.extend(ingest_extra_fragment(&store, tag, 4).await?);
+        }
+        // Rows 0-1 (first fragment) and 8-9 (third) in one merge_update: the
+        // rewritten fragment holds `[0, 1, 8, 9]`, straddling the second.
+        let mut scattered = embedded(&keys[0..2]);
+        scattered.extend(embedded(&keys[8..10]));
+        store.write_embeddings(&scattered).await?;
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let before = crate::rowmap::rowmap_scan_fallbacks();
+        let streamed = out.join("streamed.rmm");
+        assert!(
+            !store.build_rowmap_from_scan(&streamed, 1).await?,
+            "interleaved live row ids have no ascending fragment order",
+        );
+        assert!(
+            crate::rowmap::rowmap_scan_fallbacks() > before,
+            "the fallback must be countable, not only logged",
+        );
+        assert!(
+            !streamed.exists(),
+            "a build that fell back publishes nothing",
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&out)?
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the fallback must reclaim its staging temps before the caller rescans: {leftovers:?}",
+        );
+
+        // The sorting path still produces a correct map for this store.
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache)?;
+        store.ensure_rowmap(&cache).await?;
+        let set = store.rowmap_snapshot().context("map installed")?;
+        assert_eq!(set.len(), 12);
+        Ok(())
+    }
+
+    /// The other shape sorting cannot fix: compaction rewrites fragments in the
+    /// order it read them, so compacting a store that was already out of order
+    /// bakes a backwards row-id sequence into a *single* fragment. Permanent
+    /// until the next reorder, and the reason the fallback stays.
+    #[tokio::test]
+    async fn compaction_can_bake_a_backwards_row_id_order_into_one_fragment() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let (store, keys) = store_with_messages(&temp, 8).await?;
+        ingest_extra_fragment(&store, "late", 1).await?;
+        store.write_embeddings(&embedded(&keys)).await?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?;
+
+        let dataset = store.handle.dataset(Table::Messages).await?;
+        assert_eq!(
+            dataset.get_fragments().len(),
+            1,
+            "compaction folded the store into one fragment",
+        );
+
+        let out = temp.path().join("out");
+        std::fs::create_dir_all(&out)?;
+        let before = crate::rowmap::rowmap_scan_fallbacks();
+        assert!(
+            !store
+                .build_rowmap_from_scan(&out.join("streamed.rmm"), 1)
+                .await?,
+            "one fragment holding descending row ids cannot be reordered",
+        );
+        assert!(crate::rowmap::rowmap_scan_fallbacks() > before);
         Ok(())
     }
 

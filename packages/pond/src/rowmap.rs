@@ -12,8 +12,9 @@
 //! Encoded row by row by [`RowMetaBuilder`], which holds one block of text and
 //! the dictionaries rather than the corpus, then published via temp + atomic
 //! rename and `mmap`'d read-only, so N pond processes on the box share one
-//! physical copy in the OS page cache and a restart re-`open`s instantly. Stable row ids (`enable_stable_row_ids`) keep a built map valid
-//! across compaction; it only rebuilds when the dataset version advances.
+//! physical copy in the OS page cache and a restart re-`open`s instantly.
+//! Stable row ids (`enable_stable_row_ids`) keep a built map valid across
+//! compaction; it only rebuilds when the dataset version advances.
 //!
 //! Layout: `Header | [Record; count] | [SessionEntry] | [DictEntry; project] |
 //! [DictEntry; agent] | [DictEntry; role] | [BlockEntry] | blob`. Records are
@@ -29,6 +30,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
@@ -138,6 +140,23 @@ pub struct RowMetaRef<'a> {
     pub search_text: &'a str,
 }
 
+impl RowMetaRef<'_> {
+    /// Copy every field out of whatever this row borrows - the input the
+    /// sorting rebuild needs, which outlives the cursor that produced it.
+    fn to_entry(&self) -> RowMetaEntry {
+        RowMetaEntry {
+            row_id: self.row_id,
+            session_id: self.session_id.to_owned(),
+            message_id: self.message_id.to_owned(),
+            role: self.role.to_owned(),
+            project: self.project.to_owned(),
+            source_agent: self.source_agent.to_owned(),
+            timestamp_micros: self.timestamp_micros,
+            search_text: self.search_text.to_owned(),
+        }
+    }
+}
+
 /// Rows reached [`RowMetaBuilder::push`] out of `row_id` order. The builder
 /// encodes rows in arrival order (records are binary-searched, so that order is
 /// the file's), and it has already dropped the text of every block it closed -
@@ -149,6 +168,31 @@ pub struct RowMetaRef<'a> {
 pub struct UnorderedRows {
     pub previous: u64,
     pub current: u64,
+}
+
+/// Cold base builds that could not stream and re-encoded through the buffering
+/// [`RowMetaMap::build`] instead. Process-lifetime, monotonic, `Relaxed` - a
+/// counter, not a synchronization point.
+///
+/// The streaming encoder needs ascending `row_id`s, and a Lance scan only
+/// delivers them when a fragment order exists that produces them (see
+/// `Store::build_rowmap_from_scan`). Live row ids can interleave across
+/// fragments, and a compaction can bake a non-ascending order into a single
+/// fragment, so no plan always exists. When none does the build costs what it
+/// cost before this encoder - a silent performance cliff that only a
+/// `tracing::warn!` marked, invisible to CI and to the memory gate. Counting it
+/// lets the bench lane read the number across a scenario and fail on a
+/// regression into the slow path.
+pub static ROWMAP_SCAN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one cold build that fell back off the streaming path.
+pub fn note_rowmap_scan_fallback() {
+    ROWMAP_SCAN_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Cold-build fallbacks so far this process.
+pub fn rowmap_scan_fallbacks() -> u64 {
+    ROWMAP_SCAN_FALLBACKS.load(Ordering::Relaxed)
 }
 
 /// Borrowed view of one row's meta. The dictionary-encoded fields borrow the
@@ -956,9 +1000,6 @@ impl ChainPaths {
     }
 }
 
-/// Discover the chain under `cache_dir` for `store_key`: the highest-version
-/// base (`-v{V}`) plus every delta (`-d{V}`) above it, ascending. `None` if no
-/// base exists yet.
 /// Does `file_name` name an abandoned build temp for `store_key`?
 ///
 /// One definition, two enforcement points: `Store::sweep_orphan_temps` reclaims
@@ -972,6 +1013,9 @@ pub fn is_orphan_temp(file_name: &str, store_key: &str) -> bool {
     file_name.starts_with(&format!("rowmetamap-{store_key}-")) && file_name.contains(".tmp-")
 }
 
+/// Discover the chain under `cache_dir` for `store_key`: the highest-version
+/// base (`-v{V}`) plus every delta (`-d{V}`) above it, ascending. `None` if no
+/// base exists yet.
 pub fn discover_chain(cache_dir: &Path, store_key: &str) -> Option<ChainPaths> {
     let prefix = format!("rowmetamap-{store_key}-");
     let mut bases: Vec<(u64, PathBuf)> = Vec::new();
@@ -1165,18 +1209,45 @@ impl RowMetaSet {
     /// [`RowMetaBuilder`]. The corpus is never reconstructed as owned entries:
     /// each row is a borrow into its segment's mapping and its one decompressed
     /// text block. On a `row_id` collision the newest source wins - `appended`
-    /// over every segment, later segments over earlier ones - and the superseded
-    /// rows are skipped, so a row id appears exactly once.
+    /// over every segment, later segments over earlier ones, and the last of a
+    /// run of duplicates within `appended` - and the superseded rows are
+    /// skipped, so a row id appears exactly once.
+    ///
+    /// A segment whose records are not `row_id`-sorted is corrupt (its binary
+    /// search is already wrong) and breaks the merge. That falls back to a
+    /// sorting rebuild rather than erroring: the pre-streaming build sorted, so
+    /// such a chain self-healed on the next compaction, and returning an error
+    /// here would instead fail every later `ensure_rowmap` on the same chain
+    /// forever.
     pub fn compact_into(
         &self,
         path: &Path,
         version: u64,
         mut appended: Vec<RowMetaEntry>,
     ) -> Result<()> {
-        appended.sort_unstable_by_key(|entry| entry.row_id);
+        // Stable, so a duplicated row_id keeps its arrival order and the last
+        // one really is the newest.
+        appended.sort_by_key(|entry| entry.row_id);
+        match self.merge_into(path, version, &appended) {
+            Err(error) if error.downcast_ref::<UnorderedRows>().is_some() => {
+                tracing::warn!(
+                    %error,
+                    "rowmap segment records are not row_id-ordered; compacting through a sorting rebuild"
+                );
+                self.sorted_rebuild(path, version, appended)
+            }
+            result => result,
+        }
+    }
+
+    /// The streaming k-way merge itself. `appended` must be sorted by `row_id`.
+    fn merge_into(&self, path: &Path, version: u64, appended: &[RowMetaEntry]) -> Result<()> {
         let mut cursors: Vec<SegmentCursor<'_>> =
             self.segments.iter().map(SegmentCursor::new).collect();
         let mut next_appended = 0usize;
+        let mut dropped = 0usize;
+        // An upper bound, not a count: the spine shrinks by however many row ids
+        // the merge collapses.
         let mut builder = RowMetaBuilder::new(path, version, self.len() + appended.len())?;
         loop {
             let mut row_id = appended.get(next_appended).map(|entry| entry.row_id);
@@ -1191,27 +1262,69 @@ impl RowMetaSet {
                 .get(next_appended)
                 .is_some_and(|entry| entry.row_id == row_id);
             if from_appended {
+                // Newest wins inside `appended` too: skip to the last entry of
+                // this row id's run instead of emitting a record per duplicate.
+                while appended
+                    .get(next_appended + 1)
+                    .is_some_and(|entry| entry.row_id == row_id)
+                {
+                    next_appended += 1;
+                }
                 builder.push(appended[next_appended].as_row())?;
+                next_appended += 1;
             } else if let Some(newest) = cursors
                 .iter()
                 .rposition(|cursor| cursor.peek() == Some(row_id))
             {
                 cursors[newest].load_block();
-                if let Some(row) = cursors[newest].row() {
-                    builder.push(row)?;
+                match cursors[newest].row() {
+                    Some(row) => builder.push(row)?,
+                    // A record whose blob offsets do not resolve: the rebuilt
+                    // base is short that row, and a caller reading it can no
+                    // longer tell. Loud, because a base that silently loses rows
+                    // outlives every read that would have caught it.
+                    None => dropped += 1,
                 }
             }
 
-            if from_appended {
-                next_appended += 1;
-            }
             for cursor in &mut cursors {
                 if cursor.peek() == Some(row_id) {
                     cursor.advance();
                 }
             }
         }
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                path = %path.display(),
+                "rowmap compaction could not read some segment records; the rebuilt base is short that many rows"
+            );
+        }
         builder.finish()
+    }
+
+    /// Re-encode the whole chain plus `appended` through the sorting
+    /// [`RowMetaMap::build`] - what the pre-streaming compaction did. Holds the
+    /// corpus as owned entries, so it is the corruption path only.
+    fn sorted_rebuild(&self, path: &Path, version: u64, appended: Vec<RowMetaEntry>) -> Result<()> {
+        let mut merged: HashMap<u64, RowMetaEntry> = HashMap::with_capacity(self.len());
+        // Base first, deltas ascending, `appended` last: the later insert for a
+        // row id overwrites the earlier, which is the same newest-wins order the
+        // merge applies.
+        for segment in &self.segments {
+            let mut cursor = SegmentCursor::new(segment);
+            while cursor.peek().is_some() {
+                cursor.load_block();
+                if let Some(row) = cursor.row() {
+                    merged.insert(row.row_id, row.to_entry());
+                }
+                cursor.advance();
+            }
+        }
+        for entry in appended {
+            merged.insert(entry.row_id, entry);
+        }
+        RowMetaMap::build(path, version, merged.into_values().collect())
     }
 }
 
@@ -1628,10 +1741,15 @@ mod tests {
     }
 
     /// A deliberately awkward corpus for the byte-compat guards: three blocks
-    /// with a partial last one, duplicate-key runs (session, project, agent,
-    /// role) whose lengths are coprime with `BLOCK_ROWS` so runs straddle every
-    /// block boundary, empty and non-ASCII `search_text`, and dictionary values
-    /// whose first-seen order differs from their lexical order. Returned in
+    /// with a partial last one, duplicate-key runs (session, project, agent) of
+    /// 7, 5 and 13 rows - lengths coprime with `BLOCK_ROWS`, so every run
+    /// straddles both block boundaries - empty and non-ASCII `search_text`, and
+    /// project/agent/role dictionary values whose first-seen order differs from
+    /// their lexical order. `role` cycles every row, so it is the run-length-1
+    /// case rather than a straddling run. The session dictionary is deliberately
+    /// first-seen == lexical here so the pinned digest stays legible; the
+    /// non-identity session remap is covered by
+    /// [`remapped_session_dictionary_matches_the_buffered_build`]. Returned in
     /// ascending `row_id` order - the streaming build's required input order.
     fn compat_fixture() -> Vec<RowMetaEntry> {
         let roles = ["user", "assistant", "system"];
@@ -1733,6 +1851,170 @@ mod tests {
                 "chunk size {chunk} changed the bytes"
             );
         }
+    }
+
+    /// `compat_fixture`'s session ids are first-seen in lexical order, so the
+    /// pinned digest never exercises a non-identity session remap: the staged
+    /// row headers' session ids and the `session_aggs` reorder both happen to be
+    /// the identity there. This runs the same guards over a fixture whose
+    /// session first-seen order is the reverse of its lexical order, so every
+    /// session id in every staged row header has to be rewritten and every
+    /// aggregate has to move.
+    #[test]
+    fn remapped_session_dictionary_matches_the_buffered_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = (BLOCK_ROWS as u64 * 2 + 37).div_ceil(7);
+        // Descending session ids: `sess-0000` is first seen last.
+        let rows: Vec<RowMetaEntry> = compat_fixture()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut row)| {
+                row.session_id = format!("sess-{:04}", sessions - 1 - i as u64 / 7);
+                row
+            })
+            .collect();
+        assert!(
+            rows[0].session_id > rows[rows.len() - 1].session_id,
+            "the fixture must see its sessions in reverse lexical order",
+        );
+
+        let buffered = dir.path().join("buffered.rmm");
+        RowMetaMap::build(&buffered, 42, rows.clone()).unwrap();
+        let expected = digest(&buffered);
+
+        for chunk in [1usize, 7, 256, 1000] {
+            let path = dir.path().join(format!("chunked-{chunk}.rmm"));
+            let mut builder = RowMetaBuilder::new(&path, 42, rows.len()).unwrap();
+            for batch in rows.chunks(chunk) {
+                let batch: Vec<RowMetaEntry> = batch.to_vec();
+                for row in &batch {
+                    builder.push(row.as_row()).unwrap();
+                }
+            }
+            builder.finish().unwrap();
+            assert_eq!(
+                digest(&path),
+                expected,
+                "chunk size {chunk} changed the bytes under a remapped session dictionary"
+            );
+        }
+
+        // Functional too, not just byte-equal: a remap that lost track of which
+        // aggregate belonged to which session would still digest-match itself.
+        let map = RowMetaMap::open(&buffered).unwrap();
+        let mut expected_counts: HashMap<&str, usize> = HashMap::new();
+        let mut expected_max_ts: HashMap<&str, i64> = HashMap::new();
+        for row in &rows {
+            *expected_counts.entry(&row.session_id).or_default() += 1;
+            let slot = expected_max_ts.entry(&row.session_id).or_insert(i64::MIN);
+            *slot = (*slot).max(row.timestamp_micros);
+            assert_eq!(
+                map.lookup(row.row_id),
+                Some((row.session_id.as_str(), row.message_id.as_str())),
+                "row {} resolves to its own session and message",
+                row.row_id,
+            );
+        }
+        for (session, count) in expected_counts {
+            assert_eq!(
+                map.lookup_count(session),
+                Some(count),
+                "count for {session}"
+            );
+            assert_eq!(
+                map.lookup_max_ts(session),
+                expected_max_ts.get(session).copied(),
+                "max timestamp for {session}",
+            );
+        }
+    }
+
+    /// Duplicate `row_id`s inside `appended` are unreachable from a real corpus
+    /// (`collect_row_metas_delta` emits each row once), but the merge used to
+    /// emit a record per duplicate, which binary search resolves arbitrarily.
+    /// They collapse the same way a segment collision does: newest wins.
+    #[test]
+    fn compaction_collapses_duplicate_appended_row_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        RowMetaMap::build(
+            &RowMetaMap::path_for(dir.path(), "dup", 1),
+            1,
+            vec![entry(1, "sess-a", "m1", 10, "one")],
+        )
+        .unwrap();
+        let set = RowMetaSet::open(&discover_chain(dir.path(), "dup").expect("chain")).unwrap();
+
+        let compacted = dir.path().join("compacted.rmm");
+        set.compact_into(
+            &compacted,
+            2,
+            vec![
+                entry(5, "sess-a", "m5-stale", 20, "stale five"),
+                entry(5, "sess-a", "m5-newest", 30, "newest five"),
+                entry(9, "sess-b", "m9", 40, "nine"),
+            ],
+        )
+        .unwrap();
+
+        let map = RowMetaMap::open(&compacted).unwrap();
+        assert_eq!(map.len(), 3, "the duplicate collapses to one record");
+        assert_eq!(map.lookup(5), Some(("sess-a", "m5-newest")));
+        assert_eq!(
+            map.lookup_count("sess-a"),
+            Some(2),
+            "one row 1 and one row 5"
+        );
+    }
+
+    /// A segment whose records are not `row_id`-sorted is corrupt, and the merge
+    /// cannot absorb it. The pre-streaming compaction sorted its inputs, so such
+    /// a chain healed on the next compaction; erroring instead would fail every
+    /// later `ensure_rowmap` on that chain forever.
+    #[test]
+    fn compaction_self_heals_an_unordered_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = RowMetaMap::path_for(dir.path(), "heal", 1);
+        let rows: Vec<RowMetaEntry> = (1..=5u64)
+            .map(|i| entry(i, "sess-a", &format!("m{i}"), i as i64, &format!("row {i}")))
+            .collect();
+        RowMetaMap::build(&base, 1, rows).unwrap();
+
+        // Swap two records in the spine: both still point at valid blob offsets
+        // inside the one text block, so every row still reads - the file is
+        // simply no longer sorted, which is what breaks `locate` and the merge.
+        let mut bytes = std::fs::read(&base).unwrap();
+        let spine = size_of::<Header>();
+        let record = size_of::<Record>();
+        let (first, second) = (spine + record, spine + 3 * record);
+        for byte in 0..record {
+            bytes.swap(first + byte, second + byte);
+        }
+        std::fs::write(&base, &bytes).unwrap();
+
+        let set = RowMetaSet::open(&discover_chain(dir.path(), "heal").expect("chain")).unwrap();
+        let appended = vec![entry(9, "sess-b", "m9", 9, "nine")];
+        assert!(
+            set.merge_into(&dir.path().join("merged.rmm"), 2, &appended)
+                .expect_err("the swapped spine must break the streaming merge")
+                .downcast_ref::<UnorderedRows>()
+                .is_some(),
+            "the heal below only means anything if the merge really fails first",
+        );
+
+        let compacted = dir.path().join("compacted.rmm");
+        set.compact_into(&compacted, 2, appended).unwrap();
+
+        let map = RowMetaMap::open(&compacted).unwrap();
+        assert_eq!(map.len(), 6);
+        for i in 1..=5u64 {
+            let message_id = format!("m{i}");
+            assert_eq!(
+                map.lookup(i),
+                Some(("sess-a", message_id.as_str())),
+                "row {i} survived the heal",
+            );
+        }
+        assert_eq!(map.lookup(9), Some(("sess-b", "m9")));
     }
 
     #[test]
