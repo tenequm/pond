@@ -4,4 +4,5 @@ skills:
   - source: ./skills
     skills: "*"
   - source: https://github.com/tenequm/skills
+    ref: skills-1cf72df
     skills: [rust-dev, lance-format, mcp-best-practices]

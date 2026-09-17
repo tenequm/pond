@@ -5,6 +5,19 @@
 # backstop. Rules + verified-false-positive allowlist: .github/gitleaks.toml.
 set -euo pipefail
 
+if command -v kst >/dev/null 2>&1; then
+  if ! kst sync --config kasetto.yaml --project --update add-adapter -q --color never; then
+    echo "pre-commit: skill refresh failed; run kst sync --config kasetto.yaml --project --update add-adapter and retry." >&2
+    exit 1
+  fi
+  if ! git diff --quiet -- kasetto.lock; then
+    echo "pre-commit: review kasetto.lock, run git add kasetto.lock, then retry the commit." >&2
+    exit 1
+  fi
+else
+  echo "pre-commit: kasetto not installed; SKIPPING skill refresh. Install with cargo install kasetto, then run kst sync." >&2
+fi
+
 if ! command -v gitleaks >/dev/null 2>&1; then
   echo "pre-commit: gitleaks not installed; SKIPPING the secret scan." >&2
   echo "  install: brew install gitleaks" >&2

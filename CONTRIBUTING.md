@@ -2,6 +2,14 @@
 
 Issues and pull requests are welcome. For anything larger than a bug fix, comment on the matching [roadmap](README.md#roadmap) issue first - or open one - so we agree on scope before you invest; adapters are the exception, see below. Repo conventions live in [AGENTS.md](AGENTS.md); the system contract is [docs/spec.md](docs/spec.md). Security issues go through [SECURITY.md](.github/SECURITY.md).
 
+## Agent skills
+
+Install [kasetto](https://github.com/pivoshenko/kasetto), then run `kst sync --config kasetto.yaml --project` once in each fresh checkout or worktree. Agent installation directories are generated and ignored; edit the repo's own skill in `skills/add-adapter/`.
+
+The moon-managed pre-commit hook refreshes `add-adapter` when kasetto is installed. If the refresh changes `kasetto.lock`, review and stage that file, then retry the commit. Without kasetto the hook prints a reminder and skips the refresh.
+
+External skills use an immutable release tag from `tenequm/skills`. To upgrade them, change `ref` in `kasetto.yaml` to the desired release tag, run `kst sync --config kasetto.yaml --project`, and commit the config and lockfile together.
+
 ## Adding an adapter
 
 The most wanted contribution. The full playbook is [`skills/add-adapter/SKILL.md`](skills/add-adapter/SKILL.md) - loadable as the `/add-adapter` skill in Claude Code or Codex once [kasetto](https://github.com/pivoshenko/kasetto) installs it (`kst sync`), readable as a document by anyone. The short form:

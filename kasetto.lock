@@ -10,11 +10,11 @@ skills:
     scope: project
   https://github.com/tenequm/skills::lance-format:
     destination: .claude/skills/lance-format,.agents/skills/lance-format
-    hash: 7fa09bd20addf483802da9c2cdf56a71a2f49f862e244764bfe43611ae4495f9
+    hash: 4e9e32d4c8161d024ac218896c52bfaa80c15c783fef61f1c13e6eac6940f48f
     skill: lance-format
-    description: Deep reference for Lance v12 columnar format, its Rust crates, and pylance - file encodings, table format, indexes, schema evolution, time travel. Use when building on the Lance crates or reading .lance datasets, not the LanceDB product.
+    description: Deep reference for Lance v13 columnar format, its Rust crates, and pylance - file encodings, table format, indexes, schema evolution, time travel. Use when building on the Lance crates or reading .lance datasets, not the LanceDB product.
     source: https://github.com/tenequm/skills
-    source_revision: branch:main
+    source_revision: ref:skills-1cf72df
     scope: project
   https://github.com/tenequm/skills::mcp-best-practices:
     destination: .claude/skills/mcp-best-practices,.agents/skills/mcp-best-practices
@@ -22,7 +22,7 @@ skills:
     skill: mcp-best-practices
     description: Build, harden, and debug production MCP servers with the TypeScript SDK. Use when writing or reviewing an MCP server - transports, tool schemas, errors, OAuth, token bloat, SDK migrations, MCP Apps, Registry. Assumes a server already exists.
     source: https://github.com/tenequm/skills
-    source_revision: branch:main
+    source_revision: ref:skills-1cf72df
     scope: project
   https://github.com/tenequm/skills::rust-dev:
     destination: .claude/skills/rust-dev,.agents/skills/rust-dev
@@ -30,6 +30,6 @@ skills:
     skill: rust-dev
     description: Day-1 guide to building well in Rust - ownership, errors as values, String vs &str, Box/Rc/Arc, anyhow vs thiserror, and a crate shortlist (tokio, serde, axum, sqlx). Use when starting a Rust project, fighting the borrow checker, or picking crates.
     source: https://github.com/tenequm/skills
-    source_revision: branch:main
+    source_revision: ref:skills-1cf72df
     scope: project
 assets: {}
