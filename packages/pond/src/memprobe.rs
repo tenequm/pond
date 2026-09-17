@@ -149,9 +149,9 @@ pub fn reset_heap_peak() {
 
 /// The `/proc/self/status` resident-set probe lives in `memory.rs`, which
 /// every build compiles because the memory ceiling reads it. Re-exported so
-/// the bench lane keeps one vocabulary across all three layers. `None` off
-/// Linux (no `/proc`); use [`ru_maxrss_kb`] there.
-pub use crate::memory::{RssStats, current_rss_kb, rss};
+/// the bench lane keeps calling `memprobe::rss`. `None` off Linux (no
+/// `/proc`); use [`ru_maxrss_kb`] there.
+pub use crate::memory::{RssStats, rss};
 
 /// Reset the kernel's `VmHWM` watermark to the current `VmRSS`. Linux exposes
 /// this only as a side effect of `/proc/self/clear_refs` mode 5, which is
@@ -218,7 +218,7 @@ impl RssSampler {
             let (peak, stop) = (Arc::clone(&peak_kb), Arc::clone(&stop));
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    if let Some(kb) = current_rss_kb() {
+                    if let Some(kb) = crate::memory::current_rss_kb() {
                         peak.fetch_max(kb, Ordering::Relaxed);
                     }
                     thread::sleep(interval);

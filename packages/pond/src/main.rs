@@ -1211,32 +1211,42 @@ fn spawn_prewarm(state: AppState) {
 /// the store and state without leaving the process - would not reclaim
 /// anything held outside them, which is why the process boundary is the reset.
 ///
-/// `stop_early` closes the HTTP listener before the drain; the stdio surfaces
-/// have no listener, so there the drain simply waits out the in-flight tool
-/// call. Nothing is armed where the platform exposes no resident-set reading.
-fn spawn_memory_ceiling(
-    state: AppState,
-    limit_bytes: u64,
+/// The returned handle carries the stop through its stages: a breach closes
+/// the intake, drains, then lets the transport close (`flush` bounds that last
+/// wait, since a stdio transport never closes on its own). Both serving
+/// surfaces arm it the same way, so `pond mcp` and `pond serve --transport
+/// stdio` cannot drift apart. Nothing is armed where the platform exposes no
+/// resident-set reading, and `oom_score_adj` is applied either way.
+fn arm_memory_guardrail(
+    runtime: &pond::config::RuntimeConfig,
+    state: &AppState,
     surface: &'static str,
-    stop_early: tokio_util::sync::CancellationToken,
-) {
+    flush: Duration,
+) -> pond::memory::CeilingStop {
     use pond::memory::{
-        CEILING_CHECK_INTERVAL, CEILING_CONFIRMATIONS, CEILING_DRAIN_TIMEOUT, CeilingVerdict,
-        DrainOutcome, EXIT_MEMORY_CEILING, MemoryCeiling, ProcMeter, ResidentMeter,
+        CEILING_CHECK_INTERVAL, CEILING_CONFIRMATIONS, CeilingStop, CeilingVerdict, DrainOutcome,
+        EXIT_MEMORY_CEILING, MemoryCeiling, ProcMeter, ResidentMeter,
     };
 
+    pond::memory::apply_oom_score_adj(runtime.oom_score_adj);
+    let stop = CeilingStop::default();
+    let Some(limit_bytes) = runtime.memory_ceiling_bytes() else {
+        return stop;
+    };
+    let in_flight = state.in_flight();
     if ProcMeter.resident_bytes().is_none() {
         tracing::info!(
             "memory ceiling inert: this platform exposes no resident-set reading; \
              bound the process with a cgroup or a job object instead"
         );
-        return;
+        return stop;
     }
     tracing::info!(
         limit_bytes,
         seconds = CEILING_CHECK_INTERVAL.as_secs(),
         "memory ceiling armed"
     );
+    let guard_stop = stop.clone();
     tokio::spawn(async move {
         let mut ceiling = MemoryCeiling::new(ProcMeter, limit_bytes, CEILING_CONFIRMATIONS);
         loop {
@@ -1267,14 +1277,12 @@ fn spawn_memory_ceiling(
                 consecutive,
                 "memory ceiling breached; draining in-flight work, then stopping"
             );
-            stop_early.cancel();
-            let in_flight = state.in_flight();
             if let DrainOutcome::TimedOut { outstanding } =
-                pond::memory::drain(&in_flight, CEILING_DRAIN_TIMEOUT).await
+                pond::memory::stop_at_ceiling(&in_flight, &guard_stop, flush).await
             {
                 tracing::warn!(
                     outstanding,
-                    seconds = CEILING_DRAIN_TIMEOUT.as_secs(),
+                    seconds = pond::memory::CEILING_DRAIN_TIMEOUT.as_secs(),
                     "drain window elapsed with work outstanding; stopping anyway"
                 );
             }
@@ -1285,29 +1293,36 @@ fn spawn_memory_ceiling(
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "{surface}: stopping at the memory ceiling ({resident_bytes} bytes resident, \
-                 limit {limit_bytes}); exit {EXIT_MEMORY_CEILING} - start a fresh process. \
-                 Raise or disable it with [runtime].memory_ceiling."
+                "{surface}: stopping at the memory ceiling ({resident} resident, limit \
+                 {limit}); exit {EXIT_MEMORY_CEILING} - start a fresh process. Raise or \
+                 disable it with [runtime].memory_ceiling.",
+                resident = format_bytes(resident_bytes),
+                limit = format_bytes(limit_bytes),
             );
             std::process::exit(EXIT_MEMORY_CEILING);
         }
     });
+    stop
 }
 
-/// Hand the exit to the memory ceiling once it has taken over the stop.
+/// Report that the transport has returned, then hand the exit to the memory
+/// ceiling if it has taken over the stop.
 ///
-/// The serving future returns as soon as its listener is closed, and closing
-/// the listener is the *first* thing a breach does - so without this the serve
+/// The serving future returns as soon as its transport is closed, and closing
+/// the intake is the *first* thing a breach does - so without this the serve
 /// arm would return while the guard is still draining, `run` would end with
 /// code 0, and dropping the runtime would abort the very in-serve sync cycle
-/// the drain exists to protect. Parking leaves [`spawn_memory_ceiling`]'s task
+/// the drain exists to protect. Parking leaves [`arm_memory_guardrail`]'s task
 /// as the only thing that can end the process, so the drain always runs to its
 /// own conclusion and the code is always `EXIT_MEMORY_CEILING`; that task's
-/// drain window is what bounds the wait. A normal stop - ctrl-c, SIGTERM -
-/// leaves the token uncancelled and returns here immediately.
-async fn park_for_ceiling_exit(stop: &tokio_util::sync::CancellationToken) {
-    if stop.is_cancelled() {
-        tracing::info!("listener closed at the memory ceiling; the guard owns the exit");
+/// drain and flush windows are what bound the wait. Cancelling
+/// `transport_closed` on the way in is what tells the guard the last response
+/// is written, so the exit truncates nothing. A normal stop - ctrl-c, SIGTERM
+/// - leaves the intake uncancelled and returns here immediately.
+async fn park_for_ceiling_exit(stop: &pond::memory::CeilingStop) {
+    stop.transport_closed.cancel();
+    if stop.is_breached() {
+        tracing::info!("transport closed at the memory ceiling; the guard owns the exit");
         std::future::pending::<()>().await;
     }
 }
@@ -1732,11 +1747,18 @@ async fn run() -> anyhow::Result<()> {
                 opened
             });
             let state = AppState::new(store, embedder, config.search.clone());
-            pond::memory::apply_oom_score_adj(config.runtime.oom_score_adj);
-            let ceiling_stop = tokio_util::sync::CancellationToken::new();
-            if let Some(limit_bytes) = config.runtime.memory_ceiling_bytes() {
-                spawn_memory_ceiling(state.clone(), limit_bytes, "serve", ceiling_stop.clone());
-            }
+            // HTTP waits for the server to close its connections, which is what
+            // finishes writing the last response; stdio has no such signal, so
+            // it takes a fixed grace for rmcp to write the last result.
+            let ceiling_stop = arm_memory_guardrail(
+                &config.runtime,
+                &state,
+                "serve",
+                match transport {
+                    ServeTransport::Http => pond::memory::CEILING_HTTP_CLOSE_TIMEOUT,
+                    ServeTransport::Stdio => pond::memory::CEILING_STDIO_FLUSH,
+                },
+            );
             spawn_prewarm(state.clone());
             // `--with-sync`: fold the periodic sync into this process, reusing
             // the store + embedder above (no separate child cold-loading a
@@ -1752,18 +1774,22 @@ async fn run() -> anyhow::Result<()> {
                     state.in_flight(),
                 );
             }
-            match transport {
+            let served = match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
                     transport::http::serve(state, host, port, allowed_host, ceiling_stop.clone())
-                        .await?;
+                        .await
                 }
                 ServeTransport::Stdio => {
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
-                    transport::mcp::serve_stdio(state).await?;
+                    transport::mcp::serve_stdio(state).await
                 }
-            }
+            };
+            // Park before propagating: a transport that fails during a ceiling
+            // drain would otherwise end `run` with the wrong code, and abort
+            // the drain with it.
             park_for_ceiling_exit(&ceiling_stop).await;
+            served?;
         }
         Command::Mcp {} => {
             let config = Config::load(config_path(config))?;
@@ -1781,20 +1807,20 @@ async fn run() -> anyhow::Result<()> {
                 opened
             });
             let state = AppState::new(store, embedder, config.search.clone());
-            pond::memory::apply_oom_score_adj(config.runtime.oom_score_adj);
-            if let Some(limit_bytes) = config.runtime.memory_ceiling_bytes() {
-                // No listener to close on stdio: the client owns this process's
-                // lifecycle, so a breach finishes the in-flight tool call and
-                // exits, and the client reconnects (`/mcp` in Claude Code).
-                spawn_memory_ceiling(
-                    state.clone(),
-                    limit_bytes,
-                    "mcp",
-                    tokio_util::sync::CancellationToken::new(),
-                );
-            }
+            // No listener to close on stdio: the client owns this process's
+            // lifecycle, so a breach finishes the in-flight tool call, refuses
+            // the next one, and exits; the client reconnects (`/mcp` in Claude
+            // Code).
+            let ceiling_stop = arm_memory_guardrail(
+                &config.runtime,
+                &state,
+                "mcp",
+                pond::memory::CEILING_STDIO_FLUSH,
+            );
             spawn_prewarm(state.clone());
-            transport::mcp::serve_stdio(state).await?;
+            let served = transport::mcp::serve_stdio(state).await;
+            park_for_ceiling_exit(&ceiling_stop).await;
+            served?;
         }
         Command::Search {
             query,
@@ -4403,10 +4429,16 @@ fn spawn_in_serve_sync(
     tokio::spawn(async move {
         loop {
             {
-                // The only write path inside a serving process: held for the
-                // whole cycle so a memory-ceiling stop waits for the commit
-                // rather than landing in the middle of it.
-                let _busy = in_flight.enter();
+                // The write path no request guard covers (`POST /v1/ingest`
+                // carries its own): held for the whole cycle so a
+                // memory-ceiling stop waits out the commit, bounded by its
+                // drain window, rather than landing in the middle of it.
+                // Refused once that drain has begun - a cycle started then
+                // could only be cut short.
+                let Some(_busy) = in_flight.try_enter() else {
+                    tracing::info!("in-serve sync stopping: the memory ceiling is draining");
+                    return;
+                };
                 if let Err(error) =
                     in_serve_sync_once(&store, &config, &config_file, storage_path.clone()).await
                 {
@@ -7637,23 +7669,33 @@ mod tests {
 
     use super::*;
 
-    /// A breach closes the listener first, so the serve future returns while
-    /// the guard is still draining. If that return reached `run` the process
-    /// would exit 0 and abandon the drain mid-cycle; this is the park that
-    /// keeps the guard the only thing that ends the process.
+    /// A breach closes the intake first, so the serve future returns while the
+    /// guard is still draining. If that return reached `run` the process would
+    /// exit 0 and abandon the drain mid-cycle; this is the park that keeps the
+    /// guard the only thing that ends the process. It also has to report the
+    /// closed transport, which is what releases the guard's flush wait.
     #[tokio::test]
     async fn a_ceiling_stop_hands_the_exit_to_the_guard() {
-        let stop = tokio_util::sync::CancellationToken::new();
+        let stop = pond::memory::CeilingStop::default();
         tokio::time::timeout(Duration::from_millis(100), park_for_ceiling_exit(&stop))
             .await
             .expect("a normal stop returns straight away");
+        assert!(
+            stop.transport_closed.is_cancelled(),
+            "the guard waits on this before it exits"
+        );
 
-        stop.cancel();
+        let stop = pond::memory::CeilingStop::default();
+        stop.intake.cancel();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), park_for_ceiling_exit(&stop))
                 .await
                 .is_err(),
             "a ceiling stop must not let the serve arm finish `run`"
+        );
+        assert!(
+            stop.transport_closed.is_cancelled(),
+            "the park reports the closed transport before it parks"
         );
     }
 

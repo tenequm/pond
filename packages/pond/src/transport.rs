@@ -32,8 +32,9 @@ pub struct AppState {
     /// [`AppState::take_completed_activity`]. Shared by every clone, so the
     /// periodic task in `main` sees the requests both transports served.
     activity: Arc<AtomicBool>,
-    /// Requests currently being served. The memory ceiling drains this to zero
-    /// before it stops the process, so a restart never lands mid-request.
+    /// Requests being served, plus any in-serve sync cycle. The memory ceiling
+    /// drains this to zero before it stops the process, so a stop never lands
+    /// mid-request or mid-cycle.
     in_flight: InFlight,
 }
 
@@ -44,7 +45,7 @@ impl AppState {
             embedder,
             search,
             activity: Arc::new(AtomicBool::new(false)),
-            in_flight: InFlight::new(),
+            in_flight: InFlight::default(),
         }
     }
 
@@ -57,6 +58,17 @@ impl AppState {
             completed: Arc::clone(&self.activity),
             _in_flight: self.in_flight.enter(),
         }
+    }
+
+    /// [`AppState::track_activity`] for a surface that can refuse: `None` once
+    /// a ceiling stop is draining. The HTTP listener closes on a breach, but a
+    /// stdio client's pipe stays open, so without this a busy agent keeps
+    /// feeding a process that is already on its way out.
+    fn admit(&self) -> Option<ActivityGuard> {
+        Some(ActivityGuard {
+            completed: Arc::clone(&self.activity),
+            _in_flight: self.in_flight.try_enter()?,
+        })
     }
 
     /// Whether a request completed since the last call, clearing the flag.
@@ -188,15 +200,15 @@ pub mod http {
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
     /// `allowed_hosts` names the public authorities the `/mcp` route accepts
-    /// (see [`mcp_allowed_hosts`]). `stop_early` is the memory ceiling's
-    /// handle: cancelling it closes the listener so nothing new arrives while
-    /// the guard drains what is already in flight.
+    /// (see [`mcp_allowed_hosts`]). `ceiling` is the memory guard's handle:
+    /// cancelling its intake closes the listener so nothing new arrives, and
+    /// the sessions stay up until the guard reports the drain done.
     pub async fn serve(
         state: AppState,
         host: String,
         port: u16,
         allowed_hosts: Vec<String>,
-        stop_early: CancellationToken,
+        ceiling: crate::memory::CeilingStop,
     ) -> anyhow::Result<()> {
         let ip: IpAddr = host
             .parse()
@@ -215,13 +227,26 @@ pub mod http {
             .local_addr()
             .context("failed to read bound address")?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
+        let breached = ceiling.clone();
         let stop = async move {
             tokio::select! {
                 () = shutdown_signal() => {}
-                () = stop_early.cancelled() => {}
+                () = breached.intake.cancelled() => {}
             }
         };
-        serve_with_shutdown(listener, state, &allowed_hosts, stop).await
+        // A ceiling stop closes the listener first and the sessions last, with
+        // the drain in between; a signal stop has nothing to wait for and
+        // closes them at once. A second signal during a ceiling drain gives up
+        // waiting, so a supervisor can still cut it short.
+        let close_sessions = async move {
+            if ceiling.is_breached() {
+                tokio::select! {
+                    () = ceiling.drained.cancelled() => {}
+                    () = shutdown_signal() => {}
+                }
+            }
+        };
+        serve_in_stages(listener, state, &allowed_hosts, stop, close_sessions).await
     }
 
     /// The serving half of [`serve`], with the stop trigger injected. Public so
@@ -239,23 +264,42 @@ pub mod http {
         allowed_hosts: &[String],
         stop: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
+        serve_in_stages(listener, state, allowed_hosts, stop, std::future::ready(())).await
+    }
+
+    /// [`serve_with_shutdown`] with the two stages separated: `stop` closes the
+    /// listener, and the MCP sessions live until `close_sessions` resolves
+    /// after it. They are one step apart for a signal, but a memory-ceiling
+    /// stop holds the sessions open across its drain - cancelling the token
+    /// cuts the response stream of every tool call still running on a session
+    /// (rmcp streams each request-wise response under a child of it), which is
+    /// exactly the work the drain is waiting for.
+    pub async fn serve_in_stages(
+        listener: TcpListener,
+        state: AppState,
+        allowed_hosts: &[String],
+        stop: impl Future<Output = ()> + Send + 'static,
+        close_sessions: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
         let mcp_shutdown = CancellationToken::new();
+        let listener_closed = CancellationToken::new();
         let server = axum::serve(listener, router(state, allowed_hosts, mcp_shutdown.clone()))
             .with_graceful_shutdown({
-                let mcp_shutdown = mcp_shutdown.clone();
+                let listener_closed = listener_closed.clone();
                 async move {
                     stop.await;
-                    tracing::info!("shutdown: closing MCP sessions, then draining");
-                    mcp_shutdown.cancel();
+                    listener_closed.cancel();
                 }
             });
         tokio::select! {
             result = server => result.context("axum server error"),
-            // rmcp only ever derives `child_token()` from this token and never
-            // cancels it, so it resolves exactly when the arm above cancels it:
-            // the deadline runs from the stop request, not from startup.
+            // The deadline runs from the session cancel, not from startup, and
+            // that cancel is this arm's own - nothing else touches the token.
             () = async move {
-                mcp_shutdown.cancelled().await;
+                listener_closed.cancelled().await;
+                close_sessions.await;
+                tracing::info!("shutdown: closing MCP sessions, then draining");
+                mcp_shutdown.cancel();
                 tokio::time::sleep(SHUTDOWN_DRAIN).await;
             } => {
                 tracing::warn!(
@@ -1001,6 +1045,20 @@ Examples (4 patterns the agent should recognize):
             }
         }
 
+        /// Hold this for the body of a call. It refuses once a memory-ceiling
+        /// stop is draining: the client owns a stdio process's lifecycle and
+        /// keeps its pipe open, so answering "retry" beats starting work this
+        /// process is about to walk away from.
+        fn admit(&self) -> Result<super::ActivityGuard, ErrorData> {
+            self.state.admit().ok_or_else(|| {
+                ErrorData::internal_error(
+                    "pond is stopping at its memory ceiling; reconnect to a fresh \
+                     process and retry",
+                    None,
+                )
+            })
+        }
+
         #[tool(
             description = "Find relevant messages in past sessions - the entry point for \
                            recall: \"have we worked on X\", \"what did we decide about Y\", \
@@ -1022,7 +1080,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSearchParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let _activity = self.state.track_activity();
+            let _activity = self.admit()?;
             let Some(mode) = parse_search_mode(params.mode.as_deref()) else {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "unknown mode {:?}; use \"vector\" or \"fts\"",
@@ -1095,7 +1153,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpGetSessionParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let _activity = self.state.track_activity();
+            let _activity = self.admit()?;
             let first_page =
                 params.after_message_id.is_none() && params.before_message_id.is_none();
             let request = GetSessionRequest {
@@ -1147,7 +1205,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpGetMessageParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let _activity = self.state.track_activity();
+            let _activity = self.admit()?;
             let request = GetMessageRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(default_namespace()),
@@ -1185,7 +1243,7 @@ Examples (4 patterns the agent should recognize):
             &self,
             Parameters(params): Parameters<McpSqlParams>,
         ) -> Result<CallToolResult, ErrorData> {
-            let _activity = self.state.track_activity();
+            let _activity = self.admit()?;
             let mode = match params.format.as_deref() {
                 None | Some("text") => sql::Mode::Inline,
                 Some("parquet") => sql::Mode::Export(sql::Format::Parquet),
@@ -1375,7 +1433,7 @@ Examples (4 patterns the agent should recognize):
             request: ReadResourceRequestParams,
             context: RequestContext<RoleServer>,
         ) -> Result<ReadResourceResponse, ErrorData> {
-            let _activity = self.state.track_activity();
+            let _activity = self.admit()?;
             // The schema docs are the same for every caller; stats and exports
             // are this store's data, which no shared cache may hand to another.
             let (mut result, scope) = match request.uri.as_str() {
@@ -1809,6 +1867,41 @@ Examples (4 patterns the agent should recognize):
                 ().serve(client_io).await?
             };
             Ok((temp, client, server_task))
+        }
+
+        /// A stdio client's pipe stays open through a memory-ceiling stop, so
+        /// the tool surface is what has to refuse: without this a busy agent
+        /// keeps a process that is already leaving above zero in flight until
+        /// the drain window expires, and the last call is cut mid-answer. The
+        /// admitted case is also the only place the guard can be seen held -
+        /// every response looks the same with or without it.
+        #[tokio::test]
+        async fn a_draining_process_refuses_new_tool_calls() -> anyhow::Result<()> {
+            let temp = tempfile::TempDir::new()?;
+            let state = AppState::new(
+                Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
+                Arc::new(crate::embed::LazyEmbedder::candle()),
+                crate::config::SearchConfig::default(),
+            );
+            let server = PondMcp::new(state.clone());
+            let in_flight = state.in_flight();
+
+            let admitted = server.admit().expect("an open process admits a call");
+            assert_eq!(in_flight.count(), 1, "an admitted call holds the drain");
+            drop(admitted);
+            assert_eq!(in_flight.count(), 0, "answering releases it");
+
+            crate::memory::drain(&in_flight, std::time::Duration::ZERO).await;
+            let Err(refused) = server.admit() else {
+                panic!("a draining process refuses");
+            };
+            assert!(
+                refused.message.contains("memory ceiling"),
+                "the refusal has to name the reason: {}",
+                refused.message
+            );
+            assert_eq!(in_flight.count(), 0, "a refusal must not hold the drain");
+            Ok(())
         }
 
         /// The `(ttl_ms, cache_scope)` a client sees on every cacheable surface

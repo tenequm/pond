@@ -52,7 +52,7 @@ If the cache cannot be written, `serve` still starts and logs a warning, but eve
 
 ## Run it under a supervisor
 
-`serve` bounds its own resident set and stops itself at [`[runtime].memory_ceiling`](/reference/configuration#memory-ceiling-and-oom-priority) (4 GiB by default), draining in-flight work first and exiting [`75`](/reference/exit-codes). That turns unbounded growth into a one-second bounce instead of an OOM kill - but only if something restarts it:
+`serve` bounds its own resident set and stops itself at [`[runtime].memory_ceiling`](/reference/configuration#memory-ceiling-and-oom-priority) (4 GiB by default), draining in-flight work first and exiting [`75`](/reference/exit-codes). Unlike the signal stop above, it holds the MCP sessions open until that drain is done, so a tool call in flight is still answered. That turns unbounded growth into a one-second bounce instead of an OOM kill - but only if something restarts it:
 
 ```ini
 [Service]

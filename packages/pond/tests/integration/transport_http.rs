@@ -179,6 +179,78 @@ async fn shutdown_completes_while_an_mcp_stream_is_open() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// A memory-ceiling stop closes the listener first and the MCP sessions last,
+/// because cancelling the session token cuts the response stream of every tool
+/// call still running on it - the very work the drain is waiting for. So the
+/// sessions have to outlive the drain: here the server must still be serving
+/// while the drain is pending, and stop once it reports done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ceiling_stop_holds_mcp_sessions_open_until_the_drain_ends() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let state = empty_state(&temp).await?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // The two stages of a breach: the intake closes, the drain runs, and only
+    // then may the sessions close.
+    let intake = tokio_util::sync::CancellationToken::new();
+    let drained = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn({
+        let intake = intake.clone();
+        let drained = drained.clone();
+        async move {
+            http::serve_in_stages(
+                listener,
+                state,
+                &[],
+                async move { intake.cancelled().await },
+                async move { drained.cancelled().await },
+            )
+            .await
+        }
+    });
+
+    let session = mcp_session(addr).await?;
+    let mut stream = TcpStream::connect(addr).await?;
+    let head = request(
+        &mut stream,
+        &format!(
+            "GET /mcp HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\
+             Mcp-Session-Id: {session}\r\n\r\n"
+        ),
+    )
+    .await?;
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "the /mcp stream has to be established for this test to mean anything:\n{head}"
+    );
+
+    // The breach closes the listener; the session - and with it any in-flight
+    // tool call's response stream - must still be up while the drain runs.
+    intake.cancel();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !server.is_finished(),
+        "sessions must outlive the drain, not close when the listener does"
+    );
+
+    let started = Instant::now();
+    drained.cancel();
+    let served = tokio::time::timeout(Duration::from_secs(30), server)
+        .await
+        .expect("a reported drain lets the sessions close and the server stop")?;
+    served?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < http::SHUTDOWN_DRAIN,
+        "the session teardown, not the {:?} backstop, has to end it (took {elapsed:?})",
+        http::SHUTDOWN_DRAIN
+    );
+
+    drop(stream);
+    Ok(())
+}
+
 /// Initialize an MCP session over a fresh connection and return its id.
 async fn mcp_session(addr: SocketAddr) -> anyhow::Result<String> {
     let body = json!({
@@ -370,9 +442,11 @@ async fn completed_requests_arm_the_periodic_allocator_trim() -> anyhow::Result<
 }
 
 /// The memory ceiling drains this counter to zero before it stops the process,
-/// so a handler that lost its guard would turn a bounded restart into one that
-/// cuts a request - or a write - in half. Nothing else would catch that: the
-/// counter is invisible in every response.
+/// so a handler that answered without releasing its guard would hold the drain
+/// open for its whole 30 s window and then stop mid-request anyway. Nothing
+/// else would catch that: the counter is invisible in every response. That the
+/// guard is *held* during a call is covered where it can be observed - in the
+/// MCP admission test in `transport.rs`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_served_request_leaves_nothing_in_flight() -> anyhow::Result<()> {
     let temp = TempDir::new()?;

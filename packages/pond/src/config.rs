@@ -292,7 +292,7 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # work and exits 75, so a supervisor (`Restart=always`) or an MCP client starts a
 # fresh process instead of the kernel OOM-killing this one.
 # `oom_score_adj` biases the kernel's victim choice toward the large pond process
-# (default 200 when nothing else set one, `0` opts out).
+# (default 200 when nothing else set one; `0` leaves the inherited score alone).
 #
 # [runtime]
 # index_cache_bytes    = \"256 MiB\"
@@ -446,8 +446,8 @@ pub struct RuntimeConfig {
     #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
     pub memory_ceiling: Option<usize>,
     /// `oom_score_adj` for `pond serve` and `pond mcp`. Unset means pond's
-    /// default unless the supervisor already chose one; see
-    /// [`crate::memory::oom_score_adj_target`].
+    /// default unless the supervisor already chose one, and `0` means pond
+    /// never writes the score at all.
     #[serde(default)]
     pub oom_score_adj: Option<i32>,
 }
