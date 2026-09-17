@@ -59,7 +59,8 @@ runs:
           echo "devshell profile hit: $profile"
           # The reaper's last-use signal. A hit only reads the profile, so
           # without this its mtime stays "first built" and the hottest key looks
-          # the oldest; readlink's atime is no substitute on a noatime mount.
+          # the oldest. atime is no substitute: every nix GC readlinks each root,
+          # which refreshes it, and a noatime mount never records it at all.
           # -h stamps the symlink, never the store path behind it, whose mtime
           # nix pins to 1. A miss needs no touch: nix writes the symlink fresh.
           # Not fatal: a lost stamp costs at most a rebuild after a reap.
