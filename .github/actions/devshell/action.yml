@@ -41,8 +41,9 @@ runs:
 
         # No flock, unlike the bootstrap this replaces: that one hand-rolled
         # curl+mv into shared paths and had to serialize concurrent pods itself.
-        # Nix locks the store and the profile generation on its own, so two pods
-        # racing here converge instead of clobbering.
+        # Two pods racing here converge instead of clobbering: both realize the
+        # same store paths under nix's own store locks, and the profile link is
+        # swapped by an atomic rename (nix takes no profile lock).
         #
         # The substituter is pond's own public-read binary cache: no credential,
         # so fork PRs and dev machines pull the same toolchain closure. Passed as
@@ -100,11 +101,15 @@ runs:
           | "\(.key)<<\($delim)\n\(.value.value)\n\($delim)"
         ' "$json" >> "$GITHUB_ENV"
 
-        # GITHUB_PATH prepends in file order, so the shell's entries win over
-        # the image's while git, the runner's node and docker stay reachable.
+        # The shell's entries win over the image's while git, the runner's node
+        # and docker stay reachable. `tac` because the runner builds PATH from
+        # GITHUB_PATH in REVERSE (the last line lands first; actions/runner
+        # ScriptHandler: PrependPath.Reverse()), and the shell's own order
+        # matters: each cc/bintools wrapper dir precedes the unwrapped gcc/ld
+        # dir, and reversed, CC=gcc would resolve to the unwrapped compiler.
         # -e, not just -r: without it a missing PATH key writes the literal
         # "null" and the job dies ten steps later on `rustc: not found`.
-        "${jq[@]}" -er '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' >> "$GITHUB_PATH"
+        "${jq[@]}" -er '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' | tac >> "$GITHUB_PATH"
 
         # The cache locations the deleted bootstrap also exported. RUSTUP_HOME
         # is gone with rustup itself; PROTO_HOME stays only because
@@ -138,9 +143,11 @@ runs:
         # component, so the rustfmt/clippy ones count too: `cargo fmt` and
         # `cargo clippy` resolve cargo-fmt/cargo-clippy off PATH like any
         # subcommand, and those proxies now point at a rustup that is gone.
-        for proxy in rustc cargo rustup rustfmt cargo-fmt cargo-clippy clippy-driver; do
+        # cargo-zigbuild too: cargo resolves it from $CARGO_HOME/bin first, and
+        # a stray copy there would link the release.
+        for proxy in rustc cargo rustup rustfmt cargo-fmt cargo-clippy clippy-driver cargo-zigbuild; do
           if [ -e "$CARGO_HOME/bin/$proxy" ]; then
-            echo "::error::$CARGO_HOME/bin/$proxy is a leftover rustup proxy and would shadow the devshell toolchain. Delete /ci-cache/{rustup,bin} and the rustup proxies in /ci-cache/cargo/bin (keep the registry cache) on the runner PVC." >&2
+            echo "::error::$CARGO_HOME/bin/$proxy is left over from the old bootstrap and would shadow the devshell toolchain. Delete /ci-cache/{rustup,bin} and the rustup proxies in /ci-cache/cargo/bin (keep the registry cache) on the runner PVC." >&2
             exit 1
           fi
         done
