@@ -84,7 +84,12 @@ runs:
         # the ones that would actively break the runner - HOME above all, which
         # the build env sets to /homeless-shelter. PATH is handled separately
         # because it must PREPEND, not replace.
-        deny='^(HOME|OLDPWD|PATH|PWD|SHELL|SHLVL|TEMP|TEMPDIR|TMP|TMPDIR|TERM|TZ|NIX_BUILD_TOP|NIX_BUILD_CORES|NIX_LOG_FD|NIX_STORE)$'
+        # It must cover every name `nix develop` itself drops (ignoreVars in
+        # src/nix/develop.cc), because --json applies no such filter. The one
+        # that bites is NIX_ENFORCE_PURITY=1: with NIX_STORE and NIX_BUILD_TOP
+        # gone, the cc/ld wrappers die on an unbound variable, so every C
+        # compile and every rustc link fails.
+        deny='^(BASHOPTS|HOME|NIX_BUILD_CORES|NIX_BUILD_TOP|NIX_ENFORCE_PURITY|NIX_LOG_FD|NIX_REMOTE|NIX_STORE|OLDPWD|PATH|PPID|PWD|SHELL|SHELLOPTS|SHLVL|SSL_CERT_FILE|TEMP|TEMPDIR|TERM|TMP|TMPDIR|TZ|UID)$'
         delim="POND_DEVSHELL_$(date +%s%N)"
         "${jq[@]}" -r --arg delim "$delim" --arg deny "$deny" '
           .variables
