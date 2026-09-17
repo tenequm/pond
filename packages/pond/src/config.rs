@@ -277,18 +277,28 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 # compaction_fragment_cap = 64
 # cleanup_older_than = \"1d\"
 
-# Long-running process caps. Both accept either a plain byte count or a
-# humansize-style suffix (\"128 MiB\", \"1 GiB\"). Both are optional - leave
-# unset to let pond pick the backend-aware default:
+# Long-running process caps. The byte-valued knobs accept either a plain byte
+# count or a humansize-style suffix (\"128 MiB\", \"1 GiB\"). The cache caps are
+# optional - leave unset to let pond pick the backend-aware default:
 #   local FS  : index_cache = 256 MiB, metadata_cache = 128 MiB
 #   remote    : index_cache = 2 GiB,   metadata_cache = 512 MiB
 # Lance's library defaults (6 GiB / 1 GiB) are too generous for a per-session
 # `pond mcp` process; tightening them is what keeps RSS under the 500 MiB target
 # without measurable latency regressions on typical agent-history corpora.
 #
+# `memory_ceiling` bounds the resident set of the long-lived `pond serve` and
+# `pond mcp` processes (default 4 GiB, floor 256 MiB, `0` disables). Reaching it
+# twice in a row - each reading taken after an allocator trim - drains in-flight
+# work and exits 75, so a supervisor (`Restart=always`) or an MCP client starts a
+# fresh process instead of the kernel OOM-killing this one.
+# `oom_score_adj` biases the kernel's victim choice toward the large pond process
+# (default 200 when nothing else set one, `0` opts out).
+#
 # [runtime]
 # index_cache_bytes    = \"256 MiB\"
 # metadata_cache_bytes = \"128 MiB\"
+# memory_ceiling       = \"4 GiB\"
+# oom_score_adj        = 200
 
 # Storage address and credentials (spec.md#storage-url-grammar).
 #
@@ -418,10 +428,11 @@ pub fn creds_set_name_error(name: &str) -> String {
     )
 }
 
-/// `[runtime]`: long-running process caps. Both knobs accept either a plain
-/// byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`). Both are
-/// optional - `None` lets `pond::substrate` pick the backend-aware default
-/// (local FS gets a tight cap; object stores stay near Lance's defaults).
+/// `[runtime]`: long-running process caps. The byte-valued knobs accept either
+/// a plain byte count or a `humansize`-style suffix (`"128 MiB"`, `"1 GiB"`).
+/// All are optional - `None` on the cache caps lets `pond::substrate` pick the
+/// backend-aware default (local FS gets a tight cap; object stores stay near
+/// Lance's defaults).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RuntimeConfig {
@@ -429,6 +440,58 @@ pub struct RuntimeConfig {
     pub index_cache_bytes: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
     pub metadata_cache_bytes: Option<usize>,
+    /// Resident-set ceiling for `pond serve` and `pond mcp`. Unset means
+    /// [`crate::memory::DEFAULT_MEMORY_CEILING_BYTES`]; `0` turns the guard
+    /// off. See [`RuntimeConfig::memory_ceiling_bytes`].
+    #[serde(default, deserialize_with = "deserialize_byte_size_opt")]
+    pub memory_ceiling: Option<usize>,
+    /// `oom_score_adj` for `pond serve` and `pond mcp`. Unset means pond's
+    /// default unless the supervisor already chose one; see
+    /// [`crate::memory::oom_score_adj_target`].
+    #[serde(default)]
+    pub oom_score_adj: Option<i32>,
+}
+
+impl RuntimeConfig {
+    /// The ceiling a serving process enforces: the configured value, the
+    /// built-in default when unset, or `None` when explicitly zeroed - the
+    /// documented off switch, for operators who bound memory with a cgroup
+    /// instead.
+    #[must_use]
+    pub fn memory_ceiling_bytes(&self) -> Option<u64> {
+        match self.memory_ceiling {
+            None => Some(crate::memory::DEFAULT_MEMORY_CEILING_BYTES),
+            Some(0) => None,
+            Some(bytes) => Some(u64::try_from(bytes).unwrap_or(u64::MAX)),
+        }
+    }
+
+    /// Structural rules, checked at load so a value that would restart-loop a
+    /// server is rejected before the server starts rather than after it is
+    /// deployed.
+    fn validate(&self) -> Result<()> {
+        if let Some(bytes) = self.memory_ceiling_bytes()
+            && bytes < crate::memory::MIN_MEMORY_CEILING_BYTES
+        {
+            bail!(
+                "[runtime].memory_ceiling is {bytes} bytes, below the {} byte floor - \
+                 a serving process peaks above that at startup, so it would restart in \
+                 a loop; raise it, or set 0 to disable the ceiling",
+                crate::memory::MIN_MEMORY_CEILING_BYTES,
+            );
+        }
+        if let Some(value) = self.oom_score_adj
+            && !(crate::memory::OOM_SCORE_ADJ_MIN..=crate::memory::OOM_SCORE_ADJ_MAX)
+                .contains(&value)
+        {
+            bail!(
+                "[runtime].oom_score_adj is {value}; the kernel accepts {} to {}",
+                crate::memory::OOM_SCORE_ADJ_MIN,
+                crate::memory::OOM_SCORE_ADJ_MAX,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// `[search]`: optional Lance vector-query tuning knobs.
@@ -593,6 +656,7 @@ impl Config {
             .extract_lossy()
             .map_err(|error| anyhow!("failed to load config: {error}"))?;
         config.embeddings.validate()?;
+        config.runtime.validate()?;
         config.validate_creds()?;
         Ok(config)
     }
@@ -617,6 +681,7 @@ impl Config {
             anyhow!("failed to load config {}: {error}", path.display())
         })?;
         config.embeddings.validate()?;
+        config.runtime.validate()?;
         config.validate_creds()?;
         config.embeddings.install_runtime();
         // Tilde expansion is per-adapter (inside each factory's `open()`):
@@ -750,10 +815,11 @@ impl Config {
 
 /// The `POND_*` env mirror (spec.md#storage-env-mirror): `POND_STORAGE_PATH`
 /// -> `storage.path`, `POND_EMBEDDINGS_ENABLED` -> `embeddings.enabled`,
-/// `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`. Filtered to exactly
-/// those three shapes - clap owns its own `POND_*` vars (`POND_CONFIG_FILE`,
-/// `POND_HOST`, ...) and an unfiltered prefix would turn each of them into an
-/// unknown-field error here.
+/// `POND_RUNTIME_MEMORY_CEILING` / `POND_RUNTIME_OOM_SCORE_ADJ` ->
+/// `runtime.*`, `POND_CREDS_<NAME>_<FIELD>` -> `creds.<name>.<field>`.
+/// Filtered to exactly those shapes - clap owns its own `POND_*` vars
+/// (`POND_CONFIG_FILE`, `POND_HOST`, ...) and an unfiltered prefix would turn
+/// each of them into an unknown-field error here.
 fn env_mirror() -> Env {
     // Keys reach these closures pre-lowercasing (`CREDS_...`), so compare on
     // an ascii-lowered copy; `str::starts_with` is case-sensitive.
@@ -765,6 +831,10 @@ fn env_mirror() -> Env {
             // file (or URL query params).
             key == "storage_path"
                 || key == "embeddings_enabled"
+                // The memory guardrail's two knobs: a containerized deploy
+                // sizes the ceiling to its cgroup limit and has no file.
+                || key == "runtime_memory_ceiling"
+                || key == "runtime_oom_score_adj"
                 || (key.starts_with("creds_") && !key.ends_with("_extra"))
         })
         .map(|key| {
@@ -1707,6 +1777,62 @@ region        = "file-region"
             // silently; the figment error names the key.
             jail.set_env("POND_EMBEDDINGS_ENABLED", "garbage");
             assert!(load().is_err());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_memory_ceiling_defaults_and_can_be_turned_off() {
+        let unset = RuntimeConfig::default();
+        assert_eq!(
+            unset.memory_ceiling_bytes(),
+            Some(crate::memory::DEFAULT_MEMORY_CEILING_BYTES)
+        );
+        let off = RuntimeConfig {
+            memory_ceiling: Some(0),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(off.memory_ceiling_bytes(), None);
+        let sized = RuntimeConfig {
+            memory_ceiling: Some(2 << 30),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(sized.memory_ceiling_bytes(), Some(2 << 30));
+    }
+
+    /// A ceiling under the startup peak would restart-loop a server, so the
+    /// load fails instead of shipping one.
+    #[test]
+    fn a_ceiling_below_the_floor_fails_the_load() {
+        let error = Config::load_str("[runtime]\nmemory_ceiling = \"16 MiB\"\n")
+            .expect_err("a 16 MiB ceiling must be refused")
+            .to_string();
+        assert!(error.contains("memory_ceiling"), "names the key: {error}");
+        assert!(error.contains("restart in a loop"), "says why: {error}");
+        assert!(
+            Config::load_str("[runtime]\nmemory_ceiling = 0\n").is_ok(),
+            "0 is the documented off switch, not a too-small ceiling"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_oom_score_adj_fails_the_load() {
+        assert!(Config::load_str("[runtime]\noom_score_adj = 1001\n").is_err());
+        assert!(Config::load_str("[runtime]\noom_score_adj = -1001\n").is_err());
+        let config =
+            Config::load_str("[runtime]\noom_score_adj = -500\n").expect("an in-range score loads");
+        assert_eq!(config.runtime.oom_score_adj, Some(-500));
+    }
+
+    #[test]
+    fn env_mirror_maps_the_memory_guardrail_knobs() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("POND_RUNTIME_MEMORY_CEILING", "2 GiB");
+            jail.set_env("POND_RUNTIME_OOM_SCORE_ADJ", "750");
+            let config =
+                Config::load("/nonexistent/pond-config-xyz.toml").expect("env-only config loads");
+            assert_eq!(config.runtime.memory_ceiling_bytes(), Some(2 << 30));
+            assert_eq!(config.runtime.oom_score_adj, Some(750));
             Ok(())
         });
     }

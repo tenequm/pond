@@ -20,8 +20,11 @@ Branch on exit codes, not output text.
 | 4 | could not write the restored files (no restored session file was left behind) | resume |
 | 5 | store lacks conditional-put (OCC) | storage, copy |
 | 6 | destination missing source rows, or duplicate destination rows | copy |
+| 75 | stopped at the memory ceiling - start a fresh process | serve, mcp |
 
 Codes are scoped to the command, so the same number can mean different things across families - always branch on the pair, not the number alone.
+
+Exit `75` asks for a retry rather than a fix. `serve` and `mcp` bound their own resident set ([`[runtime].memory_ceiling`](/reference/configuration#memory-ceiling-and-oom-priority), 4 GiB by default); on a sustained breach the process finishes what it is serving, names the reading on stderr, and exits `75` so a supervisor or an MCP client starts a clean one. Nothing is lost - in-flight requests and any running in-serve sync cycle are drained first. `Restart=always` already covers it; `RestartForceExitStatus=75` makes the intent explicit in a unit that restarts selectively.
 
 `copy` exit `6` is recoverable: re-run, the union merge converges. A malformed URL passed to `copy` fails with the generic exit `1`; only `storage check` / `storage use` exit `2` on it.
 

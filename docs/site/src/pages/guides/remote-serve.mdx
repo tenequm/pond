@@ -50,6 +50,21 @@ If the cache cannot be written, `serve` still starts and logs a warning, but eve
 
 `serve` stops on SIGTERM as well as ctrl-c. It closes live MCP sessions first (agents hold their `/mcp` stream open for the life of the session) and bounds the drain to five seconds, so a supervisor's stop finishes in milliseconds instead of timing out into SIGKILL. Give it any grace period of five seconds or more.
 
+## Run it under a supervisor
+
+`serve` bounds its own resident set and stops itself at [`[runtime].memory_ceiling`](/reference/configuration#memory-ceiling-and-oom-priority) (4 GiB by default), draining in-flight work first and exiting [`75`](/reference/exit-codes). That turns unbounded growth into a one-second bounce instead of an OOM kill - but only if something restarts it:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/pond serve --host 127.0.0.1 --port 9797 --with-sync
+Restart=always
+RestartSec=1
+# Explicit rather than required: Restart=always already covers exit 75.
+RestartForceExitStatus=75
+```
+
+Leave `OOMScoreAdjust=` out unless you want a specific value - pond sets `oom_score_adj` to 200 itself when nothing else has, so the kernel prefers the large pond process over unrelated services on the box. A `MemoryMax=` on the unit is complementary, not a substitute: it caps the cgroup, while the ceiling is what makes the process leave cleanly before that cap is hit.
+
 ::::
 
 ## Connect a client

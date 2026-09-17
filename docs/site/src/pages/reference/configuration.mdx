@@ -61,12 +61,35 @@ pond optimize --drop-index messages_vector_ivfpq
 
 The stored vectors themselves stay as data columns, so re-enabling later picks up where it left off.
 
+## Memory ceiling and OOM priority
+
+`pond serve` and `pond mcp` are long-lived, and a process whose live heap keeps growing ends at the OOM killer - which on the reported hosts picked unrelated ~30 MB victims while the multi-GB pond process survived. Both processes therefore bound themselves:
+
+```toml
+[runtime]
+memory_ceiling = "4 GiB"   # default; "0" disables
+oom_score_adj  = 200       # default when nothing else set one; 0 opts out
+```
+
+Every 30 seconds the process reads its own resident set. Over the ceiling it first asks the allocator to return freed pages and reads again, so retained-but-free memory never counts as growth; two consecutive readings that are still over are a breach. On a breach it stops accepting new HTTP connections, waits up to 30 seconds for in-flight requests and any running in-serve sync cycle to finish, prints the reading to stderr, and exits [`75`](/reference/exit-codes). No request is cut short and no write is interrupted.
+
+What the client sees depends on the transport:
+
+- **`serve` (HTTP).** The listener closes, in-flight responses still complete, and the process exits. A supervisor with `Restart=always` brings it back in a second; the next request lands on the fresh process. Without a supervisor the server stays down, so run it under one.
+- **`serve --transport stdio` and `mcp`.** The client owns the process. It finishes the tool call it is answering, then exits and the stdio pipe closes - the agent's pond tools disconnect and reconnect on the client's next attempt (`/mcp` in Claude Code). The stderr line names the ceiling and the reading, so the reason is in the client's MCP log.
+
+A restart is the whole point: a multi-GB pond process returns to its ~157 MB steady state, so unexplained growth costs one bounded bounce instead of a kill aimed at something else. The floor on a configured ceiling is 256 MiB - a smaller one is refused at load, because a serving process peaks above that at startup and would restart in a loop. Set `0` if a cgroup (`MemoryMax=`) already bounds the process and you would rather the kernel decide.
+
+`oom_score_adj` biases that kernel decision toward pond. An inherited non-zero value - systemd's `OOMScoreAdjust=`, a container runtime's setting - is left alone; pond only fills in a default where nothing chose one. Off Linux there is no cheap resident-set reading and no `oom_score_adj`: both knobs are inert, and the process logs that at startup.
+
 ## Environment
 
 - `POND_STORAGE_PATH` - storage URL (overrides `[storage].path`)
 - `POND_CONFIG_FILE` - config path
 - `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `POND_CREDS_DEFAULT_SECRET_ACCESS_KEY` - default creds
 - `POND_EMBEDDINGS_ENABLED` - `true` or `false`, turns semantic search on or off (overrides `[embeddings].enabled`)
+- `POND_RUNTIME_MEMORY_CEILING` - resident-set ceiling for `serve` / `mcp` (overrides `[runtime].memory_ceiling`)
+- `POND_RUNTIME_OOM_SCORE_ADJ` - OOM victim bias for `serve` / `mcp` (overrides `[runtime].oom_score_adj`)
 
 `POND_STORAGE_PATH` plus the two creds vars is a complete configuration with no file.
 

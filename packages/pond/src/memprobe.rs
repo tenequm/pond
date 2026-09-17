@@ -147,50 +147,11 @@ pub fn reset_heap_peak() {
     }
 }
 
-/// Linux `/proc/self/status` resident-set fields, in KiB. `vm_hwm` is the
-/// kernel's own high-water mark - a true peak, unlike anything sampled.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RssStats {
-    pub vm_rss_kb: u64,
-    pub vm_hwm_kb: u64,
-    pub rss_anon_kb: u64,
-}
-
-/// `None` off Linux (no `/proc`); use [`ru_maxrss_kb`] there.
-#[must_use]
-pub fn rss() -> Option<RssStats> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let field = |name: &str| -> u64 {
-            status
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix(name)?
-                        .split_whitespace()
-                        .next()?
-                        .parse::<u64>()
-                        .ok()
-                })
-                .unwrap_or(0)
-        };
-        Some(RssStats {
-            vm_rss_kb: field("VmRSS:"),
-            vm_hwm_kb: field("VmHWM:"),
-            rss_anon_kb: field("RssAnon:"),
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
-/// Current resident set in KiB, or `None` off Linux.
-#[must_use]
-pub fn current_rss_kb() -> Option<u64> {
-    rss().map(|r| r.vm_rss_kb)
-}
+/// The `/proc/self/status` resident-set probe lives in `memory.rs`, which
+/// every build compiles because the memory ceiling reads it. Re-exported so
+/// the bench lane keeps one vocabulary across all three layers. `None` off
+/// Linux (no `/proc`); use [`ru_maxrss_kb`] there.
+pub use crate::memory::{RssStats, current_rss_kb, rss};
 
 /// Reset the kernel's `VmHWM` watermark to the current `VmRSS`. Linux exposes
 /// this only as a side effect of `/proc/self/clear_refs` mode 5, which is
@@ -294,19 +255,6 @@ impl Drop for RssSampler {
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
-
-    #[test]
-    fn rss_probe_matches_platform_support() {
-        // Linux must report a non-zero resident set for a running process;
-        // elsewhere the probe is absent by design.
-        if cfg!(target_os = "linux") {
-            let stats = rss().expect("/proc/self/status readable on linux");
-            assert!(stats.vm_rss_kb > 0);
-            assert!(stats.vm_hwm_kb >= stats.vm_rss_kb);
-        } else {
-            assert!(rss().is_none());
-        }
-    }
 
     #[cfg(feature = "mem-probe")]
     #[test]

@@ -369,6 +369,53 @@ async fn completed_requests_arm_the_periodic_allocator_trim() -> anyhow::Result<
     Ok(())
 }
 
+/// The memory ceiling drains this counter to zero before it stops the process,
+/// so a handler that lost its guard would turn a bounded restart into one that
+/// cuts a request - or a write - in half. Nothing else would catch that: the
+/// counter is invisible in every response.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_served_request_leaves_nothing_in_flight() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let state = empty_state(&temp).await?;
+    let app = http::router(
+        state.clone(),
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let in_flight = state.in_flight();
+    assert_eq!(in_flight.count(), 0, "a fresh process is drained");
+
+    for (route, body) in [
+        (
+            "/v1/get-session",
+            json!({"protocol_version": PROTOCOL_VERSION, "session_id": "absent"}),
+        ),
+        (
+            "/v1/search",
+            json!({"protocol_version": PROTOCOL_VERSION, "query": "anything"}),
+        ),
+        (
+            "/v1/ingest",
+            json!({"protocol_version": PROTOCOL_VERSION, "events": []}),
+        ),
+    ] {
+        post(&app, route, &body).await;
+        assert_eq!(
+            in_flight.count(),
+            0,
+            "{route} must release the drain when it answers"
+        );
+    }
+
+    assert_eq!(
+        pond::memory::drain(&in_flight, std::time::Duration::from_secs(5)).await,
+        pond::memory::DrainOutcome::Idle,
+        "a served server drains immediately"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_and_get_round_trip() -> anyhow::Result<()> {
     let (_temp, store, app) = router().await?;

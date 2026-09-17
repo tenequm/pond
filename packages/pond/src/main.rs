@@ -1200,6 +1200,96 @@ fn spawn_prewarm(state: AppState) {
     });
 }
 
+/// Guard a long-lived `serve` / `mcp` process against unbounded growth: sample
+/// its resident set against `limit_bytes` and, on a sustained breach, drain
+/// what is in flight and stop so something else starts a fresh process.
+///
+/// Stopping is the fix, not a workaround. #111 measured that a restart returns
+/// a multi-GB pond process to its ~157 MB steady state, so unexplained growth
+/// costs one bounded restart instead of an OOM kill the kernel repeatedly
+/// aimed at unrelated processes (#245). An in-process "restart" - rebuilding
+/// the store and state without leaving the process - would not reclaim
+/// anything held outside them, which is why the process boundary is the reset.
+///
+/// `stop_early` closes the HTTP listener before the drain; the stdio surfaces
+/// have no listener, so there the drain simply waits out the in-flight tool
+/// call. Nothing is armed where the platform exposes no resident-set reading.
+fn spawn_memory_ceiling(
+    state: AppState,
+    limit_bytes: u64,
+    surface: &'static str,
+    stop_early: tokio_util::sync::CancellationToken,
+) {
+    use pond::memory::{
+        CEILING_CHECK_INTERVAL, CEILING_CONFIRMATIONS, CEILING_DRAIN_TIMEOUT, CeilingVerdict,
+        DrainOutcome, EXIT_MEMORY_CEILING, MemoryCeiling, ProcMeter, ResidentMeter,
+    };
+
+    if ProcMeter.resident_bytes().is_none() {
+        tracing::info!(
+            "memory ceiling inert: this platform exposes no resident-set reading; \
+             bound the process with a cgroup or a job object instead"
+        );
+        return;
+    }
+    tracing::info!(
+        limit_bytes,
+        seconds = CEILING_CHECK_INTERVAL.as_secs(),
+        "memory ceiling armed"
+    );
+    tokio::spawn(async move {
+        let mut ceiling = MemoryCeiling::new(ProcMeter, limit_bytes, CEILING_CONFIRMATIONS);
+        loop {
+            tokio::time::sleep(CEILING_CHECK_INTERVAL).await;
+            let (resident_bytes, consecutive) = match ceiling.sample() {
+                CeilingVerdict::Unmeasured | CeilingVerdict::Clear { .. } => continue,
+                CeilingVerdict::Over {
+                    resident_bytes,
+                    consecutive,
+                } => {
+                    tracing::warn!(
+                        resident_bytes,
+                        limit_bytes,
+                        consecutive,
+                        needed = CEILING_CONFIRMATIONS,
+                        "over the memory ceiling after a trim; another sample decides"
+                    );
+                    continue;
+                }
+                CeilingVerdict::Breached {
+                    resident_bytes,
+                    consecutive,
+                } => (resident_bytes, consecutive),
+            };
+            tracing::error!(
+                resident_bytes,
+                limit_bytes,
+                consecutive,
+                "memory ceiling breached; draining in-flight work, then stopping"
+            );
+            stop_early.cancel();
+            let in_flight = state.in_flight();
+            if let DrainOutcome::TimedOut { outstanding } =
+                pond::memory::drain(&in_flight, CEILING_DRAIN_TIMEOUT).await
+            {
+                tracing::warn!(
+                    outstanding,
+                    seconds = CEILING_DRAIN_TIMEOUT.as_secs(),
+                    "drain window elapsed with work outstanding; stopping anyway"
+                );
+            }
+            // Not tracing: this is the process's own death notice, and it has
+            // to survive whatever log filter the client or unit set.
+            eprintln!(
+                "{surface}: stopping at the memory ceiling ({resident_bytes} bytes resident, \
+                 limit {limit_bytes}); exit {EXIT_MEMORY_CEILING} - start a fresh process. \
+                 Raise or disable it with [runtime].memory_ceiling."
+            );
+            std::process::exit(EXIT_MEMORY_CEILING);
+        }
+    });
+}
+
 #[cfg(unix)]
 fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
     use rlimit::{Resource, getrlimit, setrlimit};
@@ -1620,6 +1710,11 @@ async fn run() -> anyhow::Result<()> {
                 opened
             });
             let state = AppState::new(store, embedder, config.search.clone());
+            pond::memory::apply_oom_score_adj(config.runtime.oom_score_adj);
+            let ceiling_stop = tokio_util::sync::CancellationToken::new();
+            if let Some(limit_bytes) = config.runtime.memory_ceiling_bytes() {
+                spawn_memory_ceiling(state.clone(), limit_bytes, "serve", ceiling_stop.clone());
+            }
             spawn_prewarm(state.clone());
             // `--with-sync`: fold the periodic sync into this process, reusing
             // the store + embedder above (no separate child cold-loading a
@@ -1632,12 +1727,13 @@ async fn run() -> anyhow::Result<()> {
                     config_file,
                     storage_path,
                     Duration::from_secs(sync_every.max(1) * 60),
+                    state.in_flight(),
                 );
             }
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
-                    transport::http::serve(state, host, port, allowed_host).await?;
+                    transport::http::serve(state, host, port, allowed_host, ceiling_stop).await?;
                 }
                 ServeTransport::Stdio => {
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
@@ -1661,6 +1757,18 @@ async fn run() -> anyhow::Result<()> {
                 opened
             });
             let state = AppState::new(store, embedder, config.search.clone());
+            pond::memory::apply_oom_score_adj(config.runtime.oom_score_adj);
+            if let Some(limit_bytes) = config.runtime.memory_ceiling_bytes() {
+                // No listener to close on stdio: the client owns this process's
+                // lifecycle, so a breach finishes the in-flight tool call and
+                // exits, and the client reconnects (`/mcp` in Claude Code).
+                spawn_memory_ceiling(
+                    state.clone(),
+                    limit_bytes,
+                    "mcp",
+                    tokio_util::sync::CancellationToken::new(),
+                );
+            }
             spawn_prewarm(state.clone());
             transport::mcp::serve_stdio(state).await?;
         }
@@ -4266,13 +4374,20 @@ fn spawn_in_serve_sync(
     config_file: PathBuf,
     storage_path: Option<StorageUrl>,
     interval: Duration,
+    in_flight: pond::memory::InFlight,
 ) {
     tokio::spawn(async move {
         loop {
-            if let Err(error) =
-                in_serve_sync_once(&store, &config, &config_file, storage_path.clone()).await
             {
-                tracing::warn!(%error, "in-serve sync cycle failed");
+                // The only write path inside a serving process: held for the
+                // whole cycle so a memory-ceiling stop waits for the commit
+                // rather than landing in the middle of it.
+                let _busy = in_flight.enter();
+                if let Err(error) =
+                    in_serve_sync_once(&store, &config, &config_file, storage_path.clone()).await
+                {
+                    tracing::warn!(%error, "in-serve sync cycle failed");
+                }
             }
             tokio::time::sleep(interval).await;
         }

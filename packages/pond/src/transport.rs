@@ -12,7 +12,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::{config::SearchConfig, embed::LazyEmbedder, sessions::Store};
+use crate::{
+    config::SearchConfig,
+    embed::LazyEmbedder,
+    memory::{InFlight, InFlightGuard},
+    sessions::Store,
+};
 
 /// Shared state handed to both transports. `embedder` holds a lazy handle:
 /// the model isn't loaded until the first vector search asks for it, so
@@ -27,6 +32,9 @@ pub struct AppState {
     /// [`AppState::take_completed_activity`]. Shared by every clone, so the
     /// periodic task in `main` sees the requests both transports served.
     activity: Arc<AtomicBool>,
+    /// Requests currently being served. The memory ceiling drains this to zero
+    /// before it stops the process, so a restart never lands mid-request.
+    in_flight: InFlight,
 }
 
 impl AppState {
@@ -36,14 +44,19 @@ impl AppState {
             embedder,
             search,
             activity: Arc::new(AtomicBool::new(false)),
+            in_flight: InFlight::new(),
         }
     }
 
     /// Hold the returned guard for the body of a request; dropping it - on the
     /// response path or on a cancelled future, both of which leave allocator
-    /// residue behind - records that this process had work to do.
+    /// residue behind - records that this process had work to do and releases
+    /// the memory ceiling's drain.
     fn track_activity(&self) -> ActivityGuard {
-        ActivityGuard(Arc::clone(&self.activity))
+        ActivityGuard {
+            completed: Arc::clone(&self.activity),
+            _in_flight: self.in_flight.enter(),
+        }
     }
 
     /// Whether a request completed since the last call, clearing the flag.
@@ -52,13 +65,23 @@ impl AppState {
     pub fn take_completed_activity(&self) -> bool {
         self.activity.swap(false, Ordering::AcqRel)
     }
+
+    /// The critical-section counter both transports feed. Handed to the
+    /// in-serve sync loop too, so a ceiling restart waits for a write.
+    #[must_use]
+    pub fn in_flight(&self) -> InFlight {
+        self.in_flight.clone()
+    }
 }
 
-struct ActivityGuard(Arc<AtomicBool>);
+struct ActivityGuard {
+    completed: Arc<AtomicBool>,
+    _in_flight: InFlightGuard,
+}
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        self.completed.store(true, Ordering::Release);
     }
 }
 
@@ -165,12 +188,15 @@ pub mod http {
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
     /// `allowed_hosts` names the public authorities the `/mcp` route accepts
-    /// (see [`mcp_allowed_hosts`]).
+    /// (see [`mcp_allowed_hosts`]). `stop_early` is the memory ceiling's
+    /// handle: cancelling it closes the listener so nothing new arrives while
+    /// the guard drains what is already in flight.
     pub async fn serve(
         state: AppState,
         host: String,
         port: u16,
         allowed_hosts: Vec<String>,
+        stop_early: CancellationToken,
     ) -> anyhow::Result<()> {
         let ip: IpAddr = host
             .parse()
@@ -189,7 +215,13 @@ pub mod http {
             .local_addr()
             .context("failed to read bound address")?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
-        serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
+        let stop = async move {
+            tokio::select! {
+                () = shutdown_signal() => {}
+                () = stop_early.cancelled() => {}
+            }
+        };
+        serve_with_shutdown(listener, state, &allowed_hosts, stop).await
     }
 
     /// The serving half of [`serve`], with the stop trigger injected. Public so
