@@ -249,6 +249,8 @@ Reconciliations (a second lance-10 `ops_bench --url` run, same store, minutes la
 
 Method: the production store was s5cmd-copied to identical scratch prefixes (parity-verified: 417 objects / 12.2 GB / 2,931,634 message rows each), and the same frozen 4-session / +741-row / +46-searchable delta (a snapshot of the local source dir) was synced into each copy once per binary. `warm` = local index/rowmap cache primed by an immediately preceding `--dry-run` against the same copy, which is the recurring-cron shape (cache persists across runs on one store path); `cold` = first-ever run against that store path. Embeddings disabled, matching the read-gate rows. Every run converged to the identical end state (2,932,375 rows).
 
+Update 2026-09-17: the 417 objects / 12.2 GB above is the store as it stood that day and stays as recorded. The live store now measures 42.5 GiB / ~1,200 objects, of which 26.3 GiB is `parts` data pending cleanup (live parts ~4.5 GiB); see `docs/plans/2609-17-read-latency-campaign.md`.
+
 | state | lance 8 (pond 0.15.1) | lance 10 (feat/lance-10-upgrade) | verdict |
 |---|---|---|---|
 | cold sync | 133.3 s | 134.3 s | parity |
