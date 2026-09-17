@@ -381,8 +381,22 @@ Search and hydration must consult every fragment's index segment, so they
 track fragment count directly; the analytics shapes read manifest metadata
 and column statistics, which compaction does not change. The remedy is
 cheap: `pond optimize` ran in **1.00 s** (0.40 s at M3) and restored the
-folded state. M0 reproduced #252's shape closely - 8 messages fragments and
-9 versions at 200k messages, against the 9 / 11 that report recorded.
+folded state.
+
+One correction to how that remedy reads: `pond sync` already runs the same
+optimize pass - compaction, index fold and version cleanup - after every
+sync that brought in new rows, and has done since `2680cea` (2026-05-16).
+Small stores stay fragmented because of policy, not a missing call. Sync
+inherits `DEFAULT_COMPACTION_FRAGMENT_CAP = 64` (`substrate.rs:901`), which
+vetoes any planned compaction task below 64 fragments, while `pond optimize`
+runs with threshold 0 and never skips. The ladder's M2 store was built by
+bench ingest, which bypasses sync's optimize stage entirely, so its 7
+fragments are the unmanaged worst case rather than what a synced store would
+carry. The follow-up candidate is tuning that veto policy - auto-compaction
+already exists and does not need adding.
+
+M0 reproduced #252's shape closely - 8 messages fragments and 9 versions at
+200k messages, against the 9 / 11 that report recorded.
 
 Two bounds on those percentages. The bigger M0 -> M1 figure (`fts_search`
 p50 88 ms -> under 1 ms) measures *index presence*, not fragmentation - M0
