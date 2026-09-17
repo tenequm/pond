@@ -323,8 +323,11 @@ sync-incremental and rowmap-build-cold, peak RSS moved -24.6% / -19.2% /
 
 `ingest-large-session` is labelled not comparable because #258 wired the
 byte-budget flush into `mem_bench`'s `ingest_batched` (the gap called out
-above under #252), so the PRE row committed one fragment per table and the
-POST row commits nine - different work, not a memory win of that size.
+above under #252): the bench had been flushing only at session boundaries,
+so a one-session scenario never fired the budget. The POST row carries
+fragment accounting the PRE row has no field for, and on `large` the budget
+now cuts 9 fragments per table where the ci corpus stays under it at 1. The
+two rows measure different work, not a memory win of that size.
 
 The five scenarios #258 added (`search-query-latency`, `ingest-throughput`,
 `serve-sync-retention`, `sync-under-contention`,
