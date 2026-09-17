@@ -3592,7 +3592,7 @@ async fn optimize_table_indices(
 /// intent name.
 ///
 /// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// skips the remapper entirely (lance-11 `optimize.rs` `needs_remapping`) and
+/// skips the remapper entirely (lance-12 `optimize.rs` `needs_remapping`) and
 /// only rewrites each covered index's `fragment_bitmap` to the new fragment
 /// ids (lance-table `transaction/index_maintenance.rs`
 /// `recalculate_fragment_bitmap`). A rewrite of covered
@@ -3878,6 +3878,12 @@ pub mod index_cache {
             })
         }
 
+        /// Keeps the listing pushdown. This wrapper observes rather than
+        /// intercepts: it serves `_indices/*` reads from local disk and is
+        /// read-through, so a cached path is one the origin holds too, and
+        /// every `list*` call already delegates to `inner`. A pushed-down
+        /// listing therefore sees exactly what `wrap`'s store would list.
+        /// Returning `None` would only cost the pushdown, buying nothing.
         fn wrap_paginated(
             &self,
             _store_prefix: &str,
@@ -4204,6 +4210,10 @@ pub mod durability {
             Arc::new(FsyncStore { inner })
         }
 
+        /// Keeps the listing pushdown. This wrapper only fsyncs after a write
+        /// has already been published and hides, rewrites or fails no paths -
+        /// every `list*` call delegates to `inner` - so a listing that goes
+        /// around it reads the same directory either way.
         fn wrap_paginated(
             &self,
             _store_prefix: &str,
