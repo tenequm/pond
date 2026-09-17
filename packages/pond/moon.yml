@@ -20,10 +20,6 @@ fileGroups:
     - '/Cargo.toml'
     - '/Cargo.lock'
     - '/rust-toolchain.toml'
-    # The devShell's nixpkgs-resolved tools (zig, the C compiler, cmake) - see
-    # the same entry in the root moon.yml, including why a protoc bump, which
-    # edits flake.nix only, still moves no declared input.
-    - '/flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
     # the old ones - lint-msvc and test-msvc are exactly the tasks that carry
@@ -33,18 +29,23 @@ fileGroups:
   tests:
     - 'tests/**/*'
     - 'benches/**/*'
+  # The devShell's derivation path per system - see the same group in the root
+  # moon.yml. Linux/macOS tasks only; the msvc tasks never enter the flake and
+  # take windows-bootstrap instead.
+  nixToolchain:
+    - '/ops/toolchain-id.json'
 
 tasks:
   format:
     command: 'cargo fmt --check'
-    inputs: ['@group(sources)', '@group(tests)']
+    inputs: ['@group(sources)', '@group(tests)', '@group(nixToolchain)']
   lint:
     # --all-targets: without it tests/ and benches/ were linted only on Windows.
     command: 'cargo clippy --locked --all-targets -- -D warnings'
-    inputs: ['@group(sources)', '@group(tests)']
+    inputs: ['@group(sources)', '@group(tests)', '@group(nixToolchain)']
   test:
     command: 'cargo test --locked'
-    inputs: ['@group(sources)', '@group(tests)']
+    inputs: ['@group(sources)', '@group(tests)', '@group(nixToolchain)']
   # The Windows leg. A separate task, not `test` run on a Windows runner:
   # moon's own fingerprint carries no OS, so sharing one task would hit the hash
   # the Linux runner already cached and report "cached" without compiling
@@ -55,12 +56,12 @@ tasks:
   # sees a cfg(windows) block, so Windows-only code was ungated until this task.
   lint-msvc:
     command: 'cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --features windows-launcher -- -D warnings'
-    inputs: ['@group(sources)', '@group(tests)']
+    inputs: ['@group(sources)', '@group(tests)', '/.github/actions/windows-bootstrap/action.yml']
   test-msvc:
     # windows-launcher so pondw.exe is compiled here on every PR; the job that
     # builds it for the zip is release-gated, too late to learn it is broken.
     command: 'cargo test --locked --target x86_64-pc-windows-msvc --features windows-launcher'
-    inputs: ['@group(sources)', '@group(tests)']
+    inputs: ['@group(sources)', '@group(tests)', '/.github/actions/windows-bootstrap/action.yml']
   # Cheap packaging gate: `cargo package --list` must contain every file the
   # code embeds via include_str!/include_bytes! (a full verify build is skipped
   # at publish time - publish_no_verify in .github/release-plz.toml). The script
@@ -72,4 +73,4 @@ tasks:
   # test - which do take the lockfile as input - failed on it.
   check-package:
     command: 'bash ../../ops/scripts/check-package-contents.sh'
-    inputs: ['@group(sources)', '/ops/scripts/check-package-contents.sh']
+    inputs: ['@group(sources)', '@group(nixToolchain)', '/ops/scripts/check-package-contents.sh']

@@ -17,9 +17,9 @@
 
     # The devShell resolves against THIS input, not `nixpkgs`, so a routine
     # `nixpkgs` bump (which only feeds `packages.pond`) moves no compiler store
-    # path: cargo does not rerun build scripts and kache keys do not miss.
-    # moon's do: /flake.lock is a declared input of the Rust tasks, whichever
-    # input moved. Bump this one deliberately and expect one cold build.
+    # path: cargo does not rerun build scripts, kache keys do not miss, and
+    # `lib.toolchainId` (moon's toolchain input) stays put. Bump this one
+    # deliberately, regenerate ops/toolchain-id.json, and expect one cold build.
     nixpkgs-toolchain.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # Vendored rustup manifests, so `fromRustupToolchainFile` stays a pure eval -
@@ -164,8 +164,10 @@
 
       # The devShell is built from `nixpkgs-toolchain` and must NOT reference
       # `self` or the source tree: CI keys a `nix print-dev-env` profile on the
-      # hash of flake.nix, flake.lock and rust-toolchain.toml, and a source
-      # reference would make every commit a fresh derivation (plan 2609-16 2.2).
+      # hash of flake.nix, flake.lock, rust-toolchain.toml and
+      # ops/toolchain-id.json, moon keys the Rust tasks on its drvPath
+      # (`lib.toolchainId`), and a source reference would make every commit a
+      # fresh derivation (plan 2609-16 2.2).
       mkDevShell =
         system:
         let
@@ -361,7 +363,21 @@
         );
     in
     {
-      lib = { inherit toolVersions; };
+      lib = {
+        inherit toolVersions;
+
+        # The devShell's derivation path per system: the moon cache key for the
+        # whole toolchain. It moves exactly when something the shell builds
+        # from moves - a nixpkgs-toolchain or rust-overlay bump, a toolVersions
+        # pin, the SDK stubs or the zigbuild patch - and not on a `nixpkgs` bump
+        # or a comment edit. Committed as ops/toolchain-id.json, which the Rust
+        # moon tasks take as an input instead of /flake.lock; CI refuses to run
+        # moon when that file disagrees with this. Evaluating it builds nothing,
+        # so every system's entry comes from any one machine.
+        toolchainId = nixpkgs.lib.genAttrs systems (
+          system: builtins.unsafeDiscardStringContext self.devShells.${system}.default.drvPath
+        );
+      };
 
       overlays.default = final: _prev: { pond = final.callPackage ./ops/nix/pond.nix { }; };
 

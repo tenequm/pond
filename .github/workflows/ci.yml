@@ -204,6 +204,21 @@ jobs:
             sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/rust \1/p' rust-toolchain.toml
           } | jq -Rn '[inputs | split(" ") | {(.[0]): .[1]}] | add' | jq -S . > "$out/extracted.json"
           diff -u "$out/evaluated.json" "$out/extracted.json"
+      # The Rust moon tasks take ops/toolchain-id.json as their toolchain input
+      # instead of /flake.lock, so a nixpkgs bump no longer invalidates them -
+      # but only while the committed ids are the real devShell derivation paths.
+      # Evaluating them builds nothing, so this covers all three systems from
+      # this x86_64 runner; the devshell action checks only the one system its
+      # job runs on, and only when it builds a profile.
+      # Files, not process substitution: `set -o pipefail` does not reach into
+      # `<(...)`, so a step written that way passes green when BOTH sides fail.
+      - name: ops/toolchain-id.json matches the evaluated devShell drvPaths
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP:-$(mktemp -d)}"
+          nix eval --json .#lib.toolchainId | jq -S . > "$out/toolchain-evaluated.json"
+          jq -S . ops/toolchain-id.json > "$out/toolchain-committed.json"
+          diff -u "$out/toolchain-evaluated.json" "$out/toolchain-committed.json"
 
   # Windows runs as TWO jobs, deliberately. One serial job cost 46 min warm
   # (20.7 test + 23.8 dist). Split, they start together on separate hosted

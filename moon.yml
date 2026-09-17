@@ -20,15 +20,6 @@ fileGroups:
     - 'Cargo.toml'
     - 'Cargo.lock'
     - 'rust-toolchain.toml'
-    # The flake devShell is CI's toolchain now, and this lock pins what it
-    # resolves from nixpkgs-toolchain and rust-overlay: zig, cargo-zigbuild,
-    # rcodesign, the stdenv C compiler, cmake. A bump of any of those moves the
-    # lock, so it can no longer replay results built by the previous toolchain.
-    # The compiler itself is pinned by rust-toolchain.toml (above). protoc,
-    # moon, kache, uv and node are prebuilt archives whose version and hash live
-    # in flake.nix, which is NOT in this group - a protoc bump still moves
-    # nothing declared here. build-dist alone adds flake.nix, below.
-    - 'flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
     # the old ones. kache's own keys already include the flags, so adding this
@@ -37,6 +28,19 @@ fileGroups:
   tests:
     - 'packages/pond/tests/**/*'
     - 'packages/pond/benches/**/*'
+  # The flake devShell is the Linux and macOS toolchain, and this file holds its
+  # derivation path per system (`lib.toolchainId`): it moves when anything the
+  # shell is built from moves - zig, cargo-zigbuild, rcodesign, the C compiler,
+  # cmake, protoc, the SDK stubs, the zigbuild patch - and not on a `nixpkgs`
+  # bump, which only feeds packages.pond. /flake.lock itself is deliberately
+  # not an input: it moved on every such bump and invalidated every Rust task,
+  # the msvc ones included. The CI devshell step fails a job whose entry for the
+  # runner's own system is stale, so no cache entry is written under an outdated
+  # id; flake-check covers the other two systems. Not in `sources`:
+  # the msvc tasks share that group and never enter the flake - they take
+  # windows-bootstrap, where their pins live, instead.
+  nixToolchain:
+    - 'ops/toolchain-id.json'
 
 tasks:
   check-changelog:
@@ -85,7 +89,7 @@ tasks:
       # A toolchain bump changes codegen and with it what the row measures; omit
       # it and moon replays a cached pass over a different compiler.
       - 'rust-toolchain.toml'
-      - 'flake.lock'
+      - '@group(nixToolchain)'
       - 'ops/scripts/mem-gate.sh'
       - 'docs/benchmarks/mem-gate-baseline.jsonl'
     options:
@@ -131,12 +135,11 @@ tasks:
     # cache is for, and there HEAD is unchanged.
     inputs:
       - '@group(sources)'
+      # Covers the macOS SDK stubs and the cargo-zigbuild patch too: both are
+      # part of the devShell derivation, so flake.nix itself is not needed.
+      - '@group(nixToolchain)'
       - 'ops/scripts/build-dist.sh'
       - 'ops/scripts/patch-macos-sdk.py'
-      # The macOS SDK stubs and the cargo-zigbuild patch live in flake.nix, not
-      # flake.lock, and both change what ships. Free here: every release
-      # already misses on the version bump above.
-      - 'flake.nix'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'
@@ -163,6 +166,9 @@ tasks:
     command: 'pwsh -NoProfile -File ops/scripts/build-dist-msvc.ps1'
     inputs:
       - '@group(sources)'
+      # This leg's toolchain pins (moon, protoc, kache) live in the action, not
+      # the flake.
+      - '.github/actions/windows-bootstrap/action.yml'
       - 'ops/scripts/build-dist-msvc.ps1'
     outputs:
       - 'dist/pond-x86_64-pc-windows-msvc.zip'

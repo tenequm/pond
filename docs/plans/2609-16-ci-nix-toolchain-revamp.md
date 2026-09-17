@@ -320,3 +320,16 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   makes the hottest key look the oldest. A sibling marker file
   was rejected because `pond-dev-<key>.last-used` would match the reaper's own
   `pond-dev-*` glob.
+- **`/flake.lock` is no longer the moon toolchain input** (supersedes phase 3's
+  "add `/flake.lock` to the hashed inputs", and the `nixpkgs`-bump caveats at the
+  top): the lock moved on every `nix flake update`, including a `nixpkgs` bump
+  that feeds only `packages.pond`, and invalidated every Rust task - the msvc
+  ones included, which never enter the flake. The Rust file groups now take
+  `ops/toolchain-id.json`, a committed `lib.toolchainId` = the devShell's
+  drvPath per system, so the key moves only when the shell itself does; the msvc
+  tasks take `.github/actions/windows-bootstrap/action.yml`, where their pins
+  live. `flake-check` diffs the file against a fresh evaluation, and the
+  devshell action's profile key grew a fourth file (it hashes
+  `ops/toolchain-id.json` too) and verifies the committed id for its own system
+  before it creates the profile - so a hit implies the check already passed and
+  no moon step can write cache entries under a stale id.

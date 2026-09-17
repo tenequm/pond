@@ -36,23 +36,6 @@ runs:
           exit 1
         fi
 
-        # The devShell derivation depends on exactly these three files (it must
-        # not reference `self` or the source tree - see the comment above
-        # mkDevShell in flake.nix), so their hash is a sound profile key. The
-        # flake EVALUATION cache cannot help us: it is keyed on the git
-        # fingerprint, so every commit misses it. A profile hit skips evaluation
-        # entirely - measured at ~0.1 s against ~30 s for a cold eval.
-        # Each distinct key is its own profile and its own permanent GC root:
-        # pruning old pond-dev-* is the ops side's job (plan 2609-16 phase 5).
-        key=$(sha256sum flake.nix flake.lock rust-toolchain.toml | sha256sum | cut -c1-32)
-        profile="/nix/var/nix/profiles/pond-dev-$key"
-
-        # No flock, unlike the bootstrap this replaces: that one hand-rolled
-        # curl+mv into shared paths and had to serialize concurrent pods itself.
-        # Two pods racing here converge instead of clobbering: both realize the
-        # same store paths under nix's own store locks, and the profile link is
-        # swapped by an atomic rename (nix takes no profile lock).
-        #
         # The substituter is pond's own public-read binary cache: no credential,
         # so fork PRs and dev machines pull the same toolchain closure. Passed as
         # flags as well as declared in the flake's nixConfig, because nixConfig
@@ -62,6 +45,48 @@ runs:
           --extra-substituters 'https://pond-nix-cache.nbg1.your-objectstorage.com'
           --extra-trusted-public-keys 'pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU='
         )
+
+        # jq is not guaranteed on the stripped runner image, and this runs
+        # before the devshell (which does ship jq) is on PATH. Resolve it from
+        # the flake's own locked nixpkgs rather than the registry, so the
+        # fallback is as pinned as everything else.
+        if command -v jq >/dev/null 2>&1; then
+          jq=(jq)
+        else
+          # Resolved once, not per use: the array is expanded several times, and
+          # `nix run` would re-resolve nixpkgs#jq each time - on the hit path
+          # whose whole point is skipping evaluation. `.bin` because plain
+          # `nixpkgs#jq` realizes bin AND man, i.e. two output paths.
+          jq=("$("${nix[@]}" build --inputs-from . --no-link --print-out-paths nixpkgs#jq.bin)/bin/jq")
+        fi
+
+        # The devShell derivation depends on exactly flake.nix, flake.lock and
+        # rust-toolchain.toml (it must not reference `self` or the source tree -
+        # see the comment above mkDevShell in flake.nix), so their hash is a
+        # sound profile key. The flake EVALUATION cache cannot help us: it is
+        # keyed on the git fingerprint, so every commit misses it. A profile hit
+        # skips evaluation entirely - measured at ~0.1 s against ~30 s for a
+        # cold eval.
+        # ops/toolchain-id.json is in the key too, though the shell does not
+        # depend on it: a profile is only ever created after the check below
+        # passed, so a hit proves this exact file was already verified against
+        # these exact three.
+        # Each distinct key is its own profile and its own permanent GC root:
+        # pruning old pond-dev-* is the ops side's job (plan 2609-16 phase 5).
+        # Checked rather than left to sha256sum: a ref that predates the file
+        # would otherwise die on a bare `No such file or directory`.
+        if [ ! -f ops/toolchain-id.json ]; then
+          echo "::error file=ops/toolchain-id.json::ops/toolchain-id.json is missing. Generate it: nix eval --json .#lib.toolchainId | jq -S . > ops/toolchain-id.json" >&2
+          exit 1
+        fi
+        key=$(sha256sum flake.nix flake.lock rust-toolchain.toml ops/toolchain-id.json | sha256sum | cut -c1-32)
+        profile="/nix/var/nix/profiles/pond-dev-$key"
+
+        # No flock, unlike the bootstrap this replaces: that one hand-rolled
+        # curl+mv into shared paths and had to serialize concurrent pods itself.
+        # Two pods racing here converge instead of clobbering: both realize the
+        # same store paths under nix's own store locks, and the profile link is
+        # swapped by an atomic rename (nix takes no profile lock).
         json="$RUNNER_TEMP/pond-dev-env.json"
         if [ -e "$profile" ]; then
           echo "devshell profile hit: $profile"
@@ -76,27 +101,26 @@ runs:
           "${nix[@]}" print-dev-env --json "$profile" > "$json"
         else
           echo "devshell profile miss, building: $profile"
+          # The Rust moon tasks key on ops/toolchain-id.json instead of the
+          # flake, so a stale file would let this job write cache entries for
+          # the new toolchain under the old toolchain's key. Checked before the
+          # profile exists, so no hit - here or on a pod racing this one - can
+          # skip it.
+          system=$("${nix[@]}" eval --impure --raw --expr builtins.currentSystem)
+          shell=".#devShells.$system.default"
+          actual=$("${nix[@]}" eval --raw "$shell.drvPath")
+          committed=$("${jq[@]}" -r --arg s "$system" '.[$s] // "(missing)"' ops/toolchain-id.json)
+          if [ "$actual" != "$committed" ]; then
+            echo "::error file=ops/toolchain-id.json::ops/toolchain-id.json is stale for $system: it says $committed, the devShell is $actual. Regenerate it: nix eval --json .#lib.toolchainId | jq -S . > ops/toolchain-id.json" >&2
+            exit 1
+          fi
           # --profile both records the result and makes it a GC root, so the
           # next job on this node takes the branch above.
-          "${nix[@]}" print-dev-env --json --profile "$profile" .# > "$json"
+          "${nix[@]}" print-dev-env --json --profile "$profile" "$shell" > "$json"
         fi
         # Announced only once the profile exists, so a job whose entry failed
         # advertises no path for the cache-push step to copy.
         echo "profile=$profile" >> "$GITHUB_OUTPUT"
-
-        # jq is not guaranteed on the stripped runner image, and this runs
-        # before the devshell (which does ship jq) is on PATH. Resolve it from
-        # the flake's own locked nixpkgs rather than the registry, so the
-        # fallback is as pinned as everything else.
-        if command -v jq >/dev/null 2>&1; then
-          jq=(jq)
-        else
-          # Resolved once, not per use: the array below is expanded twice, and
-          # `nix run` would re-resolve nixpkgs#jq each time - on the hit path
-          # whose whole point is skipping evaluation. `.bin` because plain
-          # `nixpkgs#jq` realizes bin AND man, i.e. two output paths.
-          jq=("$("${nix[@]}" build --inputs-from . --no-link --print-out-paths nixpkgs#jq.bin)/bin/jq")
-        fi
 
         # Uppercase-initial names only: every lowercase key in the dump is a
         # derivation attribute (out, outputs, buildInputs, shellHook, system...)
