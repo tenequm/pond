@@ -45,20 +45,20 @@ Status 2026-09-16: plan committed to main; B2/B3/B4 launched as parallel
 worktree agents; Phase 0 done (below) - B1 demoted to a cheap bound, B5 added
 from Phase 0's bonus finding; track A starting.
 
-Status 2026-09-16 (campaign close-out): every PR in the #245 lane is merged -
-twelve in all (#250, #254, #253, #251, #249, #255, #244, #252, #259, #260,
-#256, #262), the last wave being #252 (`6c2d09d`, bounded ingest flush
+Status 2026-09-17 (campaign close-out): every PR in the #245 lane is merged -
+thirteen in all (#250, #254, #253, #251, #249, #255, #244, #252, #259, #260,
+#256, #262, #258), the last wave being #252 (`6c2d09d`, bounded ingest flush
 memory), #259 (`3b6c609`, sync cursor oracle preference order pinned), #260
-(`03d2a46`, cold rowmap build in a bounded chunk window) and #256
-(`f253629`, stops the per-message options stamp clones). Still in flight:
-#258 (bench-gate extensions) on `feat/bench-gate-extensions`. The memory
+(`03d2a46`, cold rowmap build in a bounded chunk window), #256
+(`f253629`, stops the per-message options stamp clones) and #258
+(`abc49b9`, bench-gate extensions). The memory
 ceiling plus supervised self-restart for `mcp`/`serve` moved to follow-up
 issue #266; the allocator-trim half of that old either/or item already
-shipped in #249. The closing measurement sweep is designed and pending
-execution once #258 merges: the mem gate on both sides, `moon run
+shipped in #249. The closing measurement sweep ran 2026-09-16/17 with #258
+in place: the mem gate on both sides, `moon run
 repo:bench-gate` on both sides, and read latency on an unoptimized store
-ingested under #252 - all built on rustc 1.98.1. Its numbers land in a
-follow-up commit on this branch. Refs #245.
+ingested with the post-#252 binary - all built on rustc 1.98.1. Its numbers
+are in section 6 below. Refs #245.
 
 ### Phase 0 - zero-code experiment (DONE 2026-09-16, hypothesis not confirmed)
 
@@ -300,8 +300,10 @@ comments.
 
 ## 6. Closing numbers (2026-09-17)
 
-PRE is `44886ce`, the pre-campaign baseline commit; POST is `abc49b9`, final
-main. Both sides were built and measured under the same toolchain
+PRE is `44886ce`, the pre-campaign baseline commit (the tip of the #253
+harness branch, squash-merged to main as `41b3663`, so it is not itself a
+main commit); POST is `abc49b9`, final main. Both sides were built and
+measured under the same toolchain
 (`rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc
 2026-08-05)`), so these deltas are code, not compiler. The re-recorded rows
 are on PR [#270](https://github.com/tenequm/pond/pull/270).
@@ -366,9 +368,12 @@ the read-latency ladder.
 
 ### Read-latency ladder (M0-M3)
 
-Measured on a 200k-message local store ingested under #252 and left
-unoptimized. The quotable pair is M2 (7 messages fragments, indexes present)
-versus M3 (the same store after `pond optimize`, 2 fragments):
+Measured on a 200k-message local store ingested with the post-#252 binary and
+left unoptimized. The quotable pair is M2 (7 messages fragments, indexes
+present) versus M3 (the same store after `pond optimize`, 2 fragments). The
+#252 chunked-flush path itself was not exercised: the M2 tail came from six
+small fixture ingests (~10 MB in total), so the 32 MiB flush budget never
+bound and those 7 fragments are per-commit fragments, not byte-budget cuts.
 
 | metric | M2 | M3 | M2 worse by |
 |---|---|---|---|
@@ -386,14 +391,20 @@ folded state.
 One correction to how that remedy reads: `pond sync` already runs the same
 optimize pass - compaction, index fold and version cleanup - after every
 sync that brought in new rows, and has done since `2680cea` (2026-05-16).
-Small stores stay fragmented because of policy, not a missing call. Sync
-inherits `DEFAULT_COMPACTION_FRAGMENT_CAP = 64` (`substrate.rs:901`), which
-vetoes any planned compaction task below 64 fragments, while `pond optimize`
-runs with threshold 0 and never skips. The ladder's M2 store was built by
-bench ingest, which bypasses sync's optimize stage entirely, so its 7
-fragments are the unmanaged worst case rather than what a synced store would
-carry. The follow-up candidate is tuning that veto policy - auto-compaction
-already exists and does not need adding.
+Sync and `pond optimize` build that policy through the same function
+(`configured_maintenance_policy`, `main.rs:1540` and `main.rs:4609`) and both
+inherit `DEFAULT_COMPACTION_FRAGMENT_CAP = 64` (`substrate.rs:901`); sync
+differs only in its cleanup interval and index-fold thresholds
+(`main.rs:4610-4612`). The cap is a per-task bypass, not a floor: in
+`task_veto_reason` (`substrate.rs:1096`) a task of 64 fragments or more skips
+the width and amplification checks outright, while a narrower task is still
+allowed through unless it trips `cannot_shrink`, `row_target_unattainable` or
+`absorb_veto`. So the cap does not by itself explain a small fragmented tail.
+The ladder's M2 store was built by bench ingest, which never calls the
+optimize stage at all, so its 7 fragments are the unmanaged worst case rather
+than what a synced store would carry - and this run therefore says nothing
+about what sync leaves behind. Measuring a synced store directly is the
+follow-up; auto-compaction already exists and does not need adding.
 
 M0 reproduced #252's shape closely - 8 messages fragments and 9 versions at
 200k messages, against the 9 / 11 that report recorded.
