@@ -16,8 +16,15 @@ type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
-# Per-job and schema-tagged, same reasoning as windows-verify.toml. This
-# prefix starts empty: the first release build after the rotation is the cold
-# one (~76 min), which is why it gets a forced prewarm dispatch before the
-# next release PR merges.
+# Per-job and schema-tagged, same reasoning as windows-verify.toml. A freshly
+# rotated prefix starts empty and the first release build into it is the cold
+# one (~76 min).
+#
+# Prewarming it needs a PUSH TO MAIN, not a dispatch. Since kache 0.17 the
+# remote is forced read-only for every GitHub event except a push to a
+# protected branch (src/policy.rs, is_trusted_github_writer: event == push AND
+# ref_type == branch AND GITHUB_REF_PROTECTED truthy), and KACHE_REMOTE_READONLY=0
+# cannot override it. A `force_build` workflow_dispatch therefore compiles for
+# real, pulls, and uploads NOTHING - it warms the runner it ran on and nobody
+# else. Rotate together with a change that lands on main.
 prefix = "kache/pond/windows-dist/k31"
