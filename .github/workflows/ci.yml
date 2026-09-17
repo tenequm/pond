@@ -26,7 +26,7 @@ on:
         default: false
 
 # Default read-only; publish-release elevates to contents:write for its own
-# `gh release upload`. The release PR and publishes use the GH_RELEASE_TOKEN
+# asset uploads. The release PR and publishes use the GH_RELEASE_TOKEN
 # PAT, not the workflow token.
 permissions:
   contents: read
@@ -602,7 +602,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write   # `gh release upload` to this repo via the workflow token
+      contents: write   # release asset uploads to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run
     # instead of killing it between release-plz tagging and the publishes.
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
@@ -652,13 +652,15 @@ jobs:
             echo "released=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Only a 404 means "no release"; any other failure must not turn a
-          # re-run into a green job that published nothing.
+          # publish-release only runs while the tag is missing, and release-plz
+          # skips a version whose tag exists or whose crate is already on
+          # crates.io without creating the release. So a 404 here is a partial
+          # publish, and it must fail rather than go green with nothing shipped.
           code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/tenequm/pond/releases/tags/v$V")
           case "$code" in
             200) echo "released=true" >> "$GITHUB_OUTPUT" ;;
-            404) echo "released=false" >> "$GITHUB_OUTPUT" ;;
+            404) echo "::error::release-plz created no release and v$V has none: the crate or tag was published without the GitHub release. Create the v$V release by hand, then re-run this job." >&2; exit 1 ;;
             *) echo "::error::release lookup for v$V returned HTTP $code" >&2; exit 1 ;;
           esac
 

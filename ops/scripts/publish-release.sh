@@ -33,22 +33,24 @@ cat dist/checksums.txt
 # One file per request with a hard timeout, through curl: `gh release upload`
 # (2.100.0) stalled for minutes on the 81 MB Windows zip that curl posts in
 # seconds. A killed upload leaves the asset in state "starter", which blocks a
-# plain retry with "already exists", so each try first clears it.
+# plain retry with "already exists", so each try first clears it. The skip
+# compares GitHub's asset digest, not size: checksums.txt is the same size in
+# every release.
 release_id=$(gh api "repos/$repo/releases/tags/$tag" --jq .id)
 upload() {
-  local f=$1 name size try existing id state asize present
+  local f=$1 name want try existing id state digest present
   name=${f##*/}
-  size=$(wc -c < "$f" | tr -d ' ')
+  want="sha256:$(sha256sum "$f" | cut -d' ' -f1)"
   for try in 1 2 3; do
     if existing=$(gh api "repos/$repo/releases/$release_id" \
-      --jq ".assets[] | select(.name == \"$name\") | [.id, .state, .size] | @tsv"); then
+      --jq ".assets[] | select(.name == \"$name\") | [.id, .state, .digest // \"\"] | @tsv"); then
       present=false
-      while IFS=$'\t' read -r id state asize; do
+      while IFS=$'\t' read -r id state digest; do
         [ -n "$id" ] || continue
-        if [ "$state" = uploaded ] && [ "$asize" = "$size" ]; then
+        if [ "$state" = uploaded ] && [ "$digest" = "$want" ]; then
           present=true
         else
-          echo "$name: deleting asset $id (state=$state size=$asize, want uploaded/$size)"
+          echo "$name: deleting asset $id (state=$state digest=$digest, want uploaded/$want)"
           gh api -X DELETE "repos/$repo/releases/assets/$id" || true
         fi
       done <<< "$existing"
@@ -89,7 +91,8 @@ jq -n --arg v "$V" \
   '{version: $v, hashes: {"x86_64-linux": $x86, "aarch64-linux": $arm, "aarch64-darwin": $mac}}' \
   > "$tmp/release.json"
 
-main_release=$(GH_TOKEN=$GH_RELEASE_TOKEN gh api "repos/$repo/contents/ops/nix/release.json?ref=main" --jq .content | base64 -d || true)
+# No `|| true` on the read: a failed lookup must not skip the rollback guard.
+main_release=$(GH_TOKEN=$GH_RELEASE_TOKEN gh api "repos/$repo/contents/ops/nix/release.json?ref=main" --jq .content | base64 -d)
 main_version=$(jq -r '.version // empty' <<< "$main_release" 2>/dev/null || true)
 if [ "$(jq -S . <<< "$main_release" 2>/dev/null || true)" = "$(jq -S . "$tmp/release.json")" ]; then
   echo "ops/nix/release.json on main already points at $tag"
