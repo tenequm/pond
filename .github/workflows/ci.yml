@@ -99,6 +99,9 @@ jobs:
       - name: Push the devshell closure to the binary cache
         if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.devshell.outputs.profile != '' }}
         continue-on-error: true
+        # continue-on-error does not cover the job timeout: a stalled upload
+        # must fail this step, not run out the job's clock and redden the build.
+        timeout-minutes: 15
         env:
           NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
           # kache's Hetzner key pair also has write access to pond-nix-cache.
