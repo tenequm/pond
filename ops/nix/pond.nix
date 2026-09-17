@@ -2,13 +2,10 @@
 let
   inherit (stdenv) hostPlatform;
   inherit (hostPlatform) system;
-  version = "0.17.3";
+  # The release job rewrites only release.json; this file stays static.
+  release = lib.importJSON ./release.json;
+  inherit (release) version;
   base = "https://github.com/tenequm/pond/releases/download/v${version}";
-  shaMap = {
-    x86_64-linux = "c0f54473e97352e2cd45f3cc893c8f94284d4171686f3debe62e4abb0db87965";
-    aarch64-linux = "7021e2268348abdd44a8909ce160b823c452339ba7a6bb0a12f67daf0d1cc56b";
-    aarch64-darwin = "ba19eb863333eaf70e8b584ce6a20f5dcf5c9f9940513b3bab3c8e1d3041cee3";
-  };
   urlMap = {
     x86_64-linux = "${base}/pond-x86_64-unknown-linux-gnu.tar.xz";
     aarch64-linux = "${base}/pond-aarch64-unknown-linux-gnu.tar.xz";
@@ -21,7 +18,7 @@ stdenv.mkDerivation {
 
   src = fetchurl {
     url = urlMap.${system};
-    sha256 = shaMap.${system};
+    sha256 = release.hashes.${system};
   };
 
   sourceRoot = ".";

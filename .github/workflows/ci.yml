@@ -596,247 +596,71 @@ jobs:
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
     needs: [dist-build, macos-verify, windows-verify, windows-dist]
-    # ARC runner pod: gh and rust both come from the flake devShell (release-plz
-    # runs `cargo publish` here); the cargo registry stays on the /ci-cache PVC.
-    runs-on: pond-ci
+    # GitHub-hosted, no devshell: release-plz only packages and uploads
+    # (publish_no_verify in release-plz.toml, so nothing compiles), and gh, jq
+    # and sha256sum ship on the image. Keeps the release off the ARC pool.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: write   # `gh release upload` to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run
-    # instead of killing it between release-plz tagging and the four publishes.
+    # instead of killing it between release-plz tagging and the publishes.
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
+    # Same rule as flake-check/npm-publish: the workflow-level env hands the
+    # remote-cache secret to every job, and nothing here runs moon.
     env:
       V: ${{ needs.dist-build.outputs.v }}
+      BAZEL_REMOTE_AUTH: ""
     outputs:
-      released: ${{ steps.release-plz.outputs.releases_created }}
+      released: ${{ steps.gate.outputs.released }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
-      - uses: ./.github/actions/devshell
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-all, path: dist }
       # The msvc zip is built natively by windows-dist, not by the moon dist
       # task, so it arrives as its own artifact.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-windows, path: dist }
+      # Before release-plz: crates.io must not ship unless every archive the
+      # tail publishes is here.
+      - run: ls -l dist/pond-{x86_64,aarch64}-unknown-linux-gnu.tar.xz dist/pond-aarch64-apple-darwin.tar.xz dist/pond-x86_64-pc-windows-msvc.zip
 
-      # checksums.txt is produced INSIDE the cached moon dist task, so it
-      # structurally cannot cover an artifact built on another runner.
-      # Regenerate over the merged dist/ before anything reads it - the
-      # `gh release upload` below globs dist/pond-* and would otherwise ship a
-      # checksums file with no line for the Windows zip.
-      - name: Merge the Windows zip into checksums
-        run: |
-          set -euo pipefail
-          test -f dist/pond-x86_64-pc-windows-msvc.zip
-          ( cd dist && sha256sum pond-* > checksums.txt )
-          cat dist/checksums.txt
-
-      # No rustup here any more, so neither the `rustup toolchain install stable`
-      # step nor the RUSTUP_TOOLCHAIN=stable that used to sit on this action
-      # survives: without rustup, plain cargo ignores RUSTUP_TOOLCHAIN and the
-      # install step is a missing command. The action's normal path is
-      # cargo-binstall pulling a PREBUILT release-plz, which needs no Rust at
-      # all. Its degraded path - GitHub's GraphQL API down, so binstall cannot
-      # discover the asset - now source-builds against pond's pinned rustc
-      # instead of stable, and the pin may be too old for release-plz's dep
-      # tree. That is a loud failure on a step `gh run rerun --failed` retries,
-      # not a silent second toolchain; release-prep, which runs on every main
-      # push, keeps its hosted dtolnay/rust-toolchain stable for that fallback.
+      # Same pinned action as release-prep. RUSTUP_TOOLCHAIN outranks
+      # rust-toolchain.toml, so rustup does not install pond's pin just to run
+      # `cargo package`; it also covers release-plz's source-build fallback
+      # (binstall cannot find the prebuilt asset when GitHub GraphQL is down).
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with: { toolchain: stable }
       - uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         id: release-plz
         with: { command: release, config: .github/release-plz.toml }
         env:
+          RUSTUP_TOOLCHAIN: stable
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      # Assemble pond's own release first: it is the single host of the release
-      # binaries - the homebrew formula, the repo flake (ops/nix), and the pond-nix legacy
-      # mirror all fetch from it - so it must be complete before anything else.
-      - name: Mirror binaries to pond release
-        if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
-        run: gh release upload "v$V" dist/pond-* dist/checksums.txt --repo tenequm/pond --clobber
-
-      # One rendered nix derivation feeds both the repo flake (canonical,
-      # github:tenequm/pond - the root flake.nix callPackages this file) and
-      # the pond-nix legacy mirror.
-      - name: Render nix package
-        if: ${{ steps.release-plz.outputs.releases_created }}
+      # A re-run finds the tag already cut, so release-plz reports no release;
+      # the release existing is what lets the tail (and npm/winget) resume.
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CREATED: ${{ steps.release-plz.outputs.releases_created }}
         run: |
           set -euo pipefail
-          sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
-          cat > "$RUNNER_TEMP/pond.nix" <<EOF
-          { lib, fetchurl, stdenv, autoPatchelfHook, installShellFiles, zlib }:
-          let
-            inherit (stdenv) hostPlatform;
-            inherit (hostPlatform) system;
-            version = "$V";
-            base = "https://github.com/tenequm/pond/releases/download/v\${version}";
-            shaMap = {
-              x86_64-linux = "$(sha x86_64-unknown-linux-gnu)";
-              aarch64-linux = "$(sha aarch64-unknown-linux-gnu)";
-              aarch64-darwin = "$(sha aarch64-apple-darwin)";
-            };
-            urlMap = {
-              x86_64-linux = "\${base}/pond-x86_64-unknown-linux-gnu.tar.xz";
-              aarch64-linux = "\${base}/pond-aarch64-unknown-linux-gnu.tar.xz";
-              aarch64-darwin = "\${base}/pond-aarch64-apple-darwin.tar.xz";
-            };
-          in
-          stdenv.mkDerivation {
-            pname = "pond";
-            inherit version;
+          if [ "$CREATED" = true ] || gh release view "v$V" --repo tenequm/pond >/dev/null; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
 
-            src = fetchurl {
-              url = urlMap.\${system};
-              sha256 = shaMap.\${system};
-            };
-
-            sourceRoot = ".";
-
-            # Prebuilt glibc ELF won't run on NixOS until its interpreter and RPATH
-            # are rewritten to Nix-store paths; darwin Mach-O needs no patching.
-            nativeBuildInputs = [ installShellFiles ] ++ lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];
-
-            # The released Linux build is CPU-only candle + vendored onig + rustls,
-            # so the sole dynamic deps beyond glibc are libgcc_s/libstdc++.
-            buildInputs = lib.optionals hostPlatform.isLinux [ stdenv.cc.cc.lib zlib ];
-
-            # Completions ship pre-generated in the tarball: the binary can't
-            # run here (autoPatchelfHook rewrites the interpreter later, in
-            # fixupPhase).
-            installPhase = ''
-              runHook preInstall
-              install -Dm755 pond \$out/bin/pond
-              installShellCompletion --bash completions/pond.bash --zsh completions/_pond --fish completions/pond.fish
-              runHook postInstall
-            '';
-
-            meta = {
-              description = "Lossless storage, full-text search, and optional semantic search for sessions from any AI agent client";
-              homepage = "https://pond.locker/";
-              changelog = "https://github.com/tenequm/pond/releases/tag/v\${version}";
-              license = lib.licenses.asl20;
-              mainProgram = "pond";
-              sourceProvenance = with lib.sourceTypes; [ binaryNativeCode ];
-              platforms = [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ];
-              maintainers = with lib.maintainers; [ ];
-            };
-          }
-          EOF
-
-      # The tag was cut from this checkout's HEAD, so this lands one commit
-      # after it: tag-pinned flake refs carry the previous release's hashes,
-      # main is always current. [skip ci] keeps the push from triggering CI.
-      # The commit is created through GraphQL createCommitOnBranch instead of
-      # git push: GitHub signs API commits itself, so main satisfies the
-      # ruleset's required-signatures rule with no key material on the runner.
-      - name: Point the repo flake at the new binaries
-        if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
-        run: |
-          set -euo pipefail
-          # Re-read the head OID on every try: the checkout is minutes old, and
-          # expectedHeadOid must be main's tip at commit time. Retries only lose
-          # to a push landing inside that seconds-wide window.
-          for i in 1 2 3; do
-            if gh api graphql \
-              -f query='mutation($head: GitObjectID!, $contents: Base64String!, $message: String!) {
-                createCommitOnBranch(input: {
-                  branch: { repositoryNameWithOwner: "tenequm/pond", branchName: "main" }
-                  expectedHeadOid: $head
-                  message: { headline: $message }
-                  fileChanges: { additions: [{ path: "ops/nix/pond.nix", contents: $contents }] }
-                }) { commit { oid } }
-              }' \
-              -f head="$(gh api repos/tenequm/pond/branches/main --jq .commit.sha)" \
-              -f contents="$(base64 < "$RUNNER_TEMP/pond.nix" | tr -d '\n')" \
-              -f message="chore(release): point flake at v$V binaries [skip ci]"; then
-              exit 0
-            fi
-            sleep "$i"
-          done
-          echo "createCommitOnBranch kept losing the head-OID race" >&2
-          exit 1
-
-      - name: Publish Homebrew formula
-        if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
-        run: |
-          set -euo pipefail
-          base="https://github.com/tenequm/pond/releases/download/v$V"
-          sha() { sha256sum "dist/pond-$1.tar.xz" | cut -d' ' -f1; }
-          tap="$RUNNER_TEMP/tap"
-          rm -rf "$tap"
-          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/homebrew-tap" "$tap"
-          cat > "$tap/Formula/pond.rb" <<EOF
-          # typed: false
-          # frozen_string_literal: true
-
-          class Pond < Formula
-            desc "Lossless storage and full-text/semantic search for AI agent sessions"
-            homepage "https://pond.locker/"
-            license "Apache-2.0"
-
-            livecheck do
-              url :stable
-              strategy :github_releases
-              regex(/^v?(\d+(?:\.\d+)+)\$/i)
-            end
-
-            on_macos do
-              # Apple Silicon only: there is no x86_64-apple-darwin build, so
-              # the arch dependency refuses Intel before any download is attempted.
-              depends_on arch: :arm64
-              on_arm do
-                url "$base/pond-aarch64-apple-darwin.tar.xz"
-                sha256 "$(sha aarch64-apple-darwin)"
-              end
-            end
-
-            on_linux do
-              on_intel do
-                url "$base/pond-x86_64-unknown-linux-gnu.tar.xz"
-                sha256 "$(sha x86_64-unknown-linux-gnu)"
-              end
-              on_arm do
-                url "$base/pond-aarch64-unknown-linux-gnu.tar.xz"
-                sha256 "$(sha aarch64-unknown-linux-gnu)"
-              end
-            end
-
-            def install
-              bin.install "pond"
-              generate_completions_from_executable(bin/"pond", "completions")
-            end
-
-            test do
-              assert_match "pond #{version}", shell_output("#{bin}/pond --version")
-              system bin/"pond", "--help"
-              assert_match "_pond", shell_output("#{bin}/pond completions zsh")
-            end
-          end
-          EOF
-          git -C "$tap" add Formula/pond.rb
-          git -C "$tap" diff --quiet --staged || git -C "$tap" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
-          git -C "$tap" push
-      # Legacy mirror for existing github:tenequm/pond-nix users; the canonical
-      # flake now lives in this repo. Both fetch binaries from pond's release,
-      # so pond-nix no longer gets releases of its own.
-      - name: Update pond-nix legacy mirror
-        if: ${{ steps.release-plz.outputs.releases_created }}
-        env: { GH_RELEASE_TOKEN: "${{ secrets.GH_RELEASE_TOKEN }}" }
-        run: |
-          set -euo pipefail
-          nix="$RUNNER_TEMP/pond-nix"
-          rm -rf "$nix"
-          git clone --depth 1 "https://x-access-token:$GH_RELEASE_TOKEN@github.com/tenequm/pond-nix" "$nix"
-          mkdir -p "$nix/pkgs/pond"
-          cp "$RUNNER_TEMP/pond.nix" "$nix/pkgs/pond/default.nix"
-          git -C "$nix" add pkgs/pond/default.nix
-          git -C "$nix" diff --quiet --staged || git -C "$nix" -c user.name=ci -c user.email=ci@pond commit -m "pond $V"
-          git -C "$nix" push
+      # Checksums merge, binary upload, repo flake commit, Homebrew formula.
+      # Idempotent, so "Re-run failed jobs" is safe.
+      - if: steps.gate.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+        run: ops/scripts/publish-release.sh
 
   # The npm plugins (openclaw-pond, pi-pond) ride the same release train,
   # published right after the crate release so a new binary never waits on

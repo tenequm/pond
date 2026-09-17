@@ -1,0 +1,46 @@
+# typed: false
+# frozen_string_literal: true
+
+class Pond < Formula
+  desc "Lossless storage and full-text/semantic search for AI agent sessions"
+  homepage "https://pond.locker/"
+  license "Apache-2.0"
+
+  livecheck do
+    url :stable
+    strategy :github_releases
+    regex(/^v?(\d+(?:\.\d+)+)$/i)
+  end
+
+  on_macos do
+    # Apple Silicon only: there is no x86_64-apple-darwin build, so
+    # the arch dependency refuses Intel before any download is attempted.
+    depends_on arch: :arm64
+    on_arm do
+      url "@BASE@/pond-aarch64-apple-darwin.tar.xz"
+      sha256 "@SHA_aarch64-apple-darwin@"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "@BASE@/pond-x86_64-unknown-linux-gnu.tar.xz"
+      sha256 "@SHA_x86_64-unknown-linux-gnu@"
+    end
+    on_arm do
+      url "@BASE@/pond-aarch64-unknown-linux-gnu.tar.xz"
+      sha256 "@SHA_aarch64-unknown-linux-gnu@"
+    end
+  end
+
+  def install
+    bin.install "pond"
+    generate_completions_from_executable(bin/"pond", "completions")
+  end
+
+  test do
+    assert_match "pond #{version}", shell_output("#{bin}/pond --version")
+    system bin/"pond", "--help"
+    assert_match "_pond", shell_output("#{bin}/pond completions zsh")
+  end
+end
