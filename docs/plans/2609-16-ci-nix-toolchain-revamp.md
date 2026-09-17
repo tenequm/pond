@@ -39,7 +39,9 @@ history; file citations are from the tools' own repos.
   costs one ~100s-class cold build.
 - **From nixpkgs at the exact versions already pinned**: zig 0.16 (plus the
   `synchronization.def` copy as a package patch - moved out of the runner
-  image), cargo-zigbuild 0.23.4, rcodesign 0.29.0, gh.
+  image), cargo-zigbuild 0.23.4, rcodesign 0.29.0. gh was here too and was
+  dropped (PR #276): it is the host's GitHub client, a shell copy shadowed the
+  host's auth wiring, and pond-ci jobs get it from the pond-runner image instead.
 - **Custom fetch packages** (the infra-repo pattern: fetchurl + install):
   macOS SDK 15.5 (sets `SDKROOT` in the shell), moon, protoc, uv, node/npm,
   kache (static musl release tarball).

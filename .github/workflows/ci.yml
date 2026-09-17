@@ -596,8 +596,9 @@ jobs:
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
     needs: [dist-build, macos-verify, windows-verify, windows-dist]
-    # ARC runner pod: gh and rust both come from the flake devShell (release-plz
-    # runs `cargo publish` here); the cargo registry stays on the /ci-cache PVC.
+    # ARC runner pod: rust comes from the flake devShell (release-plz runs
+    # `cargo publish` here) and gh from the pond-runner image - the devShell
+    # deliberately ships no gh. The cargo registry stays on the /ci-cache PVC.
     runs-on: pond-ci
     timeout-minutes: 30
     permissions:
