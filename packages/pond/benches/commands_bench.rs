@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 // `libc::getrusage` is the cross-platform peak-RSS sampler; needs `unsafe`.
 #![allow(unsafe_code)]

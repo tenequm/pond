@@ -3834,6 +3834,7 @@ pub mod index_cache {
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
 
     fn is_index_path(location: &ObjPath) -> bool {
         AsRef::<str>::as_ref(location).contains("_indices/")
@@ -3875,6 +3876,14 @@ pub mod index_cache {
                 local: self.local.clone(),
                 inflight: self.inflight.clone(),
             })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            Some(original)
         }
     }
 
@@ -4107,6 +4116,7 @@ pub mod durability {
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
     use object_store::path::Path as ObjPath;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -4192,6 +4202,14 @@ pub mod durability {
     impl WrappingObjectStore for FsyncOnWrite {
         fn wrap(&self, _store_prefix: &str, inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
             Arc::new(FsyncStore { inner })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            Some(original)
         }
     }
 

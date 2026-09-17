@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod adapter;
 pub mod config;
 pub mod embed;
