@@ -51,9 +51,18 @@ jobs:
     # cargo registry, target/ and proto's tool tree stay on the /ci-cache PVC.
     # Both persist across the ephemeral pods.
     # Fork PRs run hosted instead: those volumes are writable and shared with
-    # the release jobs, so untrusted code must never touch them.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'pond-ci' }}
-    timeout-minutes: 60
+    # the release jobs, so untrusted code must never touch them. Same test as
+    # windows-verify, inverted; a PR whose head repo is gone also lands hosted.
+    # A hosted run is always cold (windows-verify measured 76 min cold), hence
+    # its longer timeout.
+    runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      'ubuntu-latest' || 'pond-ci' }}
+    timeout-minutes: >-
+      ${{ github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      120 || 60 }}
     # A newer push to the same ref supersedes an in-flight build.
     concurrency: { group: "ci-build-${{ github.ref }}", cancel-in-progress: true }
     steps:
@@ -66,15 +75,25 @@ jobs:
       # runs unchanged: a single-user install leaves /nix owned by the runner
       # user (the daemon install's root-owned store fails the action's
       # writable-store check), and /ci-cache is a throwaway directory.
-      - if: github.event.pull_request.head.repo.fork
+      # The image guarantees only ~14 GB free, less than the toolchain closure
+      # plus a cold target/, so the largest unused SDKs go first. /mnt is no
+      # longer guaranteed to exist, so it is not an option.
+      - if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /ci-cache
+          df -h /
+      - if: runner.environment == 'github-hosted'
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           install_options: --no-daemon
+          # Ubuntu 24.04's AppArmor userns restriction breaks an unprivileged
+          # sandbox, and sandbox-fallback does not catch it. pond-ci runs
+          # sandbox-less too.
           extra_nix_config: |
+            sandbox = false
             extra-substituters = https://pond-nix-cache.nbg1.your-objectstorage.com
             extra-trusted-public-keys = pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=
-      - if: github.event.pull_request.head.repo.fork
-        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /ci-cache
       - uses: ./.github/actions/devshell
       # One moon session: independent tasks interleave (cargo serializes the
       # heavy ones on its target-dir lock; format/changelog are instant). The
