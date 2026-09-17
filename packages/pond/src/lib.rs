@@ -1,3 +1,7 @@
+// The embed worker and the ingest handler nest Lance futures 130 query-depth
+// levels deep when rustc computes their layout, past the default limit of 128.
+#![recursion_limit = "256"]
+
 pub mod adapter;
 pub mod config;
 pub mod embed;

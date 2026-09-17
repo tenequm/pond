@@ -1301,8 +1301,8 @@ impl IndexParamsKind {
     /// True for families whose search results are row *addresses*
     /// (`fragment_id << 32 | offset`) emitted straight from the persisted
     /// payload - named after Lance's `ScalarIndex::results_are_row_addresses`.
-    /// Lance 10 has two such families, ZoneMap and BloomFilter; pond ships
-    /// only the ZoneMap. Fragment ids die at compaction, so these indexes go
+    /// Lance 12 has three such families: ZoneMap, BloomFilter and FM-Index; pond
+    /// ships only the ZoneMap. Fragment ids die at compaction, so these indexes go
     /// stale when covered fragments are rewritten; row-id-domain families
     /// survive rewrites via stable row ids.
     fn results_are_row_addresses(&self) -> bool {
@@ -3592,7 +3592,7 @@ async fn optimize_table_indices(
 /// intent name.
 ///
 /// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// skips the remapper entirely (lance-11 `optimize.rs` `needs_remapping`) and
+/// skips the remapper entirely (lance-12 `optimize.rs` `needs_remapping`) and
 /// only rewrites each covered index's `fragment_bitmap` to the new fragment
 /// ids (lance-table `transaction/index_maintenance.rs`
 /// `recalculate_fragment_bitmap`). A rewrite of covered
@@ -3834,6 +3834,7 @@ pub mod index_cache {
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
 
     fn is_index_path(location: &ObjPath) -> bool {
         AsRef::<str>::as_ref(location).contains("_indices/")
@@ -3875,6 +3876,16 @@ pub mod index_cache {
                 local: self.local.clone(),
                 inflight: self.inflight.clone(),
             })
+        }
+
+        /// Keeps listing pushdown because every `list*` call delegates to
+        /// `inner`, so a pushed-down listing reads the same directory either way.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            Some(original)
         }
     }
 
@@ -4107,6 +4118,7 @@ pub mod durability {
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use lance_io::object_store::WrappingObjectStore;
+    use object_store::list::PaginatedListStore;
     use object_store::path::Path as ObjPath;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -4192,6 +4204,18 @@ pub mod durability {
     impl WrappingObjectStore for FsyncOnWrite {
         fn wrap(&self, _store_prefix: &str, inner: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
             Arc::new(FsyncStore { inner })
+        }
+
+        /// Keeps the listing pushdown. This wrapper only fsyncs after a write
+        /// has already been published and hides, rewrites or fails no paths -
+        /// every `list*` call delegates to `inner` - so a listing that goes
+        /// around it reads the same directory either way.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn PaginatedListStore>,
+        ) -> Option<Arc<dyn PaginatedListStore>> {
+            Some(original)
         }
     }
 
@@ -5875,7 +5899,13 @@ mod tests {
         )
         .unwrap();
         let reader = RecordBatchIterator::new([Ok(batch)], schema);
-        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(crate::sessions::write_params_for_create()),
+        )
+        .await
+        .unwrap();
 
         let data_files = || -> std::collections::BTreeSet<PathBuf> {
             std::fs::read_dir(uri_owned.join("data"))

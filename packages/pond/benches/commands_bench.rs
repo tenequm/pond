@@ -1,4 +1,7 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+// `run_sync` instantiates the lib's deep async sync future; its layout
+// computation exceeds rustc's default query-depth limit of 128.
+#![recursion_limit = "256"]
 // `libc::getrusage` is the cross-platform peak-RSS sampler; needs `unsafe`.
 #![allow(unsafe_code)]
 

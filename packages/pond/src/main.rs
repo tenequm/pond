@@ -1,4 +1,4 @@
-// Lance 11 nests `init::run` futures past the default query depth limit.
+// Lance nests `init::run` futures past the default query depth limit.
 #![recursion_limit = "256"]
 use std::{
     collections::HashMap,
