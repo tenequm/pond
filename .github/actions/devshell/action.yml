@@ -31,8 +31,8 @@ runs:
         # first real build with `executing '/nix/store/...-bash': No such file or
         # directory` - because in a chroot store that path is only valid inside
         # the chroot. Say what is actually wrong, before spending the download.
-        if [ ! -d /nix/var/nix ] || [ ! -w /nix/store ]; then
-          echo "::error::/nix is not a writable native store on this runner (need /nix/var/nix present and /nix/store writable by the runner user). Deploy the pond-runner image and the /nix store volume - see docs/plans/2609-16-ci-nix-toolchain-revamp.md phase 5." >&2
+        if [ ! -d /nix/var/nix ] || [ ! -w /nix/store ] || [ ! -w /nix/var/nix/profiles ]; then
+          echo "::error::/nix is not a writable native store on this runner (need /nix/var/nix present, and /nix/store and /nix/var/nix/profiles writable by the runner user). Deploy the pond-runner image and the /nix store volume - see docs/plans/2609-16-ci-nix-toolchain-revamp.md phase 5." >&2
           exit 1
         fi
 
@@ -49,8 +49,9 @@ runs:
 
         # No flock, unlike the bootstrap this replaces: that one hand-rolled
         # curl+mv into shared paths and had to serialize concurrent pods itself.
-        # Nix locks the store and the profile generation on its own, so two pods
-        # racing here converge instead of clobbering.
+        # Two pods racing here converge instead of clobbering: both realize the
+        # same store paths under nix's own store locks, and the profile link is
+        # swapped by an atomic rename (nix takes no profile lock).
         #
         # The substituter is pond's own public-read binary cache: no credential,
         # so fork PRs and dev machines pull the same toolchain closure. Passed as
@@ -95,7 +96,12 @@ runs:
         # the ones that would actively break the runner - HOME above all, which
         # the build env sets to /homeless-shelter. PATH is handled separately
         # because it must PREPEND, not replace.
-        deny='^(HOME|OLDPWD|PATH|PWD|SHELL|SHLVL|TEMP|TEMPDIR|TMP|TMPDIR|TERM|TZ|NIX_BUILD_TOP|NIX_BUILD_CORES|NIX_LOG_FD|NIX_STORE)$'
+        # It must cover every name `nix develop` itself drops (ignoreVars in
+        # src/nix/develop.cc), because --json applies no such filter. The one
+        # that bites is NIX_ENFORCE_PURITY=1: with NIX_STORE and NIX_BUILD_TOP
+        # gone, the cc/ld wrappers die on an unbound variable, so every C
+        # compile and every rustc link fails.
+        deny='^(BASHOPTS|HOME|NIX_BUILD_CORES|NIX_BUILD_TOP|NIX_ENFORCE_PURITY|NIX_LOG_FD|NIX_REMOTE|NIX_STORE|OLDPWD|PATH|PPID|PWD|SHELL|SHELLOPTS|SHLVL|SSL_CERT_FILE|TEMP|TEMPDIR|TERM|TMP|TMPDIR|TZ|UID)$'
         delim="POND_DEVSHELL_$(date +%s%N)"
         "${jq[@]}" -r --arg delim "$delim" --arg deny "$deny" '
           .variables
@@ -106,11 +112,15 @@ runs:
           | "\(.key)<<\($delim)\n\(.value.value)\n\($delim)"
         ' "$json" >> "$GITHUB_ENV"
 
-        # GITHUB_PATH prepends in file order, so the shell's entries win over
-        # the image's while git, the runner's node and docker stay reachable.
+        # The shell's entries win over the image's while git, the runner's node
+        # and docker stay reachable. `tac` because the runner builds PATH from
+        # GITHUB_PATH in REVERSE (the last line lands first; actions/runner
+        # ScriptHandler: PrependPath.Reverse()), and the shell's own order
+        # matters: each cc/bintools wrapper dir precedes the unwrapped gcc/ld
+        # dir, and reversed, CC=gcc would resolve to the unwrapped compiler.
         # -e, not just -r: without it a missing PATH key writes the literal
         # "null" and the job dies ten steps later on `rustc: not found`.
-        "${jq[@]}" -er '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' >> "$GITHUB_PATH"
+        "${jq[@]}" -er '.variables.PATH.value' "$json" | tr ':' '\n' | grep -v '^$' | tac >> "$GITHUB_PATH"
 
         # The cache locations the deleted bootstrap also exported. RUSTUP_HOME
         # is gone with rustup itself; PROTO_HOME stays only because
@@ -144,9 +154,11 @@ runs:
         # component, so the rustfmt/clippy ones count too: `cargo fmt` and
         # `cargo clippy` resolve cargo-fmt/cargo-clippy off PATH like any
         # subcommand, and those proxies now point at a rustup that is gone.
-        for proxy in rustc cargo rustup rustfmt cargo-fmt cargo-clippy clippy-driver; do
+        # cargo-zigbuild too: cargo resolves it from $CARGO_HOME/bin first, and
+        # a stray copy there would link the release.
+        for proxy in rustc cargo rustup rustfmt cargo-fmt cargo-clippy clippy-driver cargo-zigbuild; do
           if [ -e "$CARGO_HOME/bin/$proxy" ]; then
-            echo "::error::$CARGO_HOME/bin/$proxy is a leftover rustup proxy and would shadow the devshell toolchain. Delete /ci-cache/{rustup,bin} and the rustup proxies in /ci-cache/cargo/bin (keep the registry cache) on the runner PVC." >&2
+            echo "::error::$CARGO_HOME/bin/$proxy is left over from the old bootstrap and would shadow the devshell toolchain. Delete /ci-cache/{rustup,bin} and the rustup proxies in /ci-cache/cargo/bin (keep the registry cache) on the runner PVC." >&2
             exit 1
           fi
         done
@@ -157,9 +169,7 @@ runs:
         protoc --version
         kache --version
         zig version
-        # cargo-zigbuild has no --version flag of its own; the flake's `pinned`
-        # assertion is what fixes its version, so presence is all there is to check.
-        command -v cargo-zigbuild
+        cargo-zigbuild --version
         rcodesign --version
         gh --version
         xz --version | head -1

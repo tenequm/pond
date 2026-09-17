@@ -152,7 +152,7 @@ jobs:
       # carrying its own copies. This step keeps that text form honest: the
       # literals, plus rust-toolchain.toml's channel which is not repeated
       # there, must equal what the flake evaluates to. It does NOT cover
-      # windows-bootstrap's own moon/protoc copies; the "keep in lockstep"
+      # windows-bootstrap's own moon/protoc/kache copies; the "lockstep"
       # comments there are still the only guard for those.
       - name: toolVersions text extraction matches the evaluated attrset
         run: |
@@ -665,8 +665,8 @@ jobs:
       # discover the asset - now source-builds against pond's pinned rustc
       # instead of stable, and the pin may be too old for release-plz's dep
       # tree. That is a loud failure on a step `gh run rerun --failed` retries,
-      # not a silent second toolchain; release-prep, which runs on every main
-      # push, keeps its hosted dtolnay/rust-toolchain stable for that fallback.
+      # not a silent second toolchain. release-prep's hosted stable toolchain
+      # serves only its own release-pr step; this job has no such fallback.
       - uses: release-plz/action@8e61445f0b34e7c6d985255f2f1f05a36eb350dc # v0.5.137
         id: release-plz
         with: { command: release, config: .github/release-plz.toml }
