@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.18.1](https://github.com/tenequm/pond/compare/v0.18.0...v0.18.1) - 2026-09-17
+
+### <!-- 3 -->🚀 Performance
+- **ci:** kache 0.22, moon 2.5.5 + moon ci, and an overlapped Windows warm pull ([#264](https://github.com/tenequm/pond/pull/264)) ([1c47a6f](https://github.com/tenequm/pond/commit/1c47a6f39a3b5441a2045a3917abe13b8a7ad35e))
+  CI is both faster and simpler to pin: the Linux test leg now runs only
+  the suites a change actually affects, the Windows build cache warms up
+  alongside the compile instead of blocking it for minutes first, and moon
+  takes node, npm and rust from the environment rather than its own
+  version pins.
+
+### <!-- 6 -->🧹 Chores
+- **nix:** phase 5 - enter the devshell in CI and delete the bootstrap ([#265](https://github.com/tenequm/pond/pull/265)) ([6a74625](https://github.com/tenequm/pond/commit/6a746252d9aab8c72788c6990dfabedeba55c999))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.18.0...v0.18.1
+
 ## [0.18.0](https://github.com/tenequm/pond/compare/v0.17.3...v0.18.0) - 2026-09-17
 
 This release raises the minimum supported Rust version and refreshes the
