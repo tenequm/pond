@@ -1,4 +1,10 @@
-//! `pond schedule`: register `pond sync -q --no-wait` with the OS scheduler.
+//! `pond schedule` and `pond service`: the two OS-scheduler registrations.
+//!
+//! `schedule` registers the periodic `pond sync -q --no-wait`; `service`
+//! registers one resident `pond serve --transport http --with-sync`, whose
+//! whole point is that the prewarm, the rowmap build, and the FTS postings
+//! load once per host instead of once per MCP client process. Both share this
+//! module's OS-service machinery - there is no pond supervisor.
 //!
 //! macOS uses launchd ONLY (cron on macOS runs without the user's GUI
 //! context, trips TCC folder-access denials, and silently drops jobs that
@@ -94,6 +100,89 @@ pub(crate) enum ScheduleCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum ServiceCmd {
+    /// Register the resident `pond serve` (idempotent: safe to re-run).
+    ///
+    /// Re-running with different flags replaces the registration; re-running
+    /// with the same ones is a no-op.
+    #[command(after_long_help = "Examples:
+  pond service start                   http://127.0.0.1:9797/mcp
+  pond service start --port 9800
+  pond service start --sync-every 15")]
+    Start {
+        /// Loopback bind address for the resident server.
+        #[arg(long, default_value = ServeEndpoint::DEFAULT_HOST)]
+        host: String,
+        /// Bind port for the resident server.
+        #[arg(long, default_value_t = ServeEndpoint::DEFAULT_PORT)]
+        port: u16,
+        /// Minutes between the resident server's in-process syncs.
+        #[arg(long, default_value_t = 5)]
+        sync_every: u64,
+    },
+    /// Remove the registration and stop the resident server.
+    ///
+    /// Succeeds (exit 0) when nothing was registered.
+    Stop,
+    /// Show whether the resident server is registered.
+    ///
+    /// Exit 0 when active, 1 when not configured.
+    Status,
+    /// Show recent resident-server output.
+    Logs {
+        /// Number of trailing log lines to print.
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+}
+
+/// Where a resident `pond serve` listens, and therefore the `/mcp` URL an MCP
+/// client registers against.
+///
+/// Loopback by default and deliberately so: the `/mcp` route validates the
+/// `Host` header against rmcp's allowlist (the MCP spec's DNS-rebinding
+/// defence), whose defaults are `localhost`, `127.0.0.1`, and `::1` with no
+/// port pinned - so a loopback registration satisfies it on any port without
+/// `--allowed-host` widening anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServeEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for ServeEndpoint {
+    fn default() -> Self {
+        Self {
+            host: Self::DEFAULT_HOST.to_owned(),
+            port: Self::DEFAULT_PORT,
+        }
+    }
+}
+
+impl ServeEndpoint {
+    pub(crate) const DEFAULT_HOST: &'static str = "127.0.0.1";
+    pub(crate) const DEFAULT_PORT: u16 = 9797;
+
+    pub(crate) fn mcp_url(&self) -> String {
+        format!("http://{}:{}/mcp", self.host, self.port)
+    }
+
+    pub(crate) fn socket(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Whether this endpoint is one rmcp's default `Host` allowlist admits.
+    /// A non-loopback bind needs `pond serve --allowed-host <name>`, which is
+    /// an operator decision and not something a registration may assume.
+    pub(crate) fn is_loopback(&self) -> bool {
+        self.host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or_else(|_| self.host.eq_ignore_ascii_case("localhost"))
+    }
+}
+
 /// One scheduler probe's answer, shared by the `pond status` text line and
 /// the JSON document (which needs the fields structured, not pre-rendered).
 #[derive(Default)]
@@ -165,6 +254,146 @@ fn render_state(state: &State) -> String {
 /// used by both platform modules and the shared `logs()` function.
 pub(crate) fn log_path() -> PathBuf {
     crate::syncstate::pond_state_dir().join("sync.log")
+}
+
+/// Where a launchd/cron-style registration sends the resident server's
+/// stderr. systemd routes to the journal instead (see [`service_logs`]).
+pub(crate) fn service_log_path() -> PathBuf {
+    crate::syncstate::pond_state_dir().join("serve.log")
+}
+
+/// Internal state of the resident-service registration. Separate from
+/// [`State`] because the interesting detail is an endpoint, not a cadence.
+struct ServiceState {
+    backend: &'static str,
+    endpoint: Option<ServeEndpoint>,
+}
+
+fn render_service_state(state: Option<&ServiceState>) -> String {
+    match state {
+        Some(ServiceState { backend, endpoint }) => {
+            let at = endpoint
+                .as_ref()
+                .map(|endpoint| format!(", {}", endpoint.mcp_url()))
+                .unwrap_or_default();
+            format!("{}   active ({backend}{at})", paint("service", dim()))
+        }
+        None => format!(
+            "{}   not configured - run `pond service start` to keep one warm pond serve",
+            paint("service", dim()),
+        ),
+    }
+}
+
+/// Registration entry point shared by `pond service start` and the `pond init`
+/// MCP section (which registers the resident server before pointing a client
+/// at it). `explicit` is the config path the caller resolved, pinned into the
+/// unit for the same reason the sync registration pins it.
+pub(crate) fn service_start(
+    endpoint: &ServeEndpoint,
+    sync_every: u64,
+    explicit: Option<PathBuf>,
+) -> Result<()> {
+    if !endpoint.is_loopback() {
+        anyhow::bail!(
+            "--host {} is not loopback; the resident registration is loopback-only because \
+             the /mcp route's Host allowlist is, and widening it is an operator decision - \
+             run `pond serve --host {} --allowed-host <name>` under your own supervisor instead",
+            endpoint.host,
+            endpoint.host,
+        );
+    }
+    service_platform_start(endpoint, sync_every, &config_file(explicit))
+}
+
+pub(crate) fn run_service(command: ServiceCmd, config: Option<PathBuf>) -> Result<()> {
+    match command {
+        ServiceCmd::Start {
+            host,
+            port,
+            sync_every,
+        } => service_start(&ServeEndpoint { host, port }, sync_every, config),
+        ServiceCmd::Stop => service_platform_stop(),
+        ServiceCmd::Status => {
+            let state = service_platform_probe()?;
+            line(&render_service_state(state.as_ref()))?;
+            if state.is_none() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        ServiceCmd::Logs { lines } => service_logs(lines),
+    }
+}
+
+/// Wait for the freshly registered server to accept a connection. A cold
+/// first start opens the store and builds the rowmap before it binds, which
+/// can take minutes, so a timeout is reported as "still starting" rather than
+/// as a failure - the registration itself already succeeded.
+fn wait_for_endpoint(endpoint: &ServeEndpoint, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    let probe = std::time::Duration::from_millis(250);
+    loop {
+        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&endpoint.socket())
+            && addrs
+                .into_iter()
+                .any(|addr| std::net::TcpStream::connect_timeout(&addr, probe).is_ok())
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(probe);
+    }
+}
+
+/// Announce a completed registration: the state line, then where the logs are
+/// and whether the endpoint is answering yet.
+fn report_service_started(backend: &'static str, endpoint: &ServeEndpoint) -> Result<()> {
+    line(&render_service_state(Some(&ServiceState {
+        backend,
+        endpoint: Some(endpoint.clone()),
+    })))?;
+    if wait_for_endpoint(endpoint, std::time::Duration::from_secs(15)) {
+        line(&format!(
+            "{}   {} answering",
+            paint("endpoint", dim()),
+            endpoint.mcp_url(),
+        ))?;
+    } else {
+        line(&format!(
+            "{}   not answering yet - a cold first start builds the rowmap before it binds; \
+             `pond service logs` follows it",
+            paint("endpoint", dim()),
+        ))?;
+    }
+    Ok(())
+}
+
+/// Print the last `lines` lines of the resident server's output. On
+/// Linux+systemd, delegates to journalctl; everywhere else reads the log file
+/// the registration pointed the process at.
+fn service_logs(lines: usize) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if unix::systemd_service_enabled() {
+        let status = std::process::Command::new("journalctl")
+            .args([
+                "--user",
+                "-u",
+                "pond-serve.service",
+                "-n",
+                &lines.to_string(),
+                "--no-pager",
+            ])
+            .status()
+            .context("failed to run journalctl")?;
+        if !status.success() {
+            anyhow::bail!("journalctl exited {status}");
+        }
+        return Ok(());
+    }
+    tail_log(&service_log_path(), lines)
 }
 
 pub(crate) fn status_snapshot() -> ScheduleSnapshot {
@@ -249,15 +478,20 @@ pub(crate) fn logs(lines: usize) -> Result<()> {
         return Ok(());
     }
 
-    let path = log_path();
+    tail_log(&log_path(), lines)
+}
+
+/// Print the last `lines` lines of a registration's log file, naming the file
+/// first so an empty tail is not mistaken for a missing log.
+fn tail_log(path: &Path, lines: usize) -> Result<()> {
     line_err(&paint(
         &format!(
             "log file: {}",
-            crate::config::display(&crate::config::url_for_path(&path)?)
+            crate::config::display(&crate::config::url_for_path(path)?)
         ),
         dim(),
     ))?;
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             line("(no log yet - the first scheduled run hasn't happened)")?;
@@ -361,6 +595,82 @@ fn platform_stop() -> Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn platform_stop() -> Result<()> {
     anyhow::bail!("pond schedule is not supported on this platform yet")
+}
+
+#[cfg(windows)]
+fn service_platform_probe() -> Result<Option<ServiceState>> {
+    windows::service_probe()
+}
+#[cfg(unix)]
+fn service_platform_probe() -> Result<Option<ServiceState>> {
+    unix::service_probe()
+}
+#[cfg(not(any(unix, windows)))]
+fn service_platform_probe() -> Result<Option<ServiceState>> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn service_platform_start(
+    endpoint: &ServeEndpoint,
+    sync_every: u64,
+    config_file: &Path,
+) -> Result<()> {
+    windows::service_start(endpoint, sync_every, config_file)
+}
+#[cfg(unix)]
+fn service_platform_start(
+    endpoint: &ServeEndpoint,
+    sync_every: u64,
+    config_file: &Path,
+) -> Result<()> {
+    unix::service_start(endpoint, sync_every, config_file)
+}
+#[cfg(not(any(unix, windows)))]
+fn service_platform_start(
+    _endpoint: &ServeEndpoint,
+    _sync_every: u64,
+    _config_file: &Path,
+) -> Result<()> {
+    anyhow::bail!("pond service is not supported on this platform yet")
+}
+
+#[cfg(windows)]
+fn service_platform_stop() -> Result<()> {
+    windows::service_stop()
+}
+#[cfg(unix)]
+fn service_platform_stop() -> Result<()> {
+    unix::service_stop()
+}
+#[cfg(not(any(unix, windows)))]
+fn service_platform_stop() -> Result<()> {
+    anyhow::bail!("pond service is not supported on this platform yet")
+}
+
+/// Recover `--host`/`--port` from a registration body pond wrote, whatever
+/// the surrounding syntax: a plist's `<string>` wrappers, a systemd
+/// `ExecStart=` line, or a quoted Task Scheduler `<Arguments>` value all
+/// reduce to the same token stream. String surgery, not three parsers: the
+/// input is always pond's own template.
+fn parse_endpoint(body: &str) -> Option<ServeEndpoint> {
+    let tokens: Vec<&str> = body
+        .split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '='))
+        // A plist wraps every argument in a `string` element, so the tag
+        // names sit between the flag and its value.
+        .filter(|token| !token.is_empty() && *token != "string" && *token != "/string")
+        .collect();
+    let after = |flag: &str| {
+        tokens
+            .iter()
+            .position(|token| *token == flag)
+            .and_then(|at| tokens.get(at + 1))
+            .copied()
+    };
+    Some(ServeEndpoint {
+        host: after("--host")?.to_owned(),
+        port: after("--port")?.parse().ok()?,
+    })
 }
 
 // ===========================================================================
@@ -476,11 +786,11 @@ mod unix {
 
     // ----- launchd (macOS) -------------------------------------------------
 
-    fn plist_path() -> Result<PathBuf> {
+    fn plist_path(label: &str) -> Result<PathBuf> {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
         Ok(PathBuf::from(home)
             .join("Library/LaunchAgents")
-            .join(format!("{LAUNCHD_LABEL}.plist")))
+            .join(format!("{label}.plist")))
     }
 
     fn plist_body(
@@ -531,9 +841,9 @@ mod unix {
         )
     }
 
-    fn launchd_registered(uid: &str) -> bool {
+    fn launchd_registered(uid: &str, label: &str) -> bool {
         Command::new("launchctl")
-            .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
+            .args(["print", &format!("gui/{uid}/{label}")])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -548,13 +858,13 @@ mod unix {
         state: &Path,
         config_file: &Path,
     ) -> Result<()> {
-        let plist = plist_path()?;
+        let plist = plist_path(LAUNCHD_LABEL)?;
         let body = plist_body(bin, every, log, state, config_file);
         let uid = current_uid()?;
         let unchanged = std::fs::read_to_string(&plist)
             .map(|existing| existing == body)
             .unwrap_or(false);
-        if unchanged && launchd_registered(&uid) {
+        if unchanged && launchd_registered(&uid, LAUNCHD_LABEL) {
             pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
@@ -598,9 +908,9 @@ mod unix {
     }
 
     fn stop_launchd() -> Result<bool> {
-        let plist = plist_path()?;
+        let plist = plist_path(LAUNCHD_LABEL)?;
         let uid = current_uid()?;
-        let was_registered = launchd_registered(&uid);
+        let was_registered = launchd_registered(&uid, LAUNCHD_LABEL);
         let _ = Command::new("launchctl")
             .args(["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
             .stdout(Stdio::null())
@@ -620,10 +930,10 @@ mod unix {
 
     fn probe_launchd() -> Result<State> {
         let uid = current_uid()?;
-        if !launchd_registered(&uid) {
+        if !launchd_registered(&uid, LAUNCHD_LABEL) {
             return Ok(Inactive);
         }
-        let every = std::fs::read_to_string(plist_path()?)
+        let every = std::fs::read_to_string(plist_path(LAUNCHD_LABEL)?)
             .ok()
             .and_then(|body| plist_interval(&body));
         Ok(State::active("launchd", every))
@@ -979,6 +1289,354 @@ mod unix {
         Ok(true)
     }
 
+    // ----- the resident `pond serve` registration --------------------------
+
+    const LAUNCHD_SERVE_LABEL: &str = "sh.pond.serve";
+    const SYSTEMD_SERVE_UNIT: &str = "pond-serve.service";
+
+    /// True when the systemd pond-serve.service is enabled. `pub(super)` so
+    /// the parent module's `service_logs` can delegate to journalctl.
+    pub(super) fn systemd_service_enabled() -> bool {
+        Command::new("systemctl")
+            .args(["--user", "is-enabled", SYSTEMD_SERVE_UNIT])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    pub(super) fn service_probe() -> Result<Option<super::ServiceState>> {
+        match std::env::consts::OS {
+            "macos" => {
+                let uid = current_uid()?;
+                if !launchd_registered(&uid, LAUNCHD_SERVE_LABEL) {
+                    return Ok(None);
+                }
+                Ok(Some(super::ServiceState {
+                    backend: "launchd",
+                    endpoint: std::fs::read_to_string(plist_path(LAUNCHD_SERVE_LABEL)?)
+                        .ok()
+                        .as_deref()
+                        .and_then(super::parse_endpoint),
+                }))
+            }
+            "linux" => {
+                if !systemd_service_enabled() {
+                    return Ok(None);
+                }
+                Ok(Some(super::ServiceState {
+                    backend: "systemd",
+                    endpoint: std::fs::read_to_string(systemd_unit_dir().join(SYSTEMD_SERVE_UNIT))
+                        .ok()
+                        .as_deref()
+                        .and_then(super::parse_endpoint),
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The command line every backend registers. `--with-sync` is the point of
+    /// the resident process: one warm store, one embedder, one S3 client
+    /// shared by the read tools and the periodic sync, instead of a sync child
+    /// cold-loading its own.
+    fn serve_args(endpoint: &super::ServeEndpoint, sync_every: u64) -> Vec<String> {
+        let port = endpoint.port.to_string();
+        // A zero interval would busy-sync the store.
+        let every = sync_every.max(1).to_string();
+        [
+            "serve",
+            "--transport",
+            "http",
+            "--with-sync",
+            "--host",
+            endpoint.host.as_str(),
+            "--port",
+            port.as_str(),
+            "--sync-every",
+            every.as_str(),
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    pub(super) fn service_start(
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        config_file: &Path,
+    ) -> Result<()> {
+        let bin = pond_bin();
+        let log = super::service_log_path();
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        // Same pins as the sync registration, for the same reason: the service
+        // manager sources no shell rc files, and the resident sync must take
+        // the same per-host lock and read the same config as a manual one.
+        let state = crate::syncstate::state_root();
+        super::reject_unembeddable("state dir", &state, super::STATE_DIR_SOURCES)?;
+        super::reject_unembeddable("config file", config_file, super::CONFIG_FILE_SOURCES)?;
+        match std::env::consts::OS {
+            "macos" => start_launchd_serve(&bin, endpoint, sync_every, &log, &state, config_file),
+            "linux" => {
+                if !systemd_user_available() {
+                    bail!(
+                        "no systemd user instance on this host, so there is nothing to keep \
+                         `pond serve` alive (a crontab entry cannot supervise a resident \
+                         process); register MCP over stdio instead \
+                         (`pond init --mcp-transport stdio`), or run \
+                         `pond serve --transport http --with-sync` under your own supervisor"
+                    );
+                }
+                start_systemd_serve(&bin, endpoint, sync_every, &state, config_file)
+            }
+            other => bail!("pond service is not supported on {other} yet"),
+        }
+    }
+
+    pub(super) fn service_stop() -> Result<()> {
+        let removed = match std::env::consts::OS {
+            "macos" => stop_launchd_serve()?,
+            "linux" => stop_systemd_serve()?,
+            other => bail!("pond service is not supported on {other} yet"),
+        };
+        if removed {
+            pond::output::line("service removed")?;
+        } else {
+            pond::output::line("no resident pond serve was registered")?;
+        }
+        Ok(())
+    }
+
+    /// `KeepAlive` is what makes this a supervised process rather than a
+    /// one-shot: launchd restarts the server if it exits, and `RunAtLoad`
+    /// starts it at login.
+    fn serve_plist_body(
+        bin: &Path,
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        log: &Path,
+        state: &Path,
+        config_file: &Path,
+    ) -> String {
+        let args = serve_args(endpoint, sync_every)
+            .iter()
+            .map(|arg| format!("\t\t<string>{arg}</string>\n"))
+            .collect::<String>();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- created and maintained by pond; edits may be replaced -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>{LAUNCHD_SERVE_LABEL}</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{bin}</string>
+{args}	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>XDG_STATE_HOME</key>
+		<string>{state}</string>
+		<key>POND_CONFIG_FILE</key>
+		<string>{config_file}</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>{log}</string>
+	<key>StandardErrorPath</key>
+	<string>{log}</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
+"#,
+            bin = bin.display(),
+            log = log.display(),
+            state = state.display(),
+            config_file = config_file.display(),
+        )
+    }
+
+    fn start_launchd_serve(
+        bin: &Path,
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        log: &Path,
+        state: &Path,
+        config_file: &Path,
+    ) -> Result<()> {
+        let plist = plist_path(LAUNCHD_SERVE_LABEL)?;
+        let body = serve_plist_body(bin, endpoint, sync_every, log, state, config_file);
+        let uid = current_uid()?;
+        let unchanged = std::fs::read_to_string(&plist)
+            .map(|existing| existing == body)
+            .unwrap_or(false);
+        if unchanged && launchd_registered(&uid, LAUNCHD_SERVE_LABEL) {
+            pond::output::line(&format!("already running ({})", endpoint.mcp_url()))?;
+            return Ok(());
+        }
+        if let Some(parent) = plist.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(&plist, &body)
+            .with_context(|| format!("failed to write {}", plist.display()))?;
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{LAUNCHD_SERVE_LABEL}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let output = Command::new("launchctl")
+            .args(["bootstrap", &format!("gui/{uid}")])
+            .arg(&plist)
+            .output()
+            .context("failed to run launchctl bootstrap")?;
+        if !output.status.success() {
+            bail!(
+                "launchctl bootstrap exited {}: {} - remove {} and retry",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim(),
+                plist.display(),
+            );
+        }
+        super::report_service_started("launchd", endpoint)
+    }
+
+    fn stop_launchd_serve() -> Result<bool> {
+        let plist = plist_path(LAUNCHD_SERVE_LABEL)?;
+        let uid = current_uid()?;
+        let was_registered = launchd_registered(&uid, LAUNCHD_SERVE_LABEL);
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("gui/{uid}/{LAUNCHD_SERVE_LABEL}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let had_plist = match std::fs::remove_file(&plist) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove {}", plist.display()));
+            }
+        };
+        Ok(was_registered || had_plist)
+    }
+
+    /// `Restart=always` is the supervision; `WantedBy=default.target` starts it
+    /// at login. A user unit only survives logout on a host with lingering
+    /// enabled (`loginctl enable-linger`), which is the operator's call, not
+    /// a registration's.
+    fn systemd_serve_body(
+        bin: &Path,
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        state: &Path,
+        config_file: &Path,
+    ) -> String {
+        format!(
+            "# created and maintained by pond; edits may be replaced\n\
+             [Unit]\n\
+             Description=pond serve (resident HTTP + MCP endpoint)\n\n\
+             [Service]\n\
+             Type=simple\n\
+             Environment=\"XDG_STATE_HOME={state}\"\n\
+             Environment=\"POND_CONFIG_FILE={config}\"\n\
+             ExecStart={bin} {args}\n\
+             Restart=always\n\
+             RestartSec=5\n\n\
+             [Install]\n\
+             WantedBy=default.target\n",
+            state = state.display(),
+            config = config_file.display(),
+            bin = bin.display(),
+            args = serve_args(endpoint, sync_every).join(" "),
+        )
+    }
+
+    fn start_systemd_serve(
+        bin: &Path,
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        state: &Path,
+        config_file: &Path,
+    ) -> Result<()> {
+        let dir = systemd_unit_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        let unit_path = dir.join(SYSTEMD_SERVE_UNIT);
+        let unit = systemd_serve_body(bin, endpoint, sync_every, state, config_file);
+        let unchanged = std::fs::read_to_string(&unit_path)
+            .map(|existing| existing == unit)
+            .unwrap_or(false);
+        if unchanged && systemd_service_enabled() {
+            pond::output::line(&format!("already running ({})", endpoint.mcp_url()))?;
+            return Ok(());
+        }
+        std::fs::write(&unit_path, unit)
+            .with_context(|| format!("failed to write {}", unit_path.display()))?;
+        for args in [
+            vec!["--user", "daemon-reload"],
+            // `restart` rather than `start`: a unit whose ExecStart just
+            // changed must pick the new command line up, and the enable's
+            // --now would leave an already-running old process in place.
+            vec!["--user", "enable", SYSTEMD_SERVE_UNIT],
+            vec!["--user", "restart", SYSTEMD_SERVE_UNIT],
+        ] {
+            let output = Command::new("systemctl")
+                .args(&args)
+                .output()
+                .context("failed to run systemctl")?;
+            if !output.status.success() {
+                bail!(
+                    "systemctl {} exited {}: {}",
+                    args.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                );
+            }
+        }
+        super::report_service_started("systemd", endpoint)?;
+        pond::output::line(&format!(
+            "{}      journalctl --user -u {SYSTEMD_SERVE_UNIT}  (pond service logs)",
+            pond::output::paint("logs", pond::output::dim()),
+        ))?;
+        Ok(())
+    }
+
+    fn stop_systemd_serve() -> Result<bool> {
+        let was_enabled = systemd_service_enabled();
+        if was_enabled {
+            let _ = Command::new("systemctl")
+                .args(["--user", "disable", "--now", SYSTEMD_SERVE_UNIT])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let unit_path = systemd_unit_dir().join(SYSTEMD_SERVE_UNIT);
+        let removed = match std::fs::remove_file(&unit_path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to remove {}", unit_path.display()));
+            }
+        };
+        if removed {
+            let _ = Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        Ok(was_enabled || removed)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1039,6 +1697,58 @@ mod unix {
             // The pinned env has to precede the binary, or cron runs the sync
             // without it.
             assert!(entry.find("POND_CONFIG_FILE=") < entry.find(BIN), "{entry}");
+        }
+
+        /// The resident registration's whole value is one warm process that
+        /// also syncs, reading the same config and state dir as a manual run.
+        #[test]
+        fn the_resident_templates_supervise_a_with_sync_serve() {
+            let (bin, state, config_file) = (Path::new(BIN), Path::new(STATE), Path::new(CONFIG));
+            let endpoint = super::super::ServeEndpoint::default();
+            let unit = systemd_serve_body(bin, &endpoint, 15, state, config_file);
+            assert!(
+                unit.contains(&format!(
+                    "ExecStart={BIN} serve --transport http --with-sync \
+                     --host 127.0.0.1 --port 9797 --sync-every 15\n"
+                )),
+                "{unit}"
+            );
+            assert!(unit.contains("Restart=always\n"), "{unit}");
+            assert!(
+                unit.contains(&format!("POND_CONFIG_FILE={CONFIG}")),
+                "{unit}"
+            );
+            assert!(unit.contains(&format!("XDG_STATE_HOME={STATE}")), "{unit}");
+
+            let plist = serve_plist_body(
+                bin,
+                &endpoint,
+                15,
+                Path::new("/tmp/serve.log"),
+                state,
+                config_file,
+            );
+            assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"), "{plist}");
+            assert!(plist.contains("<string>--with-sync</string>"), "{plist}");
+            assert!(
+                plist.contains(&format!(
+                    "<key>POND_CONFIG_FILE</key>\n\t\t<string>{CONFIG}</string>"
+                )),
+                "{plist}"
+            );
+            // Both round-trip through the probe that `pond service status`
+            // and init's repair pass read the live endpoint with.
+            for body in [&unit, &plist] {
+                assert_eq!(
+                    super::super::parse_endpoint(body).as_ref(),
+                    Some(&endpoint),
+                    "{body}"
+                );
+            }
+
+            // A zero interval would busy-sync; the template floors it at one.
+            let floored = systemd_serve_body(bin, &endpoint, 0, state, config_file);
+            assert!(floored.contains("--sync-every 1\n"), "{floored}");
         }
     }
 }
@@ -1285,6 +1995,240 @@ mod windows {
                 bail!(
                     "schtasks /Delete failed: {}\n\
                      the task is {ELEVATED_OWNERSHIP_HINT}",
+                    decode_console(&output.stderr).trim()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ----- the resident `pond serve` registration --------------------------
+
+    const SERVE_TASK_NAME: &str = "pond-serve";
+
+    fn serve_query_xml() -> Result<Option<String>> {
+        let output = Command::new("schtasks")
+            .args(["/Query", "/TN", SERVE_TASK_NAME, "/XML", "ONE"])
+            .output()
+            .context("failed to run schtasks /Query")?;
+        Ok(output
+            .status
+            .success()
+            .then(|| decode_console(&output.stdout)))
+    }
+
+    pub(super) fn service_probe() -> Result<Option<super::ServiceState>> {
+        let Some(xml) = serve_query_xml()? else {
+            return Ok(None);
+        };
+        Ok(Some(super::ServiceState {
+            backend: "task-scheduler",
+            endpoint: super::parse_endpoint(&xml),
+        }))
+    }
+
+    /// The `<Arguments>` line for the resident server: pondw's own `--log`,
+    /// then the pond command line it supervises.
+    fn serve_task_arguments(
+        log: &std::path::Path,
+        bin: &std::path::Path,
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        state_root: &std::path::Path,
+        config_file: &std::path::Path,
+    ) -> String {
+        format!(
+            "--log {log} -- {bin} serve --transport http --with-sync \
+             --host {host} --port {port} --sync-every {sync_every} \
+             --state-dir {state} --config-file {config}",
+            log = quote_arg(log),
+            bin = quote_arg(bin),
+            host = endpoint.host,
+            port = endpoint.port,
+            sync_every = sync_every.max(1),
+            state = quote_arg(state_root),
+            config = quote_arg(config_file),
+        )
+    }
+
+    /// Task XML for the resident server. Windows has no user-scoped service
+    /// manager a non-elevated install can write to, so a logon-triggered task
+    /// with `RestartOnFailure` and no execution time limit is the launchd
+    /// `KeepAlive` / systemd `Restart=always` equivalent.
+    fn serve_task_xml(launcher: &std::path::Path, arguments: &str) -> String {
+        let launcher_str = xml_escape(&launcher.display().to_string());
+        let arguments = xml_escape(arguments);
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+             <Task version=\"1.2\" \
+             xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+             \x20\x20<RegistrationInfo>\n\
+             \x20\x20  <Description>pond serve (managed by pond; do not edit)</Description>\n\
+             \x20\x20</RegistrationInfo>\n\
+             \x20\x20<Triggers>\n\
+             \x20\x20  <LogonTrigger>\n\
+             \x20\x20    <Enabled>true</Enabled>\n\
+             \x20\x20  </LogonTrigger>\n\
+             \x20\x20</Triggers>\n\
+             \x20\x20<Settings>\n\
+             \x20\x20  <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+             \x20\x20  <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+             \x20\x20  <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+             \x20\x20  <StartWhenAvailable>true</StartWhenAvailable>\n\
+             \x20\x20  <Hidden>true</Hidden>\n\
+             \x20\x20  <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+             \x20\x20  <RestartOnFailure>\n\
+             \x20\x20    <Interval>PT1M</Interval>\n\
+             \x20\x20    <Count>99</Count>\n\
+             \x20\x20  </RestartOnFailure>\n\
+             \x20\x20  <Priority>7</Priority>\n\
+             \x20\x20</Settings>\n\
+             \x20\x20<Actions Context=\"Author\">\n\
+             \x20\x20  <Exec>\n\
+             \x20\x20    <Command>{launcher_str}</Command>\n\
+             \x20\x20    <Arguments>{arguments}</Arguments>\n\
+             \x20\x20  </Exec>\n\
+             \x20\x20</Actions>\n\
+             </Task>\n"
+        )
+    }
+
+    pub(super) fn service_start(
+        endpoint: &super::ServeEndpoint,
+        sync_every: u64,
+        config_file: &std::path::Path,
+    ) -> Result<()> {
+        let bin = pond_bin();
+        if !bin.is_file() {
+            bail!(
+                "could not resolve the pond binary to register ({}); run \
+                 `pond service start` from an installed pond",
+                bin.display()
+            );
+        }
+        let launcher = pondw_bin(&bin)?;
+        let log = super::service_log_path();
+        let state_root = crate::syncstate::state_root();
+        let pond_state = crate::syncstate::pond_state_dir();
+        std::fs::create_dir_all(&pond_state)
+            .with_context(|| format!("failed to create {}", pond_state.display()))?;
+
+        for (what, path, sources) in [
+            (
+                "launcher",
+                launcher.as_path(),
+                "the installed pond binary's directory",
+            ),
+            ("pond binary", bin.as_path(), "the installed pond location"),
+            (
+                "serve log",
+                log.as_path(),
+                "the state dir (--state-dir or XDG_STATE_HOME)",
+            ),
+            (
+                "state dir",
+                state_root.as_path(),
+                "--state-dir or XDG_STATE_HOME",
+            ),
+            ("config file", config_file, super::CONFIG_FILE_SOURCES),
+        ] {
+            super::reject_unembeddable(what, path, sources)?;
+        }
+
+        let arguments =
+            serve_task_arguments(&log, &bin, endpoint, sync_every, &state_root, config_file);
+        let launcher_str = launcher.display().to_string();
+        if let Some(xml) = serve_query_xml()?
+            && between(&xml, "<Command>", "</Command>")
+                .map(xml_unescape)
+                .as_deref()
+                == Some(launcher_str.as_str())
+            && between(&xml, "<Arguments>", "</Arguments>")
+                .map(xml_unescape)
+                .as_deref()
+                == Some(arguments.as_str())
+        {
+            pond::output::line(&format!("already running ({})", endpoint.mcp_url()))?;
+            return Ok(());
+        }
+        if shell_is_elevated() {
+            pond::output::line(
+                "note: this shell is elevated - the task will be owned by Administrators, \
+                 and `pond service start`/`stop` from a normal shell will fail with \
+                 Access denied; re-run from a non-elevated shell unless that is intended",
+            )?;
+        }
+
+        let xml = serve_task_xml(&launcher, &arguments);
+        let tmp_xml = pond_state.join("pond-serve-task.xml.tmp");
+        std::fs::write(&tmp_xml, utf16le_bom(&xml))
+            .with_context(|| format!("failed to write {}", tmp_xml.display()))?;
+        let create_result = Command::new("schtasks")
+            .args(["/Create", "/TN", SERVE_TASK_NAME, "/XML"])
+            .arg(&tmp_xml)
+            .arg("/F")
+            .output()
+            .context("failed to run schtasks /Create");
+        let _ = std::fs::remove_file(&tmp_xml);
+
+        let output = create_result?;
+        if !output.status.success() {
+            let stderr = decode_console(&output.stderr);
+            let stderr = stderr.trim();
+            if matches!(serve_query_xml(), Ok(Some(_))) {
+                bail!(
+                    "schtasks /Create failed: {stderr}\n\
+                     the existing '{SERVE_TASK_NAME}' task could not be replaced - it was \
+                     likely registered from an elevated shell and is owned by Administrators; \
+                     remove it with `schtasks /Delete /TN {SERVE_TASK_NAME} /F` from an \
+                     elevated shell, then re-run `pond service start` unelevated"
+                );
+            }
+            bail!("schtasks /Create failed: {stderr}");
+        }
+        // A logon trigger alone would leave the endpoint dead until the next
+        // sign-in, so the registration also starts it now. /Run's own failure
+        // is not the registration's: report it and let the probe speak.
+        let run = Command::new("schtasks")
+            .args(["/Run", "/TN", SERVE_TASK_NAME])
+            .output()
+            .context("failed to run schtasks /Run")?;
+        if !run.status.success() {
+            pond::output::line(&format!(
+                "note: schtasks /Run failed ({}); the task starts at the next sign-in",
+                decode_console(&run.stderr).trim(),
+            ))?;
+        }
+        super::report_service_started("task-scheduler", endpoint)?;
+        pond::output::line(&format!(
+            "{}      {}  (pond service logs)",
+            pond::output::paint("logs", pond::output::dim()),
+            crate::config::display(&crate::config::url_for_path(&log)?),
+        ))?;
+        Ok(())
+    }
+
+    pub(super) fn service_stop() -> Result<()> {
+        // /End stops the running instance; it fails benignly on an idle task,
+        // which says nothing about whether the registration exists.
+        let _ = Command::new("schtasks")
+            .args(["/End", "/TN", SERVE_TASK_NAME])
+            .output();
+        let output = Command::new("schtasks")
+            .args(["/Delete", "/TN", SERVE_TASK_NAME, "/F"])
+            .output()
+            .context("failed to run schtasks /Delete")?;
+        if output.status.success() {
+            pond::output::line("service removed")?;
+            return Ok(());
+        }
+        match service_probe()? {
+            None => pond::output::line("no resident pond serve was registered")?,
+            Some(_) => {
+                bail!(
+                    "schtasks /Delete failed: {}\n\
+                     the '{SERVE_TASK_NAME}' task is likely owned by Administrators; remove it \
+                     with `schtasks /Delete /TN {SERVE_TASK_NAME} /F` from an elevated shell",
                     decode_console(&output.stderr).trim()
                 );
             }
@@ -1554,6 +2498,58 @@ mod windows {
             }
         }
 
+        /// The resident task is supervised and unbounded, unlike the sync
+        /// task: a logon trigger instead of a repetition, `RestartOnFailure`
+        /// as launchd's `KeepAlive` equivalent, and no execution time limit
+        /// (`PT1H` would kill the server every hour).
+        #[test]
+        fn the_resident_task_supervises_an_unbounded_serve() {
+            let launcher = std::path::PathBuf::from("C:\\Program Files\\pond\\pondw.exe");
+            let endpoint = super::super::ServeEndpoint::default();
+            let arguments = serve_task_arguments(
+                std::path::Path::new("C:\\Users\\Adam\\AppData\\Local\\pond\\state\\serve.log"),
+                std::path::Path::new("C:\\Program Files\\pond\\pond.exe"),
+                &endpoint,
+                5,
+                std::path::Path::new("C:\\Users\\Adam\\AppData\\Local\\pond\\state"),
+                std::path::Path::new("C:\\Users\\Adam\\AppData\\Roaming\\pond\\config.toml"),
+            );
+            assert!(
+                arguments.contains("serve --transport http --with-sync"),
+                "{arguments}"
+            );
+            assert!(
+                arguments.contains("--host 127.0.0.1 --port 9797"),
+                "{arguments}"
+            );
+            // An Exec action has no environment block, so both pins ride as
+            // arguments - the same invariant the sync task carries.
+            assert!(
+                arguments.contains("--state-dir \"C:\\Users\\Adam\\AppData\\Local\\pond\\state\""),
+                "{arguments}"
+            );
+            assert!(arguments.contains("--config-file \"C:\\"), "{arguments}");
+            assert_eq!(
+                super::super::parse_endpoint(&arguments).as_ref(),
+                Some(&endpoint),
+            );
+
+            let xml = serve_task_xml(&launcher, &arguments);
+            assert!(xml.contains("<Command>C:\\Program Files\\pond\\pondw.exe</Command>"));
+            assert!(xml.contains("<LogonTrigger>"), "{xml}");
+            assert!(
+                xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+                "{xml}"
+            );
+            assert!(xml.contains("<RestartOnFailure>"), "{xml}");
+            assert!(!xml.contains("<Repetition>"), "{xml}");
+            // The no-op comparison reads the decoded element text back.
+            assert_eq!(
+                between(&xml, "<Arguments>", "</Arguments>").map(xml_unescape),
+                Some(arguments),
+            );
+        }
+
         #[test]
         fn launcher_problem_flags_only_a_missing_command() {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1727,6 +2723,88 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// The registration is loopback-only, which is exactly what rmcp's
+    /// default `Host` allowlist admits - so the local MCP registration needs
+    /// no `--allowed-host` and the DNS-rebinding defence stays intact.
+    #[test]
+    fn the_default_endpoint_is_loopback() {
+        let default = ServeEndpoint::default();
+        assert!(default.is_loopback());
+        assert_eq!(default.mcp_url(), "http://127.0.0.1:9797/mcp");
+        assert!(
+            ServeEndpoint {
+                host: "localhost".to_owned(),
+                port: 1,
+            }
+            .is_loopback()
+        );
+        assert!(
+            ServeEndpoint {
+                host: "::1".to_owned(),
+                port: 1,
+            }
+            .is_loopback()
+        );
+        assert!(
+            !ServeEndpoint {
+                host: "0.0.0.0".to_owned(),
+                port: 1,
+            }
+            .is_loopback()
+        );
+        assert!(
+            !ServeEndpoint {
+                host: "pond.example.com".to_owned(),
+                port: 1,
+            }
+            .is_loopback()
+        );
+    }
+
+    /// `pond service status` recovers the endpoint from whatever the backend
+    /// stored, so every template's argument shape has to parse back.
+    #[test]
+    fn endpoints_round_trip_out_of_every_registration_shape() {
+        let want = ServeEndpoint {
+            host: "127.0.0.1".to_owned(),
+            port: 9800,
+        };
+        let plist = "\t\t<string>--host</string>\n\t\t<string>127.0.0.1</string>\n\
+                     \t\t<string>--port</string>\n\t\t<string>9800</string>\n";
+        assert_eq!(parse_endpoint(plist).as_ref(), Some(&want));
+        let unit = "ExecStart=/usr/local/bin/pond serve --transport http --with-sync \
+                    --host 127.0.0.1 --port 9800 --sync-every 5\n";
+        assert_eq!(parse_endpoint(unit).as_ref(), Some(&want));
+        let task = "<Arguments>--log \"C:\\s\\serve.log\" -- \"C:\\bin\\pond.exe\" serve \
+                    --transport http --with-sync --host 127.0.0.1 --port 9800 \
+                    --sync-every 5</Arguments>";
+        assert_eq!(parse_endpoint(task).as_ref(), Some(&want));
+        // A registration written by some other pond, or a hand-edited one
+        // missing a flag, reports "no endpoint" rather than a guess.
+        assert_eq!(parse_endpoint("ExecStart=/usr/local/bin/pond serve"), None);
+        assert_eq!(parse_endpoint("--host 127.0.0.1 --port not-a-port"), None);
+    }
+
+    /// A non-loopback `--host` cannot be registered: the /mcp route would
+    /// answer 403 for that name until `--allowed-host` listed it, and a
+    /// registration may not make that call for the operator.
+    #[test]
+    fn service_start_refuses_a_non_loopback_bind() {
+        let error = service_start(
+            &ServeEndpoint {
+                host: "0.0.0.0".to_owned(),
+                port: 9797,
+            },
+            5,
+            Some(PathBuf::from("/tmp/pond-config.toml")),
+        )
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(error.contains("not loopback"), "{error}");
+        assert!(error.contains("--allowed-host"), "{error}");
     }
 
     /// The pinned path is re-read from the scheduler's working directory, so

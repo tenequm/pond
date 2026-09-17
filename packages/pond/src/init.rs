@@ -20,7 +20,20 @@ use pond::config::{self, Config, CredsSet};
 use pond::substrate::StorageUrl;
 use toml_edit::{DocumentMut, Item, Table, Value, value};
 
-use crate::schedule::{self, ScheduleEvery};
+use crate::schedule::{self, ScheduleEvery, ServeEndpoint};
+
+/// How an MCP client is pointed at pond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum McpTransport {
+    /// Streamable HTTP against a resident `pond serve --with-sync`.
+    Http,
+    /// A `pond mcp` child per client process.
+    Stdio,
+}
+
+/// Minutes between the resident server's in-process syncs, when init is the
+/// one registering it. Matches `pond schedule`'s recommended cadence.
+const SERVICE_SYNC_EVERY: u64 = 5;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct InitArgs {
@@ -33,6 +46,15 @@ pub(crate) struct InitArgs {
     /// Skip MCP registration and the skill install.
     #[arg(long)]
     skip_mcp: bool,
+    /// How MCP clients reach pond: `http` (one resident `pond serve`, warm)
+    /// or `stdio` (a `pond mcp` process per client, cold on every start).
+    ///
+    /// `http` also registers that resident server with the OS service manager
+    /// (`pond service`). Interactively the choice is a prompt, defaulting to
+    /// `http`; non-interactively this flag is the only way to change an
+    /// existing host's topology.
+    #[arg(long = "mcp-transport", value_enum, value_name = "TRANSPORT")]
+    mcp_transport: Option<McpTransport>,
     /// Accept defaults for everything not covered by a flag (non-interactive).
     #[arg(long, short = 'y')]
     yes: bool,
@@ -109,6 +131,7 @@ pub(crate) async fn run(
     let any_flag = storage_path.is_some()
         || args.adapters.is_some()
         || args.schedule.is_some()
+        || args.mcp_transport.is_some()
         || args.skip_mcp;
     if !interactive && !args.yes && !any_flag {
         bail!(
@@ -373,7 +396,7 @@ pub(crate) async fn run(
     // exits above, so a cancelled wizard never mutates another tool's config
     // or the scheduler.
     if !args.skip_mcp {
-        mcp_section(prompts, args.yes)?;
+        mcp_section(prompts, args.yes, args.mcp_transport, &config_file)?;
     }
 
     // ---- first sync, then the schedule --------------------------------------
@@ -915,8 +938,9 @@ fn pick_adapters(args: &InitArgs, rows: &[AdapterRow], prompts: bool) -> Result<
 /// and goes through the interpreter instead. `raw_arg` because MSVCRT argument
 /// quoting is not what cmd.exe parses (the trap `substrate::run_command`
 /// documents); the outer quote pair survives cmd's strip-first-and-last rule
-/// whether or not the path has spaces. `args` reach cmd unquoted, which both
-/// call sites satisfy by passing fixed literals.
+/// whether or not the path has spaces. `args` reach cmd unquoted, which every
+/// call site satisfies: all are fixed literals except the loopback `/mcp`
+/// URL, which has no spaces and no cmd metacharacters.
 fn agent_command(bin: &Path, args: &[&str]) -> Command {
     #[cfg(windows)]
     if bin
@@ -935,75 +959,329 @@ fn agent_command(bin: &Path, args: &[&str]) -> Command {
     command
 }
 
+/// What `claude mcp get pond` reports about the current registration.
+#[derive(Debug, PartialEq, Eq)]
+enum Registration {
+    Absent,
+    Stdio,
+    Http(String),
+}
+
+/// The registration shape init should leave behind. Distinct from
+/// [`Registration`] so "what is there" and "what we want" cannot be confused,
+/// and so every desired state is a real one (there is no desired `Absent`).
+#[derive(Debug, PartialEq, Eq)]
+enum Target {
+    Stdio,
+    Http(String),
+}
+
+/// What it takes to make the registration match the target.
+#[derive(Debug, PartialEq, Eq)]
+enum McpPlan {
+    Keep,
+    Add,
+    /// Registered, but as something else: the payload describes what is being
+    /// switched away from, so the wizard can say so.
+    Switch(String),
+}
+
+impl Registration {
+    fn describe(&self) -> String {
+        match self {
+            Self::Absent => "not registered".to_owned(),
+            Self::Stdio => "one-shot stdio (`pond mcp`)".to_owned(),
+            Self::Http(url) => format!("HTTP at {url}"),
+        }
+    }
+}
+
+impl Target {
+    fn describe(&self) -> String {
+        match self {
+            Self::Stdio => "one-shot stdio (`pond mcp`)".to_owned(),
+            Self::Http(url) => format!("HTTP at {url}"),
+        }
+    }
+
+    /// The `claude mcp add` argv. Every element is a fixed literal except the
+    /// loopback `/mcp` URL, which carries no shell or cmd metacharacters (see
+    /// [`agent_command`] on Windows argument handling).
+    fn claude_add_args(&self) -> Vec<&str> {
+        match self {
+            Self::Stdio => vec!["mcp", "add", "-s", "user", "pond", "--", "pond", "mcp"],
+            Self::Http(url) => {
+                vec![
+                    "mcp",
+                    "add",
+                    "-s",
+                    "user",
+                    "--transport",
+                    "http",
+                    "pond",
+                    url.as_str(),
+                ]
+            }
+        }
+    }
+
+    /// The command a user runs by hand - codex's registration is never driven
+    /// for them, and a failed `claude mcp add` prints this as the fallback.
+    fn claude_add_command(&self) -> String {
+        format!("claude {}", self.claude_add_args().join(" "))
+    }
+
+    fn codex_add_command(&self) -> String {
+        match self {
+            Self::Stdio => "codex mcp add pond -- pond mcp".to_owned(),
+            Self::Http(url) => format!("codex mcp add pond --url {url}"),
+        }
+    }
+}
+
+/// Read the current registration out of `claude mcp get pond` output. Line
+/// scanning, not a parser: the fields are `Type:` and, for the HTTP and SSE
+/// transports, `URL:`. An unrecognized transport counts as registered-as-
+/// something-else (an `Http` with an empty URL never matches a target), so a
+/// re-run switches it rather than silently leaving it.
+fn parse_claude_registration(stdout: &str) -> Registration {
+    let field = |name: &str| {
+        stdout.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(name)
+                .map(|value| value.trim().to_owned())
+        })
+    };
+    match field("Type:").as_deref() {
+        None => Registration::Absent,
+        Some("stdio") => Registration::Stdio,
+        Some(_) => Registration::Http(field("URL:").unwrap_or_default()),
+    }
+}
+
+fn claude_registration(claude: &Path) -> Registration {
+    match agent_command(claude, &["mcp", "get", "pond"])
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            parse_claude_registration(&String::from_utf8_lossy(&output.stdout))
+        }
+        _ => Registration::Absent,
+    }
+}
+
+fn mcp_plan(existing: &Registration, want: &Target) -> McpPlan {
+    match (existing, want) {
+        (Registration::Absent, _) => McpPlan::Add,
+        (Registration::Stdio, Target::Stdio) => McpPlan::Keep,
+        (Registration::Http(have), Target::Http(url)) if have == url => McpPlan::Keep,
+        (other, _) => McpPlan::Switch(other.describe()),
+    }
+}
+
+/// Resolve the topology: `--mcp-transport` > interactive prompt > whatever
+/// this host already has. A fresh non-interactive host defaults to stdio
+/// because a `--yes` run may be sandboxed (the e2e suite drives one) and an
+/// OS service registration would outlive the sandbox.
+fn pick_mcp_transport(
+    requested: Option<McpTransport>,
+    existing: &Registration,
+    prompts: bool,
+) -> Result<McpTransport> {
+    if let Some(requested) = requested {
+        return Ok(requested);
+    }
+    if prompts {
+        // cliclack renders hints only on the focused item, so the
+        // recommendation rides in the label to stay visible.
+        return wiz(cliclack::select("How should agent clients reach pond?")
+            .item(
+                McpTransport::Http,
+                "one resident pond serve over HTTP (recommended - stays warm between sessions)",
+                "",
+            )
+            .item(
+                McpTransport::Stdio,
+                "a pond mcp process per client (no background service; slow first query)",
+                "",
+            )
+            .initial_value(McpTransport::Http)
+            .interact());
+    }
+    Ok(match existing {
+        Registration::Http(_) => McpTransport::Http,
+        _ => McpTransport::Stdio,
+    })
+}
+
 /// Detect agent CLIs and offer MCP registration plus the bundled skill.
 /// claude has an idempotent CLI surface (`mcp get` / `mcp add`), so pond
 /// drives it directly; codex gets the exact command to run instead - pond
 /// never edits another tool's config files behind the user's back.
-fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
+///
+/// The HTTP topology is two registrations, in this order: the resident
+/// `pond serve` with the OS service manager, then the client against its
+/// loopback `/mcp` URL. Order matters - a client pointed at an endpoint
+/// nothing will answer is worse than a slow stdio one, so a service
+/// registration that fails downgrades this run to stdio and says so.
+fn mcp_section(
+    prompts: bool,
+    auto: bool,
+    requested: Option<McpTransport>,
+    config_file: &Path,
+) -> Result<()> {
     let claude = crate::find_on_path("claude");
     let codex = crate::find_on_path("codex");
+    let endpoint = ServeEndpoint::default();
     if claude.is_none() && codex.is_none() {
-        cliclack::log::info(
-            "mcp: no agent CLI detected - register later with `claude mcp add -s user pond -- pond mcp`",
-        )?;
+        cliclack::log::info(format!(
+            "mcp: no agent CLI detected - register later with `pond service start` plus \
+             `{}`, or stdio-only with `{}`",
+            Target::Http(endpoint.mcp_url()).claude_add_command(),
+            Target::Stdio.claude_add_command(),
+        ))?;
         return Ok(());
     }
+    let existing = claude
+        .as_deref()
+        .map_or(Registration::Absent, claude_registration);
+    let chosen = pick_mcp_transport(requested, &existing, prompts)?;
+    let mut target = match chosen {
+        McpTransport::Http => Target::Http(endpoint.mcp_url()),
+        McpTransport::Stdio => Target::Stdio,
+    };
+
+    // One consent covers the client registration and the skill; a fresh
+    // install that says yes here is not asked again for the skill write.
+    // Nothing is asked when claude is absent: a codex-only host gets the
+    // command to run, and the topology answer above is all the consent the
+    // resident server needs.
+    let mut skill_consented = false;
+    let consented = claude.is_some()
+        && match mcp_plan(&existing, &target) {
+            McpPlan::Keep => false,
+            McpPlan::Add => {
+                let add = if prompts {
+                    wiz(cliclack::confirm(format!(
+                        "Register pond in Claude Code ({} + the pond skill)?",
+                        target.describe(),
+                    ))
+                    .initial_value(true)
+                    .interact())?
+                } else {
+                    auto || requested.is_some()
+                };
+                skill_consented = add;
+                add
+            }
+            McpPlan::Switch(from) => {
+                if prompts {
+                    wiz(cliclack::confirm(format!(
+                        "Claude Code currently reaches pond over {from} - switch it to {}?",
+                        target.describe(),
+                    ))
+                    .initial_value(true)
+                    .interact())?
+                } else {
+                    // Only an explicit request switches a working registration:
+                    // a bare `--yes` re-init must leave the topology alone.
+                    requested.is_some()
+                }
+            }
+        };
+
+    // Register (or repair) the resident server. The repair leg is why an
+    // already-correct http registration still comes through here: it rewrites
+    // the unit with the current pond's command line, the way re-running init
+    // heals a stale sync unit after an upgrade. Interactive or explicitly
+    // requested only, for the same sandbox reason the schedule section has.
+    if matches!(chosen, McpTransport::Http)
+        && (consented || prompts || requested.is_some())
+        && let Err(error) =
+            schedule::service_start(&endpoint, SERVICE_SYNC_EVERY, Some(config_file.to_owned()))
+    {
+        cliclack::log::warning(format!(
+            "mcp: could not keep a resident pond serve running ({error:#})"
+        ))?;
+        // Downgrade only a registration this run was about to write.
+        if consented {
+            cliclack::log::info(
+                "mcp: falling back to one-shot stdio - `pond service start` retries the \
+                 resident server, then re-run `pond init --mcp-transport http`",
+            )?;
+            target = Target::Stdio;
+        }
+    }
+
+    let mut registration_changed = false;
     if let Some(claude) = &claude {
-        let registered = agent_command(claude, &["mcp", "get", "pond"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        // One consent covers registration and the skill; a fresh install
-        // that says yes here is not asked again for the skill write.
-        let mut skill_consented = false;
-        let mut fresh_registration = false;
-        if registered {
-            cliclack::log::success("mcp: pond is already registered in Claude Code")?;
-        } else {
-            let add = if prompts {
-                wiz(cliclack::confirm(
-                    "Register pond in Claude Code (MCP server + the pond skill)?",
-                )
-                .initial_value(true)
-                .interact())?
-            } else {
-                auto
-            };
-            if add {
-                let output = agent_command(
-                    claude,
-                    &["mcp", "add", "-s", "user", "pond", "--", "pond", "mcp"],
-                )
-                .output()
-                .context("failed to run `claude mcp add`")?;
+        let plan = mcp_plan(&existing, &target);
+        match (&plan, consented) {
+            (McpPlan::Keep, _) => {
+                cliclack::log::success(format!(
+                    "mcp: pond already reaches Claude Code over {}",
+                    existing.describe(),
+                ))?;
+            }
+            (_, false) => {
+                cliclack::log::info(format!(
+                    "mcp: skipped - register later with `{}`",
+                    target.claude_add_command(),
+                ))?;
+            }
+            (plan, true) => {
+                // `claude mcp add` refuses a name that already exists, so a
+                // switch removes the old entry first. User scope explicitly:
+                // `remove` without it would hunt whichever scope has it.
+                if matches!(plan, McpPlan::Switch(_)) {
+                    let removed = agent_command(claude, &["mcp", "remove", "pond", "-s", "user"])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|status| status.success())
+                        .unwrap_or(false);
+                    if !removed {
+                        cliclack::log::warning(
+                            "mcp: `claude mcp remove pond -s user` failed - the switch below \
+                             may be refused as an existing name",
+                        )?;
+                    }
+                }
+                let output = agent_command(claude, &target.claude_add_args())
+                    .output()
+                    .context("failed to run `claude mcp add`")?;
                 if output.status.success() {
-                    cliclack::log::success("mcp: registered in Claude Code (user scope)")?;
-                    fresh_registration = true;
+                    registration_changed = true;
+                    match plan {
+                        McpPlan::Switch(from) => cliclack::log::success(format!(
+                            "mcp: switched Claude Code from {from} to {} (user scope)",
+                            target.describe(),
+                        ))?,
+                        _ => cliclack::log::success(format!(
+                            "mcp: registered in Claude Code over {} (user scope)",
+                            target.describe(),
+                        ))?,
+                    }
                 } else {
                     cliclack::log::warning(format!(
-                        "mcp: `claude mcp add` exited {}: {} - run `claude mcp add -s user pond -- pond mcp` manually",
+                        "mcp: `claude mcp add` exited {}: {} - run `{}` manually",
                         output.status,
                         String::from_utf8_lossy(&output.stderr).trim(),
+                        target.claude_add_command(),
                     ))?;
                 }
-                skill_consented = true;
-            } else {
-                cliclack::log::info(
-                    "mcp: skipped - register later with `claude mcp add -s user pond -- pond mcp`",
-                )?;
             }
         }
-        let skill_changed = if registered || skill_consented {
+        let skill_changed = if existing != Registration::Absent || skill_consented {
             skill_section(prompts, auto, skill_consented)?
         } else {
             false
         };
         // Claude Code loads MCP servers and user skills at startup, so a
         // change made mid-session is invisible until the next one - one hint
-        // covers both the fresh registration and a skill install/update.
-        if fresh_registration || skill_changed {
+        // covers both the registration and a skill install/update.
+        if registration_changed || skill_changed {
             cliclack::log::info(
                 "restart Claude Code to pick this up (MCP servers and skills load at startup)",
             )?;
@@ -1012,7 +1290,10 @@ fn mcp_section(prompts: bool, auto: bool) -> Result<()> {
     if codex.is_some() {
         note(
             "codex detected",
-            "register pond manually:\n  codex mcp add pond -- pond mcp\nthen restart Codex so the pond tools load",
+            &format!(
+                "register pond manually:\n  {}\nthen restart Codex so the pond tools load",
+                target.codex_add_command(),
+            ),
         )?;
     }
     Ok(())
@@ -1287,6 +1568,137 @@ mod tests {
                 [r#"/C ""C:\Program Files\nodejs\claude.cmd" mcp get pond""#],
             );
         }
+    }
+
+    #[test]
+    fn claude_registration_output_parses_into_both_topologies() {
+        let stdio = "pond:\n  Scope: User config (available in all your projects)\n  \
+                     Status: connected\n  Type: stdio\n  Command: pond\n  Args: mcp\n";
+        assert_eq!(parse_claude_registration(stdio), Registration::Stdio);
+
+        let http = "pond:\n  Scope: User config (available in all your projects)\n  \
+                    Status: connected\n  Type: http\n  URL: http://127.0.0.1:9797/mcp\n";
+        assert_eq!(
+            parse_claude_registration(http),
+            Registration::Http("http://127.0.0.1:9797/mcp".to_owned()),
+        );
+
+        // No Type line at all (a client whose output shape changed, or an
+        // error body) reads as absent rather than as a guessed topology.
+        assert_eq!(
+            parse_claude_registration("No MCP server named pond\n"),
+            Registration::Absent,
+        );
+        // An SSE entry is neither stdio nor our URL, so it plans a switch.
+        let sse = "pond:\n  Type: sse\n  URL: http://127.0.0.1:9797/sse\n";
+        assert!(matches!(
+            mcp_plan(
+                &parse_claude_registration(sse),
+                &Target::Http("http://127.0.0.1:9797/mcp".to_owned()),
+            ),
+            McpPlan::Switch(_),
+        ));
+    }
+
+    #[test]
+    fn mcp_plan_switches_only_when_the_shape_differs() {
+        let http = Target::Http("http://127.0.0.1:9797/mcp".to_owned());
+        assert_eq!(mcp_plan(&Registration::Absent, &http), McpPlan::Add);
+        assert_eq!(
+            mcp_plan(&Registration::Absent, &Target::Stdio),
+            McpPlan::Add
+        );
+        assert_eq!(
+            mcp_plan(&Registration::Stdio, &Target::Stdio),
+            McpPlan::Keep
+        );
+        assert_eq!(
+            mcp_plan(
+                &Registration::Http("http://127.0.0.1:9797/mcp".to_owned()),
+                &http,
+            ),
+            McpPlan::Keep,
+        );
+        // stdio -> http is the migration this milestone is about, and it must
+        // name what it is leaving so the wizard can say so.
+        let switch = mcp_plan(&Registration::Stdio, &http);
+        assert_eq!(switch, McpPlan::Switch(Registration::Stdio.describe()));
+        assert!(
+            matches!(&switch, McpPlan::Switch(from) if from.contains("pond mcp")),
+            "{switch:?}"
+        );
+        // A registration pointing at another port is stale, not equivalent.
+        assert!(matches!(
+            mcp_plan(
+                &Registration::Http("http://127.0.0.1:9800/mcp".to_owned()),
+                &http,
+            ),
+            McpPlan::Switch(_),
+        ));
+    }
+
+    /// The HTTP registration has to satisfy the `/mcp` route's Host allowlist
+    /// without widening it, so the URL it hands the client is the loopback
+    /// endpoint - and the stdio form stays byte-identical to the one the
+    /// README and `pond mcp --help` document.
+    #[test]
+    fn claude_add_args_target_the_loopback_endpoint() {
+        let endpoint = ServeEndpoint::default();
+        assert!(endpoint.is_loopback());
+        let http = Target::Http(endpoint.mcp_url());
+        assert_eq!(
+            http.claude_add_args(),
+            [
+                "mcp",
+                "add",
+                "-s",
+                "user",
+                "--transport",
+                "http",
+                "pond",
+                "http://127.0.0.1:9797/mcp",
+            ],
+        );
+        assert_eq!(
+            http.codex_add_command(),
+            "codex mcp add pond --url http://127.0.0.1:9797/mcp",
+        );
+        assert_eq!(
+            Target::Stdio.claude_add_command(),
+            "claude mcp add -s user pond -- pond mcp",
+        );
+        assert_eq!(
+            Target::Stdio.codex_add_command(),
+            "codex mcp add pond -- pond mcp",
+        );
+    }
+
+    #[test]
+    fn transport_choice_prefers_the_flag_then_what_the_host_has() {
+        let http = Registration::Http("http://127.0.0.1:9797/mcp".to_owned());
+        // The flag wins over an existing registration of the other shape.
+        assert_eq!(
+            pick_mcp_transport(Some(McpTransport::Stdio), &http, false).unwrap(),
+            McpTransport::Stdio,
+        );
+        assert_eq!(
+            pick_mcp_transport(Some(McpTransport::Http), &Registration::Stdio, false).unwrap(),
+            McpTransport::Http,
+        );
+        // Non-interactive with no flag: keep this host's topology, and default
+        // a fresh host to stdio (a --yes run may be sandboxed).
+        assert_eq!(
+            pick_mcp_transport(None, &http, false).unwrap(),
+            McpTransport::Http,
+        );
+        assert_eq!(
+            pick_mcp_transport(None, &Registration::Stdio, false).unwrap(),
+            McpTransport::Stdio,
+        );
+        assert_eq!(
+            pick_mcp_transport(None, &Registration::Absent, false).unwrap(),
+            McpTransport::Stdio,
+        );
     }
 
     #[test]

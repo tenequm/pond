@@ -31,6 +31,7 @@ Commands:
 
   Serve
     serve        Run the HTTP API server
+    service      Keep one pond serve resident for MCP clients
     mcp          Serve the MCP tools over stdio
 
   Shell
@@ -67,6 +68,6 @@ Getting started:
   pond init                                  set up storage, adapters, MCP, and scheduling
   pond sync                                  import new sessions, embed, update indexes
   pond search "that auth refactor"           find past work
-  claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
+  pond service start                         keep one warm pond serve for MCP clients
 
 Every command documents itself: `pond <command> --help` carries examples.
