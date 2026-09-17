@@ -50,7 +50,9 @@ jobs:
     # from the flake devShell, realized in the node's /nix store volume; the
     # cargo registry, target/ and proto's tool tree stay on the /ci-cache PVC.
     # Both persist across the ephemeral pods.
-    runs-on: pond-ci
+    # Fork PRs run hosted instead: those volumes are writable and shared with
+    # the release jobs, so untrusted code must never touch them.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'pond-ci' }}
     timeout-minutes: 60
     # A newer push to the same ref supersedes an in-flight build.
     concurrency: { group: "ci-build-${{ github.ref }}", cancel-in-progress: true }
@@ -60,6 +62,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Hosted-runner stand-ins for the pod's volumes, so the devshell action
+      # runs unchanged: a single-user install leaves /nix owned by the runner
+      # user (the daemon install's root-owned store fails the action's
+      # writable-store check), and /ci-cache is a throwaway directory.
+      - if: github.event.pull_request.head.repo.fork
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_options: --no-daemon
+          extra_nix_config: |
+            extra-substituters = https://pond-nix-cache.nbg1.your-objectstorage.com
+            extra-trusted-public-keys = pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=
+      - if: github.event.pull_request.head.repo.fork
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" /ci-cache
       - uses: ./.github/actions/devshell
       # One moon session: independent tasks interleave (cargo serializes the
       # heavy ones on its target-dir lock; format/changelog are instant). The
