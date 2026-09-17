@@ -322,6 +322,7 @@ Commands:
 
   Serve
     serve        Run the HTTP API server
+    service      Keep one pond serve resident for MCP clients
     mcp          Serve the MCP tools over stdio
 
   Shell
@@ -346,7 +347,7 @@ Getting started:
   pond init                                  set up storage, adapters, MCP, and scheduling
   pond sync                                  import new sessions, embed, update indexes
   pond search \"that auth refactor\"           find past work
-  claude mcp add -s user pond -- pond mcp    register pond as an MCP server in Claude Code
+  pond service start                         keep one warm pond serve for MCP clients
 
 Every command documents itself: `pond <command> --help` carries examples."
 )]
@@ -729,13 +730,14 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     },
     /// Run the HTTP API server (or MCP over stdio with --transport stdio).
     ///
-    /// Serves the wire protocol over HTTP on --host:--port. Most agent
-    /// setups want `pond mcp` instead; `serve` is for the HTTP transport and
-    /// for supervised deployments.
+    /// Serves the wire protocol over HTTP on --host:--port, with MCP on
+    /// /mcp. `pond service start` keeps one of these resident so MCP clients
+    /// share a warm process instead of cold-starting `pond mcp` each.
     #[command(after_long_help = "Examples:
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`
+  pond serve --transport http --with-sync   what `pond service start` supervises
   pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name")]
     #[command(display_order = 16)]
     Serve {
@@ -795,10 +797,12 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// Equivalent to `pond serve --transport stdio`. Register once per
     /// client; the tools are pond_search, pond_get_session, pond_get_message,
     /// and pond_sql, with resources schema://pond, schema://pond-sql, and
-    /// stats://pond.
+    /// stats://pond. Every client process pays its own cold start, which
+    /// `pond service start` plus an HTTP registration avoids.
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
-  codex mcp add pond -- pond mcp             register in Codex CLI")]
+  codex mcp add pond -- pond mcp             register in Codex CLI
+  pond service start                         the warm alternative (HTTP /mcp)")]
     #[command(display_order = 17)]
     Mcp {},
     /// Manage the automatic sync schedule.
@@ -816,6 +820,25 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     Schedule {
         #[command(subcommand)]
         command: schedule::ScheduleCmd,
+    },
+    /// Keep one `pond serve` resident for MCP clients.
+    ///
+    /// Registers `pond serve --transport http --with-sync` with the same OS
+    /// service manager `pond schedule` uses: launchd on macOS, a systemd user
+    /// service on Linux, Task Scheduler on Windows. One warm process means the
+    /// prewarm, the rowmap build, and the FTS postings load once per host
+    /// instead of once per MCP client process. `pond init` offers the same
+    /// setup interactively.
+    #[command(after_long_help = "Examples:
+  pond service start               http://127.0.0.1:9797/mcp
+  pond service start --port 9800
+  pond service status
+  pond service logs
+  pond service stop")]
+    #[command(display_order = 20)]
+    Service {
+        #[command(subcommand)]
+        command: schedule::ServiceCmd,
     },
     /// Probe and switch storage destinations.
     ///
@@ -1780,6 +1803,7 @@ async fn run() -> anyhow::Result<()> {
             run_config_command(command, storage_path, config).await?;
         }
         Command::Schedule { command } => schedule::run(command, config)?,
+        Command::Service { command } => schedule::run_service(command, config)?,
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
         }

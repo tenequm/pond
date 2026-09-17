@@ -4,7 +4,7 @@ expression: sub.render_long_help().to_string()
 ---
 Run the HTTP API server (or MCP over stdio with --transport stdio).
 
-Serves the wire protocol over HTTP on --host:--port. Most agent setups want `pond mcp` instead; `serve` is for the HTTP transport and for supervised deployments.
+Serves the wire protocol over HTTP on --host:--port, with MCP on /mcp. `pond service start` keeps one of these resident so MCP clients share a warm process instead of cold-starting `pond mcp` each.
 
 Usage: pond serve [OPTIONS]
 
@@ -71,4 +71,5 @@ Examples:
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`
+  pond serve --transport http --with-sync   what `pond service start` supervises
   pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name

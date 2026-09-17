@@ -1,0 +1,46 @@
+---
+source: packages/pond/src/main.rs
+expression: sub.render_long_help().to_string()
+---
+Keep one `pond serve` resident for MCP clients.
+
+Registers `pond serve --transport http --with-sync` with the same OS service manager `pond schedule` uses: launchd on macOS, a systemd user service on Linux, Task Scheduler on Windows. One warm process means the prewarm, the rowmap build, and the FTS postings load once per host instead of once per MCP client process. `pond init` offers the same setup interactively.
+
+Usage: pond service [OPTIONS] <COMMAND>
+
+Commands:
+  start   Register the resident `pond serve` (idempotent: safe to re-run)
+  stop    Remove the registration and stop the resident server
+  status  Show whether the resident server is registered
+  logs    Show recent resident-server output
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond service start               http://127.0.0.1:9797/mcp
+  pond service start --port 9800
+  pond service status
+  pond service logs
+  pond service stop

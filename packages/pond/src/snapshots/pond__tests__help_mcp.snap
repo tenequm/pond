@@ -1,10 +1,10 @@
 ---
-source: src/main.rs
+source: packages/pond/src/main.rs
 expression: sub.render_long_help().to_string()
 ---
 Serve the MCP tools over stdio (for agent clients).
 
-Equivalent to `pond serve --transport stdio`. Register once per client; the tools are pond_search, pond_get_session, pond_get_message, and pond_sql, with resources schema://pond, schema://pond-sql, and stats://pond.
+Equivalent to `pond serve --transport stdio`. Register once per client; the tools are pond_search, pond_get_session, pond_get_message, and pond_sql, with resources schema://pond, schema://pond-sql, and stats://pond. Every client process pays its own cold start, which `pond service start` plus an HTTP registration avoids.
 
 Usage: pond mcp [OPTIONS]
 
@@ -34,3 +34,4 @@ Global options:
 Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI
+  pond service start                         the warm alternative (HTTP /mcp)
