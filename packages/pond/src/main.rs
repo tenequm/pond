@@ -1279,8 +1279,12 @@ fn spawn_memory_ceiling(
                 );
             }
             // Not tracing: this is the process's own death notice, and it has
-            // to survive whatever log filter the client or unit set.
-            eprintln!(
+            // to survive whatever log filter the client or unit set. Not
+            // `eprintln!` either - that panics on an unwritable stderr, and a
+            // panic here would strand the parked serve arm instead of exiting.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "{surface}: stopping at the memory ceiling ({resident_bytes} bytes resident, \
                  limit {limit_bytes}); exit {EXIT_MEMORY_CEILING} - start a fresh process. \
                  Raise or disable it with [runtime].memory_ceiling."
