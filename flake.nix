@@ -17,8 +17,9 @@
 
     # The devShell resolves against THIS input, not `nixpkgs`, so a routine
     # `nixpkgs` bump (which only feeds `packages.pond`) moves no compiler store
-    # path: cargo does not rerun build scripts and moon/kache keys do not miss.
-    # Bump it deliberately and expect one cold build when you do.
+    # path: cargo does not rerun build scripts and kache keys do not miss.
+    # moon's do: /flake.lock is a declared input of the Rust tasks, whichever
+    # input moved. Bump this one deliberately and expect one cold build.
     nixpkgs-toolchain.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # Vendored rustup manifests, so `fromRustupToolchainFile` stays a pure eval -
@@ -215,23 +216,10 @@
 
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
-          # cargo-zigbuild copies this def in at build time to work around zig
-          # having no -lsynchronization (ziglang/zig#14919), and that write into
-          # a read-only store path fails silently (.ok()). Bake it in instead.
-          # The lib tree is symlink-copied (~220 MB of real files stay shared)
-          # and zig is pointed at the copy through ZIG_LIB_DIR.
-          zig =
-            let
-              base = pinned v.zig pkgs.zig_0_16;
-            in
-            pkgs.runCommand "zig-${v.zig}-pond" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-              mkdir -p $out/bin $out/lib
-              cp -as ${base}/lib/zig $out/lib/zig
-              find $out/lib/zig -type d -exec chmod u+w {} +
-              cp ${base}/lib/zig/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def \
-                 $out/lib/zig/libc/mingw/lib-common/synchronization.def
-              makeWrapper ${base}/bin/zig $out/bin/zig --set-default ZIG_LIB_DIR $out/lib/zig
-            '';
+          # Also handed to cargo-zigbuild below: nixpkgs wraps it with its own
+          # `zig` on PATH, so without the override the pin would guard a
+          # different attribute than the zig that actually links the release.
+          zig = pinned v.zig pkgs.zig_0_16;
 
           moon = prebuilt {
             pname = "moon";
@@ -314,7 +302,7 @@
               # The fix (#480) is unreleased; drop this patch once a >=0.23.5
               # release reaches nixpkgs-toolchain.
               (pinned v.cargoZigbuild (
-                pkgs.cargo-zigbuild.overrideAttrs (o: {
+                (pkgs.cargo-zigbuild.override { inherit zig; }).overrideAttrs (o: {
                   patches = (o.patches or [ ]) ++ [
                     (pkgs.fetchpatch {
                       url = "https://github.com/rust-cross/cargo-zigbuild/commit/110abf59ba07cb84ed71b31c8cd81eefdc37bcec.patch";
@@ -340,8 +328,8 @@
               # archive it compresses is the released artifact.
               pkgs.xz
               # The runner image is actions-runner plus nix and gh only, so
-              # nothing else off the shell is guaranteed: `cargo metadata | jq` in ci.yml and the
-              # devshell-entry step's own env filtering both need it.
+              # nothing else off the shell is guaranteed: `cargo metadata | jq`
+              # in ci.yml and the devshell-entry step's env filtering need it.
               pkgs.jq
             ]
             # The SDK is the cross-link stub set; on darwin the native SDK that
