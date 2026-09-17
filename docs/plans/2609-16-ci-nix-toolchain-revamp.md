@@ -287,10 +287,14 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   any more, per the `PROTO_HOME` note above.
 - 2.1's "keep clang/libclang (bindgen)" is dropped: `bindgen` is not in
   `Cargo.lock`, so `LIBCLANG_PATH` pointed at a closure nothing used.
-- **Open, ops side: nothing prunes the devshell profiles.** Each key is its own
+- **Ops side: the devshell profiles are pruned by mtime.** Each key is its own
   `/nix/var/nix/profiles/pond-dev-$key`, i.e. its own permanent GC root with a
   single generation, so `nix-collect-garbage -d` frees none of them and every
   edit to flake.nix, flake.lock or rust-toolchain.toml pins another full
   toolchain closure on the node's store volume. A reaper belongs with the /nix
-  volume (age-based over `pond-dev-*`), and it cannot use mtime as read: the hit
-  path never touches the profile it reuses, so the hottest key looks the oldest.
+  volume (age-based over `pond-dev-*`). The hit path only reads the profile it
+  reuses, so left alone its mtime is "first built" and the hottest key looks the
+  oldest; the action therefore `touch -h`es the profile symlink on every hit,
+  which makes its mtime "last entered" on any mount. That mtime is the contract
+  the infra repo's `nix-store-reaper` reads - no atime, no sibling marker file
+  (a `pond-dev-<key>.last-used` would itself match the reaper's glob).

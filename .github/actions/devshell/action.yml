@@ -35,7 +35,9 @@ runs:
         # fingerprint, so every commit misses it. A profile hit skips evaluation
         # entirely - measured at ~0.1 s against ~30 s for a cold eval.
         # Each distinct key is its own profile and its own permanent GC root:
-        # pruning old pond-dev-* is the ops side's job (plan 2609-16 phase 5).
+        # pruning old pond-dev-* is the ops side's job (plan 2609-16 phase 5),
+        # and it reads the profile symlink's mtime as "last entered" - see the
+        # touch below.
         key=$(sha256sum flake.nix flake.lock rust-toolchain.toml | sha256sum | cut -c1-32)
         profile="/nix/var/nix/profiles/pond-dev-$key"
 
@@ -56,6 +58,13 @@ runs:
         json="$RUNNER_TEMP/pond-dev-env.json"
         if [ -e "$profile" ]; then
           echo "devshell profile hit: $profile"
+          # The reaper's last-use signal. A hit only reads the profile, so
+          # without this its mtime stays "first built" and the hottest key looks
+          # the oldest; readlink's atime is no substitute on a noatime mount.
+          # -h stamps the symlink itself, not the store path it points at
+          # (read-only). A miss needs no touch: nix writes the symlink fresh.
+          # Not fatal: a lost stamp costs at most a rebuild after a reap.
+          touch -h "$profile" || echo "::warning::could not stamp $profile as used; the store reaper may prune it while it is still in use" >&2
           "${nix[@]}" print-dev-env --json "$profile" > "$json"
         else
           echo "devshell profile miss, building: $profile"
