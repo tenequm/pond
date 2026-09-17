@@ -3810,6 +3810,185 @@ pub mod io_trace {
     pub fn take() -> Option<IoStats> {
         TRACKER.get().map(IOTracker::incremental_stats)
     }
+
+    /// EXPERIMENT-ONLY (do not commit): the lance-io tracker records
+    /// `read_bytes` only in aggregate - an `IoRequestRecord` for a `get_ranges`
+    /// call carries `range: None`, so bytes cannot be attributed per object.
+    /// This wrapper sits beside it and accumulates (path, method) -> (calls,
+    /// ranges, bytes) so a read's bytes can be split across tables.
+    pub mod bytes_by_path {
+        use bytes::Bytes;
+        use futures::stream::BoxStream;
+        use lance_io::object_store::WrappingObjectStore;
+        use object_store::path::Path as ObjPath;
+        use object_store::{
+            CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+            ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+            Result as OsResult,
+        };
+        use std::collections::BTreeMap;
+        use std::ops::Range;
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        pub type Row = (u64, u64, u64);
+        type Table = BTreeMap<(String, &'static str), Row>;
+
+        static STATS: OnceLock<Mutex<Table>> = OnceLock::new();
+
+        fn stats() -> &'static Mutex<Table> {
+            STATS.get_or_init(|| Mutex::new(Table::new()))
+        }
+
+        fn record(path: &ObjPath, method: &'static str, ranges: u64, bytes: u64) {
+            let mut guard = stats().lock().unwrap_or_else(|p| p.into_inner());
+            let entry = guard
+                .entry((path.to_string(), method))
+                .or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 += ranges;
+            entry.2 += bytes;
+        }
+
+        /// Read and reset.
+        pub fn take() -> Vec<((String, &'static str), Row)> {
+            let mut guard = stats().lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard).into_iter().collect()
+        }
+
+        /// EXPERIMENT-ONLY: bounded per-path sample of the actual byte ranges
+        /// requested, so the shape of a read (sequential mini-ranges vs. the
+        /// same offset over and over vs. a stride) is visible. Only
+        /// `sessions.lance` paths are sampled, and only the first
+        /// `SAMPLE_LIMIT` ranges per path.
+        pub type Sample = (&'static str, u64, u64);
+        const SAMPLE_LIMIT: usize = 200;
+        static SAMPLES: OnceLock<Mutex<BTreeMap<String, Vec<Sample>>>> = OnceLock::new();
+
+        fn samples() -> &'static Mutex<BTreeMap<String, Vec<Sample>>> {
+            SAMPLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+        }
+
+        fn sample(path: &ObjPath, method: &'static str, ranges: &[Range<u64>]) {
+            let text = path.to_string();
+            if !text.contains("sessions.lance") {
+                return;
+            }
+            let mut guard = samples().lock().unwrap_or_else(|p| p.into_inner());
+            let entry = guard.entry(text).or_default();
+            for range in ranges {
+                if entry.len() >= SAMPLE_LIMIT {
+                    break;
+                }
+                entry.push((method, range.start, range.end - range.start));
+            }
+        }
+
+        /// Read and reset the range samples.
+        pub fn take_samples() -> Vec<(String, Vec<Sample>)> {
+            let mut guard = samples().lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard).into_iter().collect()
+        }
+
+        #[derive(Debug)]
+        pub struct Factory;
+
+        impl WrappingObjectStore for Factory {
+            fn wrap(
+                &self,
+                _store_prefix: &str,
+                inner: Arc<dyn ObjectStore>,
+            ) -> Arc<dyn ObjectStore> {
+                Arc::new(Counting { inner })
+            }
+        }
+
+        #[derive(Debug)]
+        struct Counting {
+            inner: Arc<dyn ObjectStore>,
+        }
+
+        impl std::fmt::Display for Counting {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "ByteCounting({})", self.inner)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for Counting {
+            async fn get_opts(
+                &self,
+                location: &ObjPath,
+                options: GetOptions,
+            ) -> OsResult<GetResult> {
+                let result = self.inner.get_opts(location, options).await?;
+                let bytes = result.range.end - result.range.start;
+                record(location, "get_opts", 1, bytes);
+                sample(location, "get_opts", &[result.range.clone()]);
+                Ok(result)
+            }
+
+            async fn get_ranges(
+                &self,
+                location: &ObjPath,
+                ranges: &[Range<u64>],
+            ) -> OsResult<Vec<Bytes>> {
+                let result = self.inner.get_ranges(location, ranges).await?;
+                let bytes = result.iter().map(|b| b.len() as u64).sum();
+                record(location, "get_ranges", ranges.len() as u64, bytes);
+                sample(location, "get_ranges", ranges);
+                Ok(result)
+            }
+
+            async fn put_opts(
+                &self,
+                location: &ObjPath,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> OsResult<PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjPath,
+                opts: PutMultipartOptions,
+            ) -> OsResult<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, OsResult<ObjPath>>,
+            ) -> BoxStream<'static, OsResult<ObjPath>> {
+                self.inner.delete_stream(locations)
+            }
+
+            fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+
+            fn list_with_offset(
+                &self,
+                prefix: Option<&ObjPath>,
+                offset: &ObjPath,
+            ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+                self.inner.list_with_offset(prefix, offset)
+            }
+
+            async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy_opts(
+                &self,
+                from: &ObjPath,
+                to: &ObjPath,
+                opts: CopyOptions,
+            ) -> OsResult<()> {
+                self.inner.copy_opts(from, to, opts).await
+            }
+        }
+    }
 }
 
 /// On-disk cache for `_indices/*` so a fresh process serves the IVF + FTS index
@@ -4466,6 +4645,9 @@ fn store_wrapper(
         }
     }
     if let Some(tracker) = io_trace::wrapper() {
+        // Inside the io-trace tracker so the tracker's own request records stay
+        // the reference count, and this one only adds per-path bytes.
+        wrappers.push(Arc::new(io_trace::bytes_by_path::Factory));
         wrappers.push(tracker);
     }
     match wrappers.len() {
@@ -6015,10 +6197,56 @@ mod tests {
     /// for each (no spurious schema mismatch, no namespace error).
     #[tokio::test]
     async fn store_opens_via_namespace_and_scan_works() -> Result<()> {
-        let temp = TempDir::new()?;
-        let url = Url::from_directory_path(temp.path())
-            .map_err(|()| anyhow::anyhow!("temp path is not absolute"))?;
-        let handle = Handle::open(&url).await?;
+        // In-process s3s-fs, not a local dir: lance-io serves local paths with
+        // its own direct-file reader, which never reaches the object_store
+        // wrapper stack, so a local fixture traces zero IO. The S3 wire does.
+        let (endpoint, _root) = {
+            use s3s::auth::SimpleAuth;
+            use s3s::service::S3ServiceBuilder;
+            use s3s_fs::FileSystem;
+            let root = TempDir::new()?;
+            std::fs::create_dir(root.path().join("probe"))?;
+            let fs = FileSystem::new(root.path())
+                .map_err(|e| anyhow::anyhow!("FileSystem::new: {e:?}"))?;
+            let mut builder = S3ServiceBuilder::new(fs);
+            builder.set_auth(SimpleAuth::from_single("probe-key", "probe-secret"));
+            let service = builder.build();
+            let listener =
+                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                    });
+                }
+            });
+            (endpoint, root)
+        };
+        let storage_options = HashMap::from([
+            ("access_key_id".to_string(), "probe-key".to_string()),
+            ("secret_access_key".to_string(), "probe-secret".to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("endpoint".to_string(), endpoint),
+            ("allow_http".to_string(), "true".to_string()),
+            (
+                "virtual_hosted_style_request".to_string(),
+                "false".to_string(),
+            ),
+        ]);
+        let url = Url::parse("s3://probe/pond")?;
+        let handle =
+            Handle::open_with_options(&url, storage_options.clone(), RuntimeCaps::default())
+                .await?;
         // Each table has its own PK column; project the canonical one so the
         // scan is exercised end-to-end (catalog -> dataset -> scanner -> batch).
         let cases: [(Table, &[&str]); 3] = [
@@ -6032,6 +6260,386 @@ mod tests {
                 .await?;
             let batch = scanner.try_into_batch().await?;
             assert_eq!(batch.num_rows(), 0, "fresh table should be empty");
+        }
+        Ok(())
+    }
+
+    /// EXPERIMENT-ONLY (do not commit): read-only fragment census of the live
+    /// store's `sessions` dataset, plus a time-travel reproduction of the
+    /// `find_session` read storm against the version that was current while
+    /// the earlier traces were taken. `cargo test --release -p pond-db --lib
+    /// probe_sessions_fragments -- --ignored --nocapture`.
+    #[ignore = "hits the live remote store"]
+    #[tokio::test]
+    async fn probe_sessions_fragments() -> Result<()> {
+        io_trace::enable();
+        let config_path = config::default_config_path(
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            config::home_dir(),
+        );
+        let loaded = config::Config::load(config_path)?;
+        let path = loaded
+            .storage
+            .path
+            .clone()
+            .expect("[storage].path missing from config");
+        let resolved = StorageUrl::parse(&path)?.resolve(&loaded.creds)?;
+        let handle = Handle::open_with_options(
+            resolved.lance_url(),
+            resolved.options.clone(),
+            RuntimeCaps::default(),
+        )
+        .await?;
+        let latest = handle.dataset(Table::Sessions).await?;
+        census("latest", &latest).await?;
+
+        // Walk versions backwards to the one current during the storm traces
+        // (probe-out/stock*-get-message-*.txt, 2026-09-17 17:00-17:22 UTC).
+        let cutoff: chrono::DateTime<chrono::Utc> = "2026-09-17T17:10:00Z".parse()?;
+        let mut storm = None;
+        let mut version = latest.version().version;
+        while version > 1 {
+            let candidate = latest.checkout_version(version).await?;
+            let stamp = candidate.version().timestamp;
+            println!(
+                "PROBE ver={version} ts={stamp} frags={}",
+                candidate.get_fragments().len()
+            );
+            if stamp <= cutoff {
+                storm = Some(candidate);
+                break;
+            }
+            version -= 1;
+        }
+        let storm = storm.expect("no version at or before the cutoff");
+        census("storm", &storm).await?;
+
+        // The exact read `Store::find_session` issues, on each version.
+        let predicate = Predicate::Eq("id", "7c2cdcc9-8105-4e4a-ab54-771feace380e".into());
+        for (label, dataset) in [("latest", &latest), ("storm", &storm)] {
+            let _ = io_trace::take();
+            let _ = io_trace::bytes_by_path::take();
+            let _ = io_trace::bytes_by_path::take_samples();
+            let started = std::time::Instant::now();
+            let batch = scanner_with_prefilter(dataset, Some(&predicate))?
+                .try_into_batch()
+                .await?;
+            let elapsed = started.elapsed();
+            let stats = io_trace::take().expect("tracker armed");
+            println!(
+                "PROBE scan[{label}] rows={} wall_ms={} read_iops={} read_bytes={}",
+                batch.num_rows(),
+                elapsed.as_millis(),
+                stats.read_iops,
+                stats.read_bytes
+            );
+            let mut per_path: std::collections::BTreeMap<String, (u64, u64, u64)> =
+                std::collections::BTreeMap::new();
+            for ((path, method), (calls, ranges, bytes)) in io_trace::bytes_by_path::take() {
+                let entry = per_path
+                    .entry(format!("{method} {path}"))
+                    .or_insert((0, 0, 0));
+                entry.0 += calls;
+                entry.1 += ranges;
+                entry.2 += bytes;
+            }
+            let data_paths = per_path
+                .keys()
+                .filter(|key| key.contains("sessions.lance/data/"))
+                .count();
+            let data_calls: u64 = per_path
+                .iter()
+                .filter(|(key, _)| key.contains("sessions.lance/data/"))
+                .map(|(_, row)| row.0)
+                .sum();
+            println!(
+                "PROBE scan[{label}] distinct_paths={} sessions_data_files={data_paths} sessions_data_calls={data_calls}",
+                per_path.len()
+            );
+            let mut rows: Vec<_> = per_path.into_iter().collect();
+            rows.sort_by_key(|row| std::cmp::Reverse(row.1.0));
+            for (key, (calls, ranges, bytes)) in rows.iter().take(12) {
+                println!("PROBE scan[{label}]   {calls:>6} calls {ranges:>6} ranges {bytes:>10} B  {key}");
+            }
+            for (path, ranges) in io_trace::bytes_by_path::take_samples().into_iter().take(4) {
+                let text = ranges
+                    .iter()
+                    .take(12)
+                    .map(|(method, offset, len)| format!("{method}@{offset}+{len}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("PROBE scan[{label}] SAMPLE n={} {path}\n    {text}", ranges.len());
+            }
+        }
+        Ok(())
+    }
+
+    async fn census(label: &str, dataset: &Dataset) -> Result<()> {
+        let fragments = dataset.get_fragments();
+        let mut total_rows = 0u64;
+        let mut row_hist: std::collections::BTreeMap<u64, usize> =
+            std::collections::BTreeMap::new();
+        let mut distinct_paths: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut files = 0usize;
+        let mut physical_rows_known = 0usize;
+        for fragment in &fragments {
+            let meta = fragment.metadata();
+            let rows = meta.physical_rows.unwrap_or(0) as u64;
+            if meta.physical_rows.is_some() {
+                physical_rows_known += 1;
+            }
+            total_rows += rows;
+            files += meta.files.len();
+            *row_hist.entry(rows).or_insert(0) += 1;
+            for file in &meta.files {
+                distinct_paths.insert(file.path.clone());
+            }
+        }
+        println!(
+            "PROBE [{label}] version={} frags={} rows={total_rows} file_refs={files} distinct_files={} physical_rows_known={physical_rows_known}",
+            dataset.version().version,
+            fragments.len(),
+            distinct_paths.len()
+        );
+        println!("PROBE [{label}] rows_per_fragment_hist={row_hist:?}");
+        let indices = dataset.load_indices().await?;
+        for index in indices.iter() {
+            println!(
+                "PROBE [{label}] index name={} dataset_version={} covered_frags={:?}",
+                index.name,
+                index.dataset_version,
+                index.fragment_bitmap.as_ref().map(|b| b.len())
+            );
+        }
+        Ok(())
+    }
+
+    /// EXPERIMENT-ONLY (do not commit): local reproduction of the
+    /// `find_session` read storm. Builds a `sessions` table shaped like the
+    /// live store's append cadence (many tiny fragments) with a *stale*
+    /// `sessions_id_btree`, then counts the object-store calls one
+    /// `id = '...'` point lookup issues. `cargo test --release -p pond-db
+    /// --lib probe_stale_btree_fanout -- --ignored --nocapture`.
+    #[ignore = "slow: writes a many-fragment local fixture"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_stale_btree_fanout() -> Result<()> {
+        use lance_index::IndexType;
+
+        io_trace::enable();
+        let appends: usize = std::env::var("PROBE_APPENDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        // Per-row `options` blob size: controls the fragment file size, which
+        // is what decides whether Lance can cover a whole data file with one
+        // tail read or has to fetch each column's metadata block separately.
+        let blob_bytes: usize = std::env::var("PROBE_BLOB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let rows_per_append: usize = std::env::var("PROBE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        // In-process s3s-fs, not a local dir: lance-io serves local paths with
+        // its own direct-file reader, which never reaches the object_store
+        // wrapper stack, so a local fixture traces zero IO. The S3 wire does.
+        let (endpoint, _root) = {
+            use s3s::auth::SimpleAuth;
+            use s3s::service::S3ServiceBuilder;
+            use s3s_fs::FileSystem;
+            let root = TempDir::new()?;
+            std::fs::create_dir(root.path().join("probe"))?;
+            let fs = FileSystem::new(root.path())
+                .map_err(|e| anyhow::anyhow!("FileSystem::new: {e:?}"))?;
+            let mut builder = S3ServiceBuilder::new(fs);
+            builder.set_auth(SimpleAuth::from_single("probe-key", "probe-secret"));
+            let service = builder.build();
+            let listener =
+                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await?;
+            let endpoint = format!("http://{}", listener.local_addr()?);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        continue;
+                    };
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                    });
+                }
+            });
+            (endpoint, root)
+        };
+        let storage_options = HashMap::from([
+            ("access_key_id".to_string(), "probe-key".to_string()),
+            ("secret_access_key".to_string(), "probe-secret".to_string()),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("endpoint".to_string(), endpoint),
+            ("allow_http".to_string(), "true".to_string()),
+            (
+                "virtual_hosted_style_request".to_string(),
+                "false".to_string(),
+            ),
+        ]);
+        let url = Url::parse("s3://probe/pond")?;
+        let handle =
+            Handle::open_with_options(&url, storage_options.clone(), RuntimeCaps::default())
+                .await?;
+        let schema = handle.dataset(Table::Sessions).await?.schema().clone();
+        let arrow_schema: Arc<lance::deps::arrow_schema::Schema> =
+            Arc::new(lance::deps::arrow_schema::Schema::from(&schema));
+        println!(
+            "PROBE schema fields={:?}",
+            arrow_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{}", f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+        );
+
+        let make_batch = |ids: &[String]| -> Result<RecordBatch> {
+            let columns = arrow_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    use lance::deps::arrow_array::{ArrayRef, LargeBinaryArray, TimestampMicrosecondArray};
+                    use lance::deps::arrow_schema::{DataType, TimeUnit};
+                    if field.name() == "id" {
+                        return Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
+                    }
+                    if field.is_nullable() {
+                        return lance::deps::arrow_array::new_null_array(
+                            field.data_type(),
+                            ids.len(),
+                        );
+                    }
+                    match field.data_type() {
+                        DataType::Utf8 => {
+                            Arc::new(StringArray::from(vec!["probe"; ids.len()])) as ArrayRef
+                        }
+                        DataType::LargeBinary => {
+                            // Incompressible: a compressible blob just shrinks
+                            // back to a tiny file and never crosses Lance's
+                            // one-shot tail-read window.
+                            let mut state = 0x2545_F491_4F6C_DD1Du64;
+                            let blob = (0..blob_bytes)
+                                .map(|_| {
+                                    state ^= state << 13;
+                                    state ^= state >> 7;
+                                    state ^= state << 17;
+                                    (state & 0xff) as u8
+                                })
+                                .collect::<Vec<u8>>();
+                            Arc::new(LargeBinaryArray::from(
+                                vec![blob.as_slice(); ids.len()],
+                            )) as ArrayRef
+                        }
+                        DataType::Timestamp(TimeUnit::Microsecond, tz) => Arc::new(
+                            TimestampMicrosecondArray::from(vec![0i64; ids.len()])
+                                .with_timezone_opt(tz.clone()),
+                        ) as ArrayRef,
+                        other => panic!("probe does not fill {other}"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(RecordBatch::try_new(arrow_schema.clone(), columns)?)
+        };
+
+        // Fragment 0: the row the lookup will hit. Index it, then append the
+        // un-indexed tail - exactly what a store synced every 5 minutes with
+        // no index fold in between looks like.
+        let target = "00000000-0000-0000-0000-000000000000".to_string();
+        handle
+            .append_batches(Table::Sessions, vec![make_batch(&[target.clone()])?])
+            .await?;
+        {
+            let mut dataset = handle.dataset(Table::Sessions).await?;
+            dataset
+                .create_index_builder(
+                    &["id"],
+                    IndexType::BTree,
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                )
+                .name("sessions_id_btree".to_string())
+                .replace(false)
+                .await?;
+        }
+        for i in 0..appends {
+            let ids = (0..rows_per_append)
+                .map(|r| format!("tail-{i:06}-{r:04}"))
+                .collect::<Vec<_>>();
+            handle.append_batches(Table::Sessions, vec![make_batch(&ids)?]).await?;
+        }
+
+        let predicate = Predicate::Eq("id", target.clone().into());
+        for label in ["stale", "folded"] {
+            if label == "folded" {
+                let mut dataset = handle.dataset(Table::Sessions).await?;
+                dataset.optimize_indices(&Default::default()).await?;
+            }
+            // Fresh dataset object each time: no warm metadata cache, like a
+            // one-shot CLI process.
+            // A fresh Handle per measurement: cold metadata/index caches like a
+            // one-shot CLI process, and it is pond's own open path, so the
+            // io-trace wrapper is actually installed (a bare DatasetBuilder
+            // bypasses `store_wrapper` and traces nothing).
+            let probe_handle = Handle::open_with_options(
+                &url,
+                storage_options.clone(),
+                RuntimeCaps::default(),
+            )
+            .await?;
+            let dataset = probe_handle.dataset(Table::Sessions).await?;
+            let indices = dataset.load_indices().await?;
+            for index in indices.iter() {
+                println!(
+                    "PROBE [{label}] index={} covered_frags={:?} frags={}",
+                    index.name,
+                    index.fragment_bitmap.as_ref().map(|b| b.len()),
+                    dataset.get_fragments().len()
+                );
+            }
+            let _ = io_trace::take();
+            let _ = io_trace::bytes_by_path::take();
+            let _ = io_trace::bytes_by_path::take_samples();
+            let batch = scanner_with_prefilter(&dataset, Some(&predicate))?
+                .try_into_batch()
+                .await?;
+            let stats = io_trace::take().expect("armed");
+            let mut data_calls = 0u64;
+            let mut data_bytes = 0u64;
+            let mut data_paths = 0usize;
+            for ((path, _method), (calls, _ranges, bytes)) in io_trace::bytes_by_path::take() {
+                if path.contains("sessions.lance/data/") {
+                    data_calls += calls;
+                    data_bytes += bytes;
+                    data_paths += 1;
+                }
+            }
+            println!(
+                "PROBE [{label}] rows={} read_iops={} read_bytes={} sessions_data: files={data_paths} calls={data_calls} bytes={data_bytes} avg={}",
+                batch.num_rows(),
+                stats.read_iops,
+                stats.read_bytes,
+                if data_calls == 0 { 0 } else { data_bytes / data_calls }
+            );
+            let samples = io_trace::bytes_by_path::take_samples();
+            for (path, ranges) in samples.iter().take(3) {
+                let text = ranges
+                    .iter()
+                    .take(8)
+                    .map(|(m, o, l)| format!("{m}@{o}+{l}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("PROBE [{label}] SAMPLE n={} {path}\n    {text}", ranges.len());
+            }
         }
         Ok(())
     }

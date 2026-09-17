@@ -1254,6 +1254,124 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// EXPERIMENT-ONLY (do not commit): `POND_IO_TRACE=1` arms the lance-io request
+/// tracker before any store opens, so a one-shot CLI read reports its exact S3
+/// GET count / bytes / path buckets on stderr. Mirrors
+/// `serve_mem_bench --io-trace`.
+fn io_trace_armed() -> bool {
+    std::env::var_os("POND_IO_TRACE").is_some_and(|value| value != "0")
+}
+
+#[cfg(feature = "io-trace")]
+fn io_trace_bucket(path: &str) -> String {
+    if let Some(pos) = path.find("/_indices/") {
+        let after = &path[pos + "/_indices/".len()..];
+        let file = after.rsplit('/').next().unwrap_or(after);
+        format!("index/{file}")
+    } else if path.contains("/data/") {
+        let table = path.split('/').find(|seg| {
+            matches!(*seg, "sessions" | "messages" | "parts") || seg.ends_with(".lance")
+        });
+        format!("data/{}", table.unwrap_or("?"))
+    } else if path.contains("manifest") || path.contains("/_versions/") {
+        "manifest".to_string()
+    } else if path.contains("_transactions") {
+        "txn".to_string()
+    } else {
+        path.rsplit('/').next().unwrap_or(path).to_string()
+    }
+}
+
+fn io_trace_report(label: &str) {
+    if !io_trace_armed() {
+        return;
+    }
+    let Some(stats) = pond::substrate::io_trace::take() else {
+        return;
+    };
+    eprintln!(
+        "IOTRACE {label} read_iops={} read_bytes={}",
+        stats.read_iops, stats.read_bytes
+    );
+    #[cfg(feature = "io-trace")]
+    {
+        let mut hist: std::collections::BTreeMap<String, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        for request in &stats.requests {
+            let key = format!(
+                "{:>6} {}",
+                request.method,
+                io_trace_bucket(&request.path.to_string())
+            );
+            let entry = hist.entry(key).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += request.range.as_ref().map_or(0, |r| r.end - r.start);
+        }
+        let mut rows: Vec<_> = hist.into_iter().collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1.0));
+        for (key, (count, bytes)) in rows {
+            eprintln!("IOTRACE {label}   {count:>7} calls {bytes:>12} B  {key}");
+        }
+    }
+    // Per-path bytes, which the lance-io records cannot carry (get_ranges
+    // records `range: None`). Aggregated into the same coarse buckets.
+    let mut bybucket: std::collections::BTreeMap<
+        String,
+        (u64, u64, u64, std::collections::BTreeSet<String>),
+    > = std::collections::BTreeMap::new();
+    // Per-path rollup for sessions.lance, so a bucket's fan-out across
+    // distinct data files (and reads per file) is visible, not just its total.
+    let mut sessions_paths: std::collections::BTreeMap<String, (u64, u64, u64)> =
+        std::collections::BTreeMap::new();
+    for ((path, method), (calls, ranges, bytes)) in pond::substrate::io_trace::bytes_by_path::take()
+    {
+        #[cfg(feature = "io-trace")]
+        let bucket = format!("{method:>10} {}", io_trace_bucket(&path));
+        #[cfg(not(feature = "io-trace"))]
+        let bucket = format!("{method:>10} {path}");
+        if path.contains("sessions.lance") {
+            let entry = sessions_paths
+                .entry(format!("{method} {path}"))
+                .or_insert((0, 0, 0));
+            entry.0 += calls;
+            entry.1 += ranges;
+            entry.2 += bytes;
+        }
+        let entry = bybucket
+            .entry(bucket)
+            .or_insert((0, 0, 0, std::collections::BTreeSet::new()));
+        entry.0 += calls;
+        entry.1 += ranges;
+        entry.2 += bytes;
+        entry.3.insert(path);
+    }
+    let mut rows: Vec<_> = bybucket.into_iter().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1.2));
+    for (bucket, (calls, ranges, bytes, paths)) in rows {
+        eprintln!(
+            "IOTRACE {label} BYTES {calls:>7} calls {ranges:>8} ranges {bytes:>12} B  paths={:<4} {bucket}",
+            paths.len()
+        );
+    }
+    eprintln!("IOTRACE {label} SESSPATHS distinct={}", sessions_paths.len());
+    let mut sess: Vec<_> = sessions_paths.into_iter().collect();
+    sess.sort_by_key(|row| std::cmp::Reverse(row.1.0));
+    for (key, (calls, ranges, bytes)) in sess {
+        eprintln!(
+            "IOTRACE {label} SESSPATH {calls:>7} calls {ranges:>8} ranges {bytes:>12} B  {key}"
+        );
+    }
+    for (path, ranges) in pond::substrate::io_trace::bytes_by_path::take_samples() {
+        eprintln!("IOTRACE {label} SAMPLE {path} sampled={}", ranges.len());
+        let text = ranges
+            .iter()
+            .map(|(method, offset, len)| format!("{method}@{offset}+{len}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("IOTRACE {label} SAMPLE   {text}");
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     #[allow(unsafe_code)]
@@ -1266,6 +1384,9 @@ async fn run() -> anyhow::Result<()> {
     human_panic::setup_panic!();
 
     let cli = Cli::parse();
+    if io_trace_armed() {
+        pond::substrate::io_trace::enable();
+    }
     init_tracing(cli.verbose.tracing_level_filter());
     if let Err(error) = try_raise_fd_limit(65_536) {
         tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
@@ -1719,6 +1840,7 @@ async fn run() -> anyhow::Result<()> {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             load_rowmap_quietly(&store).await;
+            io_trace_report("get-session/setup");
             let first_page = after_message_id.is_none() && before_message_id.is_none();
             let request = GetSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1730,6 +1852,7 @@ async fn run() -> anyhow::Result<()> {
                 before_message_id,
             };
             let envelope = handlers::pond_get_session(&store, request).await;
+            io_trace_report("get-session/handler");
             // Spawn-only subagents are their own sessions (spec.md#datasets);
             // surface them on a session's first page so the CLI matches the MCP
             // transcript. Best-effort: a lookup failure just omits the footer.
@@ -1756,6 +1879,7 @@ async fn run() -> anyhow::Result<()> {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             load_rowmap_quietly(&store).await;
+            io_trace_report("get-message/setup");
             let request = GetMessageRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -1764,6 +1888,7 @@ async fn run() -> anyhow::Result<()> {
                 context_after,
             };
             let envelope = handlers::pond_get_message(&store, request).await;
+            io_trace_report("get-message/handler");
             if !render_get_envelope(format, &envelope, "")? {
                 std::process::exit(1);
             }
