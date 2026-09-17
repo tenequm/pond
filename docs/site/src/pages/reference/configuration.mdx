@@ -71,7 +71,7 @@ memory_ceiling = "4 GiB"   # default; "0" disables
 oom_score_adj  = 200       # default when nothing else set one; 0 opts out
 ```
 
-Every 30 seconds the process reads its own resident set. Over the ceiling it first asks the allocator to return freed pages and reads again, so retained-but-free memory never counts as growth; two consecutive readings that are still over are a breach. On a breach it stops accepting new HTTP connections, waits up to 30 seconds for in-flight requests and any running in-serve sync cycle to finish, prints the reading to stderr, and exits [`75`](/reference/exit-codes). No request is cut short and no write is interrupted.
+Every 30 seconds the process reads its own resident set. Over the ceiling it first asks the allocator to return freed pages and reads again, so retained-but-free memory never counts as growth; two consecutive readings that are still over are a breach. On a breach it stops accepting new HTTP connections, waits up to 30 seconds for in-flight requests and any running in-serve sync cycle to finish, prints the reading to stderr, and exits [`75`](/reference/exit-codes). The wait is bounded on purpose - one request wedged on an unreachable object store would otherwise disarm the ceiling - so a cycle still running after 30 seconds is logged with its outstanding count and the process leaves anyway. That costs the unfinished tail of that cycle, never a half-written row: pond writes are append-only single commits, so the next sync redoes exactly what did not commit.
 
 What the client sees depends on the transport:
 
@@ -80,7 +80,7 @@ What the client sees depends on the transport:
 
 A restart is the whole point: a multi-GB pond process returns to its ~157 MB steady state, so unexplained growth costs one bounded bounce instead of a kill aimed at something else. The floor on a configured ceiling is 256 MiB - a smaller one is refused at load, because a serving process peaks above that at startup and would restart in a loop. Set `0` if a cgroup (`MemoryMax=`) already bounds the process and you would rather the kernel decide.
 
-`oom_score_adj` biases that kernel decision toward pond. An inherited non-zero value - systemd's `OOMScoreAdjust=`, a container runtime's setting - is left alone; pond only fills in a default where nothing chose one. Off Linux there is no cheap resident-set reading and no `oom_score_adj`: both knobs are inert, and the process logs that at startup.
+`oom_score_adj` biases that kernel decision toward pond. An inherited non-zero value - systemd's `OOMScoreAdjust=`, a container runtime's setting - is left alone; pond only fills in a default where nothing chose one. Off Linux there is no cheap resident-set reading and no `oom_score_adj`: both knobs are inert, and an enabled ceiling says so in one startup line.
 
 ## Environment
 

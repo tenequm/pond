@@ -228,9 +228,13 @@ impl<M: ResidentMeter> MemoryCeiling<M> {
     }
 }
 
-/// Work a ceiling restart must not cut in half: every request in flight and
+/// Work a ceiling restart should not cut in half: every request in flight and
 /// every in-serve sync cycle. A breach waits for this to reach zero before it
-/// exits, so no write is interrupted mid-commit.
+/// exits - bounded by [`CEILING_DRAIN_TIMEOUT`], so a wedged holder cannot turn
+/// the ceiling into a no-op. Past that bound the process leaves anyway, which
+/// costs the unfinished tail of a cycle and never a half-written row: every
+/// pond write lands as one append-only Lance commit, so the next sync redoes
+/// exactly what did not commit (`lance-append-only`).
 #[derive(Clone, Default)]
 pub struct InFlight(Arc<AtomicUsize>);
 

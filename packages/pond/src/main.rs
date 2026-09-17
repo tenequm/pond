@@ -1290,6 +1290,24 @@ fn spawn_memory_ceiling(
     });
 }
 
+/// Hand the exit to the memory ceiling once it has taken over the stop.
+///
+/// The serving future returns as soon as its listener is closed, and closing
+/// the listener is the *first* thing a breach does - so without this the serve
+/// arm would return while the guard is still draining, `run` would end with
+/// code 0, and dropping the runtime would abort the very in-serve sync cycle
+/// the drain exists to protect. Parking leaves [`spawn_memory_ceiling`]'s task
+/// as the only thing that can end the process, so the drain always runs to its
+/// own conclusion and the code is always `EXIT_MEMORY_CEILING`; that task's
+/// drain window is what bounds the wait. A normal stop - ctrl-c, SIGTERM -
+/// leaves the token uncancelled and returns here immediately.
+async fn park_for_ceiling_exit(stop: &tokio_util::sync::CancellationToken) {
+    if stop.is_cancelled() {
+        tracing::info!("listener closed at the memory ceiling; the guard owns the exit");
+        std::future::pending::<()>().await;
+    }
+}
+
 #[cfg(unix)]
 fn try_raise_fd_limit(target: u64) -> anyhow::Result<()> {
     use rlimit::{Resource, getrlimit, setrlimit};
@@ -1733,13 +1751,15 @@ async fn run() -> anyhow::Result<()> {
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
-                    transport::http::serve(state, host, port, allowed_host, ceiling_stop).await?;
+                    transport::http::serve(state, host, port, allowed_host, ceiling_stop.clone())
+                        .await?;
                 }
                 ServeTransport::Stdio => {
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
                     transport::mcp::serve_stdio(state).await?;
                 }
             }
+            park_for_ceiling_exit(&ceiling_stop).await;
         }
         Command::Mcp {} => {
             let config = Config::load(config_path(config))?;
@@ -7612,6 +7632,26 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
+
+    /// A breach closes the listener first, so the serve future returns while
+    /// the guard is still draining. If that return reached `run` the process
+    /// would exit 0 and abandon the drain mid-cycle; this is the park that
+    /// keeps the guard the only thing that ends the process.
+    #[tokio::test]
+    async fn a_ceiling_stop_hands_the_exit_to_the_guard() {
+        let stop = tokio_util::sync::CancellationToken::new();
+        tokio::time::timeout(Duration::from_millis(100), park_for_ceiling_exit(&stop))
+            .await
+            .expect("a normal stop returns straight away");
+
+        stop.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), park_for_ceiling_exit(&stop))
+                .await
+                .is_err(),
+            "a ceiling stop must not let the serve arm finish `run`"
+        );
+    }
 
     fn index_status(name: &str, exists: bool, unindexed_rows: usize) -> IndexStatus {
         IndexStatus {
