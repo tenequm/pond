@@ -834,7 +834,7 @@ mod get_handler {
         sessions::{GetLookup, MessageViewParams, RetrievedMessage, SessionViewParams, Store},
         wire::{
             GetEnvelope, GetMessageRequest, GetResponse, GetResult, GetSession, GetSessionRequest,
-            MessageView, PartSummary, ResponsePart, validate_protocol,
+            MessageView, ResponsePart, validate_protocol,
         },
     };
 
@@ -845,18 +845,13 @@ mod get_handler {
     /// inlined here - they ride `GetResult::Message.target_parts`, reached by
     /// `message_id` scope.
     fn to_message_view(message: RetrievedMessage) -> MessageView {
-        let parts_summary = message
-            .parts
-            .iter()
-            .filter_map(|part| PartSummary::for_kind(&part.kind))
-            .collect();
         MessageView {
             id: message.id,
             role: message.role,
             timestamp: message.timestamp,
             text: message.text,
             content: message.content,
-            parts_summary,
+            parts_summary: message.parts_summary,
         }
     }
 
@@ -1817,27 +1812,21 @@ mod search_handler {
                     .push(hit.meta.message_id.clone());
             }
         }
-        // Per-session parts scans are independent S3 round trips - run them
-        // concurrently, not in a sequential await loop (latency would sum).
+        // A session the resident parts summary map covers costs no round trip
+        // at all; the ones it cannot answer for fall back to a parts scan, and
+        // those are independent S3 round trips - run them concurrently, not in
+        // a sequential await loop (latency would sum).
         let summary_futs = user_ids_by_session
             .iter()
             .map(|(session_id, message_ids)| async move {
                 store
-                    .summary_parts_for_messages(session_id, message_ids)
+                    .summary_parts(session_id, message_ids)
                     .await
                     .map_err(map_storage)
             });
         let mut summaries: HashMap<(String, String), Vec<PartSummary>> = HashMap::new();
         for parts_by_message in futures::future::try_join_all(summary_futs).await? {
-            for (key, parts) in parts_by_message {
-                summaries.insert(
-                    key,
-                    parts
-                        .iter()
-                        .filter_map(|part| PartSummary::for_kind(&part.kind))
-                        .collect(),
-                );
-            }
+            summaries.extend(parts_by_message);
         }
 
         let mut groups: BTreeMap<String, Acc> = BTreeMap::new();

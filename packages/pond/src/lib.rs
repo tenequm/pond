@@ -7,6 +7,7 @@ pub mod memory;
 // `#[global_allocator]` swap) does not exist in a default build.
 #[cfg(any(feature = "mem-probe", feature = "dhat-heap"))]
 pub mod memprobe;
+pub mod partsmap;
 pub mod render;
 pub mod rowmap;
 pub mod sessions;

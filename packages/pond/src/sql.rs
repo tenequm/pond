@@ -242,7 +242,8 @@ pub async fn run(
                  narrow native columns (tool_name, \
                  call_id, is_failure) instead of json_get_* over variant_data. If you were \
                  substring-scanning variant_data (json_extract + LIKE), there is no \
-                 substring index on tool bodies yet: scope-then-scan - first collect \
+                 substring index on tool bodies yet - though a tool_call params hunt \
+                 is `body_text LIKE '...'` on a plain text column: scope-then-scan - first collect \
                  candidate session_ids from the indexed conversational text (WITH hits AS \
                  (SELECT DISTINCT session_id FROM messages WHERE \
                  contains_tokens(search_text, '...')), then run the field LIKE only \
@@ -1034,7 +1035,8 @@ fn enrich(message: &str) -> String {
              embedding_model, options) | sessions(session_id, parent_session_id, \
              parent_message_id, source_agent, created_at, project, options) | \
              parts(session_id, message_id, id, ordinal, type, provenance, tool_name, \
-             call_id, is_failure, variant_data, options). Part bodies live in \
+             call_id, is_failure, body_text [tool_call params as text], preview \
+             [a ~160-char one-liner], variant_data, options). Part bodies live in \
              parts.variant_data (JSONB) and nest by part type: tool_call is {call_id, \
              name, params} - a Bash command is json_extract(variant_data, \
              '$.params.command') - tool_result is {call_id, name, is_failure, result}, \

@@ -557,11 +557,17 @@ NULL, source_agent text, created_at timestamp(us, UTC), project text, options js
 {text|reasoning|file|tool_call|tool_result|tool_approval_request|\
 tool_approval_response - exact strings, underscores not hyphens}, provenance \
 text {conversational|injected}, tool_name text NULL, call_id text NULL, \
-is_failure boolean NULL, variant_data json, options json). `tool_name` / \
-`call_id` / `is_failure` are narrow native columns materialized from the tool \
-part bodies - ALWAYS prefer them over json_get_* on `variant_data` for tool \
-analytics (name filters, GROUP BY, call->result joins, failure rates); they are \
-NULL on non-tool parts (`is_failure` is non-NULL only on tool_result). The \
+is_failure boolean NULL, body_text text NULL, preview text NULL, \
+variant_data json, options json). `tool_name` / `call_id` / `is_failure` are \
+narrow native columns materialized from the tool part bodies - ALWAYS prefer \
+them over json_get_* on `variant_data` for tool analytics (name filters, GROUP \
+BY, call->result joins, failure rates); they are NULL on non-tool parts \
+(`is_failure` is non-NULL only on tool_result). `body_text` is the tool_call \
+params as text and `preview` a ~160-char one-liner - both plain text, so LIKE \
+works on them where it cannot on JSONB: a params substring hunt is `body_text \
+LIKE '%needle%'` (still scope it by session_id or tool_name), and a preview is \
+what pond_get_session shows per part. Result bodies are deliberately not \
+materialized - reach them through `variant_data` under a session scope. The \
 verbatim part body lives in `variant_data`; its fields follow the part type, \
 e.g. tool_call carries {call_id, name, params}, tool_result carries {call_id, \
 name, is_failure, result}, text/reasoning carry {text}. FilePart binary \
@@ -896,7 +902,7 @@ Examples (4 patterns the agent should recognize):
         /// sessions(session_id, parent_session_id, parent_message_id,
         /// source_agent, created_at, project, options) | parts(session_id,
         /// message_id, id, ordinal, type, provenance, tool_name, call_id,
-        /// is_failure, variant_data, options). parts.type enums use
+        /// is_failure, body_text, preview, variant_data, options). parts.type enums use
         /// underscores: 'tool_call', 'tool_result', 'text', 'reasoning',
         /// 'file'. Tool bodies live in JSONB variant_data - tool_call is
         /// {call_id, name, params} (a Bash command is

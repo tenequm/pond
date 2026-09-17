@@ -879,14 +879,15 @@ impl RowMetaBuilder {
 }
 
 /// A build temp: streamed into, read back once, and reclaimed on drop unless
-/// [`Self::publish`] hands it over.
-struct Staging {
+/// [`Self::publish`] hands it over. Shared with the sibling segment family in
+/// `partsmap`, which stages and publishes the same way.
+pub(crate) struct Staging {
     path: PathBuf,
     writer: Option<BufWriter<File>>,
 }
 
 impl Staging {
-    fn create(path: PathBuf) -> Result<Self> {
+    pub(crate) fn create(path: PathBuf) -> Result<Self> {
         // Read access too: the staging extents are streamed out and then read
         // back through the same handle by `rewind`.
         let file = std::fs::OpenOptions::new()
@@ -904,7 +905,7 @@ impl Staging {
         })
     }
 
-    fn writer(&mut self) -> Result<&mut BufWriter<File>> {
+    pub(crate) fn writer(&mut self) -> Result<&mut BufWriter<File>> {
         self.writer
             .as_mut()
             .context("row meta map temp is already closed")
@@ -912,7 +913,7 @@ impl Staging {
 
     /// Close the writer and hand back the file positioned to be read from the
     /// start. The path stays owned, so dropping the `Staging` still reclaims it.
-    fn rewind(&mut self) -> Result<File> {
+    pub(crate) fn rewind(&mut self) -> Result<File> {
         let mut file = self.take_file()?;
         file.seek(SeekFrom::Start(0))?;
         Ok(file)
@@ -920,7 +921,7 @@ impl Staging {
 
     /// Flush, fsync, close, and give up ownership of the path: the caller is
     /// publishing the file, so drop must no longer reclaim it.
-    fn publish(&mut self) -> Result<PathBuf> {
+    pub(crate) fn publish(&mut self) -> Result<PathBuf> {
         let file = self.take_file()?;
         file.sync_all()?;
         drop(file);
@@ -1020,14 +1021,48 @@ impl ChainPaths {
 /// shape true; duplicating the predicate let the sweep change while the probe
 /// kept passing on a rule that no longer held.
 pub fn is_orphan_temp(file_name: &str, store_key: &str) -> bool {
-    file_name.starts_with(&format!("rowmetamap-{store_key}-")) && file_name.contains(".tmp-")
+    is_orphan_temp_of(file_name, ROWMAP_FAMILY, store_key)
 }
+
+/// The generic form of [`is_orphan_temp`], for a sibling map family in this
+/// cache (see [`SegmentFamily`]).
+pub fn is_orphan_temp_of(file_name: &str, family: SegmentFamily, store_key: &str) -> bool {
+    file_name.starts_with(&format!("{}-{store_key}-", family.prefix)) && file_name.contains(".tmp-")
+}
+
+/// One mmap'd segment-chain family in pond's cache directory: its file-name
+/// prefix and extension. The LSM naming (`{prefix}-{store_key}-v{V}.{ext}`
+/// bases, `-d{V}` deltas, `.tmp-{pid}-{nonce}` build temps) and everything
+/// that discovers, sweeps or purges by it is shared, so a second family - the
+/// parts summary map (#284) - gets the same lifecycle for free.
+#[derive(Clone, Copy)]
+pub struct SegmentFamily {
+    pub prefix: &'static str,
+    pub extension: &'static str,
+}
+
+/// The per-message row meta map this module encodes.
+pub const ROWMAP_FAMILY: SegmentFamily = SegmentFamily {
+    prefix: "rowmetamap",
+    extension: "rmm",
+};
 
 /// Discover the chain under `cache_dir` for `store_key`: the highest-version
 /// base (`-v{V}`) plus every delta (`-d{V}`) above it, ascending. `None` if no
 /// base exists yet.
 pub fn discover_chain(cache_dir: &Path, store_key: &str) -> Option<ChainPaths> {
-    let prefix = format!("rowmetamap-{store_key}-");
+    discover_family_chain(cache_dir, ROWMAP_FAMILY, store_key)
+}
+
+/// The generic form of [`discover_chain`], for a sibling map family in this
+/// cache (see [`SegmentFamily`]).
+pub fn discover_family_chain(
+    cache_dir: &Path,
+    family: SegmentFamily,
+    store_key: &str,
+) -> Option<ChainPaths> {
+    let prefix = format!("{}-{store_key}-", family.prefix);
+    let suffix = format!(".{}", family.extension);
     let mut bases: Vec<(u64, PathBuf)> = Vec::new();
     let mut deltas: Vec<(u64, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(cache_dir).ok()?.flatten() {
@@ -1035,7 +1070,7 @@ pub fn discover_chain(cache_dir: &Path, store_key: &str) -> Option<ChainPaths> {
         let Some(rest) = name
             .to_str()
             .and_then(|name| name.strip_prefix(&prefix))
-            .and_then(|rest| rest.strip_suffix(".rmm"))
+            .and_then(|rest| rest.strip_suffix(&suffix))
         else {
             continue;
         };
