@@ -648,11 +648,19 @@ jobs:
           CREATED: ${{ steps.release-plz.outputs.releases_created }}
         run: |
           set -euo pipefail
-          if [ "$CREATED" = true ] || gh release view "v$V" --repo tenequm/pond >/dev/null; then
+          if [ "$CREATED" = true ]; then
             echo "released=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          # Only a 404 means "no release"; any other failure must not turn a
+          # re-run into a green job that published nothing.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/tenequm/pond/releases/tags/v$V")
+          case "$code" in
+            200) echo "released=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "released=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::release lookup for v$V returned HTTP $code" >&2; exit 1 ;;
+          esac
 
       # Checksums merge, binary upload, repo flake commit, Homebrew formula.
       # Idempotent, so "Re-run failed jobs" is safe.

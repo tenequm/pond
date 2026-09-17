@@ -30,15 +30,17 @@ test -f dist/pond-x86_64-pc-windows-msvc.zip
 (cd dist && sha256sum pond-* > checksums.txt)
 cat dist/checksums.txt
 
-# One file per call with a hard timeout: a multi-file `gh release upload` that
-# stalls holds the whole job, and a killed upload leaves an asset GitHub never
-# marks `uploaded`, which blocks a plain retry with "already exists".
+# One file per request with a hard timeout, through curl: `gh release upload`
+# (2.100.0) stalled for minutes on the 81 MB Windows zip that curl posts in
+# seconds. A killed upload leaves the asset in state "starter", which blocks a
+# plain retry with "already exists", so each try first clears it.
+release_id=$(gh api "repos/$repo/releases/tags/$tag" --jq .id)
 upload() {
   local f=$1 name size try existing id state asize present
   name=${f##*/}
   size=$(wc -c < "$f" | tr -d ' ')
   for try in 1 2 3; do
-    if existing=$(gh api "repos/$repo/releases/tags/$tag" \
+    if existing=$(gh api "repos/$repo/releases/$release_id" \
       --jq ".assets[] | select(.name == \"$name\") | [.id, .state, .size] | @tsv"); then
       present=false
       while IFS=$'\t' read -r id state asize; do
@@ -54,7 +56,12 @@ upload() {
         echo "$name: already uploaded"
         return 0
       fi
-      if timeout 600 gh release upload "$tag" "$f" --repo "$repo"; then
+      if curl -sS --fail-with-body --max-time 600 -o /dev/null \
+        -H "Authorization: Bearer $GH_TOKEN" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@$f" \
+        "https://uploads.github.com/repos/$repo/releases/$release_id/assets?name=$name"; then
+        echo "$name: uploaded"
         return 0
       fi
     fi
