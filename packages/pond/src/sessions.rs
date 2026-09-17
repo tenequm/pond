@@ -34,9 +34,12 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config, embed,
+    partsmap::{
+        PARTS_SUMMARY_FAMILY, PartSummaryRef, PartsSummaryBuilder, PartsSummaryMap, PartsSummarySet,
+    },
     rowmap::{
-        RowMetaBuilder, RowMetaEntry, RowMetaMap, RowMetaRef, RowMetaSet, UnorderedRows,
-        discover_chain,
+        ROWMAP_FAMILY, RowMetaBuilder, RowMetaEntry, RowMetaMap, RowMetaRef, RowMetaSet,
+        SegmentFamily, UnorderedRows, discover_chain, discover_family_chain,
     },
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, LegacyLayout,
@@ -44,8 +47,8 @@ use crate::{
         Table, TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{
-        FileData, Message, Part, PartKind, ProviderOptions, Role, SUMMARY_PART_TYPES, Session,
-        SessionFrom,
+        FileData, Message, Part, PartKind, PartSummary, ProviderOptions, Role, SUMMARY_PART_TYPES,
+        Session, SessionFrom,
     },
 };
 use url::Url;
@@ -65,6 +68,11 @@ pub struct Store {
     /// the watermarks it actually planned against and a run whose chain was
     /// rejected persists nothing.
     sync_oracle_map: ArcSwapOption<RowMetaSet>,
+    /// Resident per-message parts summary map (see [`crate::partsmap`]), the
+    /// local answer to `pond_get_session`'s `parts_summary`. `None` until
+    /// [`Store::ensure_partsmap`] builds it, where the summary reads fall back
+    /// to the `parts` scan they replace.
+    partsmap: ArcSwapOption<PartsSummarySet>,
     /// Resident embedder for inline embed-at-ingest. `None` keeps ingest
     /// writing null vectors (tests, search-only stores); the CLI write paths
     /// attach one via [`Store::with_embedder`]. Lazy, so a store that never
@@ -358,6 +366,7 @@ impl Store {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
+            partsmap: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
         })
@@ -400,6 +409,7 @@ impl Store {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
+            partsmap: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
         })
@@ -423,6 +433,7 @@ impl Store {
             .await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
+            partsmap: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
         })
@@ -1599,7 +1610,10 @@ impl Store {
         let after_remaining = total - win_end;
         let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
 
-        let mut parts_by_message = self.summary_parts_for_messages(session_id, &ids).await?;
+        // The resident map answers with zero `parts` reads; it declines (and
+        // this falls back to the scan it replaces) when its version skews from
+        // the store's or it has never seen one of these messages.
+        let mut parts_by_message = self.summary_parts(session_id, &ids).await?;
         let messages = emitted
             .iter()
             .map(|row| RetrievedMessage {
@@ -1608,7 +1622,7 @@ impl Store {
                 timestamp: row.timestamp,
                 text: row.text.clone(),
                 content: row.content.clone(),
-                parts: parts_by_message
+                parts_summary: parts_by_message
                     .remove(&(session_id.to_owned(), row.id.clone()))
                     .unwrap_or_default(),
             })
@@ -1689,7 +1703,7 @@ impl Store {
             text: target_row.text.clone(),
             content: target_row.content.clone(),
             // Target structure is carried in full by `target_parts`.
-            parts: Vec::new(),
+            parts_summary: Vec::new(),
         };
         let siblings = window
             .iter()
@@ -1701,9 +1715,17 @@ impl Store {
                 timestamp: row.timestamp,
                 text: row.text.clone(),
                 content: row.content.clone(),
-                parts: parts_by_message
+                // Siblings ride the window scan the target's full parts
+                // already paid for, so they summarize from it rather than
+                // taking the map path.
+                parts_summary: parts_by_message
                     .get(&(session_id.clone(), row.id.clone()))
-                    .cloned()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(|part| PartSummary::for_kind(&part.kind))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             })
             .collect();
@@ -1946,6 +1968,11 @@ impl Store {
         if let Err(error) = self.ensure_rowmap(cache_dir).await {
             tracing::warn!(%error, "rowmap build skipped; arms fall back to data-take resolution");
         }
+        // Same posture for the parts summary map: on failure the get paths
+        // fall back to the `parts` scan they replace.
+        if let Err(error) = self.ensure_partsmap(cache_dir).await {
+            tracing::warn!(%error, "parts summary map build skipped; gets fall back to parts scans");
+        }
         // Warm the FTS posting lists; the rowmap build above touched only the
         // data columns.
         if let Err(error) = self
@@ -1970,8 +1997,9 @@ impl Store {
         crate::substrate::store_key(self.handle.location())
     }
 
-    /// Max delta segments before the chain is compacted into a fresh base.
-    const MAX_ROWMAP_DELTAS: usize = 16;
+    /// Max delta segments before a segment chain is compacted into a fresh
+    /// base - shared by the row meta map and the parts summary map.
+    const MAX_MAP_DELTAS: usize = 16;
 
     /// Columns the resident meta map is built from. All three scans over this
     /// list - the sorting fallback and the delta scan, both reading through
@@ -2018,7 +2046,12 @@ impl Store {
         {
             if self.rowmap_matches_store(&set, Coverage::Complete).await? {
                 self.rowmap.store(Some(Arc::new(set)));
-                Self::sweep_stale_rowmaps(cache_dir, &store_key, chain.base_version);
+                Self::sweep_stale_segments(
+                    cache_dir,
+                    ROWMAP_FAMILY,
+                    &store_key,
+                    chain.base_version,
+                );
                 return Ok(RowmapEnsure::Current);
             }
             // Fall through to the build below, which purges under the lock. NOT
@@ -2199,7 +2232,7 @@ impl Store {
 
         // Holding the lock makes us the only builder, so every build temp is a
         // dead orphan from a crashed build - clear them before writing ours.
-        Self::sweep_orphan_temps(cache_dir, store_key);
+        Self::sweep_orphan_temps(cache_dir, ROWMAP_FAMILY, store_key);
 
         // Validate any existing chain opens; an unreadable segment (an older
         // MAGIC after a pond upgrade, or a corrupt file) is purged so the build
@@ -2217,13 +2250,13 @@ impl Store {
                         store = store_key,
                         "cached rowmap describes a different store at this path; rebuilding"
                     );
-                    Self::purge_rowmaps(cache_dir, store_key);
+                    Self::purge_segments(cache_dir, ROWMAP_FAMILY, store_key);
                     None
                 }
                 Ok(set) => Some((paths, set)),
                 Err(error) => {
                     tracing::warn!(%error, store = store_key, "rowmap unreadable; purging and rebuilding");
-                    Self::purge_rowmaps(cache_dir, store_key);
+                    Self::purge_segments(cache_dir, ROWMAP_FAMILY, store_key);
                     None
                 }
             },
@@ -2245,7 +2278,7 @@ impl Store {
 
         let base_version = match (&existing, delta) {
             // Append with room: layer a new delta segment.
-            (Some((paths, _)), Some(entries)) if paths.deltas.len() < Self::MAX_ROWMAP_DELTAS => {
+            (Some((paths, _)), Some(entries)) if paths.deltas.len() < Self::MAX_MAP_DELTAS => {
                 let path = RowMetaMap::delta_path(cache_dir, store_key, version);
                 RowMetaMap::build(&path, version, entries)?;
                 paths.base_version
@@ -2277,7 +2310,7 @@ impl Store {
         let chain =
             discover_chain(cache_dir, store_key).context("rowmap chain missing after build")?;
         let set = RowMetaSet::open(&chain)?;
-        Self::sweep_stale_rowmaps(cache_dir, store_key, base_version);
+        Self::sweep_stale_segments(cache_dir, ROWMAP_FAMILY, store_key, base_version);
         crate::memory::trim_allocator();
         Ok(Some(set))
     }
@@ -2291,8 +2324,9 @@ impl Store {
     /// refuses to delete a mapped file at all. That leaks a stale `.rmm` until
     /// the next build sweeps again - which is why every sweep is unconditional
     /// rather than one-shot, and why the failure is logged, not swallowed.
-    fn sweep_stale_rowmaps(cache_dir: &Path, store_key: &str, keep: u64) {
-        let prefix = format!("rowmetamap-{store_key}-");
+    fn sweep_stale_segments(cache_dir: &Path, family: SegmentFamily, store_key: &str, keep: u64) {
+        let prefix = format!("{}-{store_key}-", family.prefix);
+        let suffix = format!(".{}", family.extension);
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
             return;
         };
@@ -2301,7 +2335,7 @@ impl Store {
             let Some(rest) = name
                 .to_str()
                 .and_then(|name| name.strip_prefix(&prefix))
-                .and_then(|rest| rest.strip_suffix(".rmm"))
+                .and_then(|rest| rest.strip_suffix(&suffix))
             else {
                 continue;
             };
@@ -2336,17 +2370,18 @@ impl Store {
     /// build lock.
     ///
     /// A segment a sibling still has mapped survives the purge on Windows (see
-    /// [`Self::sweep_stale_rowmaps`]); the rebuild below then republishes the
+    /// [`Self::sweep_stale_segments`]); the rebuild below then republishes the
     /// same version over it, which is the cycle `rowmap_purge_probe` pins down.
-    fn purge_rowmaps(cache_dir: &Path, store_key: &str) {
-        let prefix = format!("rowmetamap-{store_key}-");
+    fn purge_segments(cache_dir: &Path, family: SegmentFamily, store_key: &str) {
+        let prefix = format!("{}-{store_key}-", family.prefix);
+        let suffix = format!(".{}", family.extension);
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
             return;
         };
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str()
                 && name.starts_with(&prefix)
-                && name.ends_with(".rmm")
+                && name.ends_with(&suffix)
             {
                 Self::reclaim(&entry.path());
             }
@@ -2356,14 +2391,14 @@ impl Store {
     /// Remove abandoned build temp files (`*.tmp-*`) for this store. Best-effort,
     /// and only sound under the build lock - the holder is the sole builder, so
     /// any temp present is a crashed-build orphan, not a live write.
-    fn sweep_orphan_temps(cache_dir: &Path, store_key: &str) {
+    fn sweep_orphan_temps(cache_dir: &Path, family: SegmentFamily, store_key: &str) {
         let Ok(entries) = std::fs::read_dir(cache_dir) else {
             return;
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if crate::rowmap::is_orphan_temp(name, store_key) {
+            if crate::rowmap::is_orphan_temp_of(name, family, store_key) {
                 Self::reclaim(&entry.path());
             }
         }
@@ -2372,6 +2407,440 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn rowmap_delta_count(&self) -> Option<usize> {
         self.rowmap.load_full().map(|set| set.delta_count())
+    }
+
+    /// Columns the parts summary map is built from. Narrow natives only: what
+    /// makes the map possible is that `preview` is materialized (#284), so the
+    /// build never touches `variant_data` - the column whose page-granular
+    /// reads are the 30-40x over-read a warm get pays today.
+    const PART_SUMMARY_COLUMNS: [&str; 9] = [
+        "session_id",
+        "message_id",
+        "id",
+        "ordinal",
+        "type",
+        "tool_name",
+        "call_id",
+        "is_failure",
+        "preview",
+    ];
+
+    /// Current `parts` dataset version - the key a parts summary chain is
+    /// built against, the twin of [`Self::messages_version`].
+    pub async fn parts_version(&self) -> Result<u64> {
+        Ok(self.handle.dataset(Table::Parts).await?.version().version)
+    }
+
+    /// The preview-renderer version stamped on this store's `parts` schema,
+    /// or `None` on a store written before the column existed. A value below
+    /// [`crate::wire::PREVIEW_RENDERER_VERSION`] means the stored previews
+    /// came from an older renderer: they stay servable, and re-deriving them
+    /// is a `merge_update` over `preview` alone, never a re-ingest
+    /// (spec.md#session-additive-schema-backfill).
+    pub async fn preview_renderer_version(&self) -> Result<Option<u32>> {
+        let dataset = self.handle.dataset(Table::Parts).await?;
+        Ok(stored_preview_renderer_version(
+            &lance::deps::arrow_schema::Schema::from(dataset.schema()),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn partsmap_delta_count(&self) -> Option<usize> {
+        self.partsmap.load_full().map(|set| set.delta_count())
+    }
+
+    /// Install the resident parts summary map covering the current `parts`
+    /// version. The [`Self::ensure_rowmap`] lifecycle applied to the sibling
+    /// family: idempotent at the current version, a delta segment on a version
+    /// bump (scanning only the new fragments), a local compaction once the
+    /// deltas pile up, a full rebuild only when the chain cannot be extended -
+    /// all under its own build `flock`.
+    pub async fn ensure_partsmap(&self, cache_dir: &Path) -> Result<()> {
+        let version = self.parts_version().await?;
+        if let Some(current) = self.partsmap.load_full()
+            && current.version() == version
+        {
+            return Ok(());
+        }
+        std::fs::create_dir_all(cache_dir)
+            .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
+        let store_key = self.store_key();
+
+        // A sibling may already have published a chain at this version.
+        if let Some(chain) = discover_family_chain(cache_dir, PARTS_SUMMARY_FAMILY, &store_key)
+            && chain.version() == version
+            && let Ok(set) = PartsSummarySet::open(&chain)
+            && self
+                .partsmap_matches_store(&set, Coverage::Complete)
+                .await?
+        {
+            self.partsmap.store(Some(Arc::new(set)));
+            Self::sweep_stale_segments(
+                cache_dir,
+                PARTS_SUMMARY_FAMILY,
+                &store_key,
+                chain.base_version,
+            );
+            return Ok(());
+        }
+        if let Some(set) = self
+            .extend_partsmap_coordinated(cache_dir, &store_key, version)
+            .await?
+        {
+            self.partsmap.store(Some(Arc::new(set)));
+        }
+        Ok(())
+    }
+
+    /// Extend the parts summary chain to `version` under its build `flock`.
+    /// `None` when another local process holds the lock - this caller keeps
+    /// its current map (or the `parts` scan fallback) until a later refresh
+    /// opens what the winner published.
+    async fn extend_partsmap_coordinated(
+        &self,
+        cache_dir: &Path,
+        store_key: &str,
+        version: u64,
+    ) -> Result<Option<PartsSummarySet>> {
+        let lock_path = cache_dir.join(format!("{}-{store_key}.lock", PARTS_SUMMARY_FAMILY.prefix));
+        let lock = std::fs::File::create(&lock_path)
+            .with_context(|| format!("create parts summary build lock {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("lock parts summary build");
+            }
+        }
+
+        // Holding the lock makes us the only builder, so every build temp is a
+        // dead orphan from a crashed build.
+        Self::sweep_orphan_temps(cache_dir, PARTS_SUMMARY_FAMILY, store_key);
+
+        // An unreadable segment (an older MAGIC after a pond upgrade, or a
+        // corrupt file) is purged so the build below is a clean full rebuild
+        // rather than a delta layered on an unreadable base.
+        let chain = discover_family_chain(cache_dir, PARTS_SUMMARY_FAMILY, store_key);
+        let existing = match &chain {
+            Some(paths) => match PartsSummarySet::open(paths) {
+                // A chain from a previous store at this path is worse than no
+                // chain: it would serve that store's summaries under this
+                // store's message ids.
+                Ok(set)
+                    if !self
+                        .partsmap_matches_store(&set, Coverage::Trailing)
+                        .await? =>
+                {
+                    tracing::warn!(
+                        store = store_key,
+                        "cached parts summary map describes a different store at this path; rebuilding"
+                    );
+                    Self::purge_segments(cache_dir, PARTS_SUMMARY_FAMILY, store_key);
+                    None
+                }
+                Ok(set) => Some((paths, set)),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        store = store_key,
+                        "parts summary map unreadable; purging and rebuilding",
+                    );
+                    Self::purge_segments(cache_dir, PARTS_SUMMARY_FAMILY, store_key);
+                    None
+                }
+            },
+            None => None,
+        };
+        // Fragments added since the base decide the path (`None` - a reclaimed
+        // manifest or a net deletion - means the chain cannot be extended).
+        let added = match &existing {
+            Some((_, set)) => {
+                self.parts_fragments_since(set.version(), set.row_count())
+                    .await?
+            }
+            None => None,
+        };
+
+        let base_version = match (&existing, added) {
+            // Append with room: layer a new delta segment.
+            (Some((paths, set)), Some(fragments)) if paths.deltas.len() < Self::MAX_MAP_DELTAS => {
+                let path = PartsSummaryMap::delta_path(cache_dir, store_key, version);
+                let mut builder = PartsSummaryBuilder::new(&path, version, 0)?;
+                self.scan_part_summaries(&mut builder, Some(fragments), set.max_row_id())
+                    .await?;
+                builder.finish()?;
+                paths.base_version
+            }
+            // Append but the deltas are full: replay the chain's segments out
+            // of their own mappings, fold the new rows in, publish one base -
+            // no full store re-read.
+            (Some((_, set)), Some(fragments)) => {
+                let path = PartsSummaryMap::path_for(cache_dir, store_key, version);
+                let mut builder = PartsSummaryBuilder::new(&path, version, set.group_count())?;
+                set.push_into(&mut builder)?;
+                self.scan_part_summaries(&mut builder, Some(fragments), set.max_row_id())
+                    .await?;
+                builder.finish()?;
+                version
+            }
+            // No chain, or one that cannot be extended: full scan -> base.
+            _ => {
+                let path = PartsSummaryMap::path_for(cache_dir, store_key, version);
+                let mut builder = PartsSummaryBuilder::new(
+                    &path,
+                    version,
+                    self.handle.count_rows(Table::Parts).await?,
+                )?;
+                self.scan_part_summaries(&mut builder, None, None).await?;
+                builder.finish()?;
+                version
+            }
+        };
+
+        let chain = discover_family_chain(cache_dir, PARTS_SUMMARY_FAMILY, store_key)
+            .context("parts summary chain missing after build")?;
+        let set = PartsSummarySet::open(&chain)?;
+        Self::sweep_stale_segments(cache_dir, PARTS_SUMMARY_FAMILY, store_key, base_version);
+        crate::memory::trim_allocator();
+        Ok(Some(set))
+    }
+
+    /// `parts` fragments added since `base_version`, or `None` when the chain
+    /// cannot be cheaply extended - the parts twin of
+    /// [`Self::collect_row_metas_delta`]'s two bail-outs: `base_version`'s
+    /// manifest was reclaimed by the cleanup retention window
+    /// (spec.md#concurrency), or the live row count dropped below what the
+    /// chain covers (rows were deleted, and a pure append cannot remove the
+    /// chain's now-stale groups).
+    async fn parts_fragments_since(
+        &self,
+        base_version: u64,
+        base_row_count: usize,
+    ) -> Result<Option<Vec<Fragment>>> {
+        let dataset = self.handle.dataset(Table::Parts).await?;
+        let Ok(old) = dataset.checkout_version(base_version).await else {
+            return Ok(None);
+        };
+        if dataset.count_rows(None).await? < base_row_count {
+            return Ok(None);
+        }
+        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
+        Ok(Some(
+            dataset
+                .get_fragments()
+                .iter()
+                .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
+                .map(|fragment| fragment.metadata().clone())
+                .collect(),
+        ))
+    }
+
+    /// Fold `parts` rows into `builder`, grouped by `(session_id, message_id)`.
+    /// `fragments` scopes the scan (`None` scans the whole table);
+    /// `above_row_id` keeps only genuinely appended rows, so a rewritten or
+    /// compacted fragment - which carries existing row ids - contributes
+    /// nothing a delta would duplicate.
+    ///
+    /// Grouping is per batch and nothing is buffered across batches: a message
+    /// straddling a batch boundary is pushed as two records, which is exactly
+    /// the split the lookup unions (see [`crate::partsmap`]).
+    async fn scan_part_summaries(
+        &self,
+        builder: &mut PartsSummaryBuilder,
+        fragments: Option<Vec<Fragment>>,
+        above_row_id: Option<u64>,
+    ) -> Result<()> {
+        let dataset = self.handle.dataset(Table::Parts).await?;
+        let mut scanner = dataset.scan();
+        if let Some(fragments) = fragments {
+            // `with_fragments(vec![])` is not "scan nothing", so an empty
+            // added-fragment list short-circuits here instead.
+            if fragments.is_empty() {
+                return Ok(());
+            }
+            scanner.with_fragments(fragments);
+        }
+        scanner.with_row_id();
+        scanner.project(&Self::PART_SUMMARY_COLUMNS)?;
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let columns = PartSummaryColumns::new(&batch)?;
+            for group in columns.groups(above_row_id)? {
+                builder.push(
+                    group.session_id,
+                    group.message_id,
+                    &group.entries,
+                    group.rows,
+                    group.max_row_id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Does a cached parts summary chain describe *this* store, or a previous
+    /// one that lived at the same path? The two checks
+    /// [`Self::rowmap_matches_store`] documents at length, against `parts`:
+    /// coverage (at a version the chain claims to describe in full its row
+    /// count equals the store's - pond appends parts but never deletes one; a
+    /// chain about to be EXTENDED trails the store, so there it is only a
+    /// bound) and identity (the store's oldest parts must belong, in the map,
+    /// to the message they actually belong to).
+    async fn partsmap_matches_store(
+        &self,
+        set: &PartsSummarySet,
+        coverage: Coverage,
+    ) -> Result<bool> {
+        if set.is_empty() {
+            return Ok(true);
+        }
+        let dataset = self.handle.dataset(Table::Parts).await?;
+        let live_rows = dataset.count_rows(None).await?;
+        let covered = match coverage {
+            Coverage::Complete => set.row_count() == live_rows,
+            Coverage::Trailing => set.row_count() <= live_rows,
+        };
+        if !covered {
+            return Ok(false);
+        }
+        let mut scanner = self.handle.scanner(Table::Parts, None).await?;
+        scanner.project(&["session_id", "message_id", "id", "type"])?;
+        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        let batch = scanner.try_into_batch().await?;
+        let mut known = 0usize;
+        for row in 0..batch.num_rows() {
+            let session_id = string(&batch, "session_id", row)?.context("session_id is null")?;
+            let message_id = string(&batch, "message_id", row)?.context("message_id is null")?;
+            let part_id = string(&batch, "id", row)?.context("part id is null")?;
+            let kind = string(&batch, "type", row)?.context("part type is null")?;
+            // A group that is not here proves nothing (the probe row may be
+            // newer than the chain), it just cannot count towards
+            // recognition. A group that IS here for this exact
+            // `(session_id, message_id)` is store-specific evidence; and when
+            // the probe part earns a summary, the group must also own it - a
+            // group that does not is another store's message under a replayed
+            // id. A text or reasoning part stores no entry, so there is
+            // nothing to own and presence is all the evidence there is.
+            let Some(entries) = set.lookup_group(&session_id, &message_id) else {
+                continue;
+            };
+            if !SUMMARY_PART_TYPES.contains(&kind.as_str())
+                || entries.iter().any(|entry| entry.part_id == part_id)
+            {
+                known += 1;
+            } else {
+                return Ok(false);
+            }
+        }
+        Ok(known > 0)
+    }
+
+    /// Install an already-published parts summary chain for the current
+    /// version if a sibling built one, without building it (no full scan, no
+    /// build flock) - the one-shot read command's counterpart to
+    /// [`Self::load_rowmap_if_present`]. With no chain, the get paths keep
+    /// scanning `parts` for that single invocation.
+    pub async fn load_partsmap_if_present(&self, cache_dir: &Path) -> Result<()> {
+        let version = self.parts_version().await?;
+        if let Some(current) = self.partsmap.load_full()
+            && current.version() == version
+        {
+            return Ok(());
+        }
+        if let Some(chain) =
+            discover_family_chain(cache_dir, PARTS_SUMMARY_FAMILY, &self.store_key())
+            && chain.version() == version
+            && let Ok(set) = PartsSummarySet::open(&chain)
+        {
+            // Guarded like the build path: this map is what a get page's
+            // summaries come out of, so a chain left by a previous store at
+            // this path would answer with another store's parts.
+            if !self
+                .partsmap_matches_store(&set, Coverage::Complete)
+                .await?
+            {
+                tracing::warn!(
+                    store = self.store_key(),
+                    "cached parts summary map describes a different store at this path; ignoring it"
+                );
+                return Ok(());
+            }
+            self.partsmap.store(Some(Arc::new(set)));
+        }
+        Ok(())
+    }
+
+    /// One page's `parts_summary`, from the resident map when it can answer
+    /// and from the `parts` scan when it cannot - the single seam both get and
+    /// search read, so the two never disagree about where summaries come from.
+    pub async fn summary_parts(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<BTreeMap<(String, String), Vec<PartSummary>>> {
+        match self.summary_parts_resident(session_id, message_ids).await? {
+            Some(summaries) => Ok(summaries),
+            None => Ok(summarize_parts(
+                self.summary_parts_for_messages(session_id, message_ids)
+                    .await?,
+            )),
+        }
+    }
+
+    /// One page's `parts_summary`, served from the resident map with zero
+    /// `parts` reads. `None` (caller scans) unless the loaded chain covers the
+    /// exact `parts` version the cached handle serves and holds a group for
+    /// every message on the page: a stale map may never drop a synced part
+    /// from a page, and matching the handle's version gives the map path the
+    /// same read semantics as the scan it replaces
+    /// (spec.md#lance-handle-freshness).
+    ///
+    /// Version skew - the common case for a get straddling the 5-minute sync -
+    /// falls back per request, not per message: the `parts` scan it falls back
+    /// to is already scoped to this page's message ids, and a partial answer
+    /// cannot be assembled honestly, because a group in an older-version map
+    /// is a group a later commit may have grown.
+    ///
+    /// The version gate assumes append-only rows; a future `pond erase` must
+    /// make this row-set-aware, not just version-aware.
+    pub async fn summary_parts_resident(
+        &self,
+        session_id: &str,
+        message_ids: &[String],
+    ) -> Result<Option<BTreeMap<(String, String), Vec<PartSummary>>>> {
+        let Some(map) = self.partsmap.load_full() else {
+            return Ok(None);
+        };
+        if map.version() != self.parts_version().await? {
+            return Ok(None);
+        }
+        let mut summaries = BTreeMap::new();
+        for message_id in message_ids {
+            // A message the map has never seen is the one case it must not
+            // answer for: an empty summary and an unknown message look the
+            // same to the caller, and only one of them is honest.
+            let Some(entries) = map.lookup_group(session_id, message_id) else {
+                return Ok(None);
+            };
+            summaries.insert(
+                (session_id.to_owned(), message_id.clone()),
+                entries
+                    .iter()
+                    .filter(|entry| SUMMARY_PART_TYPES.contains(&entry.kind.as_str()))
+                    .map(|entry| {
+                        PartSummary::from_columns(
+                            &entry.kind,
+                            entry.tool_name.as_deref(),
+                            entry.call_id.as_deref(),
+                            entry.is_failure,
+                            entry.preview.as_deref(),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        Ok(Some(summaries))
     }
 
     /// The currently-installed resident meta map, if any. `pond sync` reads it
@@ -5221,7 +5690,29 @@ pub struct RetrievedMessage {
     pub timestamp: DateTime<Utc>,
     pub text: Option<String>,
     pub content: Option<String>,
-    pub parts: Vec<Part>,
+    /// One-line descriptors, not bodies: whether they came from the resident
+    /// parts summary map or from a `parts` scan is invisible here, which is
+    /// what lets the map path be a pure read-cost change.
+    pub parts_summary: Vec<PartSummary>,
+}
+
+/// Project scanned parts into the per-message summaries a response carries -
+/// the remote path's counterpart to [`Store::summary_parts_resident`].
+fn summarize_parts(
+    parts_by_message: BTreeMap<(String, String), Vec<Part>>,
+) -> BTreeMap<(String, String), Vec<PartSummary>> {
+    parts_by_message
+        .into_iter()
+        .map(|(key, parts)| {
+            (
+                key,
+                parts
+                    .iter()
+                    .filter_map(|part| PartSummary::for_kind(&part.kind))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -5797,10 +6288,17 @@ pub(crate) fn column_backfill(table_name: &str, missing: &[Field]) -> Result<Col
     }
 }
 
+/// Part types whose stored body has to be decoded to derive any backfill cell:
+/// the tool parts carry identity, `file` carries the label a preview renders.
+/// Skipping the JSONB decode for text/reasoning rows keeps the pass cheap.
+const BACKFILL_DECODED_PART_TYPES: &[&str] =
+    &["tool_call", "tool_result", "tool_approval_request", "file"];
+
 fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
     for field in missing {
         anyhow::ensure!(
-            ["tool_name", "call_id", "is_failure"].contains(&field.name().as_str())
+            ["tool_name", "call_id", "is_failure", "body_text", "preview"]
+                .contains(&field.name().as_str())
                 && field.is_nullable(),
             "column {PARTS}.{} cannot be derived from stored data - use the pond version \
              that wrote it",
@@ -5814,33 +6312,36 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
         let mut names: Vec<Option<String>> = Vec::with_capacity(rows);
         let mut call_ids: Vec<Option<String>> = Vec::with_capacity(rows);
         let mut failures: Vec<Option<bool>> = Vec::with_capacity(rows);
+        let mut body_texts: Vec<Option<String>> = Vec::with_capacity(rows);
+        let mut previews: Vec<Option<String>> = Vec::with_capacity(rows);
         for row in 0..rows {
             let type_name = string(batch, "type", row)?.context("part type is null")?;
-            // Only tool parts carry identity; skipping the JSONB decode for
-            // text/reasoning rows keeps the backfill pass cheap.
-            let kind = match type_name.as_str() {
-                "tool_call" | "tool_result" | "tool_approval_request" => {
-                    let body =
-                        json_column(batch, "variant_data", row)?.context("variant_data is null")?;
-                    // An undecodable body degrades to NULL cells (spec.md#model-no-synthesis:
-                    // a cell the stored record cannot justify stays NULL) rather than failing
-                    // the migration, which re-runs on every open and would leave the store
-                    // permanently un-openable over one bad row.
-                    match part_kind_from_json(&type_name, &body, None) {
-                        Ok(kind) => Some(kind),
-                        Err(error) => {
-                            tracing::warn!(
-                                session_id = string(batch, "session_id", row)?.as_deref(),
-                                part_id = string(batch, "id", row)?.as_deref(),
-                                error = %format!("{error:#}"),
-                                "stored tool part body failed to decode; its backfilled \
-                                 cells stay NULL",
-                            );
-                            None
-                        }
+            let kind = if BACKFILL_DECODED_PART_TYPES.contains(&type_name.as_str()) {
+                let body =
+                    json_column(batch, "variant_data", row)?.context("variant_data is null")?;
+                // A file part's payload lives in the blob column, which the
+                // backfill never reads: the placeholder lets `PartKind::File`
+                // deserialize, and no derived cell reads `data`.
+                let file_data = (type_name == "file").then(|| FileData::Bytes(Vec::new()));
+                // An undecodable body degrades to NULL cells (spec.md#model-no-synthesis:
+                // a cell the stored record cannot justify stays NULL) rather than failing
+                // the migration, which re-runs on every open and would leave the store
+                // permanently un-openable over one bad row.
+                match part_kind_from_json(&type_name, &body, file_data) {
+                    Ok(kind) => Some(kind),
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = string(batch, "session_id", row)?.as_deref(),
+                            part_id = string(batch, "id", row)?.as_deref(),
+                            error = %format!("{error:#}"),
+                            "stored tool part body failed to decode; its backfilled \
+                             cells stay NULL",
+                        );
+                        None
                     }
                 }
-                _ => None,
+            } else {
+                None
             };
             let (name, call_id, is_failure) = kind
                 .as_ref()
@@ -5849,6 +6350,8 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
             names.push(name.map(str::to_owned));
             call_ids.push(call_id.map(str::to_owned));
             failures.push(is_failure);
+            body_texts.push(kind.as_ref().and_then(crate::wire::part_body_text));
+            previews.push(kind.as_ref().and_then(crate::wire::part_preview));
         }
         let arrays: Vec<ArrayRef> = schema
             .fields()
@@ -5857,6 +6360,8 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
                 match field.name().as_str() {
                     "tool_name" => Arc::new(StringArray::from(names.clone())),
                     "call_id" => Arc::new(StringArray::from(call_ids.clone())),
+                    "body_text" => Arc::new(StringArray::from(body_texts.clone())),
+                    "preview" => Arc::new(StringArray::from(previews.clone())),
                     _ => Arc::new(BooleanArray::from(failures.clone())),
                 }
             })
@@ -5892,10 +6397,50 @@ pub(crate) fn part_schema() -> Arc<Schema> {
         Field::new("tool_name", DataType::Utf8, true),
         Field::new("call_id", DataType::Utf8, true),
         Field::new("is_failure", DataType::Boolean, true),
+        // Materialized tool-call params text (#284): the Utf8 column a
+        // substring index needs (#47), and what a `pond_sql` body hunt can
+        // scan without stringifying multi-GB JSONB. Result bodies are
+        // deliberately NOT materialized - 7.8x the bytes to serve 16 of 3,699
+        // audited queries (docs/plans/2609-17-read-latency-campaign.md).
+        Field::new("body_text", DataType::Utf8, true),
+        preview_field(),
         json_field("variant_data", false),
         legacy_blob_field("data", true),
         json_field("options", false),
     ]))
+}
+
+/// The one-line `preview` column (#284), stamped with the renderer that
+/// produced it. The stamp is field metadata rather than a column: it is one
+/// value per store, not per row, and `classify_schema` compares names only -
+/// so a renderer bump changes no schema shape and strands no store.
+fn preview_field() -> Field {
+    Field::new("preview", DataType::Utf8, true).with_metadata(
+        [(
+            PREVIEW_RENDERER_METADATA_KEY.to_owned(),
+            crate::wire::PREVIEW_RENDERER_VERSION.to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    )
+}
+
+/// Schema-metadata key carrying [`crate::wire::PREVIEW_RENDERER_VERSION`] on
+/// the `preview` field.
+pub(crate) const PREVIEW_RENDERER_METADATA_KEY: &str = "pond.preview_renderer_version";
+
+/// The renderer version stamped on a stored `parts` schema's `preview` field,
+/// or `None` on a store written before the column existed. A value below
+/// [`crate::wire::PREVIEW_RENDERER_VERSION`] means the stored previews were
+/// rendered by an older renderer and can be re-derived from `variant_data`.
+pub fn stored_preview_renderer_version(schema: &lance::deps::arrow_schema::Schema) -> Option<u32> {
+    schema
+        .field_with_name("preview")
+        .ok()?
+        .metadata()
+        .get(PREVIEW_RENDERER_METADATA_KEY)?
+        .parse()
+        .ok()
 }
 
 pub(crate) fn empty_batch(schema: Arc<Schema>) -> Result<RecordBatch> {
@@ -6332,10 +6877,22 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         .iter()
         .map(|part| json_bytes(&part.options))
         .collect::<Result<Vec<_>>>()?;
+    // Derived here rather than in `parts_chunk` so their bytes are budgeted
+    // with the rest of the row: `body_text` restates a tool call's params, so
+    // it roughly doubles a tool_call row's text footprint.
+    let derived: Vec<DerivedPartText> = parts
+        .iter()
+        .map(|part| DerivedPartText {
+            body_text: crate::wire::part_body_text(&part.kind),
+            preview: crate::wire::part_preview(&part.kind),
+        })
+        .collect();
     let mut cells = Vec::with_capacity(parts.len());
     // The blob column is a BinaryArray, exempt from the text-column bound
     // (spec.md#adapter-bounded-values); only the StringArray columns are budgeted.
-    for ((part, variant), encoded) in parts.iter().zip(&variant_data).zip(&options) {
+    for (((part, variant), encoded), derived) in
+        parts.iter().zip(&variant_data).zip(&options).zip(&derived)
+    {
         let columns = [
             part.session_id.len(),
             part.message_id.len(),
@@ -6348,7 +6905,13 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
         for bytes in columns {
             guard_cell("parts", &part.id, bytes)?;
         }
-        cells.push(columns.iter().sum());
+        // Not guarded: both derive from `variant`, which the bound above
+        // already cleared, so neither can be the cell that overruns it.
+        cells.push(
+            columns.iter().sum::<usize>()
+                + derived.body_text.as_deref().map_or(0, str::len)
+                + derived.preview.as_deref().map_or(0, str::len),
+        );
     }
     chunk_ranges(&cells)
         .into_iter()
@@ -6356,16 +6919,24 @@ pub(crate) fn parts_batches(parts: &[Part]) -> Result<Vec<RecordBatch>> {
             parts_chunk(
                 &parts[range.clone()],
                 &variant_data[range.clone()],
-                &options[range],
+                &options[range.clone()],
+                &derived[range],
             )
         })
         .collect()
+}
+
+/// The two text columns `parts` materializes from a Part's body (#284).
+struct DerivedPartText {
+    body_text: Option<String>,
+    preview: Option<String>,
 }
 
 fn parts_chunk(
     parts: &[Part],
     variant_data: &[Vec<u8>],
     options: &[Vec<u8>],
+    derived: &[DerivedPartText],
 ) -> Result<RecordBatch> {
     let schema = part_schema();
     // Legacy blob (`legacy_blob_field`) is a plain LargeBinary; the URL
@@ -6438,6 +7009,18 @@ fn parts_chunk(
             Arc::new(StringArray::from(tool_names)),
             Arc::new(StringArray::from(call_ids)),
             Arc::new(BooleanArray::from(failures)),
+            Arc::new(StringArray::from(
+                derived
+                    .iter()
+                    .map(|derived| derived.body_text.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                derived
+                    .iter()
+                    .map(|derived| derived.preview.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(LargeBinaryArray::from_iter_values(
                 variant_data.iter().map(Vec::as_slice),
             )),
@@ -6536,6 +7119,116 @@ impl<'a> RowMetaColumns<'a> {
             },
         })
     }
+}
+
+/// One batch's `parts` summary columns, and the grouping that turns them into
+/// the parts summary map's records. Borrowed throughout: a group's strings
+/// point into the batch, so a scan batch feeds the builder without allocating
+/// a row at a time.
+struct PartSummaryColumns<'a> {
+    row_ids: &'a UInt64Array,
+    session_id: &'a StringArray,
+    message_id: &'a StringArray,
+    part_id: &'a StringArray,
+    ordinal: &'a Int32Array,
+    kind: &'a StringArray,
+    tool_name: &'a StringArray,
+    call_id: &'a StringArray,
+    is_failure: &'a BooleanArray,
+    preview: &'a StringArray,
+}
+
+/// One message's parts within one batch, as [`PartsSummaryBuilder::push`]
+/// takes them.
+struct PartGroup<'a> {
+    session_id: &'a str,
+    message_id: &'a str,
+    /// Rows folded in, entry-earning or not, so the map's coverage check stays
+    /// an equality against the live `parts` row count.
+    rows: u32,
+    max_row_id: u64,
+    entries: Vec<PartSummaryRef<'a>>,
+}
+
+impl<'a> PartSummaryColumns<'a> {
+    fn new(batch: &'a RecordBatch) -> Result<Self> {
+        Ok(Self {
+            row_ids: uint64(batch, "_rowid")?,
+            session_id: string_column(batch, "session_id")?,
+            message_id: string_column(batch, "message_id")?,
+            part_id: string_column(batch, "id")?,
+            ordinal: batch
+                .column_by_name("ordinal")
+                .context("missing column ordinal")?
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context("column ordinal is not int32")?,
+            kind: string_column(batch, "type")?,
+            tool_name: string_column(batch, "tool_name")?,
+            call_id: string_column(batch, "call_id")?,
+            is_failure: batch
+                .column_by_name("is_failure")
+                .context("missing column is_failure")?
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("column is_failure is not boolean")?,
+            preview: string_column(batch, "preview")?,
+        })
+    }
+
+    /// The batch's rows grouped by `(session_id, message_id)`, in first-seen
+    /// order. `above_row_id` drops rows at or below a chain's high-water mark,
+    /// which is what keeps a delta disjoint from its base: a rewritten or
+    /// compacted fragment carries only row ids the base already holds.
+    fn groups(&self, above_row_id: Option<u64>) -> Result<Vec<PartGroup<'a>>> {
+        let mut groups: Vec<PartGroup<'a>> = Vec::new();
+        let mut index: HashMap<(&'a str, &'a str), usize> = HashMap::new();
+        for row in 0..self.part_id.len() {
+            let row_id = self.row_ids.value(row);
+            if above_row_id.is_some_and(|mark| row_id <= mark) {
+                continue;
+            }
+            let session_id = required_str(self.session_id, row, "session_id")?;
+            let message_id = required_str(self.message_id, row, "message_id")?;
+            let kind = required_str(self.kind, row, "part type")?;
+            let at = *index.entry((session_id, message_id)).or_insert_with(|| {
+                groups.push(PartGroup {
+                    session_id,
+                    message_id,
+                    rows: 0,
+                    max_row_id: 0,
+                    entries: Vec::new(),
+                });
+                groups.len() - 1
+            });
+            let group = &mut groups[at];
+            group.rows += 1;
+            group.max_row_id = group.max_row_id.max(row_id);
+            // text/reasoning parts earn no summary (`PartSummary::for_kind` is
+            // the source of truth) but still count towards `rows`, so a
+            // message made only of them has a group and reads as empty rather
+            // than as a miss.
+            if SUMMARY_PART_TYPES.contains(&kind) {
+                group.entries.push(PartSummaryRef {
+                    part_id: required_str(self.part_id, row, "part id")?,
+                    ordinal: self.ordinal.value(row),
+                    kind,
+                    tool_name: optional_str(self.tool_name, row),
+                    call_id: optional_str(self.call_id, row),
+                    is_failure: (!self.is_failure.is_null(row)).then(|| self.is_failure.value(row)),
+                    preview: optional_str(self.preview, row),
+                });
+            }
+        }
+        Ok(groups)
+    }
+}
+
+/// A nullable text cell: `None` for NULL, which every derived `parts` column
+/// uses to mean "the stored record does not carry this"
+/// (spec.md#model-no-synthesis).
+fn optional_str(array: &StringArray, row: usize) -> Option<&str> {
+    (!array.is_null(row)).then(|| array.value(row))
 }
 
 fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
@@ -7212,7 +7905,14 @@ mod tests {
             ),
         ];
         let payloads = vec![vec![1u8]; parts.len()];
-        let batch = parts_chunk(&parts, &payloads, &payloads)?;
+        let derived: Vec<DerivedPartText> = parts
+            .iter()
+            .map(|part| DerivedPartText {
+                body_text: crate::wire::part_body_text(&part.kind),
+                preview: crate::wire::part_preview(&part.kind),
+            })
+            .collect();
+        let batch = parts_chunk(&parts, &payloads, &payloads, &derived)?;
 
         let tool_name = |row| string(&batch, "tool_name", row).unwrap();
         let call_id = |row| string(&batch, "call_id", row).unwrap();
@@ -7659,6 +8359,207 @@ mod tests {
         assert_eq!(
             resident[0].timestamp.timestamp_micros(),
             1_700_000_000_123_456
+        );
+        Ok(())
+    }
+
+    /// The parts summary map must serve `pond_get_session`'s summaries byte
+    /// for byte as the `parts` scan it replaces - including after a
+    /// grown-session re-sync splits one message's parts across two segments,
+    /// which is the case the union exists for (#284).
+    #[tokio::test]
+    async fn parts_map_serves_session_summaries_and_unions_across_segments() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let cache = temp.path().join("cache");
+        let session = synthetic_session("parts-map-get");
+        let part = |id: &str, ordinal: i32, kind: PartKind| {
+            IngestEvent::Part(Part {
+                session_id: session.id.clone(),
+                id: id.to_owned(),
+                message_id: "m1".to_owned(),
+                ordinal,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind,
+            })
+        };
+        let assistant = || {
+            IngestEvent::Message(Message::Assistant {
+                id: "m1".to_owned(),
+                session_id: session.id.clone(),
+                timestamp: DateTime::from_timestamp_micros(1_700_000_000_000_000).unwrap(),
+                options: ProviderOptions::new(),
+            })
+        };
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(session.clone()),
+                assistant(),
+                // A text part keeps the message conversational, so the page
+                // carries it and its summaries at all.
+                part(
+                    "p0",
+                    0,
+                    PartKind::Text {
+                        text: Some(Extracted::from_test_value("running it".to_owned())),
+                    },
+                ),
+                part(
+                    "p1",
+                    1,
+                    PartKind::ToolCall {
+                        call_id: Some(Extracted::from_test_value("c1".to_owned())),
+                        name: Some(Extracted::from_test_value("Bash".to_owned())),
+                        params: json!({ "command": "ls -la /tmp" }),
+                        provider_executed: false,
+                    },
+                ),
+                part(
+                    "p2",
+                    2,
+                    PartKind::ToolResult {
+                        call_id: Some(Extracted::from_test_value("c1".to_owned())),
+                        name: Some(Extracted::from_test_value("Bash".to_owned())),
+                        is_failure: true,
+                        result: json!("exit 1"),
+                    },
+                ),
+            ],
+        )
+        .await?;
+
+        let params = SessionViewParams {
+            at_message_id: None,
+            after_message_id: None,
+            before_message_id: None,
+            limit: 50,
+            budget_bytes: 1_000_000,
+            session_from: SessionFrom::Start,
+        };
+        let summaries = |lookup: GetLookup<SessionPage>| match lookup {
+            GetLookup::Found(page) => page
+                .messages
+                .iter()
+                .map(|message| (message.id.clone(), message.parts_summary.clone()))
+                .collect::<Vec<_>>(),
+            other => panic!("expected a page, got {other:?}"),
+        };
+
+        let scanned = summaries(store.session_view(&session.id, params.clone()).await?);
+        store.ensure_partsmap(&cache).await?;
+        assert_eq!(
+            store.partsmap_delta_count(),
+            Some(0),
+            "the first build is a base",
+        );
+        let resident = summaries(store.session_view(&session.id, params.clone()).await?);
+        assert_eq!(
+            resident, scanned,
+            "map-served summaries must match the parts scan",
+        );
+        let served = resident
+            .iter()
+            .flat_map(|(_, parts)| parts)
+            .collect::<Vec<_>>();
+        assert_eq!(served.len(), 2, "text parts earn no summary: {served:?}");
+        assert_eq!(served[0].preview.as_deref(), Some("ls -la /tmp"));
+        assert_eq!(
+            served[1].label.as_deref(),
+            Some("Bash (failed)"),
+            "is_failure survives the round trip through the map",
+        );
+
+        // The grown-session re-sync: a later commit appends a part for a
+        // message already written, so the key lands in the delta too.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(session.clone()),
+                assistant(),
+                part(
+                    "p3",
+                    3,
+                    PartKind::ToolCall {
+                        call_id: Some(Extracted::from_test_value("c2".to_owned())),
+                        name: Some(Extracted::from_test_value("Grep".to_owned())),
+                        params: json!({ "pattern": "needle", "path": "/src" }),
+                        provider_executed: false,
+                    },
+                ),
+            ],
+        )
+        .await?;
+        assert!(
+            store
+                .summary_parts_resident(&session.id, &["m1".to_owned()])
+                .await?
+                .is_none(),
+            "a map trailing the store must decline, not serve a short group",
+        );
+
+        store.ensure_partsmap(&cache).await?;
+        assert_eq!(
+            store.partsmap_delta_count(),
+            Some(1),
+            "the re-sync layered a delta",
+        );
+        let expected = summarize_parts(
+            store
+                .summary_parts_for_messages(&session.id, &["m1".to_owned()])
+                .await?,
+        );
+        let served = store
+            .summary_parts_resident(&session.id, &["m1".to_owned()])
+            .await?
+            .expect("the map covers the message again");
+        assert_eq!(
+            served, expected,
+            "the union across base + delta must equal the scan",
+        );
+        let parts = &served[&(session.id.clone(), "m1".to_owned())];
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.label.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("Bash"), Some("Bash (failed)"), Some("Grep")],
+            "the split group comes back ordinal-ordered: {parts:?}",
+        );
+        assert_eq!(
+            parts[2].preview.as_deref(),
+            Some("path=/src pattern=needle"),
+        );
+
+        // A message the map has never seen must be a miss: an empty summary
+        // and an unknown message are not the same answer.
+        assert!(
+            store
+                .summary_parts_resident(&session.id, &["m-unknown".to_owned()])
+                .await?
+                .is_none(),
+        );
+        Ok(())
+    }
+
+    /// The renderer version is stamped on the stored schema, so a store
+    /// records which renderer produced its `preview` cells and a later pond
+    /// can re-derive them (#284).
+    #[tokio::test]
+    async fn parts_schema_stamps_the_preview_renderer_version() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        assert_eq!(
+            store.preview_renderer_version().await?,
+            Some(crate::wire::PREVIEW_RENDERER_VERSION),
+        );
+        assert_eq!(
+            stored_preview_renderer_version(&lance::deps::arrow_schema::Schema::new(vec![
+                Field::new("preview", DataType::Utf8, true),
+            ])),
+            None,
+            "an unstamped column reads as unknown, not as version 0",
         );
         Ok(())
     }
@@ -10316,7 +11217,7 @@ mod tests {
 
         let mut reached_cap = false;
         let mut compacted = false;
-        for i in 0..(Store::MAX_ROWMAP_DELTAS + 2) {
+        for i in 0..(Store::MAX_MAP_DELTAS + 2) {
             let session = format!("session-x{i}");
             ingest_events(
                 &store,
@@ -10353,13 +11254,13 @@ mod tests {
             store.ensure_rowmap(&cache).await?;
             let deltas = store.rowmap_delta_count().unwrap();
             assert!(
-                deltas <= Store::MAX_ROWMAP_DELTAS,
+                deltas <= Store::MAX_MAP_DELTAS,
                 "delta count {deltas} exceeded the cap",
             );
-            if deltas == Store::MAX_ROWMAP_DELTAS {
+            if deltas == Store::MAX_MAP_DELTAS {
                 reached_cap = true;
             }
-            if reached_cap && deltas < Store::MAX_ROWMAP_DELTAS {
+            if reached_cap && deltas < Store::MAX_MAP_DELTAS {
                 compacted = true;
             }
         }
@@ -10375,10 +11276,7 @@ mod tests {
                 rmm += 1;
             }
         }
-        assert!(
-            rmm <= Store::MAX_ROWMAP_DELTAS + 1,
-            "files unbounded: {rmm}"
-        );
+        assert!(rmm <= Store::MAX_MAP_DELTAS + 1, "files unbounded: {rmm}");
         Ok(())
     }
 
