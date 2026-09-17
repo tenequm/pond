@@ -30,6 +30,7 @@ use lance::deps::arrow_array::{
 };
 use lance::deps::arrow_schema::{DataType, Field, Schema};
 use lance::index::DatasetIndexExt;
+use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::{
     BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
@@ -165,9 +166,16 @@ async fn prep(src: &str, dst: &str) -> Result<()> {
     );
 
     let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    Dataset::write(reader, dst, Some(WriteParams::default()))
-        .await
-        .context("write text dataset")?;
+    Dataset::write(
+        reader,
+        dst,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..WriteParams::default()
+        }),
+    )
+    .await
+    .context("write text dataset")?;
     println!("wrote Utf8 dataset     = {dst}");
     Ok(())
 }

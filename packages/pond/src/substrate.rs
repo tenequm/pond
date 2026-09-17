@@ -1301,8 +1301,8 @@ impl IndexParamsKind {
     /// True for families whose search results are row *addresses*
     /// (`fragment_id << 32 | offset`) emitted straight from the persisted
     /// payload - named after Lance's `ScalarIndex::results_are_row_addresses`.
-    /// Lance 10 has two such families, ZoneMap and BloomFilter; pond ships
-    /// only the ZoneMap. Fragment ids die at compaction, so these indexes go
+    /// Lance 12 has three such families: ZoneMap, BloomFilter and FM-Index; pond
+    /// ships only the ZoneMap. Fragment ids die at compaction, so these indexes go
     /// stale when covered fragments are rewritten; row-id-domain families
     /// survive rewrites via stable row ids.
     fn results_are_row_addresses(&self) -> bool {
@@ -3878,12 +3878,8 @@ pub mod index_cache {
             })
         }
 
-        /// Keeps the listing pushdown. This wrapper observes rather than
-        /// intercepts: it serves `_indices/*` reads from local disk and is
-        /// read-through, so a cached path is one the origin holds too, and
-        /// every `list*` call already delegates to `inner`. A pushed-down
-        /// listing therefore sees exactly what `wrap`'s store would list.
-        /// Returning `None` would only cost the pushdown, buying nothing.
+        /// Keeps listing pushdown because every `list*` call delegates to
+        /// `inner`, so a pushed-down listing reads the same directory either way.
         fn wrap_paginated(
             &self,
             _store_prefix: &str,
@@ -5903,7 +5899,13 @@ mod tests {
         )
         .unwrap();
         let reader = RecordBatchIterator::new([Ok(batch)], schema);
-        let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(crate::sessions::write_params_for_create()),
+        )
+        .await
+        .unwrap();
 
         let data_files = || -> std::collections::BTreeSet<PathBuf> {
             std::fs::read_dir(uri_owned.join("data"))

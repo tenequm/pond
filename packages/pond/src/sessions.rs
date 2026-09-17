@@ -6596,15 +6596,16 @@ fn primary_field(name: &str, data_type: DataType, nullable: bool) -> Field {
     )
 }
 
-// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`). Blob v2's
-// `Struct<data, uri>` extension requires `data_storage_version >= 2.2`, which
-// is marked unstable in Lance docs (`format/file/versioning.md`) and at
-// v7.0.0-beta.16 trips a `compact_files` bug: the AllBinary blob_handling
-// path leaves the field as a 2-child struct but `BlobV2StructuralEncoder`
-// allocated only one column_info, so the decoder's second `expect_next()`
-// fires `"there were more fields in the schema than provided column
-// indices / infos"`. Legacy blob writes `BlobLayout` pages, which compact
-// handles correctly (covered by Lance's own `test_compact_blob_columns`).
+// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`): Lance 12
+// rejects legacy blob columns at `data_storage_version >= 2.2`, so
+// `write_params_for_create` must stay pinned to 2.1. Blob v2's `Struct<data,
+// uri>` extension at v7.0.0-beta.16 trips a `compact_files` bug: the AllBinary
+// blob_handling path leaves the field as a 2-child struct but
+// `BlobV2StructuralEncoder` allocated only one column_info, so the decoder's
+// second `expect_next()` fires `"there were more fields in the schema than
+// provided column indices / infos"`; legacy blob writes `BlobLayout` pages,
+// which compact handles correctly (covered by Lance's own
+// `test_compact_blob_columns`).
 fn legacy_blob_field(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::LargeBinary, nullable).with_metadata(
         [(lance_arrow::BLOB_META_KEY.to_owned(), "true".to_owned())]
