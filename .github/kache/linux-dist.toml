@@ -13,12 +13,25 @@
 # The CLI still reads KACHE_S3_PREFIX ahead of this file, so the dist-build job
 # asserts the two agree before anything runs; a split would put the daemon on
 # one prefix and the CLI on another.
+
+# Unlike the two Windows legs, this one runs on the persistent pond-ci runner:
+# /ci-cache survives every pod, so the local store usually already holds what a
+# build needs and speculative prefetch is added work rather than a head start.
+# kache's own guidance for persistent self-hosted runners
+# (docs/remote-cache/ci.mdx, "Ephemeral and persistent runners"). Exact remote
+# reads and uploads are unaffected - only the speculative planner is off. MUST
+# stay above [cache.remote]: TOML would otherwise read the key as part of the
+# remote table.
+[cache]
+prefetch_enabled = false
+
 [cache.remote]
 type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
 # Per-job and schema-tagged, same reasoning as windows-verify.toml. k31 is
-# kache 0.21.0's CACHE_KEY_VERSION - both legs bumped together, never one.
+# kache's CACHE_KEY_VERSION, unchanged from 0.17.0 through 0.22.0 - both legs
+# bumped together, never one.
 # The old shared kache/pond prefix is left in place as the revert window.
 prefix = "kache/pond/linux-dist/k31"

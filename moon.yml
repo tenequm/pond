@@ -20,6 +20,15 @@ fileGroups:
     - 'Cargo.toml'
     - 'Cargo.lock'
     - 'rust-toolchain.toml'
+    # The flake devShell is CI's toolchain now, and this lock pins what it
+    # resolves from nixpkgs-toolchain and rust-overlay: zig, cargo-zigbuild,
+    # rcodesign, the stdenv C compiler, cmake. A bump of any of those moves the
+    # lock, so it can no longer replay results built by the previous toolchain.
+    # The compiler itself is pinned by rust-toolchain.toml (above). protoc,
+    # moon, kache, uv and node are prebuilt archives whose version and hash live
+    # in flake.nix, which is NOT an input - a protoc bump still moves nothing
+    # declared here.
+    - 'flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
     # the old ones. kache's own keys already include the flags, so adding this
@@ -76,6 +85,7 @@ tasks:
       # A toolchain bump changes codegen and with it what the row measures; omit
       # it and moon replays a cached pass over a different compiler.
       - 'rust-toolchain.toml'
+      - 'flake.lock'
       - 'ops/scripts/mem-gate.sh'
       - 'docs/benchmarks/mem-gate-baseline.jsonl'
     options:
@@ -92,8 +102,9 @@ tasks:
 
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
   # cross-compiled. It is a separate task for the same reason `test-msvc` is
-  # separate from `test`: moon's fingerprint carries no OS, so a shared task
-  # would hit the hash this one already cached and ship nothing.
+  # separate from `test`: moon's own fingerprint carries no OS, so a shared task
+  # would hit the hash this one already cached and ship nothing. `rust: {}` now
+  # adds the host triple on top; the separate task is still what guarantees it.
   #
   # Machine cross-compile on the pond-ci runner (no docker/buildkit): the whole
   # toolchain (rust + its three cross targets, zig 0.16, cargo-zigbuild, the
@@ -101,101 +112,12 @@ tasks:
   # enters before this runs. Incremental cache = the runner's persistent
   # CARGO_TARGET_DIR. Runs from the repo root: cargo resolves the workspace
   # target dir and dist/ lands at the root where publish-release reads it.
+  # The body lives in ops/scripts/build-dist.sh, not inline here: moon
+  # fingerprints an inline `script:` verbatim, so every comment edit in it
+  # invalidated a three-target cross-compile. As a declared input below, only a
+  # real change to the script does.
   build-dist:
-    script: |
-      set -euo pipefail
-      export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
-      TD="${CARGO_TARGET_DIR:-target}"
-
-      # No `rustup target add` here any more: rust-toolchain.toml lists all three
-      # targets and rust-overlay materializes them with the toolchain, so there
-      # is nothing left to fetch imperatively - and no rustup to fetch it with.
-
-      # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
-      # cold-start net for a fresh /ci-cache. The remote is no longer written
-      # here - it lives in .github/kache/linux-dist.toml, which
-      # .github/actions/devshell selects through KACHE_CONFIG, so the wrapper and
-      # any daemon kache spawns for itself both resolve it from a file they can
-      # re-read. The old stub named no bucket and leaned on the job's
-      # KACHE_S3_* env, which kache strips from a daemon spawn. Push on EXIT, not after success: crates
-      # compiled before a failure still warm the retry.
-      # --all: one paginated LIST of the per-job prefix instead of one LIST
-      # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
-      # worse from a runner). Safe only because the prefix holds exactly this
-      # job's artifacts. --allow-partial: kache exits non-zero on any failed
-      # transfer, and under `set -euo pipefail` that would redden a job that
-      # would compile through fine - a partial pull is a slower build, never a
-      # broken one.
-      export RUSTC_WRAPPER=kache
-      kache sync --pull --all --allow-partial
-      trap 'kache sync --push || true' EXIT
-
-      # Cargo unifies features across all targets in one invocation, leaking
-      # cfg-gated deps across platforms, so macOS builds alone: it pulls
-      # candle's macOS-only `metal`, which the linux pair must not see.
-      #
-      # Windows is not here at all - the msvc zip is built natively by the
-      # windows-dist job in ci.yml and handed to publish-release as its own
-      # artifact. Cross-compiling Windows was dropped with the gnu target: it
-      # never worked at runtime and no CI job ever executed it.
-      cargo zigbuild --locked --profile dist --target aarch64-apple-darwin
-      cargo zigbuild --locked --profile dist \
-        --target aarch64-unknown-linux-gnu \
-        --target x86_64-unknown-linux-gnu
-
-      mkdir -p target/dist
-      cp "$TD/aarch64-apple-darwin/dist/pond" target/dist/pond-aarch64-apple-darwin
-      # zig records LC_BUILD_VERSION sdk >= 26, which makes macOS 26 dyld
-      # reject its duplicate libobjc load command; rewrite the recorded sdk to
-      # 15.0 and ad-hoc re-sign (the byte-patch invalidates the signature).
-      python3 ops/scripts/patch-macos-sdk.py target/dist/pond-aarch64-apple-darwin
-      # Developer ID + hardened runtime when the cert is present (release CI),
-      # ad-hoc otherwise so local and fork builds still get a loadable arm64
-      # binary. Gatekeeper denies unnotarized Developer ID outright, so the
-      # cert path is only ever taken by CI, which pairs it with notarization.
-      if [ -n "${APPLE_P12_BASE64:-}" ]; then
-        creds="$(mktemp -d)"
-        printf '%s' "$APPLE_P12_BASE64" | base64 -d > "$creds/id.p12"
-        printf '%s' "${APPLE_P12_PASSWORD:-}" > "$creds/id.pass"
-        rcodesign --config-file /dev/null sign \
-          --p12-file "$creds/id.p12" --p12-password-file "$creds/id.pass" \
-          --code-signature-flags runtime \
-          target/dist/pond-aarch64-apple-darwin
-        rm -rf "$creds"
-      else
-        rcodesign --config-file /dev/null sign target/dist/pond-aarch64-apple-darwin
-      fi
-      cp "$TD/aarch64-unknown-linux-gnu/dist/pond" target/dist/pond-aarch64-unknown-linux-gnu
-      cp "$TD/x86_64-unknown-linux-gnu/dist/pond" target/dist/pond-x86_64-unknown-linux-gnu
-      ls -lh target/dist/
-
-      # Completion scripts are target-independent, so one native run of the
-      # linux-amd64 binary (this runner's arch) generates them for every
-      # tarball. They must ship pre-generated: nix can't execute the binary
-      # in installPhase (autoPatchelfHook only fixes the interpreter later,
-      # in fixupPhase).
-      rm -rf completions
-      mkdir -p completions
-      chmod +x target/dist/pond-x86_64-unknown-linux-gnu
-      target/dist/pond-x86_64-unknown-linux-gnu completions bash > completions/pond.bash
-      target/dist/pond-x86_64-unknown-linux-gnu completions zsh  > completions/_pond
-      target/dist/pond-x86_64-unknown-linux-gnu completions fish > completions/pond.fish
-
-      # Package into the archive names brew/nix reference, `pond` at the root.
-      # rm first: moon can hydrate a previously cached dist/ into the tree.
-      rm -rf dist
-      mkdir -p dist
-      for t in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-        install -m755 "target/dist/pond-$t" pond
-        tar -cJf "dist/pond-$t.tar.xz" pond completions
-      done
-      rm -f pond
-      rm -rf completions
-      # Covers only what this task produced. publish-release regenerates it
-      # over the merged dist/ once the natively-built Windows zip lands, so
-      # this copy never reaches a release.
-      ( cd dist && sha256sum pond-* > checksums.txt )
-      ls -lh dist/
+    command: 'bash ops/scripts/build-dist.sh'
     # No @group(tests): tests and benches are not linked into the shipped
     # binary, so a test-only change cannot alter dist/ and should not pay a
     # three-target cross-compile.
@@ -209,6 +131,7 @@ tasks:
     # cache is for, and there HEAD is unchanged.
     inputs:
       - '@group(sources)'
+      - 'ops/scripts/build-dist.sh'
       - 'ops/scripts/patch-macos-sdk.py'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
@@ -224,47 +147,21 @@ tasks:
   # build leg has - as raw `cargo build` it could never be skipped, and paid a
   # full thin-LTO link on every release even when nothing had changed.
   #
-  # Completions come from the just-built binary, the same way the Linux tarballs
-  # get theirs. `Out-Null` and `Set-Content` both consume the whole stream, so
-  # neither trips the EPIPE that a short-circuiting matcher like
-  # `Select-String -Quiet` hands the still-writing binary - which is why the
-  # emptiness check reads the file back instead of piping into it.
-  #
   # Same POND_BUILD_COMMIT caveat as build-dist: no content hash represents HEAD,
   # and what keeps a hit from shipping a stale commit string is that a release
   # commit always bumps the version in packages/pond/Cargo.toml, which IS an input.
+  #
+  # The body lives in ops/scripts/build-dist-msvc.ps1 for the same hash-churn
+  # reason as build-dist, and is a declared input below. `-NoProfile` so a
+  # runner-image profile cannot change what a release builds; `-File` rather
+  # than `-Command` so the script's own $ErrorActionPreference governs.
   build-dist-msvc:
-    script: |
-      $ErrorActionPreference = 'Stop'
-      $env:POND_BUILD_COMMIT = (git rev-parse --short HEAD)
-      # --features windows-launcher builds pondw.exe (gated in Cargo.toml).
-      cargo build --locked --profile dist --target x86_64-pc-windows-msvc --features windows-launcher
-
-      $exe = "target\x86_64-pc-windows-msvc\dist\pond.exe"
-      & $exe --version
-      & $exe --help | Out-Null
-
-      # rm first: moon can hydrate a previously cached dist/ into the tree.
-      Remove-Item -Recurse -Force stage -ErrorAction SilentlyContinue
-      New-Item -ItemType Directory -Force -Path stage\completions | Out-Null
-      Copy-Item $exe stage\pond.exe
-      # The windowless launcher the scheduled task Execs; `pond schedule start`
-      # refuses to register without it.
-      Copy-Item target\x86_64-pc-windows-msvc\dist\pondw.exe stage\pondw.exe
-      & $exe completions powershell | Set-Content -Encoding utf8 stage\completions\_pond.ps1
-      & $exe completions bash       | Set-Content -Encoding utf8 stage\completions\pond.bash
-      & $exe completions zsh        | Set-Content -Encoding utf8 stage\completions\_pond
-      & $exe completions fish       | Set-Content -Encoding utf8 stage\completions\pond.fish
-      if (-not (Select-String -Path stage\completions\_pond.ps1 -Pattern 'pond' -Quiet)) { throw 'empty completions' }
-
-      New-Item -ItemType Directory -Force -Path dist | Out-Null
-      Compress-Archive -Path stage\pond.exe,stage\pondw.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
-      Remove-Item -Recurse -Force stage
+    command: 'pwsh -NoProfile -File ops/scripts/build-dist-msvc.ps1'
     inputs:
       - '@group(sources)'
+      - 'ops/scripts/build-dist-msvc.ps1'
     outputs:
       - 'dist/pond-x86_64-pc-windows-msvc.zip'
     options:
       cache: true
       outputStyle: stream
-      windowsShell: 'pwsh'

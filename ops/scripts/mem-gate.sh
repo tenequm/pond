@@ -14,10 +14,33 @@
 # One scenario per process invocation: peak RSS is a process-lifetime
 # high-water mark, so two scenarios in one process cannot be told apart.
 #
+# --check compares peak_rss_kb and peak_heap_bytes only, and only for the
+# scenarios NOT listed in RECORD_ONLY below. The one exception is
+# scan_fallbacks, judged on every scenario that reports it: it is a count of
+# cold rowmap builds that fell off the streaming path, so any increase over the
+# committed row fails even in record-only mode. The latency, throughput,
+# retention and fragment fields are ungated everywhere: phase 1 accumulates
+# their spread across runs, phase 2 derives thresholds from the median/IQR of
+# what landed here.
+#
+# A record-only scenario with no committed row for this host is SKIPPED rather
+# than failed: a fresh box has to be able to bootstrap its own baselines, and a
+# gate that hard-fails there is a gate nobody can adopt. The skip is loud - a
+# WARNING line per scenario plus an "unjudged" count in the summary - so a host
+# that never gets its rows committed reads as a gap, not as a pass. A GATED
+# scenario with no row still fails, unchanged.
+#
+# Appended rows carry `toolchain` (the recording host's `rustc --version`), so a
+# codegen-driven shift is visible in the row itself rather than inferred from
+# the commit. Every reader treats it as optional: rows recorded before the field
+# existed stay valid and print as "unrecorded".
+#
 #   ops/scripts/mem-gate.sh                     # ci corpus, all scenarios
 #   ops/scripts/mem-gate.sh --profile large     # 1M+ message corpus
 #   ops/scripts/mem-gate.sh --check             # gate vs committed baseline
 #   SCENARIOS="rowmap-build-cold" ops/scripts/mem-gate.sh
+#   RECORD_ONLY= ops/scripts/mem-gate.sh --check   # rehearse phase 2: gate all
+#   MEM_GATE_BASELINE=/tmp/rows.jsonl ops/scripts/mem-gate.sh  # rehearse a record
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -28,13 +51,28 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --profile=*) PROFILE="${1#*=}"; shift ;;
     --check) CHECK=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
-BASELINE="docs/benchmarks/mem-gate-baseline.jsonl"
-SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session}"
+# Overridable so a record can be rehearsed - or a reader exercised - against a
+# scratch file instead of the committed one.
+BASELINE="${MEM_GATE_BASELINE:-docs/benchmarks/mem-gate-baseline.jsonl}"
+SCENARIOS="${SCENARIOS:-sync-noop-local sync-incremental rowmap-build-cold mcp-query-growth ingest-large-session search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
+# Scenarios that RUN and get a row, but whose numbers gate nothing yet. Over ten
+# interleaved ci runs the two small-allocation scenarios swing several times
+# wider than the gate's own 20% threshold (peak heap: 139% on
+# sync-under-contention, 19% on ingest-throughput), so a threshold there would
+# fire on noise and teach people to ignore the gate. The other three are tighter
+# than that already (0.1-7%) and wait only for enough committed rows to say what
+# "normal" is. Phase 2 promotes a scenario by deleting it from this list.
+# rowmap-build-cold-partial-embed is here for its memory numbers only - its
+# scan_fallbacks count is judged above like every other scenario's.
+#
+# `-` and not `:-`, so `RECORD_ONLY=` on the command line means "gate every
+# scenario" - the way to rehearse a promotion before editing this line.
+RECORD_ONLY="${RECORD_ONLY-search-query-latency ingest-throughput serve-sync-retention sync-under-contention rowmap-build-cold-partial-embed}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -72,13 +110,25 @@ echo "--- corpus ---"
 "$BENCH_BIN" --prepare --profile "$PROFILE"
 
 HOST_TAG="${MEM_GATE_HOST:-$(uname -s)-$(uname -m)}"
+# The compiler the row was measured under. `$RUSTC` (or `rustc` on PATH) is what
+# the `cargo build` above invoked, unless cargo config overrides `build.rustc`;
+# a rustup proxy reads the same rust-toolchain.toml from this directory.
+TOOLCHAIN="$("${RUSTC:-rustc}" --version 2>/dev/null || echo unknown)"
 
 # Only append mode stamps a row, so only it needs the commit tag. A dirty tree
 # means the measured binary may not match the named commit; the baseline this
 # script appends to never affects the binary, so exclude it.
 if [ "$CHECK" = 0 ]; then
   COMMIT="$(git rev-parse --short HEAD)"
-  if [ -n "$(git status --porcelain -- ":!$BASELINE")" ]; then COMMIT="$COMMIT-dirty"; fi
+  # A MEM_GATE_BASELINE outside the tree makes git reject the exclude pathspec,
+  # and a failure inside `[ -n "$(...)" ]` would read as a clean tree. `literal`
+  # stops glob characters in the path from excluding real changes.
+  BASELINE_REL="$(python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1]))' "$BASELINE")"
+  case "$BASELINE_REL" in
+    ../*) DIRTY="$(git status --porcelain)" ;;
+    *) DIRTY="$(git status --porcelain -- ":(exclude,literal)$BASELINE_REL")" ;;
+  esac
+  if [ -n "$DIRTY" ]; then COMMIT="$COMMIT-dirty"; fi
   DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   mkdir -p "$(dirname "$BASELINE")"
   touch "$BASELINE"
@@ -101,12 +151,12 @@ print(
 )
 EOF
   else
-    python3 - "$TMP/$scenario.json" "$BASELINE" "$DATE" "$COMMIT" "$HOST_TAG" <<'EOF'
+    python3 - "$TMP/$scenario.json" "$BASELINE" "$DATE" "$COMMIT" "$HOST_TAG" "$TOOLCHAIN" <<'EOF'
 import json, sys
-row_file, baseline, date, commit, host = sys.argv[1:6]
+row_file, baseline, date, commit, host, toolchain = sys.argv[1:7]
 row = json.load(open(row_file))
 # Tags first so a row reads left-to-right as "when/what/where" then numbers.
-out = {"date": date, "commit": commit, "host": host}
+out = {"date": date, "commit": commit, "host": host, "toolchain": toolchain}
 out.update(row)
 with open(baseline, "a") as fh:
     fh.write(json.dumps(out) + "\n")
@@ -124,17 +174,25 @@ EOF
 done
 
 if [ "$CHECK" = 1 ]; then
-  echo "--- check vs committed baseline (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
-  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" <<'EOF'
+  echo "--- check vs baseline $BASELINE (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
+  python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" "$RECORD_ONLY" "$TOOLCHAIN" <<'EOF'
 import json, os, sys
 baseline, profile, tmp, pct = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 scenarios, host = sys.argv[5].split(), sys.argv[6]
+record_only = set(sys.argv[7].split())
+toolchain = sys.argv[8]
 METRICS = ("peak_rss_kb", "peak_heap_bytes")
+# Judged on every scenario, record-only included, and as an absolute count
+# rather than a percentage: a cold rowmap build that stops streaming is a
+# cliff (it re-encodes the whole corpus through the sorting build), and the
+# scenarios that report it exist to catch exactly that.
+COUNTERS = ("scan_fallbacks",)
 try:
     rows = [json.loads(line) for line in open(baseline) if line.strip()]
 except FileNotFoundError:
     rows = []
 failed = False
+unjudged = []
 for scenario in scenarios:
     fresh = json.load(open(os.path.join(tmp, scenario + ".json")))
     # Host-scoped: peak RSS is a property of the machine as much as the code, so
@@ -147,8 +205,52 @@ for scenario in scenarios:
         and r.get("host") == host
     ]
     print(f"\n[{scenario}] {profile} on {host}")
+    # `.get`, not `[...]`: rows recorded before the toolchain field existed are
+    # still valid baselines and must stay comparable.
+    print(
+        "  toolchain {}  (baseline row: {})".format(
+            toolchain, same[-1].get("toolchain", "unrecorded") if same else "none"
+        )
+    )
+    for key in COUNTERS:
+        now = fresh.get(key)
+        before = same[-1].get(key) if same else None
+        if not isinstance(now, int) or not isinstance(before, int):
+            # Say so rather than skipping in silence: a record-only scenario
+            # never reaches the "no committed baseline row" failure below, and
+            # a row that predates the counter raises no other warning.
+            if now is not None or before is not None:
+                print(f"  skip {key}: not comparable (now={now!r}, baseline={before!r})")
+            continue
+        verdict = "FAIL" if now > before else "ok"
+        if now > before:
+            failed = True
+        print(f"  {verdict:<4} {key:<18} {before:>14} -> {now:<14}")
+    if scenario in record_only:
+        # Printed with its delta, never judged: this scenario is accumulating
+        # spread, and the delta is what phase 2 reads to decide it has enough.
+        prev = same[-1] if same else {}
+        if not same:
+            # Loud, but not fatal: a fresh host has to be able to record its
+            # first rows, and hard-failing here would block that bootstrap. The
+            # summary carries the count so the gap cannot pass as a pass.
+            print(
+                "  WARNING: UNJUDGED - record-only scenario with no committed baseline row"
+                f" for host {host}; nothing was compared. Run ops/scripts/mem-gate.sh"
+                f" --profile {profile} and commit the row to give this host a baseline."
+            )
+            unjudged.append(scenario)
+        for key in METRICS:
+            now, before = fresh.get(key), prev.get(key)
+            comparable = (
+                isinstance(now, (int, float)) and isinstance(before, (int, float)) and before > 0
+            )
+            delta = f"{(now - before) / before * 100:+.1f}%" if comparable else "n/a"
+            shown_now = now if now is not None else "-"
+            print(f"  note {key:<18} {before if before is not None else '-':>14} -> {shown_now:<14} {delta:>7}  (record-only)")
+        continue
     if not same:
-        print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
+        print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh --profile {profile} locally and commit the baseline")
         failed = True
         continue
     prev = same[-1]
@@ -162,9 +264,14 @@ for scenario in scenarios:
         if delta > pct:
             failed = True
         print(f"  {verdict:<4} {key:<18} {before:>14} -> {now:<14} {delta:+.1f}%  (baseline {prev['date']} {prev['commit']})")
+summary = "{} unjudged scenario{}{}".format(
+    len(unjudged),
+    "" if len(unjudged) == 1 else "s",
+    f": {', '.join(unjudged)}" if unjudged else "",
+)
 if failed:
-    sys.exit(f"\nmem gate: regression beyond {pct:.0f}% (or missing baseline row)")
-print(f"\nmem gate: all scenarios within {pct:.0f}% of the committed baseline")
+    sys.exit(f"\nmem gate: regression beyond {pct:.0f}% (or missing baseline row); {summary}")
+print(f"\nmem gate: every judged scenario within {pct:.0f}% of the committed baseline; {summary}")
 EOF
 else
   echo "--- delta vs previous run (same scenario, same profile) ---"
@@ -172,7 +279,7 @@ else
 import json, sys
 baseline, profile, scenarios = sys.argv[1], sys.argv[2], sys.argv[3].split()
 rows = [json.loads(line) for line in open(baseline) if line.strip()]
-TAGS = ("date", "commit", "host", "scenario", "profile", "detail", "hwm_reset")
+TAGS = ("date", "commit", "host", "toolchain", "scenario", "profile", "detail", "hwm_reset")
 for scenario in scenarios:
     same = [r for r in rows if r.get("scenario") == scenario and r.get("profile") == profile]
     if not same:
@@ -184,6 +291,10 @@ for scenario in scenarios:
         continue
     prev = same[-2]
     print(f"  {'metric':<26}{'prev':>14}{'now':>14}{'delta':>9}   ({prev['date']} {prev['commit']} -> {cur['date']} {cur['commit']})")
+    # The reason a delta can be real without any source change; absent on rows
+    # older than the field, which read as "unrecorded" rather than breaking.
+    if cur.get("toolchain") != prev.get("toolchain"):
+        print(f"  toolchain changed: {prev.get('toolchain', 'unrecorded')} -> {cur.get('toolchain', 'unrecorded')}")
     for key, value in cur.items():
         if key in TAGS or not isinstance(value, (int, float)):
             continue

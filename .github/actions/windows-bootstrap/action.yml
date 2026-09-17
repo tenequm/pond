@@ -76,7 +76,7 @@ runs:
       shell: pwsh
       run: |
         $ErrorActionPreference = 'Stop'
-        $v = '2.5.4'
+        $v = '2.5.5'
         Invoke-WebRequest -Uri "https://github.com/moonrepo/moon/releases/download/v$v/moon_cli-x86_64-pc-windows-msvc.zip" -OutFile moon.zip
         Expand-Archive moon.zip -DestinationPath C:\moon
         $dir = (Get-ChildItem C:\moon -Filter moon.exe -Recurse | Select-Object -First 1).DirectoryName
@@ -122,6 +122,14 @@ runs:
       shell: pwsh
       run: |
         "CARGO_HOME=D:\cargo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        # Same disk argument once more. rustc, the linker and cargo all stage
+        # through TEMP, and the image defaults it to a user profile on C:, the
+        # slow network-attached disk. target/, CARGO_HOME and the kache store
+        # are already on D:, so this is the last hot path still crossing to C:.
+        # The image already exempts D: from Defender.
+        New-Item -ItemType Directory -Force -Path D:\temp | Out-Null
+        "TEMP=D:\temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "TMP=D:\temp"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
     # rustup honors rust-toolchain.toml, and the host triple IS this leg's build
     # target. The file's `targets` list is there for the Linux dist cross-build,
@@ -203,16 +211,24 @@ runs:
         # prefixes, never alone. kache strips the remote env from daemons it
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
         # what the bump buys is key schema 31; schema 25 could under-key
-        # module-body swaps and include_dir renames.
-        version: v0.21.0
+        # module-body swaps and include_dir renames. 0.22.0 keeps schema 31
+        # (unchanged since 0.17.0), so this bump reuses the k31 prefixes cold-free
+        # and only adds the reflink-restore write fix and a GC-responsive daemon.
+        version: v0.22.0
         manifest-key: ${{ inputs.manifest-key }}
-        # Above kache 0.21's 5%-of-disk default because the cap MUST stay above
-        # the remote prefix, while still leaving room for target/ and CARGO_HOME.
+        # Above kache's 5%-of-disk default because the cap MUST stay above the
+        # remote prefix, while still leaving room for target/ and CARGO_HOME.
         # `sync --pull --all` materializes the whole prefix locally, and a
         # cap under it makes the store evict mid-run - measured 2026-08-26 at a
         # 27.5 GiB prefix against the old 20GiB cap (138%), 13 failed transfers
-        # and demand re-fetches during the build. D: holds ~147 GB total; the
-        # warm-pull timer forces a prefix rotation long before 40GiB binds.
+        # and demand re-fetches during the build. D: holds ~147 GB total.
+        #
+        # Rotation is what keeps the prefix under the cap: rotate when it passes
+        # about twice the working set (1538 artifacts / 45 s on 2026-08-24 grew
+        # to 1925 / 156 s by 2026-08-26 - entry count lags the byte growth, and
+        # by 2026-09 the pull was ~650 s). The warm pull no longer times itself
+        # now that it runs detached, so read the size off `kache stats` in the
+        # diagnostics step instead.
         max-size: 40GiB
         # ~3 min of link time on unchanged sources; the trade is unresolved
         # .pdb paths on a restored harness. Revert this line alone if job time
@@ -250,66 +266,44 @@ runs:
           throw "kache resolved its remote to '$remote', expected an s3 remote ending in '$($env:KACHE_PREFIX_EXPECTED)' - the config at $env:KACHE_CONFIG did not load as intended"
         }
 
-    # The warm pull below moves the whole remote prefix (27.5 GiB / ~156 s
-    # measured 2026-08-26), yet moon serves the msvc tasks straight from its
-    # remote cache whenever none of their declared inputs changed - every doc-,
-    # CI- and plugin-only diff, and every merge push whose PR already compiled
-    # (12 of the 21 runs preceding this change). On those runs the pull is pure
-    # waste: cargo never starts, kache serves nothing. Skip it when the commit
-    # range touches nothing the msvc tasks take as input.
+    # The warm pull moves the whole remote prefix (27.5 GiB / ~156 s measured
+    # 2026-08-26, ~650 s by 2026-09), and it used to run to completion BEFORE
+    # the build step started. That was the single largest cost on this leg: on
+    # every run where moon then served the msvc tasks from its remote cache -
+    # every doc-, CI- and plugin-only diff, and every merge push whose PR had
+    # already compiled, 9 of 31 pulling runs measured - cargo never started and
+    # the whole pull was waste.
     #
-    # Fail-soft by construction, in both directions: any doubt (dispatch event,
-    # zero/unreachable base after a force-push, diff failure) keeps the pull,
-    # and a wrong skip (a moon miss despite untouched inputs - remote eviction,
-    # a moon version bump) only degrades that one run to kache demand fetches
-    # during the compile - slower, never red, never a wrong artifact. The path
-    # pattern deliberately over-matches (all of packages/pond/, every moon
-    # config) so an error can only be an unnecessary pull.
-    - name: Decide whether the warm pull is needed
-      id: affected
-      shell: pwsh
-      env:
-        EVENT_NAME: ${{ github.event_name }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-      run: |
-        $warm = 'true'
-        if (($env:EVENT_NAME -eq 'pull_request' -or $env:EVENT_NAME -eq 'push') -and $env:BASE_SHA -and $env:BASE_SHA -notmatch '^0+$') {
-          git cat-file -e $env:BASE_SHA 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            $changed = git diff --name-only "$($env:BASE_SHA)...HEAD" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-              $hits = @($changed | Where-Object { $_ -match '^(Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.cargo/|moon\.yml$|\.moon/|packages/pond/)' })
-              "changed: $(@($changed).Count) files, task-input hits: $($hits.Count)"
-              if ($hits.Count -eq 0) { $warm = 'false' }
-            }
-          }
-        }
-        "warm pull needed: $warm"
-        "warm=$warm" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-    # Bulk warm-up before cargo starts: one paginated LIST of the per-job
-    # prefix plus concurrent downloads with no per-object demand ceiling,
-    # instead of ~1450 on-demand fetches at ~250 ms each - this is what removes
-    # the aggregate demand latency and the >3 s recompiles (lance's 57 MB blob
-    # can never beat the wrapper's hard 3 s demand window). Only safe because
-    # the prefix holds exactly this job's artifacts: --all pulls the whole
-    # prefix, which is also the rotation trigger - rotate when the Plan: line
-    # exceeds about twice the working set, in artifacts or in bytes/pull-time
-    # (the creep that actually hurts: 1538 artifacts / 45 s on 2026-08-24 grew
-    # to 1925 / 156 s by 2026-08-26 - entry count alone lags the byte growth).
+    # It is now started DETACHED and never waited on. A background process
+    # survives the end of its step on the Windows runner, so it keeps filling
+    # the store while the caller's build step runs:
+    #   - moon replays  -> the job finishes in ~30 s and the pull is discarded
+    #     with the runner. The ~650 s is simply gone.
+    #   - real compile  -> the bulk pull overlaps cargo instead of preceding
+    #     it, and anything it has not reached yet is demand-fetched by the
+    #     wrapper exactly as it would be on a cold store.
     #
-    # --allow-partial because kache exits non-zero on any failed transfer.
-    # The trailing `exit 0` is the composite-action stand-in for
-    # continue-on-error: a warm-up failure must degrade to demand fetches
-    # during the build, never redden a job that would compile through fine.
-    - name: Warm the kache store
-      if: steps.affected.outputs.warm == 'true'
+    # This replaces a path-regex step that guessed whether the diff touched the
+    # msvc tasks' inputs. The guess deliberately over-matched, so it kept the
+    # pull far more often than needed; backgrounding removes the need to guess
+    # at all. The alternative the plan also allows - asking moon itself
+    # (`moon query affected`) and skipping on a confirmed replay - is strictly
+    # more accurate but still a prediction, and it cannot help the runs that DO
+    # compile. Revisit it if the overlapped demand fetches show up in the
+    # `Hit rate:` line of the kache diagnostics.
+    #
+    # Fail-soft in every direction: --allow-partial because kache exits
+    # non-zero on any failed transfer, output to a log the diagnostics step
+    # tails, and the step itself cannot fail the job - it only starts a
+    # process.
+    - name: Warm the kache store in the background
       shell: pwsh
       run: |
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $out = kache sync --pull --all --allow-partial 2>&1
-        $sw.Stop()
-        "kache sync --pull --all took $([math]::Round($sw.Elapsed.TotalSeconds, 1))s"
-        $out | Select-String -Pattern '^Plan:|^Sync|failed'
-        $out | Select-Object -First 20
-        exit 0
+        $log = Join-Path $env:RUNNER_TEMP 'kache-warm.log'
+        "KACHE_WARM_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        $proc = Start-Process -FilePath 'kache' `
+          -ArgumentList 'sync','--pull','--all','--allow-partial' `
+          -RedirectStandardOutput $log `
+          -RedirectStandardError "$log.err" `
+          -PassThru -NoNewWindow
+        "started kache sync --pull --all in the background, pid $($proc.Id), log $log"
