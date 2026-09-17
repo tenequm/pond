@@ -339,8 +339,8 @@
               # happens to carry it. That is not a pin anyone chose, and the
               # archive it compresses is the released artifact.
               pkgs.xz
-              # The runner image is stock actions-runner now, so nothing off the
-              # shell is guaranteed: `cargo metadata | jq` in ci.yml and the
+              # The runner image is actions-runner plus nix and gh only, so
+              # nothing else off the shell is guaranteed: `cargo metadata | jq` in ci.yml and the
               # devshell-entry step's own env filtering both need it.
               pkgs.jq
             ]
