@@ -106,11 +106,11 @@ tasks:
 
   # The release tail (checksums, asset upload, flake commit, Homebrew formula),
   # so CI reaches it through the same `moon run` surface as everything else
-  # rather than calling the script directly. Never cached and never in `moon ci`:
-  # it is a one-shot side-effecting publish, and a "cached, up to date" skip here
-  # would mean a tag with no binaries. `toolchains: 'system'` provisions nothing -
-  # the publish job is GitHub-hosted with no devshell on purpose, and moon is
-  # only the process runner.
+  # rather than calling the script directly. Never cached: it is a one-shot
+  # side-effecting publish, and a "cached, up to date" skip here would mean a
+  # tag with no binaries. `toolchains: 'system'` provisions nothing - the
+  # publish job is GitHub-hosted with no devshell on purpose, and moon is only
+  # the process runner.
   publish-release:
     command: 'bash ops/scripts/publish-release.sh'
     toolchains: 'system'
@@ -119,7 +119,13 @@ tasks:
     type: 'run'
     options:
       cache: false
-      runInCI: false
+      # Must be true, and `type: run` already defaults it to false: with it
+      # false, `moon run repo:publish-release` under CI=true resolves ZERO
+      # targets ("No tasks found", exit 1) and the publish job goes red having
+      # published nothing. Nothing sweeps it up regardless - the one `moon ci`
+      # call here passes an explicit target list, and `moon check` skips
+      # `type: run`.
+      runInCI: true
       outputStyle: stream
 
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
