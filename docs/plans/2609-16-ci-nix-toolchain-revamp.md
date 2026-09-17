@@ -296,5 +296,8 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   reuses, so left alone its mtime is "first built" and the hottest key looks the
   oldest; the action therefore `touch -h`es the profile symlink on every hit,
   which makes its mtime "last entered" on any mount. That mtime is the contract
-  the infra repo's `nix-store-reaper` reads - no atime, no sibling marker file
-  (a `pond-dev-<key>.last-used` would itself match the reaper's glob).
+  for the infra repo's `nix-store-reaper`. As first deployed, the reaper takes
+  the newer of atime and mtime and stops age-reaping when an atime probe fails;
+  its paired change drops the probe and reads mtime alone. A sibling marker file
+  was rejected because `pond-dev-<key>.last-used` would match the reaper's own
+  `pond-dev-*` glob.
