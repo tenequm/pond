@@ -685,11 +685,15 @@ jobs:
     # Never cancel a release mid-publish: a newer push queues behind this run
     # instead of killing it between release-plz tagging and the publishes.
     concurrency: { group: "pond-release-${{ github.ref }}", cancel-in-progress: false }
-    # Same rule as flake-check/npm-publish: the workflow-level env hands the
-    # remote-cache secret to every job, and nothing here runs moon.
+    # The tail runs through `moon run` like every other task, so both remote-cache
+    # vars must be blanked, not just the secret: the workflow-level MOON_REMOTE_HOST
+    # is set whenever the secret exists, and moon hard-fails a configured remote
+    # whose auth header is empty. The task itself is `cache: false`, so there is
+    # nothing to cache here anyway.
     env:
       V: ${{ needs.dist-build.outputs.v }}
       BAZEL_REMOTE_AUTH: ""
+      MOON_REMOTE_HOST: ""
     outputs:
       released: ${{ steps.gate.outputs.released }}
     steps:
@@ -743,13 +747,21 @@ jobs:
             *) echo "::error::release lookup for v$V returned HTTP $code" >&2; exit 1 ;;
           esac
 
+      # moon is the task surface everywhere else, so the release tail goes
+      # through it too. Version set inline rather than read from flake.nix's
+      # toolVersions: this job has no nix, and the task is `cache: false` /
+      # `toolchains: system`, so moon is only the process runner here and a skew
+      # against the devshell cannot change or poison anything.
+      - if: steps.gate.outputs.released == 'true'
+        uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with: { moon-version: '2.5.5', cache: false }
       # Checksums merge, binary upload, repo flake commit, Homebrew formula.
       # Idempotent, so "Re-run failed jobs" is safe.
       - if: steps.gate.outputs.released == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
-        run: ops/scripts/publish-release.sh
+        run: moon run repo:publish-release
 
   # The npm plugins (openclaw-pond, pi-pond) ride the same release train,
   # published right after the crate release so a new binary never waits on

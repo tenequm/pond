@@ -104,6 +104,24 @@ tasks:
       cache: false
       outputStyle: stream
 
+  # The release tail (checksums, asset upload, flake commit, Homebrew formula),
+  # so CI reaches it through the same `moon run` surface as everything else
+  # rather than calling the script directly. Never cached and never in `moon ci`:
+  # it is a one-shot side-effecting publish, and a "cached, up to date" skip here
+  # would mean a tag with no binaries. `toolchains: 'system'` provisions nothing -
+  # the publish job is GitHub-hosted with no devshell on purpose, and moon is
+  # only the process runner.
+  publish-release:
+    command: 'bash ops/scripts/publish-release.sh'
+    toolchains: 'system'
+    # 'run', not the inferred 'test': keeps it out of `moon check`, which sweeps
+    # up every build/test task in the project.
+    type: 'run'
+    options:
+      cache: false
+      runInCI: false
+      outputStyle: stream
+
   # The Windows leg lives in `build-dist-msvc` below, built natively rather than
   # cross-compiled. It is a separate task for the same reason `test-msvc` is
   # separate from `test`: moon's own fingerprint carries no OS, so a shared task
