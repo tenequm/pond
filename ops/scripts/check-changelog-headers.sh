@@ -51,7 +51,9 @@ fi
 # Only checked when this change actually writes the top entry - i.e. the release
 # PR. An entry already on `main` is shipped history the flow cannot fix, and
 # enforcing prose there would block every later commit on someone else's miss.
-base_section=$(git show origin/main:"$file" 2>/dev/null | awk '/^## \[/{n++} n==1{print} n==2{exit}')
+# awk reads to EOF here: exiting early SIGPIPEs `git show` once CHANGELOG.md
+# outgrows the pipe buffer, and pipefail turns that into exit 141.
+base_section=$(git show origin/main:"$file" 2>/dev/null | awk '/^## \[/{n++} n==1{print}')
 if [ -n "$base_section" ] && [ "$section" = "$base_section" ]; then
   exit 0
 fi

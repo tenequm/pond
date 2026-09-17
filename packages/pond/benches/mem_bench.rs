@@ -13,6 +13,20 @@
 //! | `rowmap-build-cold`   | `ensure_rowmap` from an empty cache             | the #61 rowmap transient |
 //! | `mcp-query-growth`    | N iterations of search + get + sql              | the per-query ratchet |
 //! | `ingest-large-session`| one session, many messages (#229 shape)         | flush-batch byte scaling |
+//! | `search-query-latency`| warmup, then N timed FTS searches               | query latency drift |
+//! | `ingest-throughput`   | N synthetic sessions into a fresh store         | write throughput drift |
+//! | `serve-sync-retention`| serve-like prewarm + sync, then a settling pause | a map or buffer pinned after sync ends |
+//! | `sync-under-contention`| sync while the rowmap build lock is held       | the trailing-oracle path's cost |
+//! | `rowmap-build-cold-partial-embed` | cold build after scattered embed windows | a cold build that stops streaming (`scan_fallbacks`) |
+//!
+//! The last five are RECORD-ONLY: they run in the gate and append rows, but
+//! `mem-gate.sh --check` judges none of their *memory* numbers - peak RSS and
+//! peak heap included - because the script's `RECORD_ONLY` list carves them
+//! out. Phase 1 gathers the spread; phase 2 derives a threshold from the
+//! committed rows' median/IQR and promotes a scenario by dropping it from that
+//! list. `scan_fallbacks` is exempt from all of that: it is a count, not a
+//! measurement, and the gate fails on any increase, on every scenario that
+//! reports it.
 //!
 //! Heap numbers need `--features mem-probe` (the counting allocator); without
 //! it the row still carries wall time and the scenario detail, with null memory
@@ -31,7 +45,7 @@
 //!   ops/scripts/profile-mem.sh rowmap-build-cold heaptrack
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeZone, Utc};
@@ -43,11 +57,12 @@ use pond::{
         extract_self_str, is_session_fresh,
     },
     config::SearchConfig,
-    embed::LazyEmbedder,
+    embed::{DEFAULT_SORT_WINDOW, LazyEmbedder},
     handlers::{
         self, IngestEvent, IngestValidator, pond_get_message, pond_get_session, pond_search,
     },
-    sessions::{RowmapOracle, Store},
+    rowmap::rowmap_scan_fallbacks,
+    sessions::{EmbeddedMessage, RowmapOracle, Store},
     sql::{self, Mode, Tables},
     substrate::{MaintenancePolicy, Table},
     wire::{
@@ -182,6 +197,12 @@ struct Profile {
     iterations: usize,
     /// `ingest-large-session` message count.
     steps: usize,
+    /// `search-query-latency` untimed warmup queries, then timed ones. The
+    /// warmup pays the one-off index paging the percentiles must not carry.
+    latency_warmup: usize,
+    latency_iterations: usize,
+    /// `ingest-throughput` sessions replayed into a fresh store.
+    throughput_sessions: usize,
 }
 
 impl Profile {
@@ -193,6 +214,9 @@ impl Profile {
                 messages: 20,
                 iterations: 20,
                 steps: 20_000,
+                latency_warmup: 5,
+                latency_iterations: 50,
+                throughput_sessions: 500,
             }),
             "large" => Ok(Self {
                 name: "large",
@@ -200,6 +224,9 @@ impl Profile {
                 messages: 50,
                 iterations: 50,
                 steps: 200_000,
+                latency_warmup: 10,
+                latency_iterations: 200,
+                throughput_sessions: 2_000,
             }),
             other => bail!("unknown profile {other:?}; expected ci|large"),
         }
@@ -279,19 +306,20 @@ fn session_events(index: usize, messages: usize) -> Vec<IngestEvent> {
 const SEED_FLUSH_BATCH: usize = 100;
 
 /// Seed through the real batched ingest path - the same `IngestValidator`
-/// push/flush/finish cycle `ingest_adapter` drives in production.
+/// push/flush/finish cycle `ingest_adapter` drives in production, including
+/// its flush test: after every event, on the substream count OR the byte
+/// budget. Testing only at session end would miss the budget inside one large
+/// session, and would drain the open session's messages on a substream-count
+/// flush - a partial write production never makes, because by then the count
+/// has already fired on the `Session` event that closed the previous one.
 async fn ingest_batched(
     store: &Store,
     sessions: impl IntoIterator<Item = Vec<IngestEvent>>,
 ) -> Result<()> {
     let mut validator = IngestValidator::default();
-    let mut index = 0usize;
-    for events in sessions {
-        for event in events {
-            validator.push(store, index, event).await?;
-            index += 1;
-        }
-        if validator.pending_substreams() >= SEED_FLUSH_BATCH {
+    for (index, event) in sessions.into_iter().flatten().enumerate() {
+        validator.push(store, index, event).await?;
+        if validator.pending_substreams() >= SEED_FLUSH_BATCH || validator.byte_budget_reached() {
             validator.flush(store).await?;
         }
     }
@@ -517,6 +545,12 @@ struct Readings {
     hwm_reset: bool,
 }
 
+/// Read a scenario's probe once the scenario has returned and its locals have
+/// dropped - the point every committed baseline row was measured at.
+fn close((probe, detail): (Probe, Value)) -> (Readings, Value) {
+    (probe.finish(), detail)
+}
+
 /// Least-squares slope over `values`, in units per index step. Zero for fewer
 /// than two points.
 fn slope_per_iter(values: &[f64]) -> f64 {
@@ -730,11 +764,11 @@ async fn scenario_mcp_query_growth(corpus: &Corpus, iterations: usize) -> Result
     ))
 }
 
-async fn scenario_ingest_large_session(steps: usize) -> Result<(Probe, Value)> {
+async fn scenario_ingest_large_session(steps: usize) -> Result<(Readings, Value)> {
     let temp = tempfile::tempdir().context("scratch store dir")?;
     let store = Store::open_local(temp.path()).await?;
-    // One session with `steps` messages: the flush batch is bounded by session
-    // count, not bytes (#229), so a single huge session is the worst shape.
+    // One session with `steps` messages: the substream-count flush never fires
+    // inside it (#229), so only the byte budget bounds the buffer here.
     // Generated before the probe starts, like the cached corpus is: `steps` is
     // up to 200k, and counting the generator's own allocations would swamp the
     // ingest peak this row exists to measure.
@@ -742,9 +776,438 @@ async fn scenario_ingest_large_session(steps: usize) -> Result<(Probe, Value)> {
     let probe = Probe::begin();
     ingest_batched(&store, std::iter::once(events)).await?;
     let (_, messages, _) = store.row_counts().await?;
+    let mut detail = json!({ "steps": steps, "messages_written": messages });
+    // Everything below is post-measurement. The store is dropped and the probe
+    // read at exactly the point they were before fragment accounting existed,
+    // so this row's peak and end numbers stay comparable to the committed
+    // baseline; only the scratch dir's removal moved after the read (an rmdir,
+    // which allocates nothing that survives it).
+    drop(store);
+    let readings = probe.finish();
+
+    // Best effort: the measurement is already in hand, so a manifest that will
+    // not reopen costs the row its fragment fields (they stay null, like on
+    // every scenario that never produces them) rather than the whole row.
+    if let Value::Object(map) = &mut detail {
+        match fragment_stats(temp.path()).await {
+            Ok(fragments) => {
+                map.insert("frag_count".to_owned(), fragments.total_count.into());
+                map.insert("data_file_bytes".to_owned(), fragments.total_bytes.into());
+                map.insert("fragments".to_owned(), fragments.per_table);
+            }
+            Err(error) => {
+                map.insert("fragments_error".to_owned(), error.to_string().into());
+            }
+        }
+    }
+    Ok((readings, detail))
+}
+
+/// Fragment shape of one ingest, read from the manifests after the measured
+/// region closes: a table's fragment count and the data-file bytes those
+/// fragments claim. Turns "did this change rewrite the write path into many
+/// small files" into a number the baseline carries.
+struct FragmentStats {
+    total_count: u64,
+    total_bytes: u64,
+    per_table: Value,
+}
+
+async fn fragment_stats(store_dir: &Path) -> Result<FragmentStats> {
+    let store = Store::open_local(store_dir).await?;
+    let mut per_table = serde_json::Map::new();
+    let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
+    for table in [Table::Messages, Table::Parts] {
+        let dataset = store.dataset(table).await?;
+        let (mut count, mut bytes, mut rows) = (0u64, 0u64, 0u64);
+        for fragment in dataset.get_fragments() {
+            let meta = fragment.metadata();
+            count += 1;
+            rows += meta.physical_rows.unwrap_or(0) as u64;
+            // A fragment whose files do not all carry sizes contributes nothing
+            // rather than a wrong total; `frag_count` still says what the shape
+            // is.
+            bytes += meta
+                .files
+                .iter()
+                .try_fold(0u64, |total, file| {
+                    Some(total + file.file_size_bytes.get()?.get())
+                })
+                .unwrap_or(0);
+        }
+        per_table.insert(
+            table.as_str().to_owned(),
+            json!({ "frag_count": count, "data_file_bytes": bytes, "rows": rows }),
+        );
+        total_count += count;
+        total_bytes += bytes;
+    }
+    Ok(FragmentStats {
+        total_count,
+        total_bytes,
+        per_table: Value::Object(per_table),
+    })
+}
+
+/// Nearest-rank percentile over an ascending slice. Empty input is 0.
+fn percentile_ms(sorted_us: &[u64], q: f64) -> f64 {
+    if sorted_us.is_empty() {
+        return 0.0;
+    }
+    let rank = ((q * sorted_us.len() as f64).ceil() as usize).clamp(1, sorted_us.len());
+    sorted_us[rank - 1] as f64 / 1000.0
+}
+
+/// Record-only query latency: `warmup` untimed searches to page the index in,
+/// then `iterations` timed ones over the cached corpus. Phase 1 of the latency
+/// lane - the row carries p50/p95/max so a threshold can be derived from the
+/// accumulated spread later, and nothing fails on these numbers today.
+async fn scenario_search_query_latency(
+    corpus: &Corpus,
+    warmup: usize,
+    iterations: usize,
+) -> Result<(Probe, Value)> {
+    let store = corpus.open().await?;
+    let cache = tempfile::tempdir().context("scratch rowmap cache")?;
+    // Same staging as `mcp-query-growth`: a server has its rowmap resident
+    // before it answers anything, so the build is not part of a query's cost.
+    store.ensure_rowmap(cache.path()).await?;
+    let embedder = LazyEmbedder::candle();
+    let search_cfg = SearchConfig::default();
+
+    let search = async |query: &str| -> Result<()> {
+        let request = SearchRequest {
+            protocol_version: PROTOCOL_VERSION,
+            namespace: Some("local".to_owned()),
+            query: query.to_owned(),
+            mode: SearchModeWire::Fts,
+            sort_by: SortBy::Relevance,
+            filters: SearchFilters::default(),
+            limit: 20,
+        };
+        match pond_search(&store, &embedder, request, &search_cfg).await {
+            SearchEnvelope::Success(_) => Ok(()),
+            SearchEnvelope::Error(error) => bail!("search failed: {error:?}"),
+        }
+    };
+
+    for i in 0..warmup {
+        search(QUERIES[i % QUERIES.len()]).await?;
+    }
+
+    let probe = Probe::begin();
+    let mut samples_us: Vec<u64> = Vec::with_capacity(iterations);
+    for i in 0..iterations {
+        let started = Instant::now();
+        search(QUERIES[i % QUERIES.len()]).await?;
+        samples_us.push(started.elapsed().as_micros() as u64);
+    }
+    let mut sorted = samples_us.clone();
+    sorted.sort_unstable();
     Ok((
         probe,
-        json!({ "steps": steps, "messages_written": messages }),
+        json!({
+            "iterations": iterations,
+            "warmup_iterations": warmup,
+            "latency_p50_ms": percentile_ms(&sorted, 0.50),
+            "latency_p95_ms": percentile_ms(&sorted, 0.95),
+            "latency_max_ms": percentile_ms(&sorted, 1.0),
+            "samples_us": samples_us,
+        }),
+    ))
+}
+
+/// Record-only ingest throughput: the profile's first N synthetic sessions -
+/// the same ones the corpus generator emits, regenerated rather than read back,
+/// so this scenario needs no prepared corpus - replayed into a fresh store
+/// through the production batched path. Events are built before the probe
+/// starts, like every other ingest scenario, and the rate's denominator is the
+/// ingest call alone - not the closing `row_counts()`, which runs inside the
+/// measured region. The generator's buffer is still resident when the probe
+/// begins and drains only as the ingest consumes it, so it floors this row's
+/// peaks; `start_heap_bytes` records that floor.
+async fn scenario_ingest_throughput(profile: Profile) -> Result<(Readings, Value)> {
+    let (sessions, messages) = (profile.throughput_sessions, profile.messages);
+    let corpus_sessions: Vec<Vec<IngestEvent>> = (0..sessions)
+        .map(|index| session_events(index, messages))
+        .collect();
+    let temp = tempfile::tempdir().context("scratch store dir")?;
+    let store = Store::open_local(temp.path()).await?;
+
+    let probe = Probe::begin();
+    let started = Instant::now();
+    ingest_batched(&store, corpus_sessions).await?;
+    let ingest = started.elapsed();
+    let (sessions_written, messages_written, parts_written) = store.row_counts().await?;
+    let readings = probe.finish();
+
+    let rows = (sessions_written + messages_written + parts_written) as f64;
+    let seconds = ingest.as_secs_f64().max(f64::EPSILON);
+    Ok((
+        readings,
+        json!({
+            "sessions": sessions,
+            "messages_per_session": messages,
+            "sessions_written": sessions_written,
+            "messages_written": messages_written,
+            "parts_written": parts_written,
+            // The denominator, on the record: `wall_ms` also carries the row
+            // count, so the rate cannot be re-derived from the row without it.
+            "ingest_ms": ingest.as_millis() as u64,
+            "throughput_rows_per_s": (rows / seconds).round() as u64,
+            "throughput_messages_per_s": (messages_written as f64 / seconds).round() as u64,
+        }),
+    ))
+}
+
+/// How long the retention scenario waits for background work to quiesce before
+/// reading the end-state numbers. Long enough for a flushed writer's tasks to
+/// finish, short enough not to dominate the row's wall time.
+const RETENTION_SETTLE: Duration = Duration::from_millis(500);
+
+/// Record-only retention floor: a serve-like process prewarms, runs one sync to
+/// completion, settles, and is then measured while still alive. The primary
+/// metrics are the row's END fields (`end_rss_kb`, `rss_anon_end_kb`,
+/// `end_heap_bytes`) - a future change that leaves a map or scan buffer pinned
+/// after sync returns (the `sync_oracle_map` class of bug) shows up there even
+/// though the peak is unchanged.
+async fn scenario_serve_sync_retention(corpus: &Corpus) -> Result<(Readings, Value)> {
+    let scratch = corpus.copy_to_temp()?;
+    let store = Store::open_local(scratch.path()).await?;
+    let cache = tempfile::tempdir().context("scratch rowmap cache")?;
+    let adapter = SyntheticAdapter {
+        sessions: corpus.profile.sessions,
+        messages: corpus.profile.messages,
+    };
+
+    let probe = Probe::begin();
+    // `serve` prewarms before it serves anything, and `--with-sync` then syncs
+    // in the same process - so the floor this row measures is what that whole
+    // startup leaves behind, not what a one-shot `pond sync` exits with.
+    store.prewarm(cache.path()).await?;
+    let oracle = store.sync_rowmap_oracle(cache.path()).await?;
+    let summary =
+        handlers::ingest_adapter(&store, &adapter, &oracle as &dyn SkipOracle, |_| {}).await?;
+    if summary.inserted > 0 {
+        bail!(
+            "serve-sync-retention inserted {} rows - the cached corpus at {} is no longer \
+             pristine; rebuild it (rm -rf that dir, then --prepare)",
+            summary.inserted,
+            corpus.dir.display(),
+        );
+    }
+    let oracle_entries = oracle.0.as_ref().map_or(0, |set| set.len());
+    // Everything the sync itself owned goes away here; what the STORE still
+    // holds is the measurement.
+    drop(oracle);
+    // Sampled either side of the pause, because the pause is a fixed duration
+    // rather than a convergence test: a delta at zero is the evidence it was
+    // long enough, and a growing one is how a change that keeps allocating
+    // after `sync` returns announces itself instead of hiding in the noise.
+    let settle_start_heap = memprobe::heap_stats().map(|h| h.live_bytes);
+    tokio::time::sleep(RETENTION_SETTLE).await;
+    let readings = probe.finish();
+    let settle_heap_delta_bytes = settle_start_heap
+        .zip(readings.heap_end_bytes)
+        .map(|(before, after)| after as i64 - before as i64);
+
+    Ok((
+        readings,
+        json!({
+            "sessions": corpus.profile.sessions,
+            "messages_per_session": corpus.profile.messages,
+            "inserted": summary.inserted,
+            "matched": summary.matched,
+            "oracle_entries": oracle_entries,
+            // The map the planner parked on the store. Retained by design
+            // today (it seeds the sync cursor); the row makes its cost visible.
+            "sync_oracle_retained": store.sync_oracle_snapshot().is_some(),
+            "rowmap_entries": store.rowmap_snapshot().map_or(0, |set| set.len()),
+            "settle_ms": RETENTION_SETTLE.as_millis() as u64,
+            "settle_heap_delta_bytes": settle_heap_delta_bytes,
+        }),
+    ))
+}
+
+/// Every Nth fragment gets an embed window in the partial-embed scenario, so
+/// the rewritten fragments are spread across the whole store.
+const PARTIAL_EMBED_FRAGMENT_STRIDE: usize = 5;
+
+/// Rows per `merge_update` - the size `EmbedWorker::drain_window` actually
+/// writes in, taken from the constant itself so it cannot drift.
+const PARTIAL_EMBED_WINDOW: usize = DEFAULT_SORT_WINDOW;
+
+/// Record-only cold build over a partially embedded store: the shape that took
+/// the unordered fallback before #260. An embed pass writes one
+/// `merge_update` per window (`embed.rs` `drain_window`), and each rewrite
+/// appends a fragment holding *lower* row ids than the fragments after it. So
+/// the setup embeds a window at the head of every Nth fragment, each as its own
+/// `merge_update`, then the measured region is a cold `ensure_rowmap`.
+///
+/// The cached corpus is compacted into one `messages` fragment, where only the
+/// ends can be rewritten without splitting its live ids, so the setup ingests
+/// the profile's sessions into a fresh store instead: one fragment per
+/// production flush, the layout a store has before its first compaction.
+///
+/// `scan_fallbacks` is the row's assertion, and it is the gate that judges it
+/// (`mem-gate.sh --check` fails on any increase over the committed row) because
+/// whether this shape is plannable at all depends on the store's size:
+/// `merge_update` returns the rewritten rows in row-id order on a small store
+/// but not on a large one (measured on this corpus: ordered at 120k rows,
+/// scrambled at 160k), and a fragment whose own live ids do not ascend has no
+/// plan by construction. So the ci row records a streamed build and the large
+/// row records the fallback, and either one moving the wrong way fails.
+async fn scenario_rowmap_build_cold_partial_embed(profile: Profile) -> Result<(Probe, Value)> {
+    let scratch = tempfile::tempdir().context("scratch store dir")?;
+    let cache = tempfile::tempdir().context("scratch rowmap cache")?;
+    let messages = profile.messages;
+    let (windows, embedded_rows) = {
+        let store = Store::open_local(scratch.path()).await?;
+        ingest_batched(
+            &store,
+            (0..profile.sessions).map(|index| session_events(index, messages)),
+        )
+        .await?;
+        // The fresh store is append-only in session order, so fragment order is
+        // row order and row `r` is message `r % messages` of session
+        // `r / messages`.
+        let fragment_rows: Vec<usize> = store
+            .dataset(Table::Messages)
+            .await?
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().physical_rows.unwrap_or(0))
+            .collect();
+        let dim = pond::sessions::embedding_dim();
+        let (mut windows, mut embedded_rows, mut first_row) = (0usize, 0usize, 0usize);
+        for (ordinal, rows) in fragment_rows.iter().enumerate() {
+            if ordinal % PARTIAL_EMBED_FRAGMENT_STRIDE == 0 && *rows > 1 {
+                let span = PARTIAL_EMBED_WINDOW.min(*rows);
+                let window: Vec<EmbeddedMessage> = (first_row..first_row + span)
+                    .map(|row| {
+                        let session = session_id(row / messages);
+                        EmbeddedMessage {
+                            id: format!("{session}-msg-{}", row % messages),
+                            session_id: session,
+                            vector: vec![(row % 97) as f32 / 97.0; dim],
+                        }
+                    })
+                    .collect();
+                store.write_embeddings(&window).await?;
+                windows += 1;
+                embedded_rows += window.len();
+            }
+            first_row += rows;
+        }
+        if windows < 2 {
+            bail!(
+                "the fresh store embedded {windows} of its {} message fragments; the partial-embed \
+                 shape needs at least two windows, so at least {} fragments of more than one row \
+                 each at stride {PARTIAL_EMBED_FRAGMENT_STRIDE}",
+                fragment_rows.len(),
+                PARTIAL_EMBED_FRAGMENT_STRIDE + 1,
+            );
+        }
+        (windows, embedded_rows)
+    };
+
+    // A fresh handle, so the build reads the post-embed manifest cold.
+    let store = Store::open_local(scratch.path()).await?;
+    let fragments = store.dataset(Table::Messages).await?.get_fragments().len();
+    let (_, messages_in_store, _) = store.row_counts().await?;
+    let fallbacks_before = rowmap_scan_fallbacks();
+    let probe = Probe::begin();
+    store.ensure_rowmap(cache.path()).await?;
+    let fallbacks = rowmap_scan_fallbacks() - fallbacks_before;
+    // Whichever path ran, the map it published has to describe the whole store.
+    let entries = store.rowmap_snapshot().map_or(0, |set| set.len());
+    if entries != messages_in_store {
+        bail!("rowmap holds {entries} entries for {messages_in_store} messages");
+    }
+    Ok((
+        probe,
+        json!({
+            "rowmap_entries": entries,
+            "sessions": profile.sessions,
+            "messages_per_session": messages,
+            "embed_windows": windows,
+            "embedded_rows": embedded_rows,
+            "message_fragments": fragments,
+            "scan_fallbacks": fallbacks,
+        }),
+    ))
+}
+
+/// Hold the rowmap build lock the way a concurrent builder would: the same
+/// `flock` on the same path `Store::extend_rowmap_coordinated` takes. `flock`
+/// is per open file description, so this conflicts with a build in this very
+/// process - no second process, no sleep, no race.
+fn hold_rowmap_build_lock(store: &Store, cache_dir: &Path) -> Result<std::fs::File> {
+    let path = cache_dir.join(format!("rowmetamap-{}.lock", store.store_key()));
+    let lock = std::fs::File::create(&path)
+        .with_context(|| format!("create rowmap build lock {}", path.display()))?;
+    lock.try_lock().context("hold rowmap build lock")?;
+    Ok(lock)
+}
+
+/// Sync while a sibling owns the rowmap build: the #251 composition, measured.
+/// The chain on disk trails the store by one session, the build lock is held,
+/// so `sync_rowmap_oracle` must fall back to the trailing map and the sync must
+/// still complete against it. Asserts the fallback actually happened - a future
+/// change that silently turns this into a full re-read would otherwise just
+/// look like a slower row.
+async fn scenario_sync_under_contention(corpus: &Corpus) -> Result<(Probe, Value)> {
+    let scratch = corpus.copy_to_temp()?;
+    let cache = tempfile::tempdir().context("scratch rowmap cache")?;
+    let extra_index = corpus.profile.sessions;
+    {
+        let builder = Store::open_local(scratch.path()).await?;
+        builder.ensure_rowmap(cache.path()).await?;
+        // One session past the chain, so the published chain no longer covers
+        // the store's current version and the sync has to build (and lose).
+        ingest_batched(
+            &builder,
+            std::iter::once(session_events(extra_index, corpus.profile.messages)),
+        )
+        .await?;
+    }
+
+    let store = Store::open_local(scratch.path()).await?;
+    let _lock = hold_rowmap_build_lock(&store, cache.path())?;
+    let adapter = SyntheticAdapter {
+        sessions: corpus.profile.sessions + 1,
+        messages: corpus.profile.messages,
+    };
+
+    let probe = Probe::begin();
+    let oracle = store.sync_rowmap_oracle(cache.path()).await?;
+    if oracle.is_empty() {
+        bail!("contended sync fell back to an empty oracle; the trailing map was not usable");
+    }
+    if store.rowmap_snapshot().is_some() {
+        bail!("the rowmap build won the lock; this scenario did not measure contention");
+    }
+    let summary =
+        handlers::ingest_adapter(&store, &adapter, &oracle as &dyn SkipOracle, |_| {}).await?;
+    if summary.inserted > 0 {
+        bail!(
+            "sync-under-contention inserted {} rows - every session it re-read was already in \
+             the store, so the trailing oracle mis-planned",
+            summary.inserted,
+        );
+    }
+    Ok((
+        probe,
+        json!({
+            "sessions": corpus.profile.sessions + 1,
+            "messages_per_session": corpus.profile.messages,
+            "inserted": summary.inserted,
+            "matched": summary.matched,
+            "oracle_entries": oracle.0.as_ref().map_or(0, |set| set.len()),
+            "trailing_oracle": true,
+            "sync_oracle_retained": store.sync_oracle_snapshot().is_some(),
+        }),
     ))
 }
 
@@ -768,30 +1231,61 @@ async fn main() -> Result<()> {
 
     let iterations = args.iterations.unwrap_or(profile.iterations);
     let steps = args.steps.unwrap_or(profile.steps);
-    let (probe, detail) = match scenario.as_str() {
+    // A scenario that reads its own probe (one needing work AFTER the measured
+    // region, like fragment accounting) returns `Readings` directly; every
+    // other one hands back a live `Probe` that is read here - after the
+    // scenario's own locals have dropped, exactly where it always was.
+    let (readings, detail) = match scenario.as_str() {
         "sync-noop-local" => {
             corpus.require_ready()?;
-            scenario_sync_noop(&corpus).await?
+            close(scenario_sync_noop(&corpus).await?)
         }
         "sync-incremental" => {
             corpus.require_ready()?;
-            scenario_sync_incremental(&corpus).await?
+            close(scenario_sync_incremental(&corpus).await?)
         }
         "rowmap-build-cold" => {
             corpus.require_ready()?;
-            scenario_rowmap_build_cold(&corpus).await?
+            close(scenario_rowmap_build_cold(&corpus).await?)
         }
         "mcp-query-growth" => {
             corpus.require_ready()?;
-            scenario_mcp_query_growth(&corpus, iterations).await?
+            close(scenario_mcp_query_growth(&corpus, iterations).await?)
         }
         "ingest-large-session" => scenario_ingest_large_session(steps).await?,
+        "search-query-latency" => {
+            corpus.require_ready()?;
+            close(
+                scenario_search_query_latency(
+                    &corpus,
+                    profile.latency_warmup,
+                    profile.latency_iterations,
+                )
+                .await?,
+            )
+        }
+        // No `require_ready`: this one regenerates its sessions rather than
+        // reading the cached corpus back.
+        "ingest-throughput" => scenario_ingest_throughput(profile).await?,
+        "serve-sync-retention" => {
+            corpus.require_ready()?;
+            scenario_serve_sync_retention(&corpus).await?
+        }
+        "sync-under-contention" => {
+            corpus.require_ready()?;
+            close(scenario_sync_under_contention(&corpus).await?)
+        }
+        // No `require_ready`: this one builds its own uncompacted store.
+        "rowmap-build-cold-partial-embed" => {
+            close(scenario_rowmap_build_cold_partial_embed(profile).await?)
+        }
         other => bail!(
             "unknown scenario {other:?}; expected sync-noop-local|sync-incremental|\
-             rowmap-build-cold|mcp-query-growth|ingest-large-session"
+             rowmap-build-cold|mcp-query-growth|ingest-large-session|search-query-latency|\
+             ingest-throughput|serve-sync-retention|sync-under-contention|\
+             rowmap-build-cold-partial-embed"
         ),
     };
-    let readings = probe.finish();
 
     let row = json!({
         "scenario": scenario,
@@ -807,7 +1301,20 @@ async fn main() -> Result<()> {
         "rss_anon_end_kb": readings.rss_anon_end_kb,
         "ru_maxrss_kb": readings.ru_maxrss_kb,
         "hwm_reset": readings.hwm_reset,
+        // Promoted out of `detail` so a row reads without digging, and null on
+        // the scenarios that do not produce them - additive, so every committed
+        // row from before these scenarios existed still parses unchanged.
         "growth_slope_bytes_per_iter": detail.get("growth_slope_bytes_per_iter").cloned(),
+        "latency_p50_ms": detail.get("latency_p50_ms").cloned(),
+        "latency_p95_ms": detail.get("latency_p95_ms").cloned(),
+        "latency_max_ms": detail.get("latency_max_ms").cloned(),
+        "throughput_rows_per_s": detail.get("throughput_rows_per_s").cloned(),
+        // Judged by `mem-gate.sh --check` on every scenario that reports it,
+        // record-only ones included: a cold build that stops streaming is a
+        // cliff, not a drift.
+        "scan_fallbacks": detail.get("scan_fallbacks").cloned(),
+        "frag_count": detail.get("frag_count").cloned(),
+        "data_file_bytes": detail.get("data_file_bytes").cloned(),
         "detail": detail,
     });
     println!("{row}");

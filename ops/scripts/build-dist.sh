@@ -20,6 +20,12 @@ TD="${CARGO_TARGET_DIR:-target}"
 # targets and rust-overlay materializes them with the toolchain, so there is
 # nothing left to fetch imperatively - and no rustup to fetch it with.
 
+# cargo-zigbuild 0.23.4 on zig 0.16 detaches the -exported_symbols_list
+# operand and breaks Apple cdylib links (rust-cross/cargo-zigbuild#479).
+# Reporting zig <0.16 takes the old path that strips that flag pair; drop
+# this once a release carries rust-cross/cargo-zigbuild#480.
+export CARGO_ZIGBUILD_ZIG_VERSION=0.15.2
+
 # kache (S3 rustc cache): warm builds ride CARGO_TARGET_DIR; this is the
 # cold-start net for a fresh /ci-cache. The remote is no longer written
 # here - it lives in .github/kache/linux-dist.toml, which
