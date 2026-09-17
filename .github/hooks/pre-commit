@@ -6,8 +6,8 @@
 set -euo pipefail
 
 if command -v kst >/dev/null 2>&1; then
-  if ! kst sync --config kasetto.yaml --project --update add-adapter -q --color never; then
-    echo "pre-commit: skill refresh failed; run kst sync --config kasetto.yaml --project --update add-adapter and retry." >&2
+  if ! kst sync --config kasetto.yaml --project --update pond-add-adapter -q --color never; then
+    echo "pre-commit: skill refresh failed; run kst sync --config kasetto.yaml --project --update pond-add-adapter and retry." >&2
     exit 1
   fi
   if ! git diff --quiet -- kasetto.lock; then

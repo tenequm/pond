@@ -1,5 +1,5 @@
 ---
-name: add-adapter
+name: pond-add-adapter
 description: Playbook for adding a new source-agent adapter to pond - spec the format from the upstream writer, capture a sandboxed fixture, implement the bidirectional codec, and prove conformance. Use when adding an adapter under packages/pond/src/adapter/ or reworking an existing one.
 ---
 

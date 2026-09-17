@@ -1027,7 +1027,7 @@ Closed gaps (kept here briefly for history):
 ## How to refresh
 
 New conformance fixtures follow the sandbox self-capture in
-`.agents/skills/add-adapter/SKILL.md` (run the agent under a throwaway home,
+`skills/pond-add-adapter/SKILL.md` (run the agent under a throwaway home,
 so the capture is born clean and this file's rules become a verification
 step). The host-capture procedure below is the legacy path the pre-playbook
 samples came from; use it only to refresh one of those in place.

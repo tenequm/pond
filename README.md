@@ -306,7 +306,7 @@ pond ships in small steps. This table lists the steps in order. Done steps stay 
 | 5 | Crash-safe local stores that self-heal on open | ✅ [v0.14.0](https://github.com/tenequm/pond/releases/tag/v0.14.0) |
 | 6 | Eleven harnesses, `pond resume` into any client, MCP registry, Windows | ✅ [v0.14.11](https://github.com/tenequm/pond/releases/tag/v0.14.11) |
 | 7 | BM25 becomes the default arm. Embeddings become opt-in. [#164](https://github.com/tenequm/pond/issues/164) | ✅ [v0.15.0](https://github.com/tenequm/pond/releases/tag/v0.15.0) |
-| 8 | New adapters become routine: `add-adapter` playbook + conformance harness [#172](https://github.com/tenequm/pond/issues/172), letta-code [#170](https://github.com/tenequm/pond/issues/170), grok CLI [#171](https://github.com/tenequm/pond/issues/171) - twelve harnesses | ✅ [v0.15.1](https://github.com/tenequm/pond/releases/tag/v0.15.1) |
+| 8 | New adapters become routine: `pond-add-adapter` playbook + conformance harness [#172](https://github.com/tenequm/pond/issues/172), letta-code [#170](https://github.com/tenequm/pond/issues/170), grok CLI [#171](https://github.com/tenequm/pond/issues/171) - twelve harnesses | ✅ [v0.15.1](https://github.com/tenequm/pond/releases/tag/v0.15.1) |
 | 9 | Lance 10, then 11: count pushdown, date-filter zonemaps, stemmer self-heal. [#145](https://github.com/tenequm/pond/issues/145) | ✅ [v0.16.0](https://github.com/tenequm/pond/releases/tag/v0.16.0)-[v0.17.0](https://github.com/tenequm/pond/releases/tag/v0.17.0) |
 | 10 | `pond erase`: the one sanctioned deletion. [#45](https://github.com/tenequm/pond/issues/45) | ⏭ Next |
 | 11 | Remote reads as fast as local reads. [#165](https://github.com/tenequm/pond/issues/165) | ⏳ Later |
@@ -340,7 +340,7 @@ The upstream schemas that shaped pond's canonical model are documented in [`docs
 
 Issues and pull requests are welcome. The most useful contributions right now:
 
-- An adapter for a harness pond does not read yet. The playbook is the [`add-adapter` skill](skills/add-adapter/SKILL.md); the PR expectations are in [CONTRIBUTING.md](CONTRIBUTING.md).
+- An adapter for a harness pond does not read yet. The playbook is the [`pond-add-adapter` skill](skills/pond-add-adapter/SKILL.md); the PR expectations are in [CONTRIBUTING.md](CONTRIBUTING.md).
 - Spec feedback on [`docs/spec.md`](docs/spec.md).
 - Pointers to additional reference schemas or session samples worth documenting under `docs/references/`.
 - Bug reports against the v1 surface (CLI verbs, wire ops, schema mismatches, OCC behavior, object-store backends).
