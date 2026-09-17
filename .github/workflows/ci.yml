@@ -679,7 +679,15 @@ jobs:
     # the devShell deliberately ships no copy of - plus jq and sha256sum all come
     # preinstalled on the image. Keeps the release off the ARC pool.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60, not 30: the upload retries are bounded per asset (3 x --max-time 180
+    # plus backoff = 10m30s), but five assets and release-plz do not fit in 30,
+    # so a degraded network could still have the job SIGKILLed mid-tail - the
+    # failure this whole path exists to avoid. The tail is idempotent and exits
+    # non-zero with an ::error:: of its own, so letting it fail on its own terms
+    # is strictly better than being killed. Five simultaneously-bad assets still
+    # exceed even 60; that means uploads.github.com is down and the release is
+    # re-run either way.
+    timeout-minutes: 60
     permissions:
       contents: write   # release asset uploads to this repo via the workflow token
     # Never cancel a release mid-publish: a newer push queues behind this run
@@ -708,6 +716,22 @@ jobs:
       # Before release-plz: crates.io must not ship unless every archive the
       # tail publishes is here.
       - run: ls -l dist/pond-{x86_64,aarch64}-unknown-linux-gnu.tar.xz dist/pond-aarch64-apple-darwin.tar.xz dist/pond-x86_64-pc-windows-msvc.zip
+
+      # moon is the task surface everywhere else, so the release tail goes
+      # through it too. Installed here - BEFORE release-plz, ungated - and not
+      # next to the step that uses it: this downloads proto and moon from GitHub
+      # releases, and a rate limit or a 5xx on that download must not land after
+      # the crate is published and the tag is cut. Ten seconds on a run that
+      # publishes nothing is the whole cost. It also sits above
+      # dtolnay/rust-toolchain so rustup's PATH entry outranks proto's shims.
+      #
+      # Version inline rather than read from flake.nix's toolVersions: this job
+      # has no nix, and the task is `cache: false` / `toolchains: system`, so
+      # moon is only the process runner here and a skew against the devshell
+      # cannot change or poison anything. Listed in AGENTS.md with the repo's
+      # other unguarded copies of that pin.
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with: { moon-version: '2.5.5', cache: false }
 
       # Same pinned action as release-prep. RUSTUP_TOOLCHAIN outranks
       # rust-toolchain.toml, so rustup does not install pond's pin just to run
@@ -747,14 +771,6 @@ jobs:
             *) echo "::error::release lookup for v$V returned HTTP $code" >&2; exit 1 ;;
           esac
 
-      # moon is the task surface everywhere else, so the release tail goes
-      # through it too. Version set inline rather than read from flake.nix's
-      # toolVersions: this job has no nix, and the task is `cache: false` /
-      # `toolchains: system`, so moon is only the process runner here and a skew
-      # against the devshell cannot change or poison anything.
-      - if: steps.gate.outputs.released == 'true'
-        uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
-        with: { moon-version: '2.5.5', cache: false }
       # Checksums merge, binary upload, repo flake commit, Homebrew formula.
       # Idempotent, so "Re-run failed jobs" is safe.
       - if: steps.gate.outputs.released == 'true'

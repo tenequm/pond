@@ -40,11 +40,25 @@ cat dist/checksums.txt
 # The timeouts are sized against the job's own `timeout-minutes`, not against a
 # healthy upload: `--max-time` alone caps total duration, so a transfer crawling
 # at 13 KB/s counts as progress and burns the whole budget before retrying. Three
-# tries at the old 600s was a 30m45s worst case for ONE of five assets, inside a
+# tries at the old 600s was a 31m30s worst case for ONE of five assets, inside a
 # 30-minute job that also runs release-plz - and the job dying there leaves the
 # tag cut and the crate published with no flake commit and no tap push.
-# `--speed-limit`/`--speed-time` abandon a dead link in 30s instead; 180s still
-# covers the 81 MB zip at 4 Mbit/s.
+# `--speed-limit`/`--speed-time` abandon a dead link instead, and `--max-time`
+# 180 caps each try at 10m30s per asset across all three.
+#
+# `--speed-time 60`, not 30: curl's throughput average decays to zero within a
+# few seconds of the last byte, so the window also covers the time GitHub spends
+# processing a fully received upload before it answers. At 30 the 81 MB zip had
+# ~35s to be acknowledged or a COMPLETE upload was abandoned and re-sent.
+# Doubling it is free in the worst case - `--max-time` is the real bound - and
+# only slows dead-link detection from ~35s to ~65s.
+#
+# Note what `--max-time 180` really asks of the 81 MB zip: 450 KB/s sustained,
+# well above the 100 KB/s floor `--speed-limit` names. A steady 200 KB/s passes
+# the stall check and still dies at max-time. That is deliberate: a hosted runner
+# that cannot hold 450 KB/s to uploads.github.com is having an outage, and
+# failing the tail fast (it is idempotent - "Re-run failed jobs" resumes) beats
+# being SIGKILLed by the job timeout somewhere in the middle of it.
 release_id=$(gh api "repos/$repo/releases/tags/$tag" --jq .id)
 upload() {
   local f=$1 name want try existing id state digest present
@@ -75,7 +89,7 @@ upload() {
       : > "$tmp/upload.body"
       if printf 'Authorization: Bearer %s\n' "$GH_TOKEN" \
         | curl -sS --fail-with-body --max-time 180 \
-          --speed-limit 100000 --speed-time 30 \
+          --speed-limit 100000 --speed-time 60 \
           -o "$tmp/upload.body" -H @- \
           -H "Content-Type: application/octet-stream" \
           --data-binary "@$f" \
