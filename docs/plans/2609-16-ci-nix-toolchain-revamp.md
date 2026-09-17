@@ -1,6 +1,10 @@
 # CI and dev toolchain revamp: the flake as the single tool source
 
-Date: 2026-09-16. Owner: tenequm. Status: proposed, nothing executed.
+Date: 2026-09-16. Owner: tenequm. Status: in flight - see the phase table in 4
+for where each phase sits. Phases 1-3 are in PR #264, phase 4 in PR #262, and
+phase 5's repo half is in PR #265 (stacked on #262); phase 5's ops half - the
+stripped runner image and the /nix store volume - has to be deployed before any
+of it can go green, and phase 6 is untouched.
 Companion: the runner and cluster side (image, store volume, cold-start tuning,
 binary-cache bucket and keys) is planned in a private ops repo.
 
@@ -242,14 +246,51 @@ The rationale and trust analysis live with the ops-side plan.
 
 ## 4. Rollout order
 
-| Phase | Change | Expected effect |
-|---|---|---|
-| 1 | Windows pull-skip + windows-verify prefix rotation; runner-pool idle window (ops side) | -650s on ~30% of Windows runs; cold pulls halved; most ~180s Linux cold starts gone |
-| 2 | kache 0.22.0 (rides the rust-1.98 PR) | none (hygiene; k31 stays) |
-| 3 | moon 2.5.5; `moon ci` for build-and-test; versionless toolchains + `rust: {}` + `/flake.lock` input | hit-path 10-15s shrinks; OS-keyed hashes unblock remote reads for devs |
-| 4 | Flake toolchain + `toolVersions` + Windows text-extraction + parity check; `.envrc` | single pin source; local UX/AX wins immediately |
-| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel |
-| 6 | Local kache preserve-incremental; moon `localReadOnly` + shared worktree cache | dep-compile hits locally; agents reuse CI results |
+| Phase | Change | Expected effect | Status |
+|---|---|---|---|
+| 1 | Windows pull-skip + windows-verify prefix rotation; runner-pool idle window (ops side) | -650s on ~30% of Windows runs; cold pulls halved; most ~180s Linux cold starts gone | PR #264 |
+| 2 | kache 0.22.0 (rides the rust-1.98 PR) | none (hygiene; k31 stays) | PR #264 |
+| 3 | moon 2.5.5; `moon ci` for build-and-test; versionless toolchains + `rust: {}` + `/flake.lock` input | hit-path 10-15s shrinks; OS-keyed hashes unblock remote reads for devs | PR #264, minus node/npm - they stay pinned until the devshell supplies them |
+| 4 | Flake toolchain + `toolVersions` + Windows text-extraction + parity check; `.envrc` | single pin source; local UX/AX wins immediately | PR #262 |
+| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in PR #265, stacked on #262; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache is read-only so far, pushing deferred |
+| 6 | Local kache preserve-incremental; moon `localReadOnly` + shared worktree cache | dep-compile hits locally; agents reuse CI results | not started |
 
 Phases 1-3 are independent of Nix entirely. Phase 5 is the only one touching
 the runner image and can roll back by reverting the image tag on the ops side.
+
+Phase 5 notes, decided while implementing (the plan was silent on each):
+
+- The devshell entry is a composite action, `.github/actions/devshell`, not three
+  copies of the same script. It stays "one step at the top of each pond-ci job".
+- The cache exports move to that action rather than to workflow-level `env:`:
+  `CARGO_TARGET_DIR=/ci-cache/target` on `ubuntu-latest` would point release-prep
+  and the npm/winget jobs at a path that does not exist there.
+- `PROTO_HOME` stays, against 2.2's "PROTO_HOME gone". That removal assumed
+  versionless `.moon/toolchains.yml`, and node/npm are still pinned there (phase
+  3), so moon still provisions them through proto. It goes when they do.
+- `rustup target add` leaves `build-dist`; `rust-toolchain.toml` carries all three
+  cross targets instead. The Windows leg's rustup downloads them too - ~90 MB it
+  never links - which is the price of one pin file.
+- publish-release's `rustup toolchain install stable` step and its
+  `RUSTUP_TOOLCHAIN: stable` are deleted, not replaced: release-plz/action
+  binstalls a prebuilt binary that needs no Rust, and its degraded source-build
+  path now fails loudly on pond's pin rather than silently using a second
+  toolchain.
+- The binary cache is wired for READ only, in three places a rotation has to
+  edit together: the flake's `nixConfig`, explicit flags on the pond-ci nix
+  invocation (nixConfig is ignored for an untrusted user), and `flake-check`'s
+  `install-nix-action` `extra_nix_config`. Pushing needs a signing key on
+  main-branch jobs (2.8 point 2) and is deferred to its own change.
+- 2.2's one-time `/ci-cache` cleanup is enforced, not assumed: the action fails
+  the job if a rustup proxy is still sitting in `$CARGO_HOME/bin`, with the
+  remedy in the error. `/ci-cache/proto` is explicitly NOT part of that cleanup
+  any more, per the `PROTO_HOME` note above.
+- 2.1's "keep clang/libclang (bindgen)" is dropped: `bindgen` is not in
+  `Cargo.lock`, so `LIBCLANG_PATH` pointed at a closure nothing used.
+- **Open, ops side: nothing prunes the devshell profiles.** Each key is its own
+  `/nix/var/nix/profiles/pond-dev-$key`, i.e. its own permanent GC root with a
+  single generation, so `nix-collect-garbage -d` frees none of them and every
+  edit to flake.nix, flake.lock or rust-toolchain.toml pins another full
+  toolchain closure on the node's store volume. A reaper belongs with the /nix
+  volume (age-based over `pond-dev-*`), and it cannot use mtime as read: the hit
+  path never touches the profile it reuses, so the hottest key looks the oldest.

@@ -2,8 +2,8 @@ language: python
 
 # Runs the plugin's pytest suite via uv (pure-stdlib runtime; pytest is the only
 # dev dep). Uses the system toolchain: proto's uv plugin fails to unpack a
-# usable binary, so CI pins uv in its bootstrap alongside protoc and kache - see
-# .moon/toolchains.yml. `uv run` handles the rest itself, resolving the dev
+# usable binary, so uv comes from the flake devShell alongside protoc and kache
+# - see .moon/toolchains.yml. `uv run` handles the rest itself, resolving the dev
 # group from pyproject.toml and downloading a managed Python if the machine has
 # none, so this needs no separate install task the way the TypeScript plugin
 # does. There is no uv.lock to declare as an input; pytest is the only dev dep,

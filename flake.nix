@@ -1,6 +1,17 @@
 {
   description = "pond - lossless session storage and search for AI agent clients";
 
+  # pond's own binary cache: public read, signed paths, no credential - so fork
+  # PRs, hosted runners and dev machines all pull the same toolchain closure
+  # instead of rebuilding it (plan 2609-16 2.7). Nix ignores a flake's config
+  # for a user it does not trust, which is why the pond-ci devshell-entry step
+  # passes the same two settings as explicit flags; a dev machine that wants
+  # them needs `--accept-flake-config` or the settings in its own nix.conf.
+  nixConfig = {
+    extra-substituters = [ "https://pond-nix-cache.nbg1.your-objectstorage.com" ];
+    extra-trusted-public-keys = [ "pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=" ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -38,8 +49,8 @@
 
       # Every tool version in one place, in plain `name = "x.y.z";` form on
       # purpose: a reader without Nix can extract it by text, which is how the
-      # Windows leg will read these once it stops carrying its own copies (plan
-      # phase 5). The flake-check job keeps that text form honest today - it
+      # Windows leg will read these once it stops carrying its own copies.
+      # The flake-check job keeps that text form honest today - it
       # fails when the literals and `nix eval --json .#lib.toolVersions`
       # disagree. Rust is not repeated here - it is read from
       # rust-toolchain.toml, which stays the single Rust pin.
@@ -54,12 +65,12 @@
         cargoZigbuild = "0.23.4";
         rcodesign = "0.29.0";
         macosSdk = "15.5";
-        moon = "2.5.4";
+        moon = "2.5.5";
         protoc = "36.1";
         uv = "0.12.13";
         node = "24.21.0";
         npm = "11.19.1";
-        kache = "0.21.0";
+        kache = "0.22.0";
       };
 
       v = toolVersions;
@@ -69,15 +80,15 @@
         moon = {
           x86_64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-x86_64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-uqbwzaj+nXUT/+uykIz9lSiIxmZZt5XaAqFO8hVutcc=";
+            hash = "sha256-85cFeiLIj/nksopKL78B2Z9Nmk815aQmNCVan1Ccy9Y=";
           };
           aarch64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-Up4z5tyBKw3oJA+mNpg6Z2UFzCZtNGM3H/+tk6EfVMY=";
+            hash = "sha256-OdVeiHdGdxgdGvNWbEzNKZTNLZ2BmfzzDcLW3vwFrHg=";
           };
           aarch64-darwin = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-apple-darwin.tar.xz";
-            hash = "sha256-xOD0H0P4BTO+QSCReFjKaOHWUGM3XeAIiII0LkU2aGc=";
+            hash = "sha256-yQljcRtwYJ2jmMG+juNrTPL2FnxexT9IbYvZuqVupXg=";
           };
         };
         protoc = {
@@ -125,15 +136,15 @@
         kache = {
           x86_64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-x86_64-unknown-linux-musl.tar.gz";
-            hash = "sha256-Y1S7dkFL5o+PkGIGyHwTlOW3n968s6nTHiJU3frcKCA=";
+            hash = "sha256-XjBmx+LyeSz0o2XSs66fUHeozSDSFjm5QiibIm5kkoo=";
           };
           aarch64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-unknown-linux-musl.tar.gz";
-            hash = "sha256-fIsOcYsEDybDWkNe7h298urUKvhSmxO+fKzJf1vI3sQ=";
+            hash = "sha256-XJXOGfXhJ39J/bdj9OiVlPL6FqrY5A+FkkgHvJs3+Xc=";
           };
           aarch64-darwin = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-apple-darwin.tar.gz";
-            hash = "sha256-GUaUMOTH8ai8xWHCjBX9SH0ytR68Yski1x7n3iHwYPA=";
+            hash = "sha256-WUg2Nyyr1K1qc4iPtBiWr1yT8W3uqMGwXATAaqnwoQI=";
           };
         };
         # npm is one tarball for every platform. node bundles an older npm than
@@ -229,7 +240,7 @@
           };
 
           # nixpkgs' protobuf is deliberately not used: protoc's exact version
-          # is a pin the bootstrap actions mirror by hand, and nixpkgs' would
+          # is a pin windows-bootstrap mirrors by hand, and nixpkgs' would
           # float with the input instead of staying that pin.
           protoc = prebuilt {
             pname = "protoc";
@@ -297,7 +308,20 @@
             packages = [
               rustToolchain
               zig
-              (pinned v.cargoZigbuild pkgs.cargo-zigbuild)
+              # 0.23.4 on zig 0.16 detaches the -exported_symbols_list operand
+              # and breaks Apple cdylib links (rust-cross/cargo-zigbuild#479).
+              # The fix (#480) is unreleased; drop this patch once a >=0.23.5
+              # release reaches nixpkgs-toolchain.
+              (pinned v.cargoZigbuild (
+                pkgs.cargo-zigbuild.overrideAttrs (o: {
+                  patches = (o.patches or [ ]) ++ [
+                    (pkgs.fetchpatch {
+                      url = "https://github.com/rust-cross/cargo-zigbuild/commit/110abf59ba07cb84ed71b31c8cd81eefdc37bcec.patch";
+                      hash = "sha256-CTmasj5u7EqWuJaZKbuxP/Vq4IYJJZKpHMPqa+EWM80=";
+                    })
+                  ];
+                })
+              ))
               (pinned v.rcodesign pkgs.rcodesign)
               moon
               protoc
@@ -308,16 +332,29 @@
               pkgs.pkg-config
               # ops/scripts/*.sh and the dist build's patch-macos-sdk.py.
               pkgs.python3
+              # Declared, not inherited: `tar -cJf` in the dist build shells out
+              # to xz, and xz is only on PATH today because stdenv's initialPath
+              # happens to carry it. That is not a pin anyone chose, and the
+              # archive it compresses is the released artifact.
+              pkgs.xz
+              # The runner image is stock actions-runner now, so nothing off the
+              # shell is guaranteed: `cargo metadata | jq` in ci.yml and the
+              # devshell-entry step's own env filtering both need it.
+              pkgs.jq
             ]
             # The SDK is the cross-link stub set; on darwin the native SDK that
             # comes with the stdenv clang wrapper is the right one.
             ++ lib.optional stdenv.hostPlatform.isLinux macosSdk;
 
-            # bindgen consumers need libclang at runtime. The C compiler itself
-            # stays the stdenv default (gcc on Linux, clang on darwin), which is
-            # what the runner image and macos-verify use today - putting a
-            # second clang on PATH would silently change who builds cc-crate code.
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            # No LIBCLANG_PATH and no clang here on purpose. `bindgen` is not in
+            # Cargo.lock at all, so nothing in the resolved graph runs it: the
+            # -sys crates that CAN use it (aws-lc-sys, libsqlite3-sys, zstd-sys,
+            # lz4-sys) all resolve to their prebuilt-bindings path, and
+            # aws-lc-sys 0.41.0 depends only on cc/cmake/dunce/fs_extra. The
+            # C compiler stays the stdenv default (gcc on Linux, clang on
+            # darwin) for the same reason it always did - a second clang on PATH
+            # would silently change who builds cc-crate code. Re-add both
+            # together, not the env var alone, if a bindgen consumer ever lands.
 
             # moon's rust plugin prepends $CARGO_HOME/bin to PATH
             # (toolchains/rust/src/tier2.rs), so a rustup proxy left in the
