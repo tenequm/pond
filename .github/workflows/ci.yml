@@ -365,7 +365,7 @@ jobs:
           name: dist-windows
           path: dist/pond-x86_64-pc-windows-msvc.zip
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
       # Same permanent diagnostics as windows-verify, and for the same reason:
       # this leg runs rarely enough that a silent cache regression would first
@@ -508,18 +508,20 @@ jobs:
       # Two artifacts, not one: the macOS jobs only need the 38MB darwin
       # tarball, while publish needs all three cross-compiled tarballs plus
       # checksums (the Windows zip reaches it separately, from windows-dist).
+      # Seven-day retention: "Re-run failed jobs" on publish-release is the
+      # recovery path, and it needs these artifacts to still exist.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-darwin
           path: dist/pond-aarch64-apple-darwin.tar.xz
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-all
           path: dist/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   # Notarization does NOT alter the artifact: a bare Mach-O has nowhere to hold
   # a ticket, so Apple serves it online and every sha256 computed from the
