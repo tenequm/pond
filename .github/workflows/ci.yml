@@ -92,74 +92,28 @@ jobs:
           pi-pond:typecheck pi-pond:test
           hermes-pond:test
 
-      # Publishes the toolchain closure this job just used, so the next cold pod
-      # substitutes it instead of building it - and so do fork PRs, hosted jobs
-      # and dev machines, which read the same bucket with no credential (plan
-      # 2.7). Nothing else fills the cache: without this step it only ever holds
-      # what someone seeded by hand.
-      #
-      # Main pushes only. Plan 2.8 point 2 puts the signing credential on
-      # main-branch jobs and nowhere else - the same trust boundary kache draws
-      # (`src/policy.rs`: read-only for every event except a push to a protected
-      # branch). A toolchain bump is therefore published by the first main run
-      # after it merges, not by the PR that proposed it.
-      #
-      # Last step, but `!cancelled()` rather than `success()`: the closure is
-      # just as valid when a suite fails, and waiting for a green rerun to warm
-      # the cache would be backwards. Running last is what keeps the upload off
-      # the build's critical path.
-      #
-      # Only this job pushes. It is the one pond-ci job that runs on every push
-      # to main; dist-build and publish-release run on a subset of those pushes
-      # and would re-upload the identical closure.
+      # Publishes the toolchain closure this job entered, so cold pods, fork PRs
+      # and dev machines substitute it (plan 2.7). Main pushes only: the signing
+      # credential lives nowhere else (plan 2.8 point 2). Non-fatal - the cache
+      # is a cold-start optimization; nix copy skips paths the bucket already has.
       - name: Push the devshell closure to the binary cache
-        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.devshell.outputs.profile != '' }}
+        continue-on-error: true
         env:
           NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
-          # kache's Hetzner credential; the same key pair has write access to
-          # the pond-nix-cache bucket. Nix reads S3 auth from the AWS names.
+          # kache's Hetzner key pair also has write access to pond-nix-cache.
           AWS_ACCESS_KEY_ID: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
           PROFILE: ${{ steps.devshell.outputs.profile }}
         run: |
           set -euo pipefail
-          if [ -z "$PROFILE" ] || [ ! -e "$PROFILE" ] \
-             || [ -z "$NIX_CACHE_SIGNING_KEY" ] \
-             || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-            echo "::warning::binary-cache push skipped: no devshell profile, or the signing key / S3 credential is missing"
-            exit 0
-          fi
-
-          # Resolve the profile's symlink chain to the store path it points at.
-          # A profile lives outside /nix/store, and nix reads an argument that is
-          # not a store path as a flake reference - which this is not.
-          closure=$(readlink -f "$PROFILE")
-
-          # Nix takes a signing key as a file path and nothing else, so write one
-          # into the pod's own scratch, 0600, and remove it on the way out. The
-          # `tr` guards against a trailing newline in the secret, which would
-          # make the key unparseable; the value never reaches the log. INT/TERM
-          # as well as EXIT: a job cancelled mid-upload signals the shell, and
-          # bash runs no EXIT trap when a signal kills it.
-          key="$RUNNER_TEMP/pond-nix-cache.key"
-          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT INT TERM
-          (umask 077; printf '%s' "$NIX_CACHE_SIGNING_KEY" | tr -d '\n' > "$key")
-
-          # `secret-key` is a store setting, so each path is signed as it is
-          # uploaded - no separate `nix store sign` pass over the local store,
-          # and no way to upload a path the signing step missed. Upload
-          # concurrency comes from the runner nix.conf's http-connections (plan
-          # 2.2); nothing job-specific to tune here.
-          store="s3://pond-nix-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1&compression=zstd&secret-key=$key"
-
-          # Warm runs are a fast no-op: nix queries the cache first and uploads
-          # only the paths it does not already hold, so this costs one narinfo
-          # lookup per path unless the toolchain actually moved.
-          if nix --extra-experimental-features nix-command copy --to "$store" "$closure"; then
-            echo "pushed the devshell closure: $closure"
-          else
-            echo "::warning::binary-cache push failed - the cache is a cold-start optimization, so this does not fail the build. Check that the runner's nix has s3:// support (\`nix store info --store 's3://pond-nix-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1'\`, plan section 3) and that the credential still has write access."
-          fi
+          key=$(mktemp -p "$RUNNER_TEMP")
+          trap 'rm -f "$key"' EXIT INT TERM
+          printf '%s' "$NIX_CACHE_SIGNING_KEY" | tr -d '\n' > "$key"
+          # region must be nbg1: Hetzner rejects signatures for any other region.
+          nix --extra-experimental-features nix-command copy \
+            --to "s3://pond-nix-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1&compression=zstd&secret-key=$key" \
+            "$(readlink -f "$PROFILE")"
 
   # Hosted, never pond-ci: the pond-ci pods are unprivileged, so their nix runs
   # with `sandbox = false` - weaker conditions than the users this check

@@ -283,12 +283,14 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   on that one** (PR #268), and it adds a fourth place - the `s3://` store URI in
   the push step: a last step in `build-and-test`, gated on a push to `main`
   (2.8 point 2), `nix copy`s the devshell profile's closure to the bucket and
-  signs each path on the way up with a key file written from
-  `NIX_CACHE_SIGNING_KEY` into the pod's scratch. Non-fatal by design - the
-  cache is a cold-start optimization, so a failed push warns instead of
-  reddening the build - and only `build-and-test` pushes: it is the one pond-ci
-  job that runs on every main push, and the release jobs of that same push would
-  re-upload the identical closure. The devshell action grew a `profile` output
+  signs each path on the way up via `secret-key=` pointing at a `mktemp` file
+  written from `NIX_CACHE_SIGNING_KEY` and removed by a trap. `nix copy` skips
+  paths the bucket already holds, so a warm run is a no-op. Non-fatal by design
+  (`continue-on-error`) - the cache is a cold-start optimization, so a failed
+  push shows as a failed step without reddening the build - and only
+  `build-and-test` pushes: it is the one pond-ci job that runs on every main
+  push, and the release jobs of that same push would re-upload the identical
+  closure. The devshell action grew a `profile` output
   for it, so the push copies the profile the job actually entered rather than
   re-deriving the key.
 - 2.2's one-time `/ci-cache` cleanup is enforced, not assumed: the action fails
