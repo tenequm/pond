@@ -110,17 +110,25 @@ echo "--- corpus ---"
 "$BENCH_BIN" --prepare --profile "$PROFILE"
 
 HOST_TAG="${MEM_GATE_HOST:-$(uname -s)-$(uname -m)}"
-# The compiler the row was measured under. `rustc` on PATH is what the `cargo
-# build` above resolved to (a rustup proxy reads the same rust-toolchain.toml
-# from this directory), so this names the codegen behind the numbers.
-TOOLCHAIN="$(rustc --version 2>/dev/null || echo unknown)"
+# The compiler the row was measured under. `$RUSTC` (or `rustc` on PATH) is what
+# the `cargo build` above invoked, unless cargo config overrides `build.rustc`;
+# a rustup proxy reads the same rust-toolchain.toml from this directory.
+TOOLCHAIN="$("${RUSTC:-rustc}" --version 2>/dev/null || echo unknown)"
 
 # Only append mode stamps a row, so only it needs the commit tag. A dirty tree
 # means the measured binary may not match the named commit; the baseline this
 # script appends to never affects the binary, so exclude it.
 if [ "$CHECK" = 0 ]; then
   COMMIT="$(git rev-parse --short HEAD)"
-  if [ -n "$(git status --porcelain -- ":!$BASELINE")" ]; then COMMIT="$COMMIT-dirty"; fi
+  # A MEM_GATE_BASELINE outside the tree makes git reject the exclude pathspec,
+  # and a failure inside `[ -n "$(...)" ]` would read as a clean tree. `literal`
+  # stops glob characters in the path from excluding real changes.
+  BASELINE_REL="$(python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1]))' "$BASELINE")"
+  case "$BASELINE_REL" in
+    ../*) DIRTY="$(git status --porcelain)" ;;
+    *) DIRTY="$(git status --porcelain -- ":(exclude,literal)$BASELINE_REL")" ;;
+  esac
+  if [ -n "$DIRTY" ]; then COMMIT="$COMMIT-dirty"; fi
   DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   mkdir -p "$(dirname "$BASELINE")"
   touch "$BASELINE"
@@ -166,7 +174,7 @@ EOF
 done
 
 if [ "$CHECK" = 1 ]; then
-  echo "--- check vs committed baseline (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
+  echo "--- check vs baseline $BASELINE (threshold ${MEM_GATE_MAX_REGRESSION_PCT:-20}%) ---"
   python3 - "$BASELINE" "$PROFILE" "$TMP" "${MEM_GATE_MAX_REGRESSION_PCT:-20}" "$SCENARIOS" "$HOST_TAG" "$RECORD_ONLY" "$TOOLCHAIN" <<'EOF'
 import json, os, sys
 baseline, profile, tmp, pct = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
@@ -209,8 +217,8 @@ for scenario in scenarios:
         before = same[-1].get(key) if same else None
         if not isinstance(now, int) or not isinstance(before, int):
             # Say so rather than skipping in silence: a record-only scenario
-            # never reaches the "no committed baseline row" failure below, so
-            # this line is the only sign the counter went unjudged.
+            # never reaches the "no committed baseline row" failure below, and
+            # a row that predates the counter raises no other warning.
             if now is not None or before is not None:
                 print(f"  skip {key}: not comparable (now={now!r}, baseline={before!r})")
             continue
@@ -227,9 +235,9 @@ for scenario in scenarios:
             # first rows, and hard-failing here would block that bootstrap. The
             # summary carries the count so the gap cannot pass as a pass.
             print(
-                f"  WARNING: UNJUDGED - record-only scenario with no committed baseline row"
-                f" for host {host}; nothing was compared. Run ops/scripts/mem-gate.sh and"
-                " commit the row to give this host a baseline."
+                "  WARNING: UNJUDGED - record-only scenario with no committed baseline row"
+                f" for host {host}; nothing was compared. Run ops/scripts/mem-gate.sh"
+                f" --profile {profile} and commit the row to give this host a baseline."
             )
             unjudged.append(scenario)
         for key in METRICS:
@@ -242,7 +250,7 @@ for scenario in scenarios:
             print(f"  note {key:<18} {before if before is not None else '-':>14} -> {shown_now:<14} {delta:>7}  (record-only)")
         continue
     if not same:
-        print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh locally and commit the baseline")
+        print(f"  FAIL: no committed baseline row for host {host} - run ops/scripts/mem-gate.sh --profile {profile} locally and commit the baseline")
         failed = True
         continue
     prev = same[-1]
@@ -259,11 +267,11 @@ for scenario in scenarios:
 summary = "{} unjudged scenario{}{}".format(
     len(unjudged),
     "" if len(unjudged) == 1 else "s",
-    f": {', '.join(unjudged)}" if unjudged else " (every scenario had a row to read)",
+    f": {', '.join(unjudged)}" if unjudged else "",
 )
 if failed:
     sys.exit(f"\nmem gate: regression beyond {pct:.0f}% (or missing baseline row); {summary}")
-print(f"\nmem gate: all scenarios within {pct:.0f}% of the committed baseline; {summary}")
+print(f"\nmem gate: every judged scenario within {pct:.0f}% of the committed baseline; {summary}")
 EOF
 else
   echo "--- delta vs previous run (same scenario, same profile) ---"
