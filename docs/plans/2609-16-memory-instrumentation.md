@@ -168,17 +168,20 @@ because mem_bench's ingest_batched skips the byte budget - wiring goes into
 + row-id-ordered scan plan with verified-disjoint live ranges and a counted
 fallback, rowmap_scan_fallbacks(); sorted fragments alone proven
 insufficient; a store compacted while disordered keeps the fallback
-forever - tracked in #257). Open: #256 (refresh reconciling the stamp
-collision with #252), #258 (bench-lane scenarios, record-only, plus the
-ingest_batched budget fix and a partial-embed rowmap scenario). CI note:
+forever - tracked in #257). Both then-open riders have since merged: #256
+(refresh reconciling the stamp collision with #252) and #258 (bench-lane
+scenarios, record-only, plus the ingest_batched budget fix and a
+partial-embed rowmap scenario), so final main for the closing sweep is
+abc49b9. CI note:
 windows-verify died repo-wide on 2026-09-16 ~17:30Z (kache k27 prefix
 outgrew the runner disk); #244 resolved it by rotating prefixes to k31 (see
-docs/plans/2609-16-ci-nix-toolchain-revamp.md). The #245 closing sweep
-must build BOTH sides (44886ce baseline and final main) under 1.98, run
-both the mem gate and the read/write `moon run repo:bench-gate` (never run
-for these storage-path PRs), check read latency on a store ingested under
-#252 and not optimized (messages 1->9 fragments at 200k messages), and
-re-record mem-gate baseline rows on 1.98 in one commit.
+docs/plans/2609-16-ci-nix-toolchain-revamp.md). The #245 closing sweep -
+build BOTH sides (44886ce baseline and final main) under 1.98, run both
+the mem gate and the read/write `moon run repo:bench-gate` (never run for
+these storage-path PRs), check read latency on a store ingested under #252
+and not optimized (messages 1->9 fragments at 200k messages), and re-record
+mem-gate baseline rows on 1.98 - ran 2026-09-16/17. Results in section 6
+below; the re-recorded rows are on PR #270.
 
 - Streaming rowmap build (#61 names the blocker: dict indexes borrow into
   `entries`; own the dict keys up front). Target peak ~400 MB. 1-2 weeks.
@@ -294,3 +297,105 @@ comments.
   re-reads outside genuine first syncs.
 - Deployment B's OOM cadence is the ultimate metric: target zero pond OOM
   kills over a 7-day window after B1+B2+B5 deploy.
+
+## 6. Closing numbers (2026-09-17)
+
+PRE is `44886ce`, the pre-campaign baseline commit; POST is `abc49b9`, final
+main. Both sides were built and measured under the same toolchain
+(`rustc 1.98.1 (48a229cea 2026-09-01)`, `cargo 1.98.1 (797e8a9bc
+2026-08-05)`), so these deltas are code, not compiler. The re-recorded rows
+are on PR [#270](https://github.com/tenequm/pond/pull/270).
+
+### mem-gate, `large` profile (20,000 sessions x 50 messages)
+
+| scenario | wall_ms | peak_rss_kb | peak_heap_bytes | note |
+|---|---|---|---|---|
+| sync-noop-local | 1434 -> 665 (-53.6%) | 681152 -> 179196 (-73.7%) | 519885409 -> 81196613 (-84.4%) | |
+| sync-incremental | 1601 -> 948 (-40.8%) | 686600 -> 181272 (-73.6%) | 519884992 -> 78633217 (-84.9%) | |
+| rowmap-build-cold | 1393 -> 650 (-53.3%) | 691512 -> 181204 (-73.8%) | 519885413 -> 79967868 (-84.6%) | |
+| mcp-query-growth | 3973 -> 4062 (+2.2%) | 589164 -> 346608 (-41.2%) | 60752939 -> 60162182 (-1.0%) | |
+| ingest-large-session | 3378 -> 3094 (-8.4%) | 1529564 -> 535984 (-65.0%) | 1435934878 -> 296530349 (-79.3%) | harness changed - not comparable |
+
+`ci` profile, same direction and smaller magnitude: on sync-noop-local,
+sync-incremental and rowmap-build-cold, peak RSS moved -24.6% / -19.2% /
+-24.9% and peak heap -53.0% / -54.4% / -49.6%; mcp-query-growth was peak RSS
+-9.7% with peak heap +1.6%; ingest-large-session again not comparable.
+
+`ingest-large-session` is labelled not comparable because #258 wired the
+byte-budget flush into `mem_bench`'s `ingest_batched` (the gap called out
+above under #252), so the PRE row committed one fragment per table and the
+POST row commits nine - different work, not a memory win of that size.
+
+The five scenarios #258 added (`search-query-latency`, `ingest-throughput`,
+`serve-sync-retention`, `sync-under-contention`,
+`rowmap-build-cold-partial-embed`) are record-only: they have no PRE
+counterpart and are baselines for the next campaign, not deltas.
+
+### bench-gate - only four fields are readable
+
+Read this table with the caveat below it, not on its own.
+
+| field | PRE -> POST | reading |
+|---|---|---|
+| `vector_iops` | 91 -> 91 (+0.0%) | unchanged |
+| `search_iops` | 274 -> 246 (-10.2%) | the one credible read regression |
+| `open_store_ms` | 1166 -> 548 (-53.0%) | real improvement |
+| `write_copy_delta_ms` | 649 -> 974 (+50.1%) | credible regression |
+
+Caveat. Both bench-gate rows were measured with the operator's live
+`pond-sync.timer` firing every 5 minutes against the measured store -
+like-for-like on both sides, matching how the committed baseline row was
+made. CLI probes are best-of-2 and noisy: inside the PRE run alone the two
+`search` attempts differed 2.6x (14.3 -> 5.5 s). Store content also drifts
+between the two sides (19,651 -> 19,676 sessions, 3,904,429 -> 3,908,280
+messages). Two POST attempts of the *same* binary at the *same* commit two
+hours apart disagree on most fields by more than PRE -> POST does, up to
+24.2x on `search_s`; only the four fields above held a run-to-run spread of
+1.1x or less, so only large consistent deltas on those four are signal.
+Everything else in the row is dominated by S3 and by concurrent sync
+traffic. For absolute scale on the noisy remainder: `rowmap_cold_ms` was
+277,097 ms PRE on the live S3 store - one sample of a minutes-long
+operation, not a gating number. Separately, the bench-gate script prints a
+delta against the committed 2026-09-10 row; that comparison spans a
+different binary, toolchain and store size, is not a code delta, and must
+not be quoted. Precise numbers for this campaign come from the mem gate and
+the read-latency ladder.
+
+### Read-latency ladder (M0-M3)
+
+Measured on a 200k-message local store ingested under #252 and left
+unoptimized. The quotable pair is M2 (7 messages fragments, indexes present)
+versus M3 (the same store after `pond optimize`, 2 fragments):
+
+| metric | M2 | M3 | M2 worse by |
+|---|---|---|---|
+| `fts_search` p50 | 9 ms | 1 ms | +800% |
+| `get_steady` p50 | 33 ms | 7 ms | +371% |
+| `fts_steady` p50 | 19 ms | 6 ms | +217% |
+| `sql_steady` p50 | 9 ms | 9 ms | 0% |
+
+Search and hydration must consult every fragment's index segment, so they
+track fragment count directly; the analytics shapes read manifest metadata
+and column statistics, which compaction does not change. The remedy is
+cheap: `pond optimize` ran in **1.00 s** (0.40 s at M3) and restored the
+folded state. M0 reproduced #252's shape closely - 8 messages fragments and
+9 versions at 200k messages, against the 9 / 11 that report recorded.
+
+Two bounds on those percentages. The bigger M0 -> M1 figure (`fts_search`
+p50 88 ms -> under 1 ms) measures *index presence*, not fragmentation - M0
+had no usable FTS index - which is why the M2/M3 pair is the one to quote.
+And the ladder ran on a local filesystem, where an extra fragment costs one
+more open file; S3 charges a round-trip per extra object, so these are a
+lower bound on production cost.
+
+### Carried out of this plan
+
+- Memory ceiling + supervised self-restart for `mcp` and `serve`, and the
+  `oom_score_adj` guidance folded into it: issue
+  [#266](https://github.com/tenequm/pond/issues/266).
+- Bench-harness follow-ups found while closing the sweep - corpus generator
+  versioning, `write_bench` `ingest_batched` parity, record-only scenario
+  policy, a toolchain field on mem-gate rows: issue
+  [#269](https://github.com/tenequm/pond/issues/269).
+
+Refs #266 #269 #270.
