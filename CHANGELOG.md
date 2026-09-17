@@ -1,5 +1,110 @@
 # Changelog
 
+## [0.18.0](https://github.com/tenequm/pond/compare/v0.17.3...v0.18.0) - 2026-09-17
+
+This release raises the minimum supported Rust version and refreshes the
+build toolchain.
+**Upgrading:** Install Rust 1.98 or newer before building pond from
+source.
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] require Rust 1.98 and refresh CI toolchains ([#244](https://github.com/tenequm/pond/pull/244)) ([59b9978](https://github.com/tenequm/pond/commit/59b9978ec03666e9beefc67ac617a90453d74a3d))
+  pond now requires Rust 1.98 or newer to build from source; prebuilt
+  binaries and packages are unaffected.
+
+### <!-- 1 -->🎉 New Features
+- **bench:** latency, retention, contention and partial-embed scenarios ([#258](https://github.com/tenequm/pond/pull/258)) ([abc49b9](https://github.com/tenequm/pond/commit/abc49b99747717ddc9c330782728a5937cb9a1ec))
+  The memory bench lane gains five scenarios - query latency, ingest
+  throughput, post-sync retained RSS, a sync under rowmap build-lock
+  contention, and a cold rowmap build over a partially embedded store -
+  plus Lance fragment counts, and ingest benches that flush on the byte
+  budget like production.
+- **bench:** memory instrumentation lane for #245 (track A) ([#253](https://github.com/tenequm/pond/pull/253)) ([41b3663](https://github.com/tenequm/pond/commit/41b36637152468fb275cb20dd63a263d2b03a13c))
+  pond gains an opt-in memory measurement lane. Build with the `mem-probe`
+  or `dhat-heap` feature, then run `ops/scripts/mem-gate.sh` for peak RSS
+  and heap rows per scenario or `ops/scripts/profile-mem.sh` for a
+  heaptrack or dhat trace. Default builds are unchanged.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **sync:** bound ingest flush memory ([#252](https://github.com/tenequm/pond/pull/252)) ([6c2d09d](https://github.com/tenequm/pond/commit/6c2d09d854d02a29483a7e675593412cff2e7b4d))
+  `pond sync` and ingest now cap the bytes a flush buffers - source
+  payload plus the fixed per-row embedding vector width - and encode
+  messages in bounded chunks, so ingest flush memory no longer grows with
+  the size of the batch.
+- **memory:** trim retained glibc pages at quiescent points ([#249](https://github.com/tenequm/pond/pull/249)) ([2323fdc](https://github.com/tenequm/pond/commit/2323fdc228e255800b7cc07099f3e696815a0865))
+  Linux serve, MCP, sync, and rowmap workloads now ask glibc to release
+  freed pages after transient peaks, reducing retained idle memory without
+  changing the allocator or non-Linux behavior.
+- **sync:** use trailing rowmap oracle on contention ([#251](https://github.com/tenequm/pond/pull/251)) ([8c20b7c](https://github.com/tenequm/pond/commit/8c20b7c2896cf0598edab1c5ad8d0b9d2b24308f))
+  Sync now falls back to a validated trailing rowmap during build-lock
+  contention, avoiding unnecessary full source reads while preserving
+  genuine first-sync behavior.
+- **sync:** persist embedded sync cursor ([#254](https://github.com/tenequm/pond/pull/254)) ([823ee36](https://github.com/tenequm/pond/commit/823ee36ea15efe753acbfda21a20caf55f169751))
+  Every successful sync now records a per-store freshness cursor, so a
+  restarted `pond sync` or `pond serve --with-sync` resumes incrementally
+  instead of re-reading every source while another process is still
+  building the rowmap. `pond sync --dry-run` previews against that same
+  state.
+- **sync:** bound Lance scan buffers for sync and copy ([#250](https://github.com/tenequm/pond/pull/250)) ([e08cf9a](https://github.com/tenequm/pond/commit/e08cf9a75b2ec6e8193d185480f01a8b6ae623b5))
+  `pond sync` and `pond copy` now cap Lance scan readahead at 256 MiB,
+  bounding worst-case scan buffering on large and remote stores. Set
+  `LANCE_DEFAULT_IO_BUFFER_SIZE` yourself to override the bound.
+- **sync:** fail the adapter, not the run, when a source dir is absent ([#237](https://github.com/tenequm/pond/pull/237)) ([c88b6fe](https://github.com/tenequm/pond/commit/c88b6fe9bf540c6d72a9209b6c92e3533bf955ae))
+  `pond sync` no longer aborts when an enabled adapter's source is absent:
+  it is named in `failed_adapters` and the run completes; naming that
+  adapter explicitly still fails hard. `pond status` now reports an absent
+  source identically on every adapter.
+
+### <!-- 3 -->🚀 Performance
+- **ingest:** stop per-message options stamp clones ([#256](https://github.com/tenequm/pond/pull/256)) ([f253629](https://github.com/tenequm/pond/commit/f253629f5154fc6add107853e047aea546e98852))
+  Ingesting large sessions now uses substantially less memory: the shared
+  metadata stamp is no longer copied per message. Stored data is
+  unchanged.
+- **rowmap:** build the cold map in a bounded chunk window ([#260](https://github.com/tenequm/pond/pull/260)) ([03d2a46](https://github.com/tenequm/pond/commit/03d2a46fd0b9c5eb8d5085202344aee0b6ea6be0))
+  Cold row-meta map builds now encode in a bounded window instead of
+  holding the
+  whole corpus in memory: peak heap on a 1M-message store drops from 321.8
+  MiB to
+  74.8 MiB (4.3x) and the build runs about twice as fast. No format
+  change, no
+  action needed.
+- **rowmap:** stream the row-meta map build ([#255](https://github.com/tenequm/pond/pull/255)) ([e63f653](https://github.com/tenequm/pond/commit/e63f653c40a50ac18b474b43a77302e7c4fbe576))
+  Row-meta map builds now stream their serialized payload and avoid
+  corpus-sized dictionary scratch allocations, reducing peak memory during
+  cold builds and delta compaction without changing the cache format.
+
+### <!-- 6 -->🧹 Chores
+- **sync:** pin the sync cursor oracle preference order ([#259](https://github.com/tenequm/pond/pull/259)) ([3b6c609](https://github.com/tenequm/pond/commit/3b6c609bca05ad60eb9330c7b65725777b1398c6))
+  Review follow-up to the #251 / #254 composition on main. That
+  composition added `Store::sync_oracle_map` and `sync_oracle_snapshot()`,
+  which is what `persist_sync_cursor` actually reads - but the four
+  existing `sync_rowmap_oracle_*` tests assert only on the oracle handed
+  back to the planner, so nothing pinned the snapshot's preference order.
+  The only coverage was a timing-dependent integration test.
+
+  The new unit test pins it directly, deterministically (the existing
+  `hold_rowmap_lock` harness, no sleeps):
+
+  - a store that has planned nothing returns `None` - the cursor is left
+  alone rather than seeded from a chain the planner rejected;
+  - after a contended plan, `rowmap_snapshot()` is `None` and
+  `sync_oracle_snapshot()` returns the exact trailing map the planner
+  handed out (`Arc::ptr_eq`);
+  - once `ensure_rowmap` installs a resident map, the snapshot flips to it
+  - the fresher map wins, which is the behaviour `run_sync_pipeline`'s
+  post-import republish depends on.
+
+  Also rewords one doc comment above `persist_sync_cursor`: it claimed the
+  cursor comes from "exactly the map this run planned against", which
+  overstates - `ensure_rowmap` at sync end can install a newer resident
+  map, and the snapshot correctly prefers it.
+
+  Test-only plus a comment; no behaviour change.
+
+  Refs #245
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.17.3...v0.18.0
+
 ## [0.17.3](https://github.com/tenequm/pond/compare/v0.17.2...v0.17.3) - 2026-09-14
 
 ### <!-- 2 -->🐛 Bug Fixes

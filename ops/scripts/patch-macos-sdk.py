@@ -2,7 +2,7 @@
 # to 15.0 so macOS 26 dyld tolerates zig's duplicate libobjc load command
 # (ziglang/zig#24349 class; the LC_LOAD_DYLIB variant is unfixed upstream).
 # Pure Python (Linux has no vtool); handles thin + fat Mach-O, edits in place.
-# Assumes zig 0.16 (pinned in the pond-runner image) - re-check on zig bumps.
+# Assumes zig 0.16 (pinned in flake.nix's toolVersions) - re-check on zig bumps.
 import struct
 import sys
 

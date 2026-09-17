@@ -17,8 +17,9 @@
 
     # The devShell resolves against THIS input, not `nixpkgs`, so a routine
     # `nixpkgs` bump (which only feeds `packages.pond`) moves no compiler store
-    # path: cargo does not rerun build scripts and moon/kache keys do not miss.
-    # Bump it deliberately and expect one cold build when you do.
+    # path: cargo does not rerun build scripts and kache keys do not miss.
+    # moon's do: /flake.lock is a declared input of the Rust tasks, whichever
+    # input moved. Bump this one deliberately and expect one cold build.
     nixpkgs-toolchain.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # Vendored rustup manifests, so `fromRustupToolchainFile` stays a pure eval -
@@ -66,12 +67,12 @@
         rcodesign = "0.29.0";
         gh = "2.100.0";
         macosSdk = "15.5";
-        moon = "2.5.4";
+        moon = "2.5.5";
         protoc = "36.1";
         uv = "0.12.13";
         node = "24.21.0";
         npm = "11.19.1";
-        kache = "0.21.0";
+        kache = "0.22.0";
       };
 
       v = toolVersions;
@@ -81,15 +82,15 @@
         moon = {
           x86_64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-x86_64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-uqbwzaj+nXUT/+uykIz9lSiIxmZZt5XaAqFO8hVutcc=";
+            hash = "sha256-85cFeiLIj/nksopKL78B2Z9Nmk815aQmNCVan1Ccy9Y=";
           };
           aarch64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-Up4z5tyBKw3oJA+mNpg6Z2UFzCZtNGM3H/+tk6EfVMY=";
+            hash = "sha256-OdVeiHdGdxgdGvNWbEzNKZTNLZ2BmfzzDcLW3vwFrHg=";
           };
           aarch64-darwin = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-apple-darwin.tar.xz";
-            hash = "sha256-xOD0H0P4BTO+QSCReFjKaOHWUGM3XeAIiII0LkU2aGc=";
+            hash = "sha256-yQljcRtwYJ2jmMG+juNrTPL2FnxexT9IbYvZuqVupXg=";
           };
         };
         protoc = {
@@ -137,15 +138,15 @@
         kache = {
           x86_64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-x86_64-unknown-linux-musl.tar.gz";
-            hash = "sha256-Y1S7dkFL5o+PkGIGyHwTlOW3n968s6nTHiJU3frcKCA=";
+            hash = "sha256-XjBmx+LyeSz0o2XSs66fUHeozSDSFjm5QiibIm5kkoo=";
           };
           aarch64-linux = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-unknown-linux-musl.tar.gz";
-            hash = "sha256-fIsOcYsEDybDWkNe7h298urUKvhSmxO+fKzJf1vI3sQ=";
+            hash = "sha256-XJXOGfXhJ39J/bdj9OiVlPL6FqrY5A+FkkgHvJs3+Xc=";
           };
           aarch64-darwin = {
             url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-apple-darwin.tar.gz";
-            hash = "sha256-GUaUMOTH8ai8xWHCjBX9SH0ytR68Yski1x7n3iHwYPA=";
+            hash = "sha256-WUg2Nyyr1K1qc4iPtBiWr1yT8W3uqMGwXATAaqnwoQI=";
           };
         };
         # npm is one tarball for every platform. node bundles an older npm than
@@ -215,23 +216,10 @@
 
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
-          # cargo-zigbuild copies this def in at build time to work around zig
-          # having no -lsynchronization (ziglang/zig#14919), and that write into
-          # a read-only store path fails silently (.ok()). Bake it in instead.
-          # The lib tree is symlink-copied (~220 MB of real files stay shared)
-          # and zig is pointed at the copy through ZIG_LIB_DIR.
-          zig =
-            let
-              base = pinned v.zig pkgs.zig_0_16;
-            in
-            pkgs.runCommand "zig-${v.zig}-pond" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-              mkdir -p $out/bin $out/lib
-              cp -as ${base}/lib/zig $out/lib/zig
-              find $out/lib/zig -type d -exec chmod u+w {} +
-              cp ${base}/lib/zig/libc/mingw/lib-common/api-ms-win-core-synch-l1-2-0.def \
-                 $out/lib/zig/libc/mingw/lib-common/synchronization.def
-              makeWrapper ${base}/bin/zig $out/bin/zig --set-default ZIG_LIB_DIR $out/lib/zig
-            '';
+          # Also handed to cargo-zigbuild below: nixpkgs wraps it with its own
+          # `zig` on PATH, so without the override the pin would guard a
+          # different attribute than the zig that actually links the release.
+          zig = pinned v.zig pkgs.zig_0_16;
 
           moon = prebuilt {
             pname = "moon";
@@ -309,7 +297,20 @@
             packages = [
               rustToolchain
               zig
-              (pinned v.cargoZigbuild pkgs.cargo-zigbuild)
+              # 0.23.4 on zig 0.16 detaches the -exported_symbols_list operand
+              # and breaks Apple cdylib links (rust-cross/cargo-zigbuild#479).
+              # The fix (#480) is unreleased; drop this patch once a >=0.23.5
+              # release reaches nixpkgs-toolchain.
+              (pinned v.cargoZigbuild (
+                (pkgs.cargo-zigbuild.override { inherit zig; }).overrideAttrs (o: {
+                  patches = (o.patches or [ ]) ++ [
+                    (pkgs.fetchpatch {
+                      url = "https://github.com/rust-cross/cargo-zigbuild/commit/110abf59ba07cb84ed71b31c8cd81eefdc37bcec.patch";
+                      hash = "sha256-CTmasj5u7EqWuJaZKbuxP/Vq4IYJJZKpHMPqa+EWM80=";
+                    })
+                  ];
+                })
+              ))
               (pinned v.rcodesign pkgs.rcodesign)
               (pinned v.gh pkgs.gh)
               moon
@@ -326,9 +327,9 @@
               # happens to carry it. That is not a pin anyone chose, and the
               # archive it compresses is the released artifact.
               pkgs.xz
-              # The runner image is stock actions-runner now, so nothing off the
-              # shell is guaranteed: `cargo metadata | jq` in ci.yml and the
-              # devshell-entry step's own env filtering both need it.
+              # The runner image is actions-runner plus nix and gh only, so
+              # nothing else off the shell is guaranteed: `cargo metadata | jq`
+              # in ci.yml and the devshell-entry step's env filtering need it.
               pkgs.jq
             ]
             # The SDK is the cross-link stub set; on darwin the native SDK that
