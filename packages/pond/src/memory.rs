@@ -136,6 +136,9 @@ pub const CEILING_STDIO_FLUSH: Duration = Duration::from_secs(1);
 /// killed unrelated ~30 MB processes while multi-GiB `pond mcp` processes
 /// survived, because those carried the lower score. +200 is the value two
 /// field deployments confirmed.
+// Linux is the only platform that has the file, so off Linux nothing but the
+// decision tests below reads either this or `oom_score_adj_target`.
+#[cfg(any(target_os = "linux", test))]
 const DEFAULT_OOM_SCORE_ADJ: i32 = 200;
 
 /// The range the kernel accepts for `oom_score_adj`.
@@ -366,6 +369,7 @@ pub async fn stop_at_ceiling(
 /// non-zero score means the service manager or the operator already chose, so
 /// pond only fills in its default where the score is still 0.
 #[must_use]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn oom_score_adj_target(configured: Option<i32>, inherited: i32) -> Option<i32> {
     match configured {
         Some(0) => None,
