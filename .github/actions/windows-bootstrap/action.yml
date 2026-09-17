@@ -197,17 +197,17 @@ runs:
         s3-bucket: ttq
         s3-endpoint: https://nbg1.your-objectstorage.com
         s3-region: nbg1
-        # Same prefix as the dist build's raw-kache usage. Content-addressed and
-        # triple-keyed, so sharing can only add hits, never cross-contaminate.
-        # Asserted equal to the config file's `prefix` by the step above.
+        # Per caller (see the s3-prefix input). Asserted equal to the config
+        # file's `prefix` by the step above.
         s3-prefix: ${{ inputs.s3-prefix }}
         s3-access-key-id: ${{ inputs.kache-access-key-id }}
         s3-secret-access-key: ${{ inputs.kache-secret-access-key }}
         github-cache: false
-        # Pinned like Linux pins KACHE_VERSION: the default resolves latest at
-        # run time, so an upstream cache-key bump invalidates the store with no
-        # commit here. 0.14.0's bump cost a 138 min run against 9.5 min warm.
-        # Bumped in lockstep with the Linux KACHE_VERSION and the k-tag in the
+        # Pinned like the Linux legs pin `kache` in flake.nix's toolVersions: the
+        # default resolves latest at run time, so an upstream cache-key bump
+        # invalidates the store with no commit here. 0.14.0's bump cost a 138 min
+        # run against 9.5 min warm.
+        # Bumped in lockstep with that flake pin and the k-tag in the
         # prefixes, never alone. kache strips the remote env from daemons it
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
         # what the bump buys is key schema 31; schema 25 could under-key

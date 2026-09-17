@@ -26,8 +26,8 @@ fileGroups:
     # lock, so it can no longer replay results built by the previous toolchain.
     # The compiler itself is pinned by rust-toolchain.toml (above). protoc,
     # moon, kache, uv and node are prebuilt archives whose version and hash live
-    # in flake.nix, which is NOT an input - a protoc bump still moves nothing
-    # declared here.
+    # in flake.nix, which is NOT in this group - a protoc bump still moves
+    # nothing declared here. build-dist alone adds flake.nix, below.
     - 'flake.lock'
     # The msvc rustflags (+crt-static) live here, and a moon fingerprint that
     # omits them lets a rustflags change be served from a cache entry built with
@@ -133,6 +133,10 @@ tasks:
       - '@group(sources)'
       - 'ops/scripts/build-dist.sh'
       - 'ops/scripts/patch-macos-sdk.py'
+      # The macOS SDK stubs and the cargo-zigbuild patch live in flake.nix, not
+      # flake.lock, and both change what ships. Free here: every release
+      # already misses on the version bump above.
+      - 'flake.nix'
     outputs:
       - 'dist/pond-aarch64-apple-darwin.tar.xz'
       - 'dist/pond-x86_64-unknown-linux-gnu.tar.xz'

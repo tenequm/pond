@@ -13,7 +13,10 @@
 # devShell the job enters before this runs.
 set -euo pipefail
 
-export POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
+# Assigned before export: `export X="$(...)"` returns export's status, so a
+# failing git would slip past `set -e` and bake an empty commit into the binary.
+POND_BUILD_COMMIT="$(git rev-parse --short HEAD)"
+export POND_BUILD_COMMIT
 TD="${CARGO_TARGET_DIR:-target}"
 
 # No `rustup target add` here any more: rust-toolchain.toml lists all three
