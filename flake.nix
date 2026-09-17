@@ -309,7 +309,20 @@
             packages = [
               rustToolchain
               zig
-              (pinned v.cargoZigbuild pkgs.cargo-zigbuild)
+              # 0.23.4 on zig 0.16 detaches the -exported_symbols_list operand
+              # and breaks Apple cdylib links (rust-cross/cargo-zigbuild#479).
+              # The fix (#480) is unreleased; drop this patch once a >=0.23.5
+              # release reaches nixpkgs-toolchain.
+              (pinned v.cargoZigbuild (
+                pkgs.cargo-zigbuild.overrideAttrs (o: {
+                  patches = (o.patches or [ ]) ++ [
+                    (pkgs.fetchpatch {
+                      url = "https://github.com/rust-cross/cargo-zigbuild/commit/110abf59ba07cb84ed71b31c8cd81eefdc37bcec.patch";
+                      hash = "sha256-CTmasj5u7EqWuJaZKbuxP/Vq4IYJJZKpHMPqa+EWM80=";
+                    })
+                  ];
+                })
+              ))
               (pinned v.rcodesign pkgs.rcodesign)
               (pinned v.gh pkgs.gh)
               moon
