@@ -23,8 +23,8 @@ runs:
         # first real build with `executing '/nix/store/...-bash': No such file or
         # directory` - because in a chroot store that path is only valid inside
         # the chroot. Say what is actually wrong, before spending the download.
-        if [ ! -d /nix/var/nix ] || [ ! -w /nix/store ]; then
-          echo "::error::/nix is not a writable native store on this runner (need /nix/var/nix present and /nix/store writable by the runner user). Deploy the pond-runner image and the /nix store volume - see docs/plans/2609-16-ci-nix-toolchain-revamp.md phase 5." >&2
+        if [ ! -d /nix/var/nix ] || [ ! -w /nix/store ] || [ ! -w /nix/var/nix/profiles ]; then
+          echo "::error::/nix is not a writable native store on this runner (need /nix/var/nix present, and /nix/store and /nix/var/nix/profiles writable by the runner user). Deploy the pond-runner image and the /nix store volume - see docs/plans/2609-16-ci-nix-toolchain-revamp.md phase 5." >&2
           exit 1
         fi
 
@@ -151,9 +151,7 @@ runs:
         protoc --version
         kache --version
         zig version
-        # cargo-zigbuild has no --version flag of its own; the flake's `pinned`
-        # assertion is what fixes its version, so presence is all there is to check.
-        command -v cargo-zigbuild
+        cargo-zigbuild --version
         rcodesign --version
         gh --version
         xz --version | head -1
