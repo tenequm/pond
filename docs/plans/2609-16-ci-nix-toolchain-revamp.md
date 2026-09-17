@@ -39,7 +39,10 @@ history; file citations are from the tools' own repos.
   a moon input, whichever input moved). Without this, every lock bump
   costs one ~100s-class cold build.
 - **From nixpkgs at the exact versions already pinned**: zig 0.16,
-  cargo-zigbuild 0.23.4 (overridden onto that same zig), rcodesign 0.29.0, gh.
+  cargo-zigbuild 0.23.4 (overridden onto that same zig), rcodesign 0.29.0.
+  gh was here too and was dropped (PR #276): it is the host's GitHub client, a
+  shell copy shadowed the host's auth wiring, and pond-ci jobs get it from the
+  pond-runner image instead.
   The runner image's `synchronization.def` copy is dropped, not ported: it only
   served the windows-gnu target, which is gone.
 - **Custom fetch packages** (the infra-repo pattern: fetchurl + install):
@@ -254,7 +257,7 @@ The rationale and trust analysis live with the ops-side plan.
 | 2 | kache 0.22.0 (rides the rust-1.98 PR) | none (hygiene; k31 stays) | PR #264 |
 | 3 | moon 2.5.5; `moon ci` for build-and-test; versionless toolchains + `rust: {}` + `/flake.lock` input | hit-path 10-15s shrinks; OS-keyed hashes unblock remote reads for devs | PR #264, minus node/npm - they stay pinned until the devshell supplies them |
 | 4 | Flake toolchain + `toolVersions` + Windows text-extraction + parity check; `.envrc` | single pin source; local UX/AX wins immediately | merged (#262), minus the Windows text-extraction (open) |
-| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in PR #265, on top of #264; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache is read-only so far, pushing deferred |
+| 5 | Runner image + /nix store volume + devshell-entry step; delete bootstrap; binary cache + fork policy settings (with the ops side) | bootstrap gone; much smaller image on cold nodes; cold-cache fills in parallel | repo half in PR #265, on top of #264; ops half (image, /nix PVC, /ci-cache cleanup) not deployed; cache push in PR #268 |
 | 6 | Local kache preserve-incremental; moon `localReadOnly` + shared worktree cache | dep-compile hits locally; agents reuse CI results | not started |
 
 Phases 1-3 are independent of Nix entirely. Phase 5 is the only one touching
@@ -278,21 +281,42 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   binstalls a prebuilt binary that needs no Rust, and its degraded source-build
   path now fails loudly on pond's pin rather than silently using a second
   toolchain.
-- The binary cache is wired for READ only, in three places a rotation has to
-  edit together: the flake's `nixConfig`, explicit flags on the pond-ci nix
+- The binary cache's READ side is wired in three places a rotation has to edit
+  together: the flake's `nixConfig`, explicit flags on the pond-ci nix
   invocation (nixConfig is ignored for an untrusted user), and `flake-check`'s
-  `install-nix-action` `extra_nix_config`. Pushing needs a signing key on
-  main-branch jobs (2.8 point 2) and is deferred to its own change.
+  `install-nix-action` `extra_nix_config`. **Pushing is its own change** (PR
+  #268), and it adds a fourth place - the `s3://` store URI in the push step:
+  a last step in `build-and-test`, gated on a push to `main` (2.8 point 2),
+  `nix copy`s the devshell profile's closure to the bucket and signs each path
+  on the way up via `secret-key=` pointing at a `mktemp` file written from
+  `NIX_CACHE_SIGNING_KEY` and removed by a trap. `nix copy` skips paths the
+  bucket already holds, so a warm run is a no-op. Non-fatal by design
+  (`continue-on-error`) - the cache is a cold-start optimization, so a failed
+  push shows as a failed step without reddening the build - and only
+  `build-and-test` pushes: it is the one pond-ci job that runs on every main
+  push, and the release jobs of that same push would re-upload the identical
+  closure. The devshell action grew a `profile` output for it, so the push
+  copies the profile the job actually entered rather than re-deriving the key.
 - 2.2's one-time `/ci-cache` cleanup is enforced, not assumed: the action fails
   the job if a rustup proxy is still sitting in `$CARGO_HOME/bin`, with the
   remedy in the error. `/ci-cache/proto` is explicitly NOT part of that cleanup
   any more, per the `PROTO_HOME` note above.
 - 2.1's "keep clang/libclang (bindgen)" is dropped: `bindgen` is not in
   `Cargo.lock`, so `LIBCLANG_PATH` pointed at a closure nothing used.
-- **Open, ops side: nothing prunes the devshell profiles.** Each key is its own
+- **Ops side: the devshell profiles are pruned by mtime.** Each key is its own
   `/nix/var/nix/profiles/pond-dev-$key`, i.e. its own permanent GC root with a
   single generation, so `nix-collect-garbage -d` frees none of them and every
   edit to flake.nix, flake.lock or rust-toolchain.toml pins another full
   toolchain closure on the node's store volume. A reaper belongs with the /nix
-  volume (age-based over `pond-dev-*`), and it cannot use mtime as read: the hit
-  path never touches the profile it reuses, so the hottest key looks the oldest.
+  volume (age-based over `pond-dev-*`). The hit path only reads the profile it
+  reuses, so left alone its mtime is "first built" and the hottest key looks the
+  oldest; the action therefore `touch -h`es the profile symlink on every hit,
+  which makes its mtime "last entered" on any mount. That mtime is the contract
+  for the infra repo's `nix-store-reaper`. As first merged, the reaper takes
+  the newer of atime and mtime and stops age-reaping when an atime probe fails;
+  its paired change drops the probe and reads mtime alone, because the reaper's
+  own `nix store gc` readlinks every profile and so refreshes every atime each
+  run. That change must follow this one: until the stamp is on main, mtime alone
+  makes the hottest key look the oldest. A sibling marker file
+  was rejected because `pond-dev-<key>.last-used` would match the reaper's own
+  `pond-dev-*` glob.

@@ -8,10 +8,18 @@ description: >
   is now the single source of truth for every tool (plan 2609-16 2.1/2.2).
   The /ci-cache exports that bootstrap also owned survive here - they are cache
   locations, not tools, and the PVC is still what makes a warm pod warm.
+outputs:
+  profile:
+    description: >
+      The `/nix/var/nix/profiles/pond-dev-$key` this job entered. Its closure is
+      the toolchain, so a later step can `nix copy` it to the binary cache
+      without re-deriving the key or re-evaluating the flake (plan 2.7).
+    value: ${{ steps.enter.outputs.profile }}
 runs:
   using: composite
   steps:
     - name: Enter the nix devshell
+      id: enter
       shell: bash
       run: |
         set -euo pipefail
@@ -57,6 +65,14 @@ runs:
         json="$RUNNER_TEMP/pond-dev-env.json"
         if [ -e "$profile" ]; then
           echo "devshell profile hit: $profile"
+          # The reaper's last-use signal. A hit only reads the profile, so
+          # without this its mtime stays "first built" and the hottest key looks
+          # the oldest. atime is no substitute: every nix GC readlinks each root,
+          # which refreshes it, and a noatime mount never records it at all.
+          # -h stamps the symlink, never the store path behind it, whose mtime
+          # nix pins to 1. A miss needs no touch: nix writes the symlink fresh.
+          # Not fatal: a lost stamp costs at most a rebuild after a reap.
+          touch -h "$profile" || echo "::warning::could not stamp $profile as used; the store reaper may prune it while it is still in use" >&2
           "${nix[@]}" print-dev-env --json "$profile" > "$json"
         else
           echo "devshell profile miss, building: $profile"
@@ -64,6 +80,9 @@ runs:
           # next job on this node takes the branch above.
           "${nix[@]}" print-dev-env --json --profile "$profile" .# > "$json"
         fi
+        # Announced only once the profile exists, so a job whose entry failed
+        # advertises no path for the cache-push step to copy.
+        echo "profile=$profile" >> "$GITHUB_OUTPUT"
 
         # jq is not guaranteed on the stripped runner image, and this runs
         # before the devshell (which does ship jq) is on PATH. Resolve it from
@@ -160,7 +179,6 @@ runs:
         zig version
         cargo-zigbuild --version
         rcodesign --version
-        gh --version
         xz --version | head -1
         # Not optional extras: uv runs hermes-pond's suite, python3 patches the
         # darwin SDK load command in the dist build, jq reads cargo metadata.

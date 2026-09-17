@@ -50,8 +50,19 @@ jobs:
     # from the flake devShell, realized in the node's /nix store volume; the
     # cargo registry, target/ and proto's tool tree stay on the /ci-cache PVC.
     # Both persist across the ephemeral pods.
-    runs-on: pond-ci
-    timeout-minutes: 60
+    # Fork PRs run hosted instead: those volumes are writable and shared with
+    # the release jobs, so untrusted code must never touch them. Same test as
+    # windows-verify, inverted; a PR whose head repo is gone also lands hosted.
+    # A hosted run is always cold (windows-verify measured 76 min cold), hence
+    # its longer timeout.
+    runs-on: >-
+      ${{ github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      'ubuntu-latest' || 'pond-ci' }}
+    timeout-minutes: >-
+      ${{ github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      120 || 60 }}
     # A newer push to the same ref supersedes an in-flight build.
     concurrency: { group: "ci-build-${{ github.ref }}", cancel-in-progress: true }
     steps:
@@ -60,7 +71,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # Hosted-runner stand-ins for the pod's volumes, so the devshell action
+      # runs unchanged: a single-user install leaves /nix owned by the runner
+      # user (the daemon install's root-owned store fails the action's
+      # writable-store check), and /ci-cache is a throwaway directory.
+      # The image guarantees only ~14 GB free, less than the toolchain closure
+      # plus a cold target/, so the largest unused SDKs go first. /mnt is no
+      # longer guaranteed to exist, so it is not an option.
+      - if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /ci-cache
+          df -h /
+      - if: runner.environment == 'github-hosted'
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_options: --no-daemon
+          # Ubuntu 24.04's AppArmor userns restriction breaks an unprivileged
+          # sandbox, and sandbox-fallback does not catch it. pond-ci runs
+          # sandbox-less too.
+          extra_nix_config: |
+            sandbox = false
+            extra-substituters = https://pond-nix-cache.nbg1.your-objectstorage.com
+            extra-trusted-public-keys = pond-nix-cache-1:hKrVA6Y14HOfAzfEP8C0Ev3T3FQPxqouI0awr6hffbU=
       - uses: ./.github/actions/devshell
+        id: devshell
       # One moon session: independent tasks interleave (cargo serializes the
       # heavy ones on its target-dir lock; format/changelog are instant). The
       # plugin suites run here too - they cost seconds next to the Rust build,
@@ -90,6 +125,32 @@ jobs:
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
           hermes-pond:test
+
+      # Publishes the toolchain closure this job entered, so cold pods, fork PRs
+      # and dev machines substitute it (plan 2.7). Main pushes only: the signing
+      # credential lives nowhere else (plan 2.8 point 2). Non-fatal - the cache
+      # is a cold-start optimization; nix copy skips paths the bucket already has.
+      - name: Push the devshell closure to the binary cache
+        if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.devshell.outputs.profile != '' }}
+        continue-on-error: true
+        # continue-on-error does not cover the job timeout: a stalled upload
+        # must fail this step, not run out the job's clock and redden the build.
+        timeout-minutes: 15
+        env:
+          NIX_CACHE_SIGNING_KEY: ${{ secrets.NIX_CACHE_SIGNING_KEY }}
+          # kache's Hetzner key pair also has write access to pond-nix-cache.
+          AWS_ACCESS_KEY_ID: ${{ secrets.KACHE_S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          PROFILE: ${{ steps.devshell.outputs.profile }}
+        run: |
+          set -euo pipefail
+          key=$(mktemp -p "$RUNNER_TEMP")
+          trap 'rm -f "$key"' EXIT INT TERM
+          printf '%s' "$NIX_CACHE_SIGNING_KEY" | tr -d '\n' > "$key"
+          # region must be nbg1: Hetzner rejects signatures for any other region.
+          nix --extra-experimental-features nix-command copy \
+            --to "s3://pond-nix-cache?endpoint=nbg1.your-objectstorage.com&region=nbg1&compression=zstd&secret-key=$key" \
+            "$(readlink -f "$PROFILE")"
 
   # Hosted, never pond-ci: the pond-ci pods are unprivileged, so their nix runs
   # with `sandbox = false` - weaker conditions than the users this check
@@ -599,8 +660,9 @@ jobs:
   publish-release:
     needs: [dist-build, macos-verify, windows-verify, windows-dist]
     # GitHub-hosted, no devshell: release-plz only packages and uploads
-    # (publish_no_verify in release-plz.toml, so nothing compiles), and gh, jq
-    # and sha256sum ship on the image. Keeps the release off the ARC pool.
+    # (publish_no_verify in release-plz.toml, so nothing compiles), and gh - which
+    # the devShell deliberately ships no copy of - plus jq and sha256sum all come
+    # preinstalled on the image. Keeps the release off the ARC pool.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

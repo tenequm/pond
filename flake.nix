@@ -56,8 +56,8 @@
       # disagree. Rust is not repeated here - it is read from
       # rust-toolchain.toml, which stays the single Rust pin.
       #
-      # The four that come from nixpkgs-toolchain (zig, cargoZigbuild,
-      # rcodesign, gh) are asserted against the package's own `version` below,
+      # The three that come from nixpkgs-toolchain (zig, cargoZigbuild,
+      # rcodesign) are asserted against the package's own `version` below,
       # so a nixpkgs bump that moves one fails evaluation instead of making
       # this table lie.
       toolVersions = {
@@ -65,7 +65,6 @@
         zig = "0.16.0";
         cargoZigbuild = "0.23.4";
         rcodesign = "0.29.0";
-        gh = "2.100.0";
         macosSdk = "15.5";
         moon = "2.5.5";
         protoc = "36.1";
@@ -312,7 +311,6 @@
                 })
               ))
               (pinned v.rcodesign pkgs.rcodesign)
-              (pinned v.gh pkgs.gh)
               moon
               protoc
               uv
@@ -386,8 +384,10 @@
       # job: this shell is the single source of truth for the toolchain -
       # rust-toolchain.toml's rust, the cross-compile set (zig, cargo-zigbuild,
       # rcodesign, the SDK stubs) and the pinned user-space binaries (moon,
-      # protoc, uv, node/npm, kache, gh). rustup is deliberately absent: it
-      # would be a second Rust pin resolving against a different source.
+      # protoc, uv, node/npm, kache). rustup is deliberately absent: it
+      # would be a second Rust pin resolving against a different source. gh is
+      # absent too: it is the host's GitHub client, and a shell copy first on
+      # PATH would shadow whatever auth the host wires into its own gh.
       devShells = nixpkgs.lib.genAttrs systems (system: { default = mkDevShell system; });
     };
 }
