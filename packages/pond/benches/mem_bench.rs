@@ -1,6 +1,6 @@
 #![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
 
-//! Memory scenarios for #245 - the harness behind `ops/scripts/mem-gate.sh`.
+//! Memory scenarios for #245 - the harness behind the `gate` bench.
 //!
 //! One scenario per process invocation (`--scenario <name>`): peak RSS is a
 //! process-lifetime high-water mark and dhat cannot reset, so the runner
@@ -20,11 +20,11 @@
 //! | `rowmap-build-cold-partial-embed` | cold build after scattered embed windows | a cold build that stops streaming (`scan_fallbacks`) |
 //!
 //! The last five are RECORD-ONLY: they run in the gate and append rows, but
-//! `mem-gate.sh --check` judges none of their *memory* numbers - peak RSS and
-//! peak heap included - because the script's `RECORD_ONLY` list carves them
-//! out. Phase 1 gathers the spread; phase 2 derives a threshold from the
-//! committed rows' median/IQR and promotes a scenario by dropping it from that
-//! list. `scan_fallbacks` is exempt from all of that: it is a count, not a
+//! `gate --check` judges none of their *memory* numbers - peak RSS and peak
+//! heap included - because the gate's `RECORD_ONLY` list carves them out.
+//! Phase 1 gathers the spread; phase 2 derives a threshold from the committed
+//! rows' median/IQR and promotes a scenario by dropping it from that list.
+//! `scan_fallbacks` is exempt from all of that: it is a count, not a
 //! measurement, and the gate fails on any increase, on every scenario that
 //! reports it.
 //!
@@ -41,7 +41,7 @@
 //! Run:
 //!   cargo bench --bench mem_bench --features mem-probe -- --prepare --profile ci
 //!   cargo bench --bench mem_bench --features mem-probe -- --scenario rowmap-build-cold
-//!   ops/scripts/mem-gate.sh                # all scenarios, one row each
+//!   cargo bench --bench gate -- --only mem   # all scenarios, one row each
 //!   ops/scripts/profile-mem.sh rowmap-build-cold heaptrack
 
 use std::path::{Path, PathBuf};
@@ -1051,7 +1051,7 @@ const PARTIAL_EMBED_WINDOW: usize = DEFAULT_SORT_WINDOW;
 /// production flush, the layout a store has before its first compaction.
 ///
 /// `scan_fallbacks` is the row's assertion, and it is the gate that judges it
-/// (`mem-gate.sh --check` fails on any increase over the committed row) because
+/// (`gate --check` fails on any increase over the committed row) because
 /// whether this shape is plannable at all depends on the store's size:
 /// `merge_update` returns the rewritten rows in row-id order on a small store
 /// but not on a large one (measured on this corpus: ordered at 120k rows,
@@ -1309,7 +1309,7 @@ async fn main() -> Result<()> {
         "latency_p95_ms": detail.get("latency_p95_ms").cloned(),
         "latency_max_ms": detail.get("latency_max_ms").cloned(),
         "throughput_rows_per_s": detail.get("throughput_rows_per_s").cloned(),
-        // Judged by `mem-gate.sh --check` on every scenario that reports it,
+        // Judged by `gate --check` on every scenario that reports it,
         // record-only ones included: a cold build that stops streaming is a
         // cliff, not a drift.
         "scan_fallbacks": detail.get("scan_fallbacks").cloned(),

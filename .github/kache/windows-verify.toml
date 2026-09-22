@@ -30,8 +30,9 @@ endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
 # Per-job and schema-tagged: nothing is shared across build shapes anyway (the
 # rustc flags differ per unit), the bootstrap's bulk `--pull --all` pulls the
-# whole prefix so the prefix must hold only this job's artifacts, and the k31
-# tag (kache's CACHE_KEY_VERSION, unchanged from 0.17.0 through 0.22.0) keeps
-# the next schema rotation a sibling directory instead of a subtree - rotation
-# IS the remote GC.
-prefix = "kache/pond/windows-verify/k31"
+# whole prefix so the prefix must hold only this job's artifacts, and the tag
+# keeps a rotation a sibling directory instead of a subtree - rotation IS the
+# remote GC. k33 = key schema 31 (kache's CACHE_KEY_VERSION, unchanged 0.17.0
+# through 0.22.0) plus one manual GC rotation, dropping the pre-Lance-12
+# artifacts from the bulk pull.
+prefix = "kache/pond/windows-verify/k33"

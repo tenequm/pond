@@ -81,7 +81,7 @@ Choose after the benchmark below. A third option - denormalizing `tenant` onto `
 
 `pond search --explain` must show the `session_id IN (...)` prefilter served by the BTree index, and `serve_mem_bench --io-trace` must record GET counts warm and cold at 100, 1k, and 5k visible sessions. Expected: on par with a direct bitmap prefilter in a warm long-lived `serve` ([#165](https://github.com/tenequm/pond/issues/165) topology), bounded by index size when cold.
 
-Adding a column or a table is a storage-path change, so `moon run bench-gate` runs on both sides (pre-change commit first, before the new binary writes to the real store) and appends its rows to `docs/benchmarks/bench-gate-baseline.jsonl` before anything lands.
+Adding a column or a table is a storage-path change, so `moon run repo:bench -- --only perf` runs on both sides (pre-change commit first, before the new binary writes to the real store) and appends its rows to `docs/benchmarks/baseline.jsonl` before anything lands.
 
 ### Surfaces
 

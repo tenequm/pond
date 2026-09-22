@@ -908,8 +908,10 @@ pub const TARGET_FRAGMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// Ceiling = Lance's own default.
 const MAX_TARGET_ROWS_PER_FRAGMENT: u64 = 1024 * 1024;
 
-/// Keep a task only when the merged-in remainder is >= largest/this:
-/// size-tiered amortization, O(log n) lifetime rewrites per row.
+/// Keep a task only when the volume it absorbs earns the mass it merely copies,
+/// on both scaled measures: the unsettled remainder must reach the settled sum
+/// divided by this, and total-minus-largest must reach the largest divided by
+/// this. Size-tiered amortization, O(log n) lifetime rewrites per row.
 pub const COMPACTION_ABSORB_FACTOR: u64 = 4;
 
 /// Default manifest-retention window for the safe cleanup pass. Matches
@@ -924,13 +926,13 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
     chrono::Duration::hours(1)
 }
 
-/// `pond sync` runs every few minutes; reclaiming old manifest versions on
-/// every run pays the full version-log walk over S3 (~9 s measured on the real
-/// corpus) to free roughly one version. Amortize by cleaning only when a
-/// table's manifest version is a multiple of this many commits. Explicit
-/// `pond optimize` and the one-shot `pond copy` keep interval 1 (clean every
-/// run) so maintenance and durability moves are never skipped.
-pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 16;
+/// `pond sync` runs every few minutes, and the per-table version-log walk costs
+/// ~9 s over S3 to reclaim roughly one version, so it fires only on manifest
+/// versions that are an EXACT multiple of this. That PACES cleanup, it does not
+/// bound the gap (see [`cleanup_due`]); 16 left the pending set at 26 GiB on the
+/// real store against a 1 h [`default_cleanup_older_than`] window, 8 halves it.
+/// `pond optimize` and the one-shot `pond copy` keep interval 1, cleaning always.
+pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 8;
 
 /// `pond sync` defers a scalar (BTree/bitmap) index fold until its unindexed
 /// tail reaches this many rows. Lance 7.0.0 ignores `OptimizeOptions::append()`
@@ -1045,8 +1047,16 @@ struct FoldThresholds {
 struct FragmentStat {
     /// `None` when the manifest lacks any file's size.
     bytes: Option<u64>,
+    /// Physical rows, tombstones included.
     rows: u64,
     deleted_rows: u64,
+}
+
+impl FragmentStat {
+    /// Rows a rewrite would actually write out.
+    fn live_rows(&self) -> u64 {
+        self.rows.saturating_sub(self.deleted_rows)
+    }
 }
 
 /// Data-file bytes of one fragment; `None` (poisoning) when any size is
@@ -1116,16 +1126,37 @@ fn task_veto_reason(
         return Some("invalid_byte_budget");
     }
 
-    let (mut total_bytes, mut largest) = (0u128, 0u128);
+    let (mut total_bytes, mut largest, mut live_rows) = (0u128, 0u128, 0u128);
+    let (mut settled, mut unsettled) = (0u128, 0u128);
     for stat in stats {
         let Some(bytes) = stat.bytes.map(u128::from) else {
             return Some("missing_sizes");
         };
+        let live = u128::from(stat.live_rows());
         total_bytes += bytes;
         largest = largest.max(bytes);
+        live_rows += live;
+        if bytes * 2 >= budget || live * 2 >= target_rows_per_fragment as u128 {
+            settled += bytes;
+        } else {
+            unsettled += bytes;
+        }
     }
 
-    let minimum_outputs = total_bytes.div_ceil(budget).max(1);
+    // Match the writer's own count: lance 12 picks `max(1, floor(surviving_rows
+    // / target))` outputs and spreads rows EVENLY across them, so each reaches
+    // the target (lance-12.0.0 optimize.rs:2499-2528). Lance 11's fixed
+    // `max_rows_per_file = target` stranded a tail instead - one output per
+    // input, a shrink the byte prediction had promised, and the same task
+    // re-planned every sync (#288, ~80 GiB/day for a 4.5 GiB table). The floor
+    // still guards: even spreading assumes near-uniform row width, so a task
+    // mixing very wide and narrow rows can still emit an under-target output.
+    let outputs_by_rows = if target_rows_per_fragment == 0 {
+        0
+    } else {
+        (live_rows / target_rows_per_fragment as u128).max(1)
+    };
+    let minimum_outputs = total_bytes.div_ceil(budget).max(outputs_by_rows).max(1);
     if u128::try_from(stats.len()).unwrap_or(u128::MAX) <= minimum_outputs {
         return Some("cannot_shrink");
     }
@@ -1143,7 +1174,23 @@ fn task_veto_reason(
         }
     }
 
-    if (total_bytes - largest) * u128::from(COMPACTION_ABSORB_FACTOR) < largest {
+    // Amplification guard, one veto over two measures of the mass a rewrite
+    // only copies. `largest` alone (the second measure) let a task of several
+    // settled peers plus a small appended tail through: the peers counted as
+    // the remainder being merged in, hiding that the only new data was a few MB
+    // of appends. So peers are summed too - merging fragments that each already
+    // hold half an output at best halves the fragment count for a full copy of
+    // their bytes, so what that copy costs has to be earned. A task with no
+    // settled peer has nothing to amortize against, and
+    // one that is all peers has nothing to absorb; the output floor above and
+    // the largest-fragment measure are what judge those. In between, a small
+    // rider defers even a merge the settled members could make on their own
+    // until the unsettled volume pays for the copy - deliberate: the task is
+    // re-planned every sync, so it runs once appends accrue.
+    let absorb_factor = u128::from(COMPACTION_ABSORB_FACTOR);
+    if (unsettled > 0 && unsettled * absorb_factor < settled)
+        || (total_bytes - largest) * absorb_factor < largest
+    {
         return Some("absorb_veto");
     }
     None
@@ -3303,11 +3350,12 @@ async fn optimize_table_compact(
     Ok(())
 }
 
-/// Gate for the version-cleanup walk: at interval `<= 1` it runs every optimize;
-/// otherwise only when the manifest `version` is a multiple of it. A run whose
-/// version steps past a multiple defers to the next one, so the gap between
-/// cleanups is bounded and - since version 0 is a multiple of every interval -
-/// cleanup always eventually fires; it is never skipped indefinitely.
+/// Gate for the version-cleanup walk: interval `<= 1` cleans every optimize,
+/// else only on an EXACT multiple - so this PACES cleanup, it does not bound the
+/// gap. The per-run version step varies, and an even step from an odd version
+/// never hits an even interval, so firings can be skipped for long stretches.
+/// Safe anyway: each firing sweeps everything older than the retention window. A
+/// durable bound needs the last-cleaned version persisted per table (follow-up).
 fn cleanup_due(version: u64, interval: u64) -> bool {
     interval <= 1 || version.is_multiple_of(interval)
 }
@@ -5979,12 +6027,25 @@ mod tests {
         // One large candidate plus tiny appends -> vetoed.
         let absorb = [stat(100_000_000), stat(1_000_000), stat(2_000_000)];
         assert!(!task_is_kept(&absorb, derived_target_rows(&absorb)));
-        // Peer-sized candidates can merge and reach the target.
-        let peers = [stat(100_000_000), stat(100_000_000)];
+        // Peer-sized candidates whose merge fits one output can reach the target.
+        let peers = [stat(50_000_000), stat(50_000_000)];
         assert!(task_is_kept(&peers, derived_target_rows(&peers)));
         // Remainder reaches largest / COMPACTION_ABSORB_FACTOR -> kept.
         let tiered = [stat(400_000), stat(60_000), stat(40_000)];
         assert!(task_is_kept(&tiered, derived_target_rows(&tiered)));
+        // No fragment holds half an output, so the settled sum is empty and the
+        // largest-fragment measure is the only one that can fire here.
+        let unsettled = [stat(400_000), stat(10_000), stat(10_000)];
+        assert_eq!(
+            task_veto_reason(
+                &unsettled,
+                64,
+                0.1,
+                derived_target_rows(&unsettled),
+                TARGET_FRAGMENT_BYTES,
+            ),
+            Some("absorb_veto"),
+        );
     }
 
     #[test]
@@ -6023,19 +6084,20 @@ mod tests {
     #[test]
     fn compaction_veto_uses_physical_rows_after_deletions() {
         let partially_deleted = || fragment(100_000_000, 100_000, 9_000);
-        let task: Vec<FragmentStat> = std::iter::repeat_with(partially_deleted).take(3).collect();
+        let task: Vec<FragmentStat> = std::iter::repeat_with(partially_deleted).take(4).collect();
         assert!(task_is_kept(&task, derived_target_rows(&task)));
     }
 
     #[test]
     fn compaction_filter_keeps_above_budget_off_boundary_task() {
         let table = [
-            fragment(100_000_000, 150_000, 0),
-            fragment(100_000_000, 150_000, 0),
-            fragment(100_000_000, 150_000, 0),
-            fragment(100_000_000, 50_000, 0),
+            fragment(70_000_000, 105_000, 0),
+            fragment(70_000_000, 105_000, 0),
+            fragment(70_000_000, 105_000, 0),
+            fragment(70_000_000, 105_000, 0),
+            fragment(70_000_000, 35_000, 0),
         ];
-        let task = &table[..3];
+        let task = &table[..4];
         let target = derived_target_rows(&table);
         let total_bytes = task.iter().map(|stat| stat.bytes.unwrap()).sum::<u64>();
 
@@ -6095,6 +6157,80 @@ mod tests {
             task_veto_reason(&second_cycle, 64, 0.1, 66_000, TARGET_FRAGMENT_BYTES),
             Some("cannot_shrink"),
         );
+    }
+
+    /// #288: the parts-table rewrite loop. The byte floor alone predicted a
+    /// 6 -> 3 shrink for six ~127 MB / ~9.8 KB-per-row fragments, but lance 11's
+    /// fixed row cap made it re-emit six, so the identical task was re-planned
+    /// every sync (~80 GiB/day rewritten for a 4.5 GiB table). lance 12 spreads
+    /// rows evenly, so this task really shrinks and its outputs leave the pool.
+    #[test]
+    fn compaction_row_floor_matches_lance12_writer() {
+        let settled_peer = || fragment(127_400_000, 13_000, 0);
+        let loop_task: Vec<FragmentStat> = std::iter::repeat_with(settled_peer).take(6).collect();
+        let target = derived_target_rows(&loop_task);
+        let live_rows: u64 = loop_task.iter().map(|stat| stat.rows).sum();
+        let bytes: u64 = loop_task.iter().map(|stat| stat.bytes.unwrap()).sum();
+        assert_eq!((target, live_rows), (13_695, 78_000));
+        // Ceil-by-rows predicted one output per input and vetoed the task; the
+        // floor lance 12 actually writes predicts five, and bytes allow three,
+        // so a real 6 -> 5 merge stands.
+        assert_eq!(live_rows.div_ceil(target as u64), 6);
+        assert_eq!((live_rows / target as u64).max(1), 5);
+        assert_eq!(bytes.div_ceil(TARGET_FRAGMENT_BYTES), 3);
+        assert!(task_is_kept(&loop_task, target));
+
+        // Same row width, fragments small enough that the whole task fits one
+        // output - still a merge worth planning.
+        let mergeable: Vec<FragmentStat> =
+            std::iter::repeat_with(|| fragment(44_900_000, 4_580, 0))
+                .take(5)
+                .collect();
+        let mergeable_target = derived_target_rows(&mergeable);
+        let mergeable_rows: u64 = mergeable.iter().map(|stat| stat.rows).sum();
+        assert_eq!((mergeable_rows / mergeable_target as u64).max(1), 1);
+        assert!(task_is_kept(&mergeable, mergeable_target));
+    }
+
+    /// #288: the absorb veto measured the remainder as total-minus-largest, so a
+    /// task of several settled peers plus a few MB of appends looked like a
+    /// productive merge - the peers counted as the remainder.
+    #[test]
+    fn compaction_veto_weighs_appends_against_all_settled_peers() {
+        let settled_peer = || fragment(100_000_000, 10_200, 0);
+        let append = || fragment(3_000_000, 320, 0);
+        let peers_plus_tail: Vec<FragmentStat> = std::iter::repeat_with(settled_peer)
+            .take(2)
+            .chain(std::iter::repeat_with(append).take(3))
+            .collect();
+        let total: u128 = peers_plus_tail
+            .iter()
+            .map(|stat| u128::from(stat.bytes.unwrap()))
+            .sum();
+        let largest = u128::from(settled_peer().bytes.unwrap());
+        // total-minus-largest read the second peer as data worth merging in.
+        assert!((total - largest) * u128::from(COMPACTION_ABSORB_FACTOR) >= largest);
+        assert_eq!(
+            task_veto_reason(
+                &peers_plus_tail,
+                64,
+                0.1,
+                derived_target_rows(&peers_plus_tail),
+                TARGET_FRAGMENT_BYTES,
+            ),
+            Some("absorb_veto"),
+        );
+
+        // Once the tail is worth the copy it merges, so appends are deferred,
+        // not stranded.
+        let peers_plus_grown_tail: Vec<FragmentStat> = std::iter::repeat_with(settled_peer)
+            .take(2)
+            .chain(std::iter::once(fragment(60_000_000, 6_120, 0)))
+            .collect();
+        assert!(task_is_kept(
+            &peers_plus_grown_tail,
+            derived_target_rows(&peers_plus_grown_tail),
+        ));
     }
 
     #[test]
@@ -6199,12 +6335,29 @@ mod tests {
         assert!(cleanup_due(7, 1));
         assert!(cleanup_due(5, 0));
         // interval N: only on multiples (the amortized pond sync path).
-        assert!(cleanup_due(0, 16));
-        assert!(cleanup_due(16, 16));
-        assert!(cleanup_due(48, 16));
-        assert!(!cleanup_due(15, 16));
-        assert!(!cleanup_due(17, 16));
-        assert!(!cleanup_due(31, 16));
+        assert!(cleanup_due(0, 8));
+        assert!(cleanup_due(8, 8));
+        assert!(cleanup_due(24, 8));
+        assert!(!cleanup_due(7, 8));
+        assert!(!cleanup_due(9, 8));
+        assert!(!cleanup_due(15, 8));
+
+        // From version 0 with a CONSTANT step `s`, the first firing is after
+        // `interval / gcd(interval, s)` runs. That cadence holds only under both
+        // premises - already on a multiple, and a fixed step - neither of which
+        // a real table guarantees.
+        let runs_to_clean = |step: u64| {
+            (1..)
+                .find(|run| cleanup_due(run * step, DEFAULT_SYNC_CLEANUP_INTERVAL))
+                .unwrap()
+        };
+        assert_eq!(runs_to_clean(3), DEFAULT_SYNC_CLEANUP_INTERVAL);
+        assert_eq!(runs_to_clean(2), DEFAULT_SYNC_CLEANUP_INTERVAL / 2);
+        assert_eq!(runs_to_clean(4), DEFAULT_SYNC_CLEANUP_INTERVAL / 4);
+
+        // The gate needs an exact multiple, so an even step from an odd version
+        // never fires: pacing, not a bound (durable fix: persist last-cleaned).
+        assert!((1..=100).all(|run| !cleanup_due(101 + run * 2, DEFAULT_SYNC_CLEANUP_INTERVAL)));
     }
 
     #[test]

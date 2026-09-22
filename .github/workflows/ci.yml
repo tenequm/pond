@@ -263,6 +263,19 @@ jobs:
     # re-runs the whole release path. The same exposure build-and-test already
     # carries. Do not "fix" this to false without that reasoning changing.
     concurrency: { group: "ci-windows-verify-${{ github.ref }}", cancel-in-progress: true }
+    # Only a main push may write moon's remote cache. A hash stored by a PR or
+    # dispatch run is one main would replay without compiling - but kache may
+    # only write its remote from a protected-branch push, so that replay leaves
+    # the artifact cache cold and every later PR rebuilds Lance from scratch.
+    # PRs still replay docs/CI-only diffs from main's own stored hashes.
+    env:
+      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # On-demand cache warmer: a main push whose head commit message carries
+      # '[force-build]' compiles for real even on a moon hash hit - the way to
+      # repopulate a cold kache prefix without waiting for an input-changing
+      # merge (dispatch can't do it: kache is read-only outside branch pushes).
+      # Renders literal 'true'/'false', the only values moon's --force accepts.
+      MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     # RUSTFLAGS is deliberately absent: setting it anywhere in this job silently
     # REPLACES the +crt-static rustflags from .cargo/config.toml.
     #
@@ -291,7 +304,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k31
+          s3-prefix: kache/pond/windows-verify/k33
           # verify only, never windows-dist: a restored harness has unresolved
           # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
           # of link time here; not worth it on the leg whose output ships.
@@ -385,6 +398,13 @@ jobs:
     # it, and after release-plz cuts the tag the is_release gate is false
     # forever - an interrupted publish cannot auto-recover.
     concurrency: { group: "ci-windows-dist-${{ github.ref }}", cancel-in-progress: false }
+    # Same cache-warming rule as windows-verify: only a main push may write
+    # moon's remote cache, so a release push compiles for real inside kache's
+    # write window instead of replaying a dispatch-stored hash.
+    env:
+      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # Same '[force-build]' warmer as windows-verify.
+      MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     steps:
       - name: Allow long paths in git
         shell: pwsh
@@ -399,7 +419,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k31
+          s3-prefix: kache/pond/windows-dist/k33
 
       # Same reasoning as the sibling job: without this, moon serves the stored
       # hash and nothing is actually compiled or measured. Same `true`-not-`1`
@@ -537,7 +557,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond/linux-dist/k31
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k33
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache

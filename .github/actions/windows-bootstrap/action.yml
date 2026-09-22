@@ -212,8 +212,8 @@ runs:
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
         # what the bump buys is key schema 31; schema 25 could under-key
         # module-body swaps and include_dir renames. 0.22.0 keeps schema 31
-        # (unchanged since 0.17.0), so this bump reuses the k31 prefixes cold-free
-        # and only adds the reflink-restore write fix and a GC-responsive daemon.
+        # (unchanged since 0.17.0). The k33 prefixes are schema 31 plus one
+        # manual GC rotation (post-Lance-12), so they start cold on purpose.
         version: v0.22.0
         manifest-key: ${{ inputs.manifest-key }}
         # Above kache's 5%-of-disk default because the cap MUST stay above the

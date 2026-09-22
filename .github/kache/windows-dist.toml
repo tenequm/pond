@@ -27,4 +27,4 @@ region = "nbg1"
 # cannot override it. A `force_build` workflow_dispatch therefore compiles for
 # real, pulls, and uploads NOTHING - it warms the runner it ran on and nobody
 # else. Rotate together with a change that lands on main.
-prefix = "kache/pond/windows-dist/k31"
+prefix = "kache/pond/windows-dist/k33"

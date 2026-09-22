@@ -48,40 +48,44 @@ tasks:
     toolchains: 'system'
     inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
 
-  # Pre-release validation against the live remote store: gate benches + CLI
-  # probes + map-vs-scan equivalence, appending to
-  # docs/benchmarks/bench-gate-baseline.jsonl and printing the delta vs the
-  # previous run. ~30 min of S3 wall-clock; never cached, always live.
-  bench-gate:
-    command: 'bash ops/scripts/bench-gate.sh'
-    toolchains: 'system'
+  # The release gate, both halves in one target: perf (CLI probes + gate
+  # benches + map-vs-scan equivalence against the live remote store, ~30 min of
+  # S3 wall-clock) and memory (one mem_bench scenario per process, ~40 min on
+  # the large profile). Appends one row per measurement unit to
+  # docs/benchmarks/baseline.jsonl and prints the delta vs the previous run for
+  # the same (scenario, profile, host). Never cached, always live. Pass flags
+  # through: `moon run repo:bench -- --profile large`, `-- --only perf`.
+  #
+  # `command`, not `script`: moon forwards passthrough args only for the former.
+  # No `toolchains: 'system'` either - this project is `language: rust`, so a
+  # plain cargo command gets the Rust toolchain moon already provisions.
+  #
+  # The trailing `--` is load-bearing: moon appends passthrough args to the
+  # command, and without the separator `-- --profile large` would reach cargo's
+  # own `--profile` instead of the gate's.
+  bench:
+    command: 'cargo bench --bench gate --'
     options:
       cache: false
       outputStyle: stream
+      # The gate writes scratch stores beside the configured store and reads a
+      # shared corpus cache; two overlapping runs would measure each other.
+      mutex: 'bench-store'
 
-  # Memory gate (#245, track A): one mem_bench scenario per process, appending
-  # to docs/benchmarks/mem-gate-baseline.jsonl and printing the delta vs the
-  # previous run. Local-only in v1 - no thresholds, not in CI. Pass flags
-  # through: `moon run repo:mem-gate -- --profile large`.
-  mem-gate:
-    command: 'bash ops/scripts/mem-gate.sh'
-    toolchains: 'system'
-    options:
-      cache: false
-      outputStyle: stream
-
-  # CI shape of the memory gate: same scenarios, but compares against the last
-  # committed baseline row per (scenario, profile) instead of appending, and
-  # fails past MEM_GATE_MAX_REGRESSION_PCT (default 20%). Cached and
-  # input-hashed so an unchanged tree - or a PR that touches none of the
-  # inputs, under `moon ci` affected filtering - skips the ~40 min run.
+  # CI shape of the gate: the same memory scenarios, but compared against the
+  # last committed baseline row per (scenario, profile, host) instead of
+  # appended, failing past MEM_GATE_MAX_REGRESSION_PCT (default 20%). The perf
+  # numbers are record-only and never gated, so --check skips that half.
+  # Cached and input-hashed so an unchanged tree - or a PR that touches none of
+  # the inputs, under `moon ci` affected filtering - skips the run.
   # Deliberately NOT wired into any workflow yet (plan hardening phase).
-  mem-gate-ci:
-    extends: 'mem-gate'
+  bench-check:
+    extends: 'bench'
     args: '--check'
     inputs:
       - 'packages/pond/src/**/*'
       - 'packages/pond/benches/mem_bench.rs'
+      - 'packages/pond/benches/gate.rs'
       - 'packages/pond/build.rs'
       - 'packages/pond/Cargo.toml'
       - 'Cargo.toml'
@@ -90,8 +94,7 @@ tasks:
       # it and moon replays a cached pass over a different compiler.
       - 'rust-toolchain.toml'
       - '@group(nixToolchain)'
-      - 'ops/scripts/mem-gate.sh'
-      - 'docs/benchmarks/mem-gate-baseline.jsonl'
+      - 'docs/benchmarks/baseline.jsonl'
     options:
       cache: true
 

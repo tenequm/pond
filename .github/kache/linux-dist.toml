@@ -30,8 +30,8 @@ type = "s3"
 bucket = "ttq"
 endpoint = "https://nbg1.your-objectstorage.com"
 region = "nbg1"
-# Per-job and schema-tagged, same reasoning as windows-verify.toml. k31 is
-# kache's CACHE_KEY_VERSION, unchanged from 0.17.0 through 0.22.0 - both legs
-# bumped together, never one.
+# Per-job and schema-tagged, same reasoning as windows-verify.toml (k33 =
+# schema 31 + one manual GC rotation after Lance 12) - all legs bumped
+# together, never one.
 # The old shared kache/pond prefix is left in place as the revert window.
-prefix = "kache/pond/linux-dist/k31"
+prefix = "kache/pond/linux-dist/k33"

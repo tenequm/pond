@@ -114,17 +114,17 @@ Conclusion: blob v2 is a **bandwidth** fix only. `get_message` latency is
 - **Preview renderer**: known-param-keys with a compact-JSON fallback, with the
   renderer version stamped so previews can be re-derived later.
 - **Memory guardrails** (post-#245 posture): every local map is mmap, never
-  heap; an ngram index requires a mem-gate scenario under a fixed index-cache
+  heap; an ngram index requires a gate mem scenario under a fixed index-cache
   cap before it may be enabled.
 
 ## 3. Issue set (filed 2026-09-17)
 
 | id | issue | title | depends on / gate |
 |---|---|---|---|
-| M0 | #282 | lance 11 -> 12 upgrade | PR #289 open (polished, awaiting merge) |
-| M1 | #283 | MCP via long-lived `pond serve` | PR #292 open (green, awaiting merge) |
-| M2 | #284 | derived preview / `body_text` columns + local summary map | implementation in progress |
-| M3a | #285 | warm-get fast path: `find_session` fan-out diagnosis and fix, straddle-fallback delta extension, io-trace instrumentation kept behind a feature flag | diagnosis DONE (see section 4); fix gated on #289 merging |
+| M0 | #282 | lance 11 -> 12 upgrade | PR #289 MERGED 2026-09-22 (main `9d43f85`); verified on a full S3 copy of the real corpus (read parity vs lance 11 byte-identical; sync/optimize/storage check exit 0); lance-12 bench/mem baselines pending |
+| M1 | #283 | MCP via long-lived `pond serve` | PR #292 open, green, conflict-free post-#289; merge decision pending (topology vs deeper-caching discussion, 2026-09-22) |
+| M2 | #284 | derived preview / `body_text` columns + local summary map | PR #293 open; polished 2026-09-22 (22 findings applied incl 6 correctness bugs, head `38b8b1e`); bench gate still to run before merge |
+| M3a | #285 | warm-get fast path: `find_session` fan-out diagnosis and fix, straddle-fallback delta extension, io-trace instrumentation kept behind a feature flag | diagnosis DONE (see section 4); fix implemented as PR #298 2026-09-22 (sessions fold threshold 0 + straddle delta extension; keymap deferred as follow-up); windows-verify CI pending at last check |
 | M3b | #286 | blob v2 bandwidth pass | GATED on a re-measure after M2 + M3a; preconditioned on #288 and on a storage-version guard (`classify_schema` compares names only) |
 | M4 | #287 | `pond_sql` just-works + params-only ngram (backlog) | #284 |
 
@@ -132,7 +132,15 @@ Filed alongside, outside the campaign scope but blocking M3b: **#288**
 `bug(maintenance): parts compaction rewrite loop - ~80 GiB/day rewritten for a
 4.5 GiB table` (root cause and proposed fix in the issue). Hotfixed the same
 evening as PR #290 (row-aware veto floor, settled-fragment absorb veto,
-cleanup interval 16 -> 8), CI green, awaiting merge.
+cleanup interval 16 -> 8). Polished 2026-09-22 (`babfa76`: single-pass settled
+sum, cleanup-pacing docs corrected - the exact-multiple gate paces, it does not
+bound the gap); pre-merge verification against a server-side duplicate of the
+live store (`pondarium/pond-fix288-verify`) in progress. A second polish pass
+the same day (`e990a46`) flagged a lance-12 divergence: the branch's `div_ceil`
+output-count formula matches lance 11, while lance 12 (now on main) uses
+`max(1, floor(live_rows/target))`, so post-merge the veto over-predicts by one
+off-boundary (errs safe - over-veto, no loop risk). Rebase onto main plus
+veto-fixture re-derivation wanted before merge.
 
 Implementation starts with **M1, M2 and M3a only**.
 
@@ -152,7 +160,7 @@ day (evidence in the linked issues):
   collapsed warm gets to ~2-3 s. Fix (under #285, gated on #289): unconditional
   sessions index fold per sync + resident sessions keymap as the durable
   follow-up. Evidence in the #285 hand-back; probes preserved on the slot-1
-  worktree branch (commit 9d51c70).
+  worktree branch (commit 9d51c70), pushed as `origin/chore/285-io-trace-probes`.
 - Compaction churn root cause: RESOLVED - it is the rewrite loop, with cleanup
   lag as a secondary amplifier; root cause and fix proposal in #288.
 - ngram size and RSS under v12 on a params-only corpus. OPEN - re-measure under
