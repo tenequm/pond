@@ -82,6 +82,9 @@ use pond::{config::Config, substrate::StorageUrl};
 const WRITE_SESSIONS: usize = 500;
 const WRITE_MESSAGES: usize = 5;
 const WRITE_SWEEP_BATCH: usize = 512;
+/// Leaf of the scratch base write_bench derives its `<base>-*` stores from; the
+/// cleanup refuses any other leaf so it can never sweep a real store's siblings.
+const SCRATCH_LEAF: &str = "benchw";
 
 const DEFAULT_SCENARIOS: &str = "sync-noop-local sync-incremental rowmap-build-cold \
     mcp-query-growth ingest-large-session search-query-latency ingest-throughput \
@@ -177,12 +180,15 @@ fn group_key(row: &Map<String, Value>) -> GroupKey {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let root = repo_root()?;
+    // Resolved before the chdir below, so a relative `--baseline` means the
+    // caller's cwd and not the repo root.
+    let baseline = match &args.baseline {
+        Some(path) => std::path::absolute(path)
+            .with_context(|| format!("cannot resolve {}", path.display()))?,
+        None => root.join("docs/benchmarks/baseline.jsonl"),
+    };
     std::env::set_current_dir(&root)
         .with_context(|| format!("cannot enter repo root {}", root.display()))?;
-    let baseline = args
-        .baseline
-        .clone()
-        .unwrap_or_else(|| root.join("docs/benchmarks/baseline.jsonl"));
 
     let only = args.only.as_deref();
     let run_mem = only != Some("perf");
@@ -190,6 +196,17 @@ async fn main() -> Result<()> {
     if args.check && only == Some("perf") {
         println!("perf metrics are record-only and are never gated; nothing to check");
         return Ok(());
+    }
+
+    // Both refusals come before the perf half: it is ~30 minutes of S3 work
+    // and appends a row, which a later refusal would leave behind.
+    let runs = if run_mem {
+        Some(mem_runs(&args)?)
+    } else {
+        None
+    };
+    if run_mem {
+        guard_against_contention(args.check, args.allow_contended)?;
     }
 
     let host = host_tag();
@@ -203,8 +220,8 @@ async fn main() -> Result<()> {
         append_line(&baseline, &encode_row(&row))?;
         touched.push(group_key(&row.into_iter().collect()));
     }
-    if run_mem {
-        let rows = mem_gate(&args, &baseline, &date, &commit, &host, &toolchain)?;
+    if let Some(runs) = runs {
+        let rows = mem_gate(&args, runs, &baseline, &date, &commit, &host, &toolchain)?;
         touched.extend(rows);
     }
     if !args.check && !touched.is_empty() {
@@ -350,7 +367,16 @@ fn tee(cmd: &mut Command) -> Result<String> {
     let mut text = String::new();
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines() {
-            let line = line.context("reading bench output")?;
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    // Never leave a bench running against the store or the
+                    // scratch prefixes after the gate has given up on it.
+                    child.kill().ok();
+                    child.wait().ok();
+                    return Err(error).context("reading bench output");
+                }
+            };
             println!("{line}");
             text.push_str(&line);
             text.push('\n');
@@ -640,7 +666,7 @@ async fn perf_gate(
         _ => storage_path_from_config(&config_path)?,
     };
     // A trailing slash would nest the benchw scratch prefix inside the store.
-    let store_url = store_url.trim_end_matches('/').to_owned();
+    let store_url = store_url.trim().trim_end_matches('/').to_owned();
     println!("=== bench gate: {store_url} ===");
 
     // POND_BIN: measure a prebuilt binary (e.g. the released pond) instead of
@@ -664,10 +690,8 @@ async fn perf_gate(
     println!("binary: {bin_version}");
 
     let tmp = tempfile::tempdir().context("scratch dir for probe output")?;
-    let probe_sid = std::env::var("PROBE_SID")
-        .unwrap_or_else(|_| "8b7b9e47-66d2-464b-8ec6-0ad70855ff57".to_owned());
-    let probe_mid = std::env::var("PROBE_MID")
-        .unwrap_or_else(|_| "419caaa5-13d7-448a-807c-5fb5105112a7".to_owned());
+    let probe_sid = env_or("PROBE_SID", "8b7b9e47-66d2-464b-8ec6-0ad70855ff57");
+    let probe_mid = env_or("PROBE_MID", "419caaa5-13d7-448a-807c-5fb5105112a7");
     // Date-scoped search is the worst-measured real query shape (28-31% success
     // vs 47-48% unfiltered in the 63-day trace behind
     // docs/researches/2608-21-semantic-vs-fts-usage-eval); the timestamp zonemap
@@ -830,12 +854,12 @@ async fn perf_gate(
                 .rsplit_once('/')
                 .map(|(parent, _)| parent.to_owned())
                 .unwrap_or_default();
-            let base = format!("{parent}/benchw");
+            let base = format!("{parent}/{SCRATCH_LEAF}");
             write_args.push("--dest-url".to_owned());
             write_args.push(base.clone());
             write_backend = Value::String("s3".to_owned());
             let leaf = store_url.rsplit('/').next().unwrap_or_default();
-            if leaf.starts_with("benchw") {
+            if leaf.starts_with(SCRATCH_LEAF) {
                 println!(
                     "WARNING: store prefix {leaf:?} would match the scratch prefix - clean s3 scratch under {base}-* manually"
                 );
@@ -845,17 +869,31 @@ async fn perf_gate(
         } else {
             write_backend = Value::String("local".to_owned());
         }
-        let config = Config::load(&config_path).context("loading config for scratch cleanup")?;
-        if let Some(base) = &scratch_base {
-            scratch_clean(base, &config).await;
+        // Only an s3 sweep needs creds, and like the shell's creds scrape a
+        // config that will not load costs the sweep, not the gate.
+        let config = match &scratch_base {
+            Some(base) => match Config::load(&config_path) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    println!(
+                        "WARNING: config unavailable for scratch cleanup - clean {base}-* manually: {error:#}"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let sweep = scratch_base.as_deref().zip(config.as_ref());
+        if let Some((base, config)) = sweep {
+            scratch_clean(base, config).await;
         }
         let argv: Vec<&str> = write_args.iter().map(String::as_str).collect();
         let profile_dir = tmp.path().join("wprof");
         let outcome = write_passes(&argv, &profile_dir);
         // Best effort, like the shell trap it replaces: a failed pass must not
         // leave the scratch prefixes behind for the next run to trip over.
-        if let Some(base) = &scratch_base {
-            scratch_clean(base, &config).await;
+        if let Some((base, config)) = sweep {
+            scratch_clean(base, config).await;
         }
         let passes = outcome?;
         copy = passes.0;
@@ -999,6 +1037,13 @@ async fn scratch_delete(base: &str, config: &Config) -> Result<usize> {
     if leaf.is_empty() {
         bail!("{base} has no prefix segment - refusing a bucket-root scratch sweep");
     }
+    // A query or fragment carrying a `/` would move the leaf onto the store's
+    // own name; anything but the leaf the gate built is refused.
+    if leaf != SCRATCH_LEAF {
+        bail!(
+            "{base} resolves to scratch leaf {leaf:?}, not {SCRATCH_LEAF:?} - refusing the sweep"
+        );
+    }
     let host = lance
         .host_str()
         .ok_or_else(|| anyhow!("{base} resolves to a URL with no bucket"))?;
@@ -1051,8 +1096,26 @@ fn word_list(value: &str) -> Vec<String> {
     value.split_whitespace().map(str::to_owned).collect()
 }
 
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn mem_runs(args: &Args) -> Result<usize> {
+    match args.runs {
+        Some(runs) if runs >= 1 => Ok(runs),
+        Some(_) => bail!("--runs must be at least 1"),
+        // A `large` scenario is minutes of work and its row gates nothing yet.
+        None if args.profile == "large" => Ok(1),
+        None => Ok(3),
+    }
+}
+
 fn mem_gate(
     args: &Args,
+    runs: usize,
     baseline: &Path,
     date: &str,
     commit: &str,
@@ -1062,23 +1125,13 @@ fn mem_gate(
     let profile = args.profile.as_str();
     let mode = if args.check { "check" } else { "append" };
     println!("\n=== mem gate: profile={profile} mode={mode} ===");
-    let scenarios =
-        word_list(&std::env::var("SCENARIOS").unwrap_or_else(|_| DEFAULT_SCENARIOS.to_owned()));
+    let scenarios = word_list(&env_or("SCENARIOS", DEFAULT_SCENARIOS));
     // `var`, not a default-when-empty: `RECORD_ONLY=` on the command line means
     // "gate every scenario" - the way to rehearse a promotion.
     let record_only: BTreeSet<String> =
         word_list(&std::env::var("RECORD_ONLY").unwrap_or_else(|_| DEFAULT_RECORD_ONLY.to_owned()))
             .into_iter()
             .collect();
-
-    let runs = match args.runs {
-        Some(runs) if runs >= 1 => runs,
-        Some(_) => bail!("--runs must be at least 1"),
-        // A `large` scenario is minutes of work and its row gates nothing yet.
-        None if profile == "large" => 1,
-        None => 3,
-    };
-    guard_against_contention(args.check, args.allow_contended)?;
 
     println!("--- build (release, --features mem-probe) ---");
     let bench_bin = mem_bench_binary()?;
@@ -1124,7 +1177,15 @@ fn mem_gate(
         }
     }
     if args.check {
-        mem_check(baseline, &scenarios, profile, host, &record_only, &fresh)?;
+        mem_check(
+            baseline,
+            &scenarios,
+            profile,
+            host,
+            toolchain,
+            &record_only,
+            &fresh,
+        )?;
     }
     Ok(touched)
 }
@@ -1274,8 +1335,7 @@ fn contending_processes() -> Vec<String> {
         if !hit {
             continue;
         }
-        let mut line = argv.join(" ");
-        line.truncate(110);
+        let line: String = argv.join(" ").chars().take(110).collect();
         busy.push(format!("{pid} {line}"));
     }
     busy.sort();
@@ -1356,6 +1416,7 @@ fn mem_check(
     scenarios: &[String],
     profile: &str,
     host: &str,
+    toolchain: &str,
     record_only: &BTreeSet<String>,
     fresh: &BTreeMap<String, Map<String, Value>>,
 ) -> Result<()> {
@@ -1367,7 +1428,6 @@ fn mem_check(
         "--- check vs baseline {} (threshold {pct:.0}%) ---",
         baseline.display()
     );
-    let toolchain = toolchain();
     let rows = read_rows(baseline)?;
     let mut failed = false;
     let mut unjudged: Vec<&str> = Vec::new();
