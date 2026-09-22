@@ -170,6 +170,8 @@ async fn prep(src: &str, dst: &str) -> Result<()> {
         reader,
         dst,
         Some(WriteParams {
+            // Match the file version pond writes in prod (`write_params_for_create`
+            // pins 2.1), so the probe measures the encodings pond actually reads.
             data_storage_version: Some(LanceFileVersion::V2_1),
             ..WriteParams::default()
         }),
