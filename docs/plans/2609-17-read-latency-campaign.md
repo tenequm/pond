@@ -114,7 +114,7 @@ Conclusion: blob v2 is a **bandwidth** fix only. `get_message` latency is
 - **Preview renderer**: known-param-keys with a compact-JSON fallback, with the
   renderer version stamped so previews can be re-derived later.
 - **Memory guardrails** (post-#245 posture): every local map is mmap, never
-  heap; an ngram index requires a mem-gate scenario under a fixed index-cache
+  heap; an ngram index requires a gate mem scenario under a fixed index-cache
   cap before it may be enabled.
 
 ## 3. Issue set (filed 2026-09-17)

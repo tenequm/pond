@@ -21,9 +21,10 @@
 //!
 //! The last five are RECORD-ONLY: they run in the gate and append rows, but
 //! `gate --check` judges none of their *memory* numbers - peak RSS and peak
-//! heap included - because the gate's `RECORD_ONLY` list carves them out. Phase 1 gathers the spread; phase 2 derives a threshold from the
-//! committed rows' median/IQR and promotes a scenario by dropping it from that
-//! list. `scan_fallbacks` is exempt from all of that: it is a count, not a
+//! heap included - because the gate's `RECORD_ONLY` list carves them out.
+//! Phase 1 gathers the spread; phase 2 derives a threshold from the committed
+//! rows' median/IQR and promotes a scenario by dropping it from that list.
+//! `scan_fallbacks` is exempt from all of that: it is a count, not a
 //! measurement, and the gate fails on any increase, on every scenario that
 //! reports it.
 //!
