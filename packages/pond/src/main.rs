@@ -174,10 +174,17 @@ fn default_cache_dir() -> PathBuf {
 /// fallback in place.
 async fn load_rowmap_quietly(store: &Store) {
     let cache_dir = default_cache_dir();
-    if let Err(error) = store.load_rowmap_if_present(&cache_dir).await {
+    // Different tables, so joined rather than awaited in turn: each is a cold
+    // dataset open plus an identity probe, and this sits on the critical path
+    // of every one-shot read command.
+    let (rowmap, partsmap) = futures::join!(
+        store.load_rowmap_if_present(&cache_dir),
+        store.load_partsmap_if_present(&cache_dir),
+    );
+    if let Err(error) = rowmap {
         tracing::debug!(%error, "rowmap load skipped; reads fall back to store scans");
     }
-    if let Err(error) = store.load_partsmap_if_present(&cache_dir).await {
+    if let Err(error) = partsmap {
         tracing::debug!(%error, "parts summary map load skipped; gets fall back to parts scans");
     }
 }
