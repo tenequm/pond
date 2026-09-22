@@ -908,8 +908,10 @@ pub const TARGET_FRAGMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// Ceiling = Lance's own default.
 const MAX_TARGET_ROWS_PER_FRAGMENT: u64 = 1024 * 1024;
 
-/// Keep a task only when the merged-in remainder is >= largest/this:
-/// size-tiered amortization, O(log n) lifetime rewrites per row.
+/// Keep a task only when the volume it absorbs earns the mass it merely copies,
+/// on both scaled measures: the unsettled remainder must reach the settled sum
+/// divided by this, and total-minus-largest must reach the largest divided by
+/// this. Size-tiered amortization, O(log n) lifetime rewrites per row.
 pub const COMPACTION_ABSORB_FACTOR: u64 = 4;
 
 /// Default manifest-retention window for the safe cleanup pass. Matches
@@ -927,15 +929,21 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
 /// `pond sync` runs every few minutes; reclaiming old manifest versions on
 /// every run pays the full version-log walk over S3 (~9 s measured on the real
 /// corpus) to free roughly one version. Amortize by cleaning only when a
-/// table's manifest version is a multiple of this many commits. Kept a power of
-/// two so [`cleanup_due`]'s worst-case gap is `interval` runs (see there), and
-/// kept below the runs a [`default_cleanup_older_than`] window spans: at 16,
-/// that worst case was 80 min against a 1 h window at the 5-min cron cadence,
-/// so garbage structurally outlived its retention window and the pending set
-/// grew without bound (26 GiB measured). 8 keeps the gap inside the window
-/// while still skipping most walks. Explicit `pond optimize` and the one-shot
-/// `pond copy` keep interval 1 (clean every run) so maintenance and durability
-/// moves are never skipped.
+/// table's manifest version is a multiple of this many commits. The gate wants
+/// an EXACT multiple (see [`cleanup_due`]), so this paces cleanup - it does not
+/// bound the gap between two cleanups. The per-run version step varies: the
+/// append commit, a compaction commit when one lands, index-phase commits that
+/// land in the NEXT run's version, and concurrent hosts advancing the same
+/// per-table counter; and only syncs that ingest rows run maintenance at all.
+/// Skipping stays safe - each firing sweeps everything older than the retention
+/// window, so the pending set is bounded whenever the gate fires - but at 16 the
+/// cadence was slack enough against a 1 h [`default_cleanup_older_than`] window
+/// that the pending set reached 26 GiB on the real store. Halving to 8 shortens
+/// the gap in every case where the gate fires at all, while still skipping most
+/// walks. A durable bound needs the last-cleaned version persisted per table
+/// (known follow-up). Explicit `pond optimize` and the one-shot `pond copy` keep
+/// interval 1 (clean every run) so maintenance and durability moves are never
+/// skipped.
 pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 8;
 
 /// `pond sync` defers a scalar (BTree/bitmap) index fold until its unindexed
@@ -1046,8 +1054,16 @@ struct FoldThresholds {
 struct FragmentStat {
     /// `None` when the manifest lacks any file's size.
     bytes: Option<u64>,
+    /// Physical rows, tombstones included.
     rows: u64,
     deleted_rows: u64,
+}
+
+impl FragmentStat {
+    /// Rows a rewrite would actually write out.
+    fn live_rows(&self) -> u64 {
+        self.rows.saturating_sub(self.deleted_rows)
+    }
 }
 
 /// Data-file bytes of one fragment; `None` (poisoning) when any size is
@@ -1118,13 +1134,20 @@ fn task_veto_reason(
     }
 
     let (mut total_bytes, mut largest, mut live_rows) = (0u128, 0u128, 0u128);
+    let (mut settled, mut unsettled) = (0u128, 0u128);
     for stat in stats {
         let Some(bytes) = stat.bytes.map(u128::from) else {
             return Some("missing_sizes");
         };
+        let live = u128::from(stat.live_rows());
         total_bytes += bytes;
         largest = largest.max(bytes);
-        live_rows += u128::from(stat.rows.saturating_sub(stat.deleted_rows));
+        live_rows += live;
+        if bytes * 2 >= budget || live * 2 >= target_rows_per_fragment as u128 {
+            settled += bytes;
+        } else {
+            unsettled += bytes;
+        }
     }
 
     // Lance's rewrite writer splits output on BOTH caps - `max_bytes_per_file`
@@ -1165,20 +1188,13 @@ fn task_veto_reason(
     // output, by whichever cap binds, cannot share one with another such
     // fragment, so including it buys nothing and what it copies has to be
     // earned. A task with no settled peer has nothing to amortize against, and
-    // one that is all peers has nothing to absorb; the output floor above is
-    // what judges those.
-    let settled: u128 = stats
-        .iter()
-        .filter(|stat| {
-            u128::from(stat.bytes.unwrap_or(0)) * 2 >= budget
-                || u128::from(stat.rows.saturating_sub(stat.deleted_rows)) * 2
-                    >= target_rows_per_fragment as u128
-        })
-        .map(|stat| u128::from(stat.bytes.unwrap_or(0)))
-        .sum();
-    let appended = total_bytes - settled;
+    // one that is all peers has nothing to absorb; the output floor above and
+    // the largest-fragment measure are what judge those. In between, a small
+    // rider defers even a merge the settled members could make on their own
+    // until the unsettled volume pays for the copy - deliberate: the task is
+    // re-planned every sync, so it runs once appends accrue.
     let absorb_factor = u128::from(COMPACTION_ABSORB_FACTOR);
-    if (appended > 0 && appended * absorb_factor < settled)
+    if (unsettled > 0 && unsettled * absorb_factor < settled)
         || (total_bytes - largest) * absorb_factor < largest
     {
         return Some("absorb_veto");
@@ -3341,12 +3357,22 @@ async fn optimize_table_compact(
 }
 
 /// Gate for the version-cleanup walk: at interval `<= 1` it runs every optimize;
-/// otherwise only when the manifest `version` is a multiple of it. A run whose
-/// version steps past a multiple does not clean - it waits for the next exact
-/// multiple - so a table advancing `s` versions per run cleans once every
-/// `interval / gcd(interval, s)` runs, which a power-of-two interval bounds at
-/// `interval` runs. Since version 0 is a multiple of every interval, cleanup
-/// always eventually fires; it is never skipped indefinitely.
+/// otherwise only when the manifest `version` is a multiple of it. The multiple
+/// must be exact - a run whose version steps past one does not clean, it waits
+/// for the next exact multiple - so this PACES cleanup, it does not bound the
+/// gap. A table advancing a CONSTANT `s` versions per run, from a version
+/// already divisible by `gcd(interval, s)`, cleans once every
+/// `interval / gcd(interval, s)` runs; neither premise holds in general. The
+/// real step varies per run (the append commit, a compaction commit when one
+/// lands, index-phase commits landing in the next run's version, and concurrent
+/// hosts advancing the same per-table counter), and an even step from an odd
+/// version never lands on a multiple of an even interval at all - so cleanup can
+/// be skipped indefinitely. Skipping stays safe: every firing sweeps everything
+/// older than the retention window (Lance's cleanup Execute path has no
+/// candidate limit), so the pending set is bounded whenever the gate fires; the
+/// failure mode is the gate rarely firing, not a backlog outgrowing one sweep.
+/// A durable bound needs the last-cleaned version persisted per table (known
+/// follow-up), not a different interval.
 fn cleanup_due(version: u64, interval: u64) -> bool {
     interval <= 1 || version.is_multiple_of(interval)
 }
@@ -5897,7 +5923,7 @@ mod tests {
     }
 
     /// #288: the parts-table rewrite loop. The byte floor alone predicted a
-    /// 6 -> 3 shrink for six ~127 MB / ~9.8 KiB-per-row fragments, but the row
+    /// 6 -> 3 shrink for six ~127 MB / ~9.8 KB-per-row fragments, but the row
     /// cap makes Lance re-emit six, so the identical task was re-planned every
     /// sync (~80 GiB/day rewritten for a 4.5 GiB table).
     #[test]
@@ -6075,9 +6101,10 @@ mod tests {
         assert!(!cleanup_due(9, 8));
         assert!(!cleanup_due(15, 8));
 
-        // The gate fires on exact multiples only, so the worst case is a table
-        // whose per-run version step is coprime with the interval: it takes
-        // `interval` runs to land on one. A power-of-two interval bounds that.
+        // From version 0 with a CONSTANT step `s`, the first firing is after
+        // `interval / gcd(interval, s)` runs. That cadence holds only under both
+        // premises - already on a multiple, and a fixed step - neither of which
+        // a real table guarantees.
         let runs_to_clean = |step: u64| {
             (1..)
                 .find(|run| cleanup_due(run * step, DEFAULT_SYNC_CLEANUP_INTERVAL))
@@ -6086,6 +6113,10 @@ mod tests {
         assert_eq!(runs_to_clean(3), DEFAULT_SYNC_CLEANUP_INTERVAL);
         assert_eq!(runs_to_clean(2), DEFAULT_SYNC_CLEANUP_INTERVAL / 2);
         assert_eq!(runs_to_clean(4), DEFAULT_SYNC_CLEANUP_INTERVAL / 4);
+
+        // The gate needs an exact multiple, so an even step from an odd version
+        // never fires: pacing, not a bound (durable fix: persist last-cleaned).
+        assert!((1..=100).all(|run| !cleanup_due(101 + run * 2, DEFAULT_SYNC_CLEANUP_INTERVAL)));
     }
 
     #[test]
