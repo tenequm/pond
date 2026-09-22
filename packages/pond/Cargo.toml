@@ -229,7 +229,7 @@ windows-launcher = []
 # per query. Never enabled for release builds; `read_iops`/`read_bytes` are
 # tracked without it, only the per-request path list needs `test-util`.
 io-trace = ["lance-io/test-util"]
-# Memory instrumentation for `mem_bench` / `ops/scripts/mem-gate.sh` (#245):
+# Memory instrumentation for `mem_bench` / the `gate` bench (#245):
 # counting global allocator + RSS probes in `src/memprobe.rs`. Off in every
 # shipped build - the allocator item only exists under this feature.
 mem-probe = []
@@ -339,6 +339,12 @@ harness = false
 
 [[bench]]
 name = "mem_bench"
+harness = false
+
+# The release gate itself: it orchestrates the benches above rather than
+# measuring anything of its own (`moon run repo:bench`).
+[[bench]]
+name = "gate"
 harness = false
 
 [lints.rust]
