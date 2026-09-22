@@ -1744,22 +1744,30 @@ impl Store {
     }
 
     /// A session's rows served from the resident meta map as [`ScanRow`]s -
-    /// zero object-store reads. `None` (caller scans) unless the loaded chain
-    /// covers the exact `messages` version the cached handle serves: a stale
-    /// map may never drop a synced message from a page, and matching the
-    /// handle's version gives the map path the same read semantics as the
-    /// scan it replaces (spec.md#lance-handle-freshness). Any map anomaly -
-    /// malformed record, hydrate miss, undecodable role or timestamp - also
-    /// returns `None`, so the store scan stays the authority over a damaged
-    /// map. The map carries no `content` (only system messages have one), so
-    /// rows come back with `content: None` - callers gate on that. The
-    /// version gate assumes append-only rows; a future `pond erase` must make
-    /// this row-set-aware, not just version-aware.
+    /// zero object-store reads when the map is current, and one
+    /// appended-fragments-only scan when it trails (see
+    /// [`Self::session_rows_since`]). A map that trails is the ordinary state
+    /// of any get straddling the sync interval, and discarding it there used
+    /// to degrade the read to a full remote `messages` scan (#285); the
+    /// delta keeps the answer as complete as that scan without paying for it.
+    /// A map *ahead* of the handle is not extended - it describes rows this
+    /// read must not see (spec.md#lance-handle-freshness).
+    ///
+    /// `None` (caller scans) when the map holds no rows for the session, when
+    /// the delta cannot be taken cheaply, or on any map anomaly - malformed
+    /// record, hydrate miss, undecodable role or timestamp - so the store scan
+    /// stays the authority over a damaged map. Map-served rows carry no
+    /// `content` (only system messages have one), so they come back with
+    /// `content: None` and callers gate on that; delta rows are read from the
+    /// store and carry theirs. The version gate assumes append-only rows; a
+    /// future `pond erase` must make this row-set-aware, not just
+    /// version-aware.
     async fn session_scan_rows_resident(&self, session_id: &str) -> Result<Option<Vec<ScanRow>>> {
         let Some(map) = self.rowmap.load_full() else {
             return Ok(None);
         };
-        if map.version() != self.messages_version().await? {
+        let version = self.messages_version().await?;
+        if map.version() > version {
             return Ok(None);
         }
         let Some(rowids) = map.session_row_ids(session_id) else {
@@ -1785,7 +1793,111 @@ impl Store {
                 content: None,
             });
         }
+        if map.version() != version {
+            let Some(delta) = self
+                .session_rows_since(
+                    session_id,
+                    map.version(),
+                    map.max_row_id().unwrap_or(0),
+                    map.len(),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            rows.extend(delta);
+        }
         Ok(Some(rows))
+    }
+
+    /// One session's rows in the `messages` fragments appended since
+    /// `map_version` - the delta that makes a trailing resident map usable
+    /// instead of discarded. Scans only the fragments the manifest says are new,
+    /// so its cost is the straddled sync's ingest, not the table.
+    ///
+    /// `None` (caller scans) when the chain cannot be cheaply extended - the
+    /// same bail-outs [`Self::collect_row_metas_delta`] documents, plus a size
+    /// guard this read path needs and that write path does not:
+    /// - `map_version`'s manifest was reclaimed by the cleanup retention window
+    ///   (spec.md#concurrency), so the version no longer resolves;
+    /// - the live row count dropped below the map's: rows were deleted, and a
+    ///   pure append cannot remove the map's now-stale entries;
+    /// - the new fragments hold more rows than [`Self::STRADDLE_DELTA_ROW_CAP`],
+    ///   which means they are a compaction rewrite of existing rows rather than
+    ///   appends - scanning those would be the whole-table read this path
+    ///   exists to avoid.
+    ///
+    /// Stable row ids (`enable_stable_row_ids`) make the merge disjoint:
+    /// compaction and embedding's `merge_update` rewrite fragments but preserve
+    /// row ids, so only genuine appends carry `row_id > map_max_row_id` and only
+    /// those are emitted - every other row in a rewritten fragment is already in
+    /// the map.
+    async fn session_rows_since(
+        &self,
+        session_id: &str,
+        map_version: u64,
+        map_max_row_id: u64,
+        map_rows: usize,
+    ) -> Result<Option<Vec<ScanRow>>> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let Ok(old) = dataset.checkout_version(map_version).await else {
+            return Ok(None);
+        };
+        if dataset.count_rows(None).await? < map_rows {
+            return Ok(None);
+        }
+        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
+        let added: Vec<_> = dataset
+            .get_fragments()
+            .iter()
+            .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
+            .map(|fragment| fragment.metadata().clone())
+            .collect();
+        if added.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        // Decided from fragment metadata, before a single data page is read.
+        let added_rows: usize = added
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap_or(0))
+            .sum();
+        if added_rows > Self::STRADDLE_DELTA_ROW_CAP {
+            tracing::debug!(
+                target: "pond::perf",
+                added_rows,
+                cap = Self::STRADDLE_DELTA_ROW_CAP,
+                "resident rowmap delta too large to extend; scanning instead",
+            );
+            return Ok(None);
+        }
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(added);
+        scanner.with_row_id();
+        let filter = Predicate::Eq("session_id", session_id.into()).to_lance();
+        scanner.filter(&filter)?;
+        scanner.project(&["id", "timestamp", "role", "search_text", "content"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        let mut out = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let rowids = uint64(&batch, "_rowid")?;
+            for row in 0..batch.num_rows() {
+                if rowids.value(row) <= map_max_row_id {
+                    continue;
+                }
+                let id = string(&batch, "id", row)?.context("message id is null")?;
+                let role =
+                    role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
+                out.push(ScanRow {
+                    id,
+                    role,
+                    timestamp: datetime(&batch, "timestamp", row)?,
+                    text: string(&batch, "search_text", row)?,
+                    content: string(&batch, "content", row)?,
+                });
+            }
+        }
+        Ok(Some(out))
     }
 
     /// Conversational scan over one session: rows ordered by
@@ -1972,6 +2084,15 @@ impl Store {
 
     /// Max delta segments before the chain is compacted into a fresh base.
     const MAX_ROWMAP_DELTAS: usize = 16;
+
+    /// Rows in the `messages` fragments appended since a trailing resident map's
+    /// version, above which [`Self::session_rows_since`] stops extending and
+    /// lets the caller scan. The straddle it exists for is one sync interval of
+    /// ingest - thousands of rows at the outside - while a compaction publishes
+    /// rewritten fragments holding a large share of the whole table. Anything
+    /// past this cap is the latter, where "scan only the new fragments" stops
+    /// being cheaper than the scan it replaces.
+    const STRADDLE_DELTA_ROW_CAP: usize = 100_000;
 
     /// Columns the resident meta map is built from. All three scans over this
     /// list - the sorting fallback and the delta scan, both reading through
@@ -5235,10 +5356,15 @@ const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ),
 ];
 
+/// BTree index name on `sessions.id` (spec.md#datasets). Stable so index
+/// creation, status and the unconditional-fold exemption name the same index.
+pub const SESSIONS_ID_INDEX: &str = "sessions_id_btree";
+
 /// Scalar index on `sessions`: `id` is filtered by `find_session` on every
-/// `get` and every grouped search.
+/// `get` and every grouped search. That is also why it is the one scalar index
+/// whose fold is never deferred - see `optimize_table_indices` (#285).
 const SESSIONS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] =
-    &[("id", BuiltinIndexType::BTree, "sessions_id_btree")];
+    &[("id", BuiltinIndexType::BTree, SESSIONS_ID_INDEX)];
 
 /// Session ids per `session_id IN (...)` chunk in an incremental copy: large
 /// enough to amortize per-scan setup, small enough to keep the pushed-down
@@ -8705,6 +8831,88 @@ mod tests {
         Ok(())
     }
 
+    /// The `sessions` scalar index is exempt from that batching (#285). Its
+    /// deferred tail is not read by a bounded scan but by a per-fragment
+    /// object-store fan-out on every `find_session` - pond never sets
+    /// `fast_search`, so Lance loads and refines every fragment outside the
+    /// index's `fragment_bitmap` - and at 1-3 sessions per sync a row threshold
+    /// never trips, so the tail grows without bound. It must fold on every run
+    /// whatever `pond sync` passes, while `messages` keeps the batching.
+    #[tokio::test]
+    async fn sessions_scalar_fold_ignores_the_sync_batching_threshold() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 24).await?;
+        store
+            .optimize_indices_with_scalar_fold_threshold(0)
+            .await?
+            .into_result()?;
+
+        // One appended session + messages: a new fragment on each table, far
+        // below any sync-sized threshold.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(Session {
+                    id: "session-straggler".to_owned(),
+                    parent_session_id: None,
+                    parent_message_id: None,
+                    source_agent: "claude-code".to_owned(),
+                    created_at: Utc::now(),
+                    project: Extracted::from_test_value("/proj/straggler".to_owned()),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Message(Message::User {
+                    id: "straggler-msg".to_owned(),
+                    session_id: "session-straggler".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-straggler".to_owned(),
+                    id: "straggler-msg-part".to_owned(),
+                    message_id: "straggler-msg".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value("straggler text".to_owned())),
+                    },
+                }),
+            ],
+        )
+        .await?;
+        assert!(
+            store
+                .handle
+                .unindexed_row_count(Table::Sessions, SESSIONS_ID_INDEX)
+                .await?
+                > 0,
+            "the appended session must start outside the index",
+        );
+
+        store
+            .optimize_indices_with_scalar_fold_threshold(1_000_000)
+            .await?
+            .into_result()?;
+        assert_eq!(
+            store
+                .handle
+                .unindexed_row_count(Table::Sessions, SESSIONS_ID_INDEX)
+                .await?,
+            0,
+            "the sessions scalar fold must ignore the threshold and cover every row",
+        );
+        assert!(
+            store
+                .handle
+                .unindexed_row_count(Table::Messages, MESSAGES_SESSION_ID_INDEX)
+                .await?
+                > 0,
+            "the exemption must be scoped to sessions - messages keeps the batching",
+        );
+        Ok(())
+    }
+
     /// At the delta-merge threshold the FTS index must REBUILD, never merge:
     /// Lance 7.0.0's inverted merge fails two ways on real segments (posting
     /// tail codec mismatch on empty segments; index-out-of-bounds panic in
@@ -9814,6 +10022,105 @@ mod tests {
             .session_message_counts(&["session-new".to_owned()])
             .await?;
         assert_eq!(counts.get("session-new").copied(), Some(1));
+        Ok(())
+    }
+
+    /// A get that straddles the sync interval reads through a rowmap whose
+    /// version trails the store. Discarding the map there used to fall back to
+    /// a full remote `messages` scan (#285); it must instead extend the map
+    /// with the fragments appended since its version, and the extended answer
+    /// must equal the scan's.
+    #[tokio::test]
+    async fn resident_rows_extend_a_trailing_rowmap_across_a_straddle() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 24).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+        let map_version = store.messages_version().await?;
+
+        let before = store
+            .session_scan_rows_resident("session-0")
+            .await?
+            .expect("a current map serves the session");
+        assert!(!before.is_empty(), "the session must start with rows");
+
+        // Grow the session without refreshing the map: exactly the state a get
+        // lands in between syncs. The session row is re-sent because ingest
+        // opens a substream on it - re-ingesting it matches, it does not
+        // duplicate.
+        ingest_events(
+            &store,
+            vec![
+                IngestEvent::Session(Session {
+                    id: "session-0".to_owned(),
+                    parent_session_id: None,
+                    parent_message_id: None,
+                    source_agent: "claude-code".to_owned(),
+                    created_at: Utc::now(),
+                    project: Extracted::from_test_value("/proj/0".to_owned()),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Message(Message::User {
+                    id: "straddle-msg".to_owned(),
+                    session_id: "session-0".to_owned(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                }),
+                IngestEvent::Part(Part {
+                    session_id: "session-0".to_owned(),
+                    id: "straddle-msg-part".to_owned(),
+                    message_id: "straddle-msg".to_owned(),
+                    ordinal: 0,
+                    provenance: crate::wire::Provenance::Conversational,
+                    options: ProviderOptions::new(),
+                    kind: PartKind::Text {
+                        text: Some(Extracted::from_test_value("straddled text".to_owned())),
+                    },
+                }),
+            ],
+        )
+        .await?;
+        assert!(
+            store.messages_version().await? > map_version,
+            "the ingest must advance the store past the map",
+        );
+        assert_eq!(
+            store.rowmap_snapshot().map(|map| map.version()),
+            Some(map_version),
+            "the resident map must still be the trailing one",
+        );
+
+        let extended = store
+            .session_scan_rows_resident("session-0")
+            .await?
+            .expect("a trailing map must be extended, not discarded");
+        let straddler = extended
+            .iter()
+            .find(|row| row.id == "straddle-msg")
+            .expect("the delta row must be served");
+        assert_eq!(
+            straddler.text.as_deref(),
+            Some("straddled text"),
+            "a delta row is read from the store, so it carries its text",
+        );
+
+        // The extension is complete, not merely non-empty: same rows as the
+        // scan it replaces.
+        let mut extended_ids: Vec<_> = extended.iter().map(|row| row.id.clone()).collect();
+        let mut scanned_ids: Vec<_> = store
+            .scan_all_messages("session-0")
+            .await?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        extended_ids.sort();
+        scanned_ids.sort();
+        assert_eq!(extended_ids, scanned_ids);
+        assert_eq!(
+            extended.len(),
+            before.len() + 1,
+            "the delta must be disjoint from the map, not a re-read of it",
+        );
         Ok(())
     }
 

@@ -1254,6 +1254,72 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// `POND_IO_TRACE=1` arms the lance-io request tracker before any store opens,
+/// so a one-shot read command reports its exact object-store GET count, bytes
+/// and - in an `io-trace` build - per-path attribution on stderr. The permanent
+/// regression probe for the warm-get read storm of #285; `serve_mem_bench
+/// --io-trace` is the same instrumentation for the server paths.
+fn io_trace_armed() -> bool {
+    std::env::var_os("POND_IO_TRACE").is_some_and(|value| value != "0")
+}
+
+/// Report and reset the IO accumulated since the last call, under `label`.
+/// Aggregate counts always; the per-path and per-range detail that names WHICH
+/// object a read storm hits only in a build with the `io-trace` feature, which
+/// is what turns lance-io's per-request recording on.
+fn io_trace_report(label: &str) {
+    if !io_trace_armed() {
+        return;
+    }
+    let Some(stats) = pond::substrate::io_trace::take() else {
+        return;
+    };
+    eprintln!(
+        "IOTRACE {label} read_iops={} read_bytes={}",
+        stats.read_iops, stats.read_bytes
+    );
+    #[cfg(feature = "io-trace")]
+    {
+        use pond::substrate::io_trace::{bucket, bytes_by_path};
+        use std::collections::BTreeMap;
+
+        let mut by_bucket: BTreeMap<String, (u64, u64, u64, usize)> = BTreeMap::new();
+        // `get_ranges` records carry `range: None`, so the tracker's own request
+        // list cannot attribute bytes - the byte columns come from the
+        // per-path wrapper, and the two are merged on the same bucket key.
+        for ((path, method), (calls, ranges, bytes)) in bytes_by_path::take() {
+            let entry = by_bucket
+                .entry(format!("{method:>10} {}", bucket(&path)))
+                .or_insert((0, 0, 0, 0));
+            entry.0 += calls;
+            entry.1 += ranges;
+            entry.2 += bytes;
+            entry.3 += 1;
+        }
+        let mut rows: Vec<_> = by_bucket.into_iter().collect();
+        rows.sort_by_key(|(_, row)| std::cmp::Reverse(row.2));
+        for (key, (calls, ranges, bytes, paths)) in rows {
+            eprintln!(
+                "IOTRACE {label}   {calls:>7} calls {ranges:>8} ranges {bytes:>12} B  paths={paths:<5} {key}"
+            );
+        }
+        // The shape of the reads themselves: many tiny ranges at the same
+        // offset across distinct files is the fan-out signature.
+        for (path, ranges) in bytes_by_path::take_samples() {
+            let text = ranges
+                .iter()
+                .take(12)
+                .map(|(method, offset, len)| format!("{method}@{offset}+{len}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "IOTRACE {label} SAMPLE n={:<4} {path}\n    {text}",
+                ranges.len()
+            );
+        }
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     #[allow(unsafe_code)]
@@ -1266,6 +1332,11 @@ async fn run() -> anyhow::Result<()> {
     human_panic::setup_panic!();
 
     let cli = Cli::parse();
+    // Before any store opens: the tracker is injected as an object-store
+    // wrapper at dataset-open time, so arming it later traces nothing.
+    if io_trace_armed() {
+        pond::substrate::io_trace::enable();
+    }
     init_tracing(cli.verbose.tracing_level_filter());
     if let Err(error) = try_raise_fd_limit(65_536) {
         tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
@@ -1719,6 +1790,7 @@ async fn run() -> anyhow::Result<()> {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             load_rowmap_quietly(&store).await;
+            io_trace_report("get-session/setup");
             let first_page = after_message_id.is_none() && before_message_id.is_none();
             let request = GetSessionRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1730,6 +1802,7 @@ async fn run() -> anyhow::Result<()> {
                 before_message_id,
             };
             let envelope = handlers::pond_get_session(&store, request).await;
+            io_trace_report("get-session/handler");
             // Spawn-only subagents are their own sessions (spec.md#datasets);
             // surface them on a session's first page so the CLI matches the MCP
             // transcript. Best-effort: a lookup failure just omits the footer.
@@ -1756,6 +1829,7 @@ async fn run() -> anyhow::Result<()> {
             let loaded = Config::load(config_path(config))?;
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             load_rowmap_quietly(&store).await;
+            io_trace_report("get-message/setup");
             let request = GetMessageRequest {
                 protocol_version: PROTOCOL_VERSION,
                 namespace: Some(namespace),
@@ -1764,6 +1838,7 @@ async fn run() -> anyhow::Result<()> {
                 context_after,
             };
             let envelope = handlers::pond_get_message(&store, request).await;
+            io_trace_report("get-message/handler");
             if !render_get_envelope(format, &envelope, "")? {
                 std::process::exit(1);
             }
