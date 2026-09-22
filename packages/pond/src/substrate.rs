@@ -1150,10 +1150,13 @@ fn task_veto_reason(
         }
     }
 
-    // Lance's rewrite writer splits output on BOTH caps - `max_bytes_per_file`
+    // Lance's re-encode writer splits output on BOTH caps - `max_bytes_per_file`
     // and `max_rows_per_file = target_rows_per_fragment` (lance-11.0.0
-    // optimize.rs:2272) - so the output floor is whichever binds. Predicting it
-    // from bytes alone promised a shrink the row cap then denied: with
+    // optimize.rs:2272) - while the binary-copy writer pond asks for first
+    // splits on rows alone (`optimize/binary_copy.rs:165,371` never reads
+    // `max_bytes_per_file`), so the row cap is the floor that binds on every
+    // path and the byte floor is the conservative one. Predicting the count from
+    // bytes alone promised a shrink the row cap then denied: with
     // `derived_target_rows` at half the byte budget the row cap binds first,
     // Lance re-emitted one output per input, and the same task was re-planned
     // every sync (measured ~80 GiB/day rewritten for a 4.5 GiB table).
@@ -1184,10 +1187,10 @@ fn task_veto_reason(
     // only copies. `largest` alone (the second measure) let a task of several
     // settled peers plus a small appended tail through: the peers counted as
     // the remainder being merged in, hiding that the only new data was a few MB
-    // of appends. So peers are summed too - a fragment already holding half an
-    // output, by whichever cap binds, cannot share one with another such
-    // fragment, so including it buys nothing and what it copies has to be
-    // earned. A task with no settled peer has nothing to amortize against, and
+    // of appends. So peers are summed too - merging fragments that each already
+    // hold half an output at best halves the fragment count for a full copy of
+    // their bytes, so what that copy costs has to be earned. A task with no
+    // settled peer has nothing to amortize against, and
     // one that is all peers has nothing to absorb; the output floor above and
     // the largest-fragment measure are what judge those. In between, a small
     // rider defers even a merge the settled members could make on their own
@@ -5809,6 +5812,19 @@ mod tests {
         // Remainder reaches largest / COMPACTION_ABSORB_FACTOR -> kept.
         let tiered = [stat(400_000), stat(60_000), stat(40_000)];
         assert!(task_is_kept(&tiered, derived_target_rows(&tiered)));
+        // No fragment holds half an output, so the settled sum is empty and the
+        // largest-fragment measure is the only one that can fire here.
+        let unsettled = [stat(400_000), stat(10_000), stat(10_000)];
+        assert_eq!(
+            task_veto_reason(
+                &unsettled,
+                64,
+                0.1,
+                derived_target_rows(&unsettled),
+                TARGET_FRAGMENT_BYTES,
+            ),
+            Some("absorb_veto"),
+        );
     }
 
     #[test]
