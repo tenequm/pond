@@ -88,6 +88,18 @@ async fn ingest_session(store: &Store, session_id: &str, tool: &str) -> anyhow::
                 result: json!("exit 1"),
             },
         )),
+        // Carries no tool identity but does earn a `preview`, which is what
+        // keeps the backfill's decoded-kind list honest: derive it from the
+        // tool columns alone and this row's preview stays NULL forever.
+        IngestEvent::Part(part(
+            "p-approval",
+            3,
+            PartKind::ToolApprovalResponse {
+                approval_id: "ap-1".to_owned(),
+                approved: false,
+                reason: None,
+            },
+        )),
     ];
     let envelope = pond_ingest(
         store,
@@ -176,6 +188,11 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
         "body_text backfilled from the stored params: {text}",
     );
     assert!(text.contains("exit 1"), "tool_result previews: {text}");
+    assert!(
+        text.contains("ap-1 (denied)"),
+        "a kind with no tool identity still previews - the backfill decodes \
+         every summary-earning kind, not just the tool ones: {text}",
+    );
     let text = run_sql(
         &store,
         "SELECT COUNT(*) AS n FROM parts WHERE body_text IS NOT NULL",
@@ -192,8 +209,17 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
     )
     .await?;
     assert!(
-        text.contains("| 1 |"),
-        "non-tool parts stay NULL (the text part): {text}",
+        text.contains("| 2 |"),
+        "non-tool parts stay NULL (text and the approval response): {text}",
+    );
+
+    // The renderer stamp is field metadata, and `add_columns` is the path it
+    // was designed for - a migrated store that lost it would read as "unknown
+    // renderer" while a fresh one reads the current version.
+    assert_eq!(
+        store.preview_renderer_version().await?,
+        Some(pond::wire::PREVIEW_RENDERER_VERSION),
+        "the backfilled preview column keeps its renderer stamp",
     );
 
     // The declared scalar index on the backfilled column builds through the
@@ -272,7 +298,7 @@ async fn old_schema_archive_restores_with_derived_columns() -> anyhow::Result<()
     let restored_dir = TempDir::new()?;
     let store = Store::open_local(restored_dir.path()).await?;
     let imported = store.import_clean_lance_datasets(archive.path()).await?;
-    assert_eq!(imported.rows.parts, 3, "all archive parts imported");
+    assert_eq!(imported.rows.parts, 4, "all archive parts imported");
 
     let text = run_sql(
         &store,

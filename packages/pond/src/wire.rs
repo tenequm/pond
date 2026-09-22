@@ -463,13 +463,9 @@ impl PartSummary {
     /// (its full body is still rendered when a message is fetched by `message_id`
     /// scope). The kinds that survive are exactly [`SUMMARY_PART_TYPES`].
     pub fn for_kind(kind: &PartKind) -> Option<Self> {
+        let preview = part_preview(kind);
         let (label, call_id) = match kind {
             PartKind::Text { .. } | PartKind::Reasoning { .. } => return None,
-            PartKind::File {
-                media_type,
-                file_name,
-                ..
-            } => (file_name.clone().or_else(|| media_type.clone()), None),
             PartKind::ToolCall { name, call_id, .. } => {
                 (name.as_deref().cloned(), call_id.as_deref().cloned())
             }
@@ -488,21 +484,20 @@ impl PartSummary {
                 });
                 (label, call_id.as_deref().cloned())
             }
-            PartKind::ToolApprovalRequest { approval_id, .. } => (Some(approval_id.clone()), None),
-            PartKind::ToolApprovalResponse {
-                approval_id,
-                approved,
-                ..
-            } => {
-                let verb = if *approved { "approved" } else { "denied" };
-                (Some(format!("{approval_id} ({verb})")), None)
-            }
+            // For these the descriptor IS the label, and it must be the
+            // rendered one: [`Self::from_columns`] has only the stored
+            // `preview` to rebuild it from, so taking the raw field here would
+            // make a long or whitespace-carrying file name answer differently
+            // depending on whether the map was warm.
+            PartKind::File { .. }
+            | PartKind::ToolApprovalRequest { .. }
+            | PartKind::ToolApprovalResponse { .. } => (preview.clone(), None),
         };
         Some(Self {
             kind: kind.type_name().to_owned(),
             label,
             call_id,
-            preview: part_preview(kind),
+            preview,
         })
     }
 
@@ -631,7 +626,7 @@ pub fn part_body_text(kind: &PartKind) -> Option<String> {
 /// bare - the common `{"command": "ls"}` shape reads as the command itself.
 fn render_params(params: &Value) -> Option<String> {
     let Some(object) = params.as_object() else {
-        return value_text(params);
+        return preview_text(params);
     };
     let known: Vec<(&str, String)> = PREVIEW_PARAM_KEYS
         .iter()
@@ -641,7 +636,7 @@ fn render_params(params: &Value) -> Option<String> {
         })
         .collect();
     match known.as_slice() {
-        [] => value_text(params),
+        [] => preview_text(params),
         [(_, only)] => Some(only.clone()),
         many => Some(
             many.iter()
@@ -652,28 +647,79 @@ fn render_params(params: &Value) -> Option<String> {
     }
 }
 
-/// [`value_text`] through a bounded head window. A tool result can be
-/// megabytes, and a preview that cloned the whole body only to truncate it
-/// would allocate the result corpus once per ingest. The window is generous
-/// enough that whitespace collapse cannot pull the rendered line under its
-/// budget for any realistic body.
+/// Head window every preview arm renders through. Generous enough that
+/// whitespace collapse cannot pull the rendered line under
+/// [`PREVIEW_MAX_CHARS`] for any realistic body.
+const PREVIEW_HEAD_CHARS: usize = PREVIEW_MAX_CHARS * 8;
+
+/// The same window in bytes - UTF-8 is at most four bytes per char, so this
+/// can never cut a body the char window would have kept.
+const PREVIEW_HEAD_BYTES: usize = PREVIEW_HEAD_CHARS * 4;
+
+/// A JSON value as preview text, every shape through a bounded head window.
+/// Bounding the non-string shapes is the point: a claude-code `tool_result`
+/// body is an array of content blocks, so that arm is the common one, and
+/// serializing a megabyte of it to keep 160 chars would allocate the result
+/// corpus once per ingest.
 fn preview_text(value: &Value) -> Option<String> {
-    const HEAD_WINDOW_CHARS: usize = PREVIEW_MAX_CHARS * 8;
     match value {
+        Value::Null => None,
         Value::String(text) => {
             let end = text
                 .char_indices()
-                .nth(HEAD_WINDOW_CHARS)
+                .nth(PREVIEW_HEAD_CHARS)
                 .map_or(text.len(), |(at, _)| at);
             Some(text[..end].to_owned())
         }
-        other => value_text(other),
+        other => compact_json_head(other, PREVIEW_HEAD_BYTES),
     }
 }
 
-/// A JSON value as text: a string is its own text, anything else is compact
-/// JSON. `null` and an unrenderable value are `None`, so an absent body stays
-/// absent rather than rendering as the word "null".
+/// Compact JSON, stopped once `max` bytes are in hand. `serde_json` walks the
+/// value either way, but the sink refusing further bytes keeps the allocation
+/// at the window rather than at the body.
+fn compact_json_head(value: &Value, max: usize) -> Option<String> {
+    struct Head {
+        buffer: Vec<u8>,
+        max: usize,
+    }
+    impl std::io::Write for Head {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let room = self.max.saturating_sub(self.buffer.len());
+            if room == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            let take = room.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            Ok(take)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut head = Head {
+        buffer: Vec::new(),
+        max,
+    };
+    // A write error here is the budget being spent, not a failure: whatever
+    // reached the buffer is the head this preview wanted.
+    let _ = serde_json::to_writer(&mut head, value);
+    let mut bytes = head.buffer;
+    // The cut lands anywhere, including mid-character; back off to the last
+    // boundary rather than lose the whole preview.
+    while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+/// A JSON value as text, in full: a string is its own text, anything else is
+/// compact JSON. `null` and an unrenderable value are `None`, so an absent
+/// body stays absent rather than rendering as the word "null". Unbounded on
+/// purpose - `body_text` is the whole params, which is what makes it the
+/// column a substring hunt can scan; previews go through [`preview_text`].
 fn value_text(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
@@ -1190,6 +1236,27 @@ mod tests {
         );
     }
 
+    /// A megabyte tool result renders its head; it is never serialized whole
+    /// to keep 160 chars. The array shape is the common one - a claude-code
+    /// `tool_result` body is a content-block array, not a string.
+    #[test]
+    fn preview_bounds_a_non_string_body() {
+        let huge = PartKind::ToolResult {
+            call_id: None,
+            name: None,
+            is_failure: false,
+            result: json!([{ "type": "text", "text": "y".repeat(1_000_000) }]),
+        };
+        let preview = part_preview(&huge).expect("rendered");
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 3);
+        assert!(preview.starts_with("[{\"text\":\"yyy"), "{preview}");
+        assert_eq!(
+            compact_json_head(&json!({ "a": "\u{1f300}\u{1f300}" }), 9),
+            Some("{\"a\":\"".to_owned()),
+            "a cut landing mid-character backs off to the last boundary",
+        );
+    }
+
     #[test]
     fn body_text_materializes_tool_call_params_only() {
         assert_eq!(
@@ -1244,6 +1311,13 @@ mod tests {
             PartKind::File {
                 media_type: Some("image/png".to_owned()),
                 file_name: None,
+                data: FileData::Bytes(Vec::new()),
+            },
+            // The label of a descriptor kind is the rendered preview, so a
+            // name the renderer collapses or truncates must still agree.
+            PartKind::File {
+                media_type: None,
+                file_name: Some(format!("a b\n{}", "x".repeat(400))),
                 data: FileData::Bytes(Vec::new()),
             },
             PartKind::ToolApprovalRequest {

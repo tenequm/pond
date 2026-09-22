@@ -284,9 +284,7 @@ impl PartsSummaryMap {
     }
 
     /// Every record whose key is exactly `(session_id, message_id)`, appended
-    /// to `out`. `true` when at least one record carried that key - which is
-    /// how a message with no summary-earning parts (it has a group, with no
-    /// entries) stays distinguishable from a message this segment never saw.
+    /// to `out`.
     ///
     /// Equal-hash records form one run (records are hash-sorted), so this
     /// binary-searches into the run and walks it both ways; `cache` holds the
@@ -297,11 +295,11 @@ impl PartsSummaryMap {
         message_id: &str,
         cache: &mut Option<(usize, Vec<u8>)>,
         out: &mut Vec<PartSummaryEntry>,
-    ) -> bool {
+    ) -> GroupHit {
         let hash = key_hash(session_id, message_id);
         let records = self.records();
         let Ok(found) = records.binary_search_by(|record| record.key_hash.cmp(&hash)) else {
-            return false;
+            return GroupHit::Absent;
         };
         let start = records[..found]
             .iter()
@@ -316,28 +314,32 @@ impl PartsSummaryMap {
             let block_idx = index / GROUP_BLOCK;
             if cache.as_ref().map(|(block, _)| *block) != Some(block_idx) {
                 let Some(plain) = self.decompress_block(block_idx) else {
-                    continue;
+                    return GroupHit::Partial;
                 };
                 *cache = Some((block_idx, plain));
             }
             let Some((_, plain)) = cache.as_ref() else {
-                continue;
+                return GroupHit::Partial;
             };
             let Ok(offset) = usize::try_from(record.group_off) else {
-                continue;
+                return GroupHit::Partial;
             };
             // A hash hit is not a key hit: verify against the group's own key
             // so a 64-bit collision costs a wasted decompression, not a wrong
             // message's summaries.
-            if let Some(group) = read_group(plain, offset)
-                && group.session_id == session_id
-                && group.message_id == message_id
-            {
+            let Some(group) = read_group(plain, offset) else {
+                return GroupHit::Partial;
+            };
+            if group.session_id == session_id && group.message_id == message_id {
                 matched = true;
                 out.extend(group.entries);
             }
         }
-        matched
+        if matched {
+            GroupHit::Complete
+        } else {
+            GroupHit::Absent
+        }
     }
 
     /// Every group in this segment, in record order - the compaction rebuild's
@@ -347,13 +349,41 @@ impl PartsSummaryMap {
         (0..self.count).filter_map(move |index| {
             let block_idx = index / GROUP_BLOCK;
             if cache.as_ref().map(|(block, _)| *block) != Some(block_idx) {
-                cache = Some((block_idx, self.decompress_block(block_idx)?));
+                let Some(plain) = self.decompress_block(block_idx) else {
+                    // A rebuild replays this, so a dropped block shrinks the
+                    // published base permanently. The coverage check turns
+                    // that into misses rather than wrong answers, but it is a
+                    // map that quietly stops helping - say so.
+                    tracing::warn!(
+                        block = block_idx,
+                        "parts summary block unreadable; its groups are dropped from the rebuild"
+                    );
+                    return None;
+                };
+                cache = Some((block_idx, plain));
             }
             let (_, plain) = cache.as_ref()?;
             let offset = usize::try_from(self.records()[index].group_off).ok()?;
             read_group(plain, offset)
         })
     }
+}
+
+/// What one segment had to say about a key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupHit {
+    /// No record in this segment carried the key.
+    Absent,
+    /// Every record carrying the key was read - including a group that holds
+    /// no entries at all, which is how a message whose parts are all text
+    /// stays distinguishable from one this segment never saw.
+    Complete,
+    /// A record in the key's hash run could not be read (an undecompressable
+    /// block, a malformed extent), so whatever was collected is a fragment of
+    /// the group - the one answer this map must never serve, since a key
+    /// routinely carries several records (see the module docs). The caller
+    /// turns it into a miss and reads the store.
+    Partial,
 }
 
 /// One decoded group: its key plus the entries it carries.
@@ -376,9 +406,16 @@ struct Group {
 pub struct PartsSummaryBuilder {
     target: PathBuf,
     tmp: PathBuf,
+    /// The `tmp-{pid}-{nonce}` marker every build temp of this builder carries,
+    /// kept so `finish`'s staging temp can be named by it too.
+    stamp: String,
     version: u64,
     groups: Staging,
     spine: Vec<Staged>,
+    /// Reused across pushes: a group's bytes are handed to the staging writer
+    /// and forgotten, so one buffer serves the whole corpus instead of an
+    /// allocation per message.
+    scratch: Vec<u8>,
     staged_len: u64,
     entry_count: u64,
     row_count: u64,
@@ -406,10 +443,12 @@ impl PartsSummaryBuilder {
             version,
             groups: Staging::create(path.with_extension(format!("{stamp}-groups")))?,
             spine: Vec::with_capacity(expected_groups),
+            scratch: Vec::new(),
             staged_len: 0,
             entry_count: 0,
             row_count: 0,
             max_row_id: 0,
+            stamp,
         })
     }
 
@@ -428,7 +467,10 @@ impl PartsSummaryBuilder {
         rows: u32,
         max_row_id: u64,
     ) -> Result<()> {
-        let mut bytes = Vec::new();
+        // Taken out so the staging writer can be borrowed alongside it; put
+        // back below, which is what makes the buffer outlive one push.
+        let mut bytes = std::mem::take(&mut self.scratch);
+        bytes.clear();
         write_str(&mut bytes, Some(session_id))?;
         write_str(&mut bytes, Some(message_id))?;
         bytes.extend_from_slice(&rows.to_le_bytes());
@@ -456,16 +498,8 @@ impl PartsSummaryBuilder {
         self.entry_count += entries.len() as u64;
         self.row_count += u64::from(rows);
         self.max_row_id = self.max_row_id.max(max_row_id);
+        self.scratch = bytes;
         Ok(())
-    }
-
-    /// Groups folded in so far.
-    pub fn len(&self) -> usize {
-        self.spine.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.spine.is_empty()
     }
 
     /// Assemble the segment and rename it into place.
@@ -482,8 +516,13 @@ impl PartsSummaryBuilder {
 
         // Group bytes are replayed in hash order into blocks; each record
         // remembers where its group landed inside its block's plaintext.
-        let mut blocks = Staging::create(self.tmp.with_extension("blocks"))?;
-        let mut block_entries: Vec<BlockEntry> = Vec::with_capacity(self.spine.len() / GROUP_BLOCK);
+        // Named by the stamp, not `with_extension("blocks")`: that REPLACES the
+        // `tmp-{pid}-{nonce}` extension, leaving a temp no `is_orphan_temp_of`
+        // sweep and no segment purge can ever match.
+        let mut blocks =
+            Staging::create(self.tmp.with_extension(format!("{}-blocks", self.stamp)))?;
+        let mut block_entries: Vec<BlockEntry> =
+            Vec::with_capacity(self.spine.len().div_ceil(GROUP_BLOCK));
         let mut records: Vec<Record> = Vec::with_capacity(self.spine.len());
         let mut plain: Vec<u8> = Vec::new();
         let mut blocks_len = 0u64;
@@ -618,7 +657,8 @@ impl PartsSummarySet {
 
     /// Groups across the chain. A split group counts once per segment that
     /// holds a piece of it, so this is an upper bound on distinct messages -
-    /// [`Self::entry_count`] is the figure to compare against the store.
+    /// [`Self::row_count`] is the figure the coverage check compares against
+    /// the store.
     pub fn group_count(&self) -> usize {
         self.segments.iter().map(PartsSummaryMap::len).sum()
     }
@@ -653,7 +693,9 @@ impl PartsSummarySet {
     /// The union is not an optimization: a part group splits across commits
     /// (grown-session re-sync, intra-commit fragment straddle), so taking only
     /// the newest segment's record would silently serve half a message's tool
-    /// calls.
+    /// calls. A segment that cannot read one of the key's records is the same
+    /// hazard arriving as an I/O failure, so it declines the whole lookup
+    /// rather than returning the half it could read.
     pub fn lookup_group(
         &self,
         session_id: &str,
@@ -663,7 +705,11 @@ impl PartsSummarySet {
         let mut found = false;
         for segment in &self.segments {
             let mut cache = None;
-            found |= segment.collect_group(session_id, message_id, &mut cache, &mut entries);
+            match segment.collect_group(session_id, message_id, &mut cache, &mut entries) {
+                GroupHit::Partial => return None,
+                GroupHit::Complete => found = true,
+                GroupHit::Absent => {}
+            }
         }
         if !found {
             return None;
@@ -679,19 +725,11 @@ impl PartsSummarySet {
         Some(entries)
     }
 
-    /// Re-encode every group of the chain into a fresh base segment at `path`:
-    /// the compaction rebuild, which never re-reads the store. Groups are
-    /// replayed verbatim (a split group stays split), so the union is
-    /// unaffected by when compaction happens.
-    pub fn compact_into(&self, path: &Path, version: u64) -> Result<()> {
-        let mut builder = PartsSummaryBuilder::new(path, version, self.group_count())?;
-        self.push_into(&mut builder)?;
-        builder.finish()
-    }
-
     /// Replay every group of the chain into `builder`, read from the segments'
     /// mappings rather than the store. Compaction is this plus `finish`; the
     /// delta-cap rebuild folds the newly appended rows in between the two.
+    /// Groups are replayed verbatim (a split group stays split), so the union
+    /// is unaffected by when compaction happens.
     pub fn push_into(&self, builder: &mut PartsSummaryBuilder) -> Result<()> {
         let max_row_id = self.max_row_id().unwrap_or(0);
         for segment in &self.segments {
@@ -773,14 +811,32 @@ fn read_i32(bytes: &[u8], at: &mut usize) -> Option<i32> {
     Some(i32::from_le_bytes(raw.try_into().ok()?))
 }
 
+/// The counts [`PartsSummaryBuilder::push`] writes are `u32`; read them back
+/// as what was written rather than round-tripping through `i32`.
+fn read_u32(bytes: &[u8], at: &mut usize) -> Option<u32> {
+    let raw = bytes.get(*at..at.checked_add(4)?)?;
+    *at += 4;
+    Some(u32::from_le_bytes(raw.try_into().ok()?))
+}
+
+/// Smallest byte length an entry can encode to: an ordinal, five length
+/// prefixes and the `is_failure` byte, with every string empty or absent. It
+/// bounds a decoded entry count against the bytes actually present, so a
+/// corrupt block asks the allocator for a plausible figure rather than
+/// aborting the process on a multi-gigabyte reservation.
+const MIN_ENTRY_BYTES: usize = 4 + 5 * 4 + 1;
+
 /// Decode the group at `offset` in a decompressed block. `None` on any
 /// malformed extent, which the caller treats as a miss.
 fn read_group(plain: &[u8], offset: usize) -> Option<Group> {
     let mut at = offset;
     let session_id = read_str(plain, &mut at)??;
     let message_id = read_str(plain, &mut at)??;
-    let rows = u32::try_from(read_i32(plain, &mut at)?).ok()?;
-    let count = usize::try_from(read_i32(plain, &mut at)?).ok()?;
+    let rows = read_u32(plain, &mut at)?;
+    let count = usize::try_from(read_u32(plain, &mut at)?).ok()?;
+    if count.checked_mul(MIN_ENTRY_BYTES)? > plain.len().checked_sub(at)? {
+        return None;
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let ordinal = read_i32(plain, &mut at)?;
@@ -1047,7 +1103,11 @@ mod tests {
 
         let set = open_chain(dir.path());
         let compacted = PartsSummaryMap::path_for(dir.path(), "s", 3);
-        set.compact_into(&compacted, 3).unwrap();
+        // The production compaction shape (sessions.rs): replay the chain out
+        // of its own mappings into a fresh builder, then publish.
+        let mut builder = PartsSummaryBuilder::new(&compacted, 3, set.group_count()).unwrap();
+        set.push_into(&mut builder).unwrap();
+        builder.finish().unwrap();
 
         let rebuilt = PartsSummarySet::open(&ChainPaths {
             base: compacted,
@@ -1094,8 +1154,71 @@ mod tests {
         let mut cache = None;
         // The same hash is reached only by the same key; a different key with
         // a forged equal hash is rejected by the stored-key comparison.
-        assert!(map.collect_group("sess-a", "msg-1", &mut cache, &mut entries));
-        assert!(!map.collect_group("sess-a", "msg-2", &mut cache, &mut entries));
+        assert_eq!(
+            map.collect_group("sess-a", "msg-1", &mut cache, &mut entries),
+            GroupHit::Complete,
+        );
+        assert_eq!(
+            map.collect_group("sess-a", "msg-2", &mut cache, &mut entries),
+            GroupHit::Absent,
+        );
         assert_eq!(entries.len(), 1);
+    }
+
+    /// A record in the key's run that cannot be read makes the collected
+    /// entries a fragment of the group. Serving that fragment is the one
+    /// answer the map must never give, so the lookup declines and the caller
+    /// reads the store.
+    #[test]
+    fn an_unreadable_block_declines_instead_of_serving_half_a_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = PartsSummaryMap::path_for(dir.path(), "s", 1);
+        let mut builder = PartsSummaryBuilder::new(&path, 1, 2).unwrap();
+        // Two records for one key, as a grown-session re-sync produces.
+        push(&mut builder, "sess-a", "msg-1", &[entry("p1", 0, None)], 1);
+        push(&mut builder, "sess-a", "msg-1", &[entry("p2", 1, None)], 2);
+        builder.finish().unwrap();
+
+        // Corrupt the compressed blob so no block decompresses.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let blob = PartsSummaryMap::open(&path).unwrap().blob_offset;
+        for byte in &mut bytes[blob..] {
+            *byte ^= 0xff;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let map = PartsSummaryMap::open(&path).unwrap();
+        let mut entries = Vec::new();
+        let mut cache = None;
+        assert_eq!(
+            map.collect_group("sess-a", "msg-1", &mut cache, &mut entries),
+            GroupHit::Partial,
+        );
+        assert_eq!(
+            PartsSummarySet::open(&ChainPaths {
+                base: path,
+                base_version: 1,
+                deltas: Vec::new(),
+            })
+            .unwrap()
+            .lookup_group("sess-a", "msg-1"),
+            None,
+            "a partial group is a miss, not a short answer",
+        );
+    }
+
+    /// A malformed extent must stay a skipped group, which includes not asking
+    /// the allocator for an entry count the block cannot possibly hold.
+    #[test]
+    fn a_forged_entry_count_is_rejected_not_reserved() {
+        let mut bytes = Vec::new();
+        write_str(&mut bytes, Some("sess-a")).unwrap();
+        write_str(&mut bytes, Some("msg-1")).unwrap();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            read_group(&bytes, 0).is_none(),
+            "an entry count past the block's own length is malformed",
+        );
     }
 }

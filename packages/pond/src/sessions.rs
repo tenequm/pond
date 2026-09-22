@@ -2359,7 +2359,7 @@ impl Store {
             tracing::debug!(
                 %error,
                 path = %path.display(),
-                "rowmap cache file not reclaimed; retried on the next sweep",
+                "segment cache file not reclaimed; retried on the next sweep",
             );
         }
     }
@@ -2513,6 +2513,22 @@ impl Store {
             }
         }
 
+        // Re-check after acquiring: a sibling may have published `version`
+        // between this caller's unlocked probe and the lock. Without it the
+        // loser redoes the whole scan the lock exists to avoid, and publishes
+        // a delta at the base's own version that discovery never orders and no
+        // sweep reclaims. An open failure here falls through to the
+        // purge+rebuild below rather than erroring.
+        if let Some(chain) = discover_family_chain(cache_dir, PARTS_SUMMARY_FAMILY, store_key)
+            && chain.version() == version
+            && let Ok(set) = PartsSummarySet::open(&chain)
+            && self
+                .partsmap_matches_store(&set, Coverage::Complete)
+                .await?
+        {
+            return Ok(Some(set));
+        }
+
         // Holding the lock makes us the only builder, so every build temp is a
         // dead orphan from a crashed build.
         Self::sweep_orphan_temps(cache_dir, PARTS_SUMMARY_FAMILY, store_key);
@@ -2586,10 +2602,13 @@ impl Store {
             // No chain, or one that cannot be extended: full scan -> base.
             _ => {
                 let path = PartsSummaryMap::path_for(cache_dir, store_key, version);
+                // The spine holds one entry per message, not per part, so the
+                // messages count is the hint - a parts count over-reserves it
+                // by parts-per-message. Both are manifest reads.
                 let mut builder = PartsSummaryBuilder::new(
                     &path,
                     version,
-                    self.handle.count_rows(Table::Parts).await?,
+                    self.handle.count_rows(Table::Messages).await?,
                 )?;
                 self.scan_part_summaries(&mut builder, None, None).await?;
                 builder.finish()?;
@@ -2706,7 +2725,7 @@ impl Store {
         }
         let mut scanner = self.handle.scanner(Table::Parts, None).await?;
         scanner.project(&["session_id", "message_id", "id", "type"])?;
-        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        scanner.limit(Some(Self::MAP_PROBE_ROWS), None)?;
         let batch = scanner.try_into_batch().await?;
         let mut known = 0usize;
         for row in 0..batch.num_rows() {
@@ -2804,7 +2823,7 @@ impl Store {
     ///
     /// The version gate assumes append-only rows; a future `pond erase` must
     /// make this row-set-aware, not just version-aware.
-    pub async fn summary_parts_resident(
+    async fn summary_parts_resident(
         &self,
         session_id: &str,
         message_ids: &[String],
@@ -3342,7 +3361,7 @@ impl Store {
         let mut scanner = self.handle.scanner(Table::Messages, None).await?;
         scanner.with_row_id();
         scanner.project(&["id"])?;
-        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        scanner.limit(Some(Self::MAP_PROBE_ROWS), None)?;
         let mut stream = scanner.try_into_stream().await?;
         let mut oldest_messages = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -3452,10 +3471,11 @@ impl Store {
         Ok(known > 0)
     }
 
-    /// Rows the identity probe reads from the store. Three, because the check is
-    /// for a wholesale mismatch, not for drift: one row settles it unless that
-    /// row is itself newly appended.
-    const ROWMAP_PROBE_ROWS: i64 = 3;
+    /// Rows an identity probe reads from the store - shared by the row meta map
+    /// and the parts summary map. Three, because the check is for a wholesale
+    /// mismatch, not for drift: one row settles it unless that row is itself
+    /// newly appended.
+    const MAP_PROBE_ROWS: i64 = 3;
 
     /// Row metas for the rows appended since the base segment - the input to a
     /// delta layered on a base whose high-water mark is `base_max_row_id` and
@@ -6288,12 +6308,6 @@ pub(crate) fn column_backfill(table_name: &str, missing: &[Field]) -> Result<Col
     }
 }
 
-/// Part types whose stored body has to be decoded to derive any backfill cell:
-/// the tool parts carry identity, `file` carries the label a preview renders.
-/// Skipping the JSONB decode for text/reasoning rows keeps the pass cheap.
-const BACKFILL_DECODED_PART_TYPES: &[&str] =
-    &["tool_call", "tool_result", "tool_approval_request", "file"];
-
 fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
     for field in missing {
         anyhow::ensure!(
@@ -6316,7 +6330,12 @@ fn parts_backfill(missing: &[Field]) -> Result<ColumnBackfill> {
         let mut previews: Vec<Option<String>> = Vec::with_capacity(rows);
         for row in 0..rows {
             let type_name = string(batch, "type", row)?.context("part type is null")?;
-            let kind = if BACKFILL_DECODED_PART_TYPES.contains(&type_name.as_str()) {
+            // Exactly the summary-earning kinds: each derives at least a
+            // `preview`, and text/reasoning derive nothing, so skipping their
+            // JSONB decode keeps the pass cheap. Reusing the constant rather
+            // than restating the list is what keeps a backfilled store's cells
+            // equal to a fresh ingest's.
+            let kind = if SUMMARY_PART_TYPES.contains(&type_name.as_str()) {
                 let body =
                     json_column(batch, "variant_data", row)?.context("variant_data is null")?;
                 // A file part's payload lives in the blob column, which the
@@ -6433,7 +6452,9 @@ pub(crate) const PREVIEW_RENDERER_METADATA_KEY: &str = "pond.preview_renderer_ve
 /// or `None` on a store written before the column existed. A value below
 /// [`crate::wire::PREVIEW_RENDERER_VERSION`] means the stored previews were
 /// rendered by an older renderer and can be re-derived from `variant_data`.
-pub fn stored_preview_renderer_version(schema: &lance::deps::arrow_schema::Schema) -> Option<u32> {
+pub(crate) fn stored_preview_renderer_version(
+    schema: &lance::deps::arrow_schema::Schema,
+) -> Option<u32> {
     schema
         .field_with_name("preview")
         .ok()?
