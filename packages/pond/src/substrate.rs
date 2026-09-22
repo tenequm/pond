@@ -926,24 +926,12 @@ pub fn default_cleanup_older_than() -> chrono::Duration {
     chrono::Duration::hours(1)
 }
 
-/// `pond sync` runs every few minutes; reclaiming old manifest versions on
-/// every run pays the full version-log walk over S3 (~9 s measured on the real
-/// corpus) to free roughly one version. Amortize by cleaning only when a
-/// table's manifest version is a multiple of this many commits. The gate wants
-/// an EXACT multiple (see [`cleanup_due`]), so this paces cleanup - it does not
-/// bound the gap between two cleanups. The per-run version step varies: the
-/// append commit, a compaction commit when one lands, index-phase commits that
-/// land in the NEXT run's version, and concurrent hosts advancing the same
-/// per-table counter; and only syncs that ingest rows run maintenance at all.
-/// Skipping stays safe - each firing sweeps everything older than the retention
-/// window, so the pending set is bounded whenever the gate fires - but at 16 the
-/// cadence was slack enough against a 1 h [`default_cleanup_older_than`] window
-/// that the pending set reached 26 GiB on the real store. Halving to 8 shortens
-/// the gap in every case where the gate fires at all, while still skipping most
-/// walks. A durable bound needs the last-cleaned version persisted per table
-/// (known follow-up). Explicit `pond optimize` and the one-shot `pond copy` keep
-/// interval 1 (clean every run) so maintenance and durability moves are never
-/// skipped.
+/// `pond sync` runs every few minutes, and the per-table version-log walk costs
+/// ~9 s over S3 to reclaim roughly one version, so it fires only on manifest
+/// versions that are an EXACT multiple of this. That PACES cleanup, it does not
+/// bound the gap (see [`cleanup_due`]); 16 left the pending set at 26 GiB on the
+/// real store against a 1 h [`default_cleanup_older_than`] window, 8 halves it.
+/// `pond optimize` and the one-shot `pond copy` keep interval 1, cleaning always.
 pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 8;
 
 /// `pond sync` defers a scalar (BTree/bitmap) index fold until its unindexed
@@ -1150,20 +1138,18 @@ fn task_veto_reason(
         }
     }
 
-    // Lance's re-encode writer splits output on BOTH caps - `max_bytes_per_file`
-    // and `max_rows_per_file = target_rows_per_fragment` (lance-11.0.0
-    // optimize.rs:2272) - while the binary-copy writer pond asks for first
-    // splits on rows alone (`optimize/binary_copy.rs:165,371` never reads
-    // `max_bytes_per_file`), so the row cap is the floor that binds on every
-    // path and the byte floor is the conservative one. Predicting the count from
-    // bytes alone promised a shrink the row cap then denied: with
-    // `derived_target_rows` at half the byte budget the row cap binds first,
-    // Lance re-emitted one output per input, and the same task was re-planned
-    // every sync (measured ~80 GiB/day rewritten for a 4.5 GiB table).
+    // Match the writer's own count: lance 12 picks `max(1, floor(surviving_rows
+    // / target))` outputs and spreads rows EVENLY across them, so each reaches
+    // the target (lance-12.0.0 optimize.rs:2499-2528). Lance 11's fixed
+    // `max_rows_per_file = target` stranded a tail instead - one output per
+    // input, a shrink the byte prediction had promised, and the same task
+    // re-planned every sync (#288, ~80 GiB/day for a 4.5 GiB table). The floor
+    // still guards: even spreading assumes near-uniform row width, so a task
+    // mixing very wide and narrow rows can still emit an under-target output.
     let outputs_by_rows = if target_rows_per_fragment == 0 {
         0
     } else {
-        live_rows.div_ceil(target_rows_per_fragment as u128)
+        (live_rows / target_rows_per_fragment as u128).max(1)
     };
     let minimum_outputs = total_bytes.div_ceil(budget).max(outputs_by_rows).max(1);
     if u128::try_from(stats.len()).unwrap_or(u128::MAX) <= minimum_outputs {
@@ -3359,23 +3345,12 @@ async fn optimize_table_compact(
     Ok(())
 }
 
-/// Gate for the version-cleanup walk: at interval `<= 1` it runs every optimize;
-/// otherwise only when the manifest `version` is a multiple of it. The multiple
-/// must be exact - a run whose version steps past one does not clean, it waits
-/// for the next exact multiple - so this PACES cleanup, it does not bound the
-/// gap. A table advancing a CONSTANT `s` versions per run, from a version
-/// already divisible by `gcd(interval, s)`, cleans once every
-/// `interval / gcd(interval, s)` runs; neither premise holds in general. The
-/// real step varies per run (the append commit, a compaction commit when one
-/// lands, index-phase commits landing in the next run's version, and concurrent
-/// hosts advancing the same per-table counter), and an even step from an odd
-/// version never lands on a multiple of an even interval at all - so cleanup can
-/// be skipped indefinitely. Skipping stays safe: every firing sweeps everything
-/// older than the retention window (Lance's cleanup Execute path has no
-/// candidate limit), so the pending set is bounded whenever the gate fires; the
-/// failure mode is the gate rarely firing, not a backlog outgrowing one sweep.
-/// A durable bound needs the last-cleaned version persisted per table (known
-/// follow-up), not a different interval.
+/// Gate for the version-cleanup walk: interval `<= 1` cleans every optimize,
+/// else only on an EXACT multiple - so this PACES cleanup, it does not bound the
+/// gap. The per-run version step varies, and an even step from an odd version
+/// never hits an even interval, so firings can be skipped for long stretches.
+/// Safe anyway: each firing sweeps everything older than the retention window. A
+/// durable bound needs the last-cleaned version persisted per table (follow-up).
 fn cleanup_due(version: u64, interval: u64) -> bool {
     interval <= 1 || version.is_multiple_of(interval)
 }
@@ -5939,31 +5914,35 @@ mod tests {
     }
 
     /// #288: the parts-table rewrite loop. The byte floor alone predicted a
-    /// 6 -> 3 shrink for six ~127 MB / ~9.8 KB-per-row fragments, but the row
-    /// cap makes Lance re-emit six, so the identical task was re-planned every
-    /// sync (~80 GiB/day rewritten for a 4.5 GiB table).
+    /// 6 -> 3 shrink for six ~127 MB / ~9.8 KB-per-row fragments, but lance 11's
+    /// fixed row cap made it re-emit six, so the identical task was re-planned
+    /// every sync (~80 GiB/day rewritten for a 4.5 GiB table). lance 12 spreads
+    /// rows evenly, so this task really shrinks and its outputs leave the pool.
     #[test]
-    fn compaction_veto_blocks_row_capped_rewrite_loop() {
+    fn compaction_row_floor_matches_lance12_writer() {
         let settled_peer = || fragment(127_400_000, 13_000, 0);
         let loop_task: Vec<FragmentStat> = std::iter::repeat_with(settled_peer).take(6).collect();
         let target = derived_target_rows(&loop_task);
+        let live_rows: u64 = loop_task.iter().map(|stat| stat.rows).sum();
         let bytes: u64 = loop_task.iter().map(|stat| stat.bytes.unwrap()).sum();
-        // The floor the old code used would have let this through.
+        assert_eq!((target, live_rows), (13_695, 78_000));
+        // Ceil-by-rows predicted one output per input and vetoed the task; the
+        // floor lance 12 actually writes predicts five, and bytes allow three,
+        // so a real 6 -> 5 merge stands.
+        assert_eq!(live_rows.div_ceil(target as u64), 6);
+        assert_eq!((live_rows / target as u64).max(1), 5);
         assert_eq!(bytes.div_ceil(TARGET_FRAGMENT_BYTES), 3);
-        assert_eq!(
-            task_veto_reason(&loop_task, 64, 0.1, target, TARGET_FRAGMENT_BYTES),
-            Some("cannot_shrink"),
-        );
+        assert!(task_is_kept(&loop_task, target));
 
-        // Same row width, fragments small enough that the row cap leaves room:
-        // five inputs really do collapse to two outputs.
+        // Same row width, fragments small enough that the whole task fits one
+        // output - still a merge worth planning.
         let mergeable: Vec<FragmentStat> =
             std::iter::repeat_with(|| fragment(44_900_000, 4_580, 0))
                 .take(5)
                 .collect();
         let mergeable_target = derived_target_rows(&mergeable);
         let mergeable_rows: u64 = mergeable.iter().map(|stat| stat.rows).sum();
-        assert_eq!(mergeable_rows.div_ceil(mergeable_target as u64), 2);
+        assert_eq!((mergeable_rows / mergeable_target as u64).max(1), 1);
         assert!(task_is_kept(&mergeable, mergeable_target));
     }
 
