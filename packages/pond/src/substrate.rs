@@ -3986,7 +3986,7 @@ pub mod io_trace {
                 let result = self.inner.get_opts(location, options).await?;
                 let bytes = result.range.end - result.range.start;
                 record(location, "get_opts", 1, bytes);
-                sample(location, "get_opts", &[result.range.clone()]);
+                sample(location, "get_opts", std::slice::from_ref(&result.range));
                 Ok(result)
             }
 
