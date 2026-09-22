@@ -451,6 +451,11 @@ fn print_row_delta(prev: &Map<String, Value>, cur: &Map<String, Value>) {
             continue;
         }
         let before = prev.get(key);
+        // A field neither row measured says nothing; the mem scenarios leave most
+        // of the promoted fields null.
+        if value.is_null() && before.is_none_or(Value::is_null) {
+            continue;
+        }
         let delta = match (before.and_then(Value::as_f64), value.as_f64()) {
             (Some(before), Some(now)) if before != 0.0 => {
                 format!("{:+.0}%", (now - before) / before * 100.0)
@@ -1001,7 +1006,7 @@ async fn scratch_delete(base: &str, config: &Config) -> Result<usize> {
     for prefix in listing.common_prefixes {
         let matches = prefix
             .parts()
-            .last()
+            .next_back()
             .is_some_and(|part| part.as_ref().starts_with(&scratch_prefix));
         if !matches {
             continue;
@@ -1258,8 +1263,8 @@ fn mem_check(
             failed |= delta > pct;
             println!(
                 "  {verdict:<4} {key:<18} {before:>14} -> {value:<14} {delta:+.1}%  (baseline {} {})",
-                last.get("date").unwrap_or(&Value::Null),
-                last.get("commit").unwrap_or(&Value::Null),
+                last.get("date").and_then(Value::as_str).unwrap_or("-"),
+                last.get("commit").and_then(Value::as_str).unwrap_or("-"),
             );
         }
     }
