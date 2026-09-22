@@ -944,9 +944,7 @@ pub const DEFAULT_SYNC_CLEANUP_INTERVAL: u64 = 8;
 /// unaffected. `pond optimize`/`pond copy` fold every run (threshold `0`).
 ///
 /// Does NOT apply to the `sessions` table, whose scalar indexes fold every run
-/// whatever this says: there the deferred tail is not read by a bounded scan but
-/// by a per-fragment object-store fan-out on every `find_session`
-/// (`optimize_table_indices`, #285).
+/// whatever this says (`optimize_table_indices`, #285).
 pub const DEFAULT_SYNC_SCALAR_FOLD_ROWS: usize = 50_000;
 
 /// Defer the FTS + vector (IVF) index fold until the unindexed tail reaches this
@@ -3855,7 +3853,8 @@ async fn index_status(
 /// object-store wrapper on every dataset read open, counting exactly how many
 /// GETs (and bytes, and - under the `io-trace` feature - which paths) each
 /// query issues against a remote store. Used by `serve_mem_bench --io-trace`
-/// to attribute the per-query S3 request load. Not a production code path.
+/// to attribute the per-query S3 request load, and by the `pond get-session` /
+/// `get-message` commands under `POND_IO_TRACE=1`. Never armed otherwise.
 pub mod io_trace {
     use lance_io::utils::tracking_store::{IOTracker, IoStats};
     use std::sync::{Arc, OnceLock};
@@ -3889,9 +3888,7 @@ pub mod io_trace {
             let file = after.rsplit('/').next().unwrap_or(after);
             format!("index/{file}")
         } else if path.contains("/data/") {
-            let table = path.split('/').find(|segment| {
-                matches!(*segment, "sessions" | "messages" | "parts") || segment.ends_with(".lance")
-            });
+            let table = path.split('/').find(|segment| segment.ends_with(".lance"));
             format!("data/{}", table.unwrap_or("?"))
         } else if path.contains("manifest") || path.contains("/_versions/") {
             "manifest".to_string()
@@ -3921,7 +3918,7 @@ pub mod io_trace {
         use object_store::path::Path as ObjPath;
         use object_store::{
             CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
-            ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+            ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
             Result as OsResult,
         };
         use std::collections::BTreeMap;
@@ -4097,6 +4094,18 @@ pub mod io_trace {
                 opts: CopyOptions,
             ) -> OsResult<()> {
                 self.inner.copy_opts(from, to, opts).await
+            }
+
+            /// Delegated, not left to the trait default: that degrades a rename
+            /// to copy+delete and bypasses `FsyncStore::rename_opts`'s terminal
+            /// error on a published commit.
+            async fn rename_opts(
+                &self,
+                from: &ObjPath,
+                to: &ObjPath,
+                opts: RenameOptions,
+            ) -> OsResult<()> {
+                self.inner.rename_opts(from, to, opts).await
             }
         }
     }
@@ -5150,7 +5159,7 @@ fn is_namespace_error_code(error: &lance::Error, code: ErrorCode) -> bool {
     .any(|inner| inner.code() == code)
 }
 
-fn scanner_with_prefilter(
+pub(crate) fn scanner_with_prefilter(
     dataset: &Dataset,
     predicate: Option<&Predicate>,
 ) -> Result<lance::dataset::scanner::Scanner> {

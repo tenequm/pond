@@ -1254,23 +1254,29 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// `POND_IO_TRACE=1` arms the lance-io request tracker before any store opens,
-/// so a one-shot read command reports its exact object-store GET count, bytes
-/// and - in an `io-trace` build - per-path attribution on stderr. The permanent
-/// regression probe for the warm-get read storm of #285; `serve_mem_bench
-/// --io-trace` is the same instrumentation for the server paths.
-fn io_trace_armed() -> bool {
-    std::env::var_os("POND_IO_TRACE").is_some_and(|value| value != "0")
+/// `POND_IO_TRACE=1` arms the lance-io request tracker, so a one-shot read
+/// command reports its exact object-store GET count, bytes and - in an
+/// `io-trace` build - per-path attribution on stderr. The permanent regression
+/// probe for the warm-get read storm of #285; `serve_mem_bench --io-trace` is
+/// the same instrumentation for the server paths. Armed per command, never
+/// process-wide: nothing drains the tracker on the write or serve paths. Must
+/// run before the command opens its store - the tracker is injected as an
+/// object-store wrapper at dataset-open time, so arming later traces nothing.
+fn arm_io_trace() {
+    if std::env::var_os("POND_IO_TRACE").is_some_and(|value| !value.is_empty() && value != "0") {
+        pond::substrate::io_trace::enable();
+    }
 }
+
+/// Range samples printed per path; the tracker keeps more than it shows.
+#[cfg(feature = "io-trace")]
+const IO_TRACE_SAMPLES_SHOWN: usize = 12;
 
 /// Report and reset the IO accumulated since the last call, under `label`.
 /// Aggregate counts always; the per-path and per-range detail that names WHICH
 /// object a read storm hits only in a build with the `io-trace` feature, which
 /// is what turns lance-io's per-request recording on.
 fn io_trace_report(label: &str) {
-    if !io_trace_armed() {
-        return;
-    }
     let Some(stats) = pond::substrate::io_trace::take() else {
         return;
     };
@@ -1308,7 +1314,7 @@ fn io_trace_report(label: &str) {
         for (path, ranges) in bytes_by_path::take_samples() {
             let text = ranges
                 .iter()
-                .take(12)
+                .take(IO_TRACE_SAMPLES_SHOWN)
                 .map(|(method, offset, len)| format!("{method}@{offset}+{len}"))
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -1332,11 +1338,6 @@ async fn run() -> anyhow::Result<()> {
     human_panic::setup_panic!();
 
     let cli = Cli::parse();
-    // Before any store opens: the tracker is injected as an object-store
-    // wrapper at dataset-open time, so arming it later traces nothing.
-    if io_trace_armed() {
-        pond::substrate::io_trace::enable();
-    }
     init_tracing(cli.verbose.tracing_level_filter());
     if let Err(error) = try_raise_fd_limit(65_536) {
         tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
@@ -1788,6 +1789,7 @@ async fn run() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
+            arm_io_trace();
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             load_rowmap_quietly(&store).await;
             io_trace_report("get-session/setup");
@@ -1827,6 +1829,7 @@ async fn run() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
+            arm_io_trace();
             let (_, store) = open_store(storage_path, &loaded, false, true).await?;
             load_rowmap_quietly(&store).await;
             io_trace_report("get-message/setup");

@@ -41,7 +41,7 @@ use crate::{
     substrate::{
         Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
         OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
-        TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
+        TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS, scanner_with_prefilter,
     },
     wire::{
         FileData, Message, Part, PartKind, ProviderOptions, Role, SUMMARY_PART_TYPES, Session,
@@ -1638,15 +1638,16 @@ impl Store {
         let Some(session) = self.find_session(&session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        // Map-served only when the map actually holds the target and it is
-        // not a system message: a system target's `content` lives only in
-        // storage, and a version-matched map missing the target (corruption)
-        // must scan rather than answer a false NotFound.
+        // Map-served only when the resident rows actually hold the target and
+        // carry everything it needs: a system target's `content` lives only in
+        // storage (a delta row read from it has it, a map row does not), and
+        // resident rows missing the target (corruption) must scan rather than
+        // answer a false NotFound.
         let mut rows = match self.session_scan_rows_resident(&session_id).await? {
             Some(rows)
-                if rows
-                    .iter()
-                    .any(|row| row.id == message_id && row.role != Role::System) =>
+                if rows.iter().any(|row| {
+                    row.id == message_id && (row.role != Role::System || row.content.is_some())
+                }) =>
             {
                 rows
             }
@@ -1723,24 +1724,12 @@ impl Store {
             .scan_batch(
                 Table::Messages,
                 Some(&Predicate::Eq("session_id", session_id.into())),
-                &["id", "timestamp", "role", "search_text", "content"],
+                &SCAN_ROW_COLUMNS,
             )
             .await?;
-        let mut rows = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let id = string(&batch, "id", row)?.context("message id is null")?;
-            let role =
-                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
-            let timestamp = datetime(&batch, "timestamp", row)?;
-            rows.push(ScanRow {
-                id,
-                role,
-                timestamp,
-                text: string(&batch, "search_text", row)?,
-                content: string(&batch, "content", row)?,
-            });
-        }
-        Ok(rows)
+        (0..batch.num_rows())
+            .map(|row| scan_row(&batch, row))
+            .collect()
     }
 
     /// A session's rows served from the resident meta map as [`ScanRow`]s -
@@ -1766,7 +1755,9 @@ impl Store {
         let Some(map) = self.rowmap.load_full() else {
             return Ok(None);
         };
-        let version = self.messages_version().await?;
+        // One handle for the gate and the delta, so both read the same version.
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let version = dataset.version().version;
         if map.version() > version {
             return Ok(None);
         }
@@ -1794,15 +1785,7 @@ impl Store {
             });
         }
         if map.version() != version {
-            let Some(delta) = self
-                .session_rows_since(
-                    session_id,
-                    map.version(),
-                    map.max_row_id().unwrap_or(0),
-                    map.len(),
-                )
-                .await?
-            else {
+            let Some(delta) = Self::session_rows_since(&dataset, &map, session_id).await? else {
                 return Ok(None);
             };
             rows.extend(delta);
@@ -1810,49 +1793,31 @@ impl Store {
         Ok(Some(rows))
     }
 
-    /// One session's rows in the `messages` fragments appended since
-    /// `map_version` - the delta that makes a trailing resident map usable
-    /// instead of discarded. Scans only the fragments the manifest says are new,
-    /// so its cost is the straddled sync's ingest, not the table.
+    /// One session's rows in the `messages` fragments appended since `map`'s
+    /// version - the delta that makes a trailing resident map usable instead
+    /// of discarded. Scans only the fragments the manifest says are new, so its
+    /// cost is the straddled sync's ingest, not the table.
     ///
-    /// `None` (caller scans) when the chain cannot be cheaply extended - the
-    /// same bail-outs [`Self::collect_row_metas_delta`] documents, plus a size
-    /// guard this read path needs and that write path does not:
-    /// - `map_version`'s manifest was reclaimed by the cleanup retention window
-    ///   (spec.md#concurrency), so the version no longer resolves;
-    /// - the live row count dropped below the map's: rows were deleted, and a
-    ///   pure append cannot remove the map's now-stale entries;
-    /// - the new fragments hold more rows than [`Self::STRADDLE_DELTA_ROW_CAP`],
-    ///   which means they are a compaction rewrite of existing rows rather than
-    ///   appends - scanning those would be the whole-table read this path
-    ///   exists to avoid.
+    /// `None` (caller scans) on the bail-outs of
+    /// [`Self::fragments_added_since`], plus a size guard this read path needs
+    /// and the rowmap write path does not: new fragments holding more rows than
+    /// [`Self::STRADDLE_DELTA_ROW_CAP`] are a compaction rewrite of existing
+    /// rows rather than appends - scanning those would be the whole-table read
+    /// this path exists to avoid.
     ///
-    /// Stable row ids (`enable_stable_row_ids`) make the merge disjoint:
-    /// compaction and embedding's `merge_update` rewrite fragments but preserve
-    /// row ids, so only genuine appends carry `row_id > map_max_row_id` and only
-    /// those are emitted - every other row in a rewritten fragment is already in
-    /// the map.
+    /// Stable row ids make the merge disjoint, as in
+    /// [`Self::collect_row_metas_delta`]: only genuine appends carry
+    /// `row_id > map.max_row_id()`, and only those are emitted - every other row
+    /// in a rewritten fragment is already in the map.
     async fn session_rows_since(
-        &self,
+        dataset: &Dataset,
+        map: &RowMetaSet,
         session_id: &str,
-        map_version: u64,
-        map_max_row_id: u64,
-        map_rows: usize,
     ) -> Result<Option<Vec<ScanRow>>> {
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let Ok(old) = dataset.checkout_version(map_version).await else {
+        let Some(added) = Self::fragments_added_since(dataset, map.version(), map.len()).await?
+        else {
             return Ok(None);
         };
-        if dataset.count_rows(None).await? < map_rows {
-            return Ok(None);
-        }
-        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
-        let added: Vec<_> = dataset
-            .get_fragments()
-            .iter()
-            .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
-            .map(|fragment| fragment.metadata().clone())
-            .collect();
         if added.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -1870,31 +1835,23 @@ impl Store {
             );
             return Ok(None);
         }
-        let mut scanner = dataset.scan();
+        let map_max_row_id = map.max_row_id().unwrap_or(0);
+        let mut scanner = scanner_with_prefilter(
+            dataset,
+            Some(&Predicate::Eq("session_id", session_id.into())),
+        )?;
         scanner.with_fragments(added);
         scanner.with_row_id();
-        let filter = Predicate::Eq("session_id", session_id.into()).to_lance();
-        scanner.filter(&filter)?;
-        scanner.project(&["id", "timestamp", "role", "search_text", "content"])?;
+        scanner.project(&SCAN_ROW_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
         let mut out = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let rowids = uint64(&batch, "_rowid")?;
             for row in 0..batch.num_rows() {
-                if rowids.value(row) <= map_max_row_id {
-                    continue;
+                if rowids.value(row) > map_max_row_id {
+                    out.push(scan_row(&batch, row)?);
                 }
-                let id = string(&batch, "id", row)?.context("message id is null")?;
-                let role =
-                    role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
-                out.push(ScanRow {
-                    id,
-                    role,
-                    timestamp: datetime(&batch, "timestamp", row)?,
-                    text: string(&batch, "search_text", row)?,
-                    content: string(&batch, "content", row)?,
-                });
             }
         }
         Ok(Some(out))
@@ -3112,11 +3069,8 @@ impl Store {
     /// Row metas for the rows appended since the base segment - the input to a
     /// delta layered on a base whose high-water mark is `base_max_row_id` and
     /// which covers `base_row_count` rows. `None` (caller rebuilds the base from
-    /// a full scan) when the chain can't be cheaply extended:
-    /// - `base_version`'s manifest was reclaimed by the cleanup retention window
-    ///   (spec.md#concurrency), so the version no longer resolves; or
-    /// - the live row count dropped below the base: rows were deleted, and a
-    ///   pure append can't remove the base's now-stale entries.
+    /// a full scan) when the chain can't be cheaply extended - the bail-outs of
+    /// [`Self::fragments_added_since`].
     ///
     /// Stable row ids (`enable_stable_row_ids`) make this an append: embedding's
     /// `merge_update` and compaction rewrite message fragments but preserve
@@ -3131,23 +3085,14 @@ impl Store {
         base_row_count: usize,
     ) -> Result<Option<Vec<RowMetaEntry>>> {
         let dataset = self.handle.dataset(Table::Messages).await?;
-        let Ok(old) = dataset.checkout_version(base_version).await else {
+        // Rewritten/compacted fragments carry only existing row_ids
+        // (<= base_max_row_id) and are filtered out row-wise; genuine appends
+        // carry higher ids and are kept.
+        let Some(added) =
+            Self::fragments_added_since(&dataset, base_version, base_row_count).await?
+        else {
             return Ok(None);
         };
-        if dataset.count_rows(None).await? < base_row_count {
-            return Ok(None);
-        }
-        // Restrict the scan to fragments added since the base (recent churn -
-        // not the untouched bulk). Rewritten/compacted fragments carry only
-        // existing row_ids (<= base_max_row_id) and are filtered out row-wise;
-        // genuine appends carry higher ids and are kept.
-        let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
-        let added: Vec<_> = dataset
-            .get_fragments()
-            .iter()
-            .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
-            .map(|fragment| fragment.metadata().clone())
-            .collect();
         if added.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -3168,6 +3113,35 @@ impl Store {
             }
         }
         Ok(Some(out))
+    }
+
+    /// `messages` fragments added since `base_version` (recent churn - not the
+    /// untouched bulk), for a row-id-keyed delta over a chain covering
+    /// `base_row_count` rows. `None` when the chain can't be cheaply extended:
+    /// - `base_version`'s manifest was reclaimed by the cleanup retention window
+    ///   (spec.md#concurrency), so the version no longer resolves; or
+    /// - the live row count dropped below the base: rows were deleted, and a
+    ///   pure append can't remove the base's now-stale entries.
+    async fn fragments_added_since(
+        dataset: &Dataset,
+        base_version: u64,
+        base_row_count: usize,
+    ) -> Result<Option<Vec<Fragment>>> {
+        let Ok(old) = dataset.checkout_version(base_version).await else {
+            return Ok(None);
+        };
+        if dataset.count_rows(None).await? < base_row_count {
+            return Ok(None);
+        }
+        let old_ids: HashSet<usize> = old.get_fragments().iter().map(|f| f.id()).collect();
+        Ok(Some(
+            dataset
+                .get_fragments()
+                .iter()
+                .filter(|fragment| !old_ids.contains(&fragment.id()))
+                .map(|fragment| fragment.metadata().clone())
+                .collect(),
+        ))
     }
 
     /// Index-only FTS retriever: `_rowid` + `_score` only, so Lance inserts no
@@ -5356,8 +5330,7 @@ const PARTS_SCALAR_INDICES: &[(&str, BuiltinIndexType, &str)] = &[
     ),
 ];
 
-/// BTree index name on `sessions.id` (spec.md#datasets). Stable so index
-/// creation, status and the unconditional-fold exemption name the same index.
+/// BTree index name on `sessions.id` (spec.md#datasets).
 pub const SESSIONS_ID_INDEX: &str = "sessions_id_btree";
 
 /// Scalar index on `sessions`: `id` is filtered by `find_session` on every
@@ -6496,6 +6469,19 @@ fn required_str<'a>(array: &'a StringArray, row: usize, name: &str) -> Result<&'
         anyhow::bail!("{name} is null");
     }
     Ok(array.value(row))
+}
+
+/// Columns [`scan_row`] decodes.
+const SCAN_ROW_COLUMNS: [&str; 5] = ["id", "timestamp", "role", "search_text", "content"];
+
+fn scan_row(batch: &RecordBatch, row: usize) -> Result<ScanRow> {
+    Ok(ScanRow {
+        id: string(batch, "id", row)?.context("message id is null")?,
+        role: role_from_str(&string(batch, "role", row)?.context("message role is null")?)?,
+        timestamp: datetime(batch, "timestamp", row)?,
+        text: string(batch, "search_text", row)?,
+        content: string(batch, "content", row)?,
+    })
 }
 
 fn row_meta_entry(batch: &RecordBatch, row_id: u64, row: usize) -> Result<RowMetaEntry> {
@@ -8831,13 +8817,9 @@ mod tests {
         Ok(())
     }
 
-    /// The `sessions` scalar index is exempt from that batching (#285). Its
-    /// deferred tail is not read by a bounded scan but by a per-fragment
-    /// object-store fan-out on every `find_session` - pond never sets
-    /// `fast_search`, so Lance loads and refines every fragment outside the
-    /// index's `fragment_bitmap` - and at 1-3 sessions per sync a row threshold
-    /// never trips, so the tail grows without bound. It must fold on every run
-    /// whatever `pond sync` passes, while `messages` keeps the batching.
+    /// The `sessions` scalar index is exempt from that batching (#285; the why
+    /// is at the exemption in `optimize_table_indices`): it must fold on every
+    /// run whatever `pond sync` passes, while `messages` keeps the batching.
     #[tokio::test]
     async fn sessions_scalar_fold_ignores_the_sync_batching_threshold() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
