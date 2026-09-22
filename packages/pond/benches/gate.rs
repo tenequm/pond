@@ -20,6 +20,16 @@
 //!   cargo bench --bench gate -- --only mem --profile large
 //!   cargo bench --bench gate -- --only perf
 //!   cargo bench --bench gate -- --check             # gate vs committed rows
+//!   cargo bench --bench gate -- --only mem --runs 5
+//!
+//! Each mem scenario runs `--runs` times (3 on `ci`, 1 on `large`) and the run
+//! whose `peak_heap_bytes` is the median is the one recorded - whole and
+//! unchanged, because an averaged row is one no process ever produced. The
+//! spread across the runs is printed so a noisy scenario is visible at a glance.
+//! Recording also refuses to start while other builds or benches are running
+//! (`--allow-contended` overrides): a loaded host starves scan readahead and
+//! reads peak heap LOW, which plants a false regression for the next run to
+//! trip over - exactly how the first lance-12 rows came out.
 //!
 //! `--check` runs the mem scenarios, appends nothing, and fails when
 //! `peak_rss_kb` or `peak_heap_bytes` regressed more than
@@ -132,6 +142,15 @@ struct Args {
     /// repo root - point it at a scratch copy to rehearse a record.
     #[arg(long)]
     baseline: Option<PathBuf>,
+    /// Runs per mem scenario; the median run by `peak_heap_bytes` is the one
+    /// recorded. Defaults to 3 on the `ci` profile and 1 on `large`, whose
+    /// scenarios are minutes each.
+    #[arg(long)]
+    runs: Option<usize>,
+    /// Record even though other builds or benches are running. They bias peak
+    /// heap low, so the row is only comparable to other contended rows.
+    #[arg(long)]
+    allow_contended: bool,
     /// Ignored. `cargo bench` passes `--bench` to every `harness = false`
     /// target; without this flag clap would reject it as unknown.
     #[arg(long, hide = true)]
@@ -1052,6 +1071,15 @@ fn mem_gate(
             .into_iter()
             .collect();
 
+    let runs = match args.runs {
+        Some(runs) if runs >= 1 => runs,
+        Some(_) => bail!("--runs must be at least 1"),
+        // A `large` scenario is minutes of work and its row gates nothing yet.
+        None if profile == "large" => 1,
+        None => 3,
+    };
+    guard_against_contention(args.check, args.allow_contended)?;
+
     println!("--- build (release, --features mem-probe) ---");
     let bench_bin = mem_bench_binary()?;
     println!("binary: {}", bench_bin.display());
@@ -1066,31 +1094,21 @@ fn mem_gate(
     let mut touched: Vec<GroupKey> = Vec::new();
     for scenario in &scenarios {
         println!("--- {scenario} ---");
-        // One scenario per process: peak RSS is a process-lifetime high-water
-        // mark, so two scenarios in one process cannot be told apart.
-        // stdout is the row; the scenario's own progress goes to stderr and
-        // stays on the terminal.
-        let stdout = capture(
-            Command::new(&bench_bin)
-                .args(["--scenario", scenario, "--profile", profile])
-                .stderr(Stdio::inherit()),
-        )?;
-        let value: Value = serde_json::from_str(stdout.trim())
-            .with_context(|| format!("mem_bench printed no JSON row for {scenario}"))?;
-        let Value::Object(body) = value else {
-            bail!("mem_bench row for {scenario} is not an object");
-        };
-        let peak_rss = body.get("peak_rss_kb").and_then(Value::as_f64);
-        let peak_heap = body.get("peak_heap_bytes").and_then(Value::as_f64);
-        println!(
-            "  wall {} ms  peak_rss {}  peak_heap {}",
-            body.get("wall_ms").unwrap_or(&Value::Null),
-            peak_rss.map_or_else(|| "n/a".to_owned(), |kb| format!("{:.1} MiB", kb / 1024.0)),
-            peak_heap.map_or_else(
-                || "n/a".to_owned(),
-                |bytes| format!("{:.1} MiB", bytes / 1_048_576.0)
-            ),
-        );
+        let mut candidates: Vec<Map<String, Value>> = Vec::with_capacity(runs);
+        for run in 1..=runs {
+            // One scenario per process: peak RSS is a process-lifetime
+            // high-water mark, so two scenarios in one process cannot be told
+            // apart - and the repeats are what the median is taken over.
+            let body = run_scenario(&bench_bin, scenario, profile)?;
+            let tag = if runs > 1 {
+                format!("  run {run}/{runs}")
+            } else {
+                String::new()
+            };
+            println!("{tag}  {}", summarize(&body));
+            candidates.push(body);
+        }
+        let body = median_run(candidates)?;
         if args.check {
             fresh.insert(scenario.clone(), body);
         } else {
@@ -1109,6 +1127,187 @@ fn mem_gate(
         mem_check(baseline, &scenarios, profile, host, &record_only, &fresh)?;
     }
     Ok(touched)
+}
+
+/// One scenario, one process, one JSON row off stdout. The scenario's own
+/// progress goes to stderr and stays on the terminal.
+fn run_scenario(bench_bin: &Path, scenario: &str, profile: &str) -> Result<Map<String, Value>> {
+    let stdout = capture(
+        Command::new(bench_bin)
+            .args(["--scenario", scenario, "--profile", profile])
+            .stderr(Stdio::inherit()),
+    )?;
+    let value: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("mem_bench printed no JSON row for {scenario}"))?;
+    match value {
+        Value::Object(body) => Ok(body),
+        _ => bail!("mem_bench row for {scenario} is not an object"),
+    }
+}
+
+fn summarize(body: &Map<String, Value>) -> String {
+    let mib = |key: &str, unit: f64| {
+        body.get(key).and_then(Value::as_f64).map_or_else(
+            || "n/a".to_owned(),
+            |value| format!("{:.1} MiB", value / unit),
+        )
+    };
+    format!(
+        "wall {} ms  peak_rss {}  peak_heap {}",
+        body.get("wall_ms").unwrap_or(&Value::Null),
+        mib("peak_rss_kb", 1024.0),
+        mib("peak_heap_bytes", 1_048_576.0),
+    )
+}
+
+fn peak_heap(row: &Map<String, Value>) -> f64 {
+    // A run with no heap figure (no `mem-probe`) sorts last rather than
+    // winning the median by default.
+    row.get("peak_heap_bytes")
+        .and_then(Value::as_f64)
+        .unwrap_or(f64::INFINITY)
+}
+
+/// The run whose `peak_heap_bytes` is the median, kept WHOLE: an averaged row
+/// is one no process ever produced, and the fields would stop agreeing with
+/// each other. An even run count takes the lower median.
+fn median_run(mut candidates: Vec<Map<String, Value>>) -> Result<Map<String, Value>> {
+    if candidates.len() < 2 {
+        return candidates.pop().context("no run to record");
+    }
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by(|a, b| peak_heap(&candidates[*a]).total_cmp(&peak_heap(&candidates[*b])));
+    let pick = order[(order.len() - 1) / 2];
+    let spread = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let heap = peak_heap(row);
+            let shown = if heap.is_finite() {
+                format!("{:.1}", heap / 1_048_576.0)
+            } else {
+                "n/a".to_owned()
+            };
+            format!("run {}: {shown}", index + 1)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "  peak_heap MiB over {} runs: {spread}  -> median is run {}, recorded whole",
+        candidates.len(),
+        pick + 1,
+    );
+    Ok(candidates.swap_remove(pick))
+}
+
+/// Builds and benches running elsewhere on this box starve scan readahead, and
+/// a starved run reads peak heap LOW - which the next run then reads as a
+/// regression. Recording refuses; a check only warns, because a CI box that
+/// never goes quiet still has to be able to fail a real regression.
+fn guard_against_contention(check: bool, allow_contended: bool) -> Result<()> {
+    let busy = contending_processes();
+    if busy.is_empty() {
+        return Ok(());
+    }
+    let listed = busy
+        .iter()
+        .map(|entry| format!("\n  {entry}"))
+        .collect::<String>();
+    if check || allow_contended {
+        println!(
+            "WARNING: {} other build/bench process(es) are live; peak heap will read low:{listed}",
+            busy.len(),
+        );
+        return Ok(());
+    }
+    bail!(
+        "refusing to record while {} other build/bench process(es) are live - a loaded host \
+         reads peak heap low and plants a false regression for the next run:{listed}\n\
+         Wait for the box to go quiet, or pass --allow-contended to record anyway.",
+        busy.len(),
+    )
+}
+
+/// Other live `cargo`, `rustc` and `*bench*` processes, as "<pid> <cmdline>".
+/// This process and its ancestors (the `cargo bench` that launched the gate)
+/// are never contention.
+#[cfg(target_os = "linux")]
+fn contending_processes() -> Vec<String> {
+    let mine = own_process_chain();
+    let mut busy = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return busy;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if mine.contains(&pid) {
+            continue;
+        }
+        let Ok(raw) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        // The first two words, so a wrapper (`kache rustc ...`) is judged by
+        // what it wraps.
+        let names = argv.iter().take(2).filter_map(|arg| {
+            Path::new(arg)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        });
+        let hit = names.into_iter().any(|name| {
+            name == "cargo"
+                || name == "rustc"
+                || name.contains("bench")
+                || name.starts_with("gate-")
+        });
+        if !hit {
+            continue;
+        }
+        let mut line = argv.join(" ");
+        line.truncate(110);
+        busy.push(format!("{pid} {line}"));
+    }
+    busy.sort();
+    busy
+}
+
+/// This process and every ancestor up to pid 1.
+#[cfg(target_os = "linux")]
+fn own_process_chain() -> BTreeSet<u32> {
+    let mut chain = BTreeSet::new();
+    let mut pid = std::process::id();
+    while pid > 1 && chain.insert(pid) {
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            break;
+        };
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:"))
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        match parent {
+            Some(parent) => pid = parent,
+            None => break,
+        }
+    }
+    chain
+}
+
+/// No /proc, no guard: the gate runs on Linux and macOS, and a macOS host has
+/// no equally cheap way to enumerate processes without a new dependency.
+#[cfg(not(target_os = "linux"))]
+fn contending_processes() -> Vec<String> {
+    Vec::new()
 }
 
 /// Build once and learn the executable's path from cargo's JSON stream; every
