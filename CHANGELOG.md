@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.19.1](https://github.com/tenequm/pond/compare/v0.19.0...v0.19.1) - 2026-09-23
+
+### <!-- 2 -->🐛 Bug Fixes
+- **optimize:** detect legacy layout by the narrowest column's page count ([#307](https://github.com/tenequm/pond/pull/307)) ([439012a](https://github.com/tenequm/pond/commit/439012acd58718393024f6545da7a0864f8208bf))
+  `pond optimize --full` and `pond status` now detect the legacy tiny-page
+  layout on tables with large rows (messages), so the one-time heal covers
+  the whole store.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.0...v0.19.1
+
 ## [0.19.0](https://github.com/tenequm/pond/compare/v0.18.0...v0.19.0) - 2026-09-23
 
 Remote reads are ~10x faster: on S3, `pond get-session` drops from ~30 s to
