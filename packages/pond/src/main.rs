@@ -5867,7 +5867,12 @@ async fn render_sync_summary(store: &Store) -> anyhow::Result<()> {
     // Manifest-level findings only, read after `index_status` loaded the same
     // index sections so they cost no request. Legacy layout needs data-file
     // footers, which no sync phase holds, so it stays on the on-demand surfaces.
-    render_findings(&store.manifest_findings().await?, true)?;
+    // Advisory only: the sync already committed, so a failed read must not
+    // turn it into a failed run.
+    match store.manifest_findings().await {
+        Ok(findings) => render_findings(&findings, true)?,
+        Err(error) => tracing::warn!("maintenance diagnosis skipped: {error:#}"),
+    }
     Ok(())
 }
 
@@ -6702,16 +6707,19 @@ async fn run_full_optimize(
     findings: &[MaintenanceFinding],
 ) -> anyhow::Result<OptimizeOutcome> {
     for finding in findings {
-        if let MaintenanceFinding::OrphanIndex { index, .. } = finding {
-            store
-                .drop_index_by_name(index)
+        if let MaintenanceFinding::OrphanIndex { table, index } = finding
+            && store
+                .drop_orphan_index(*table, index)
                 .await
-                .with_context(|| format!("drop_index({index}) failed"))?;
+                .with_context(|| format!("drop_index({index}) failed"))?
+        {
             output(&format!("optimize: dropped orphaned index {index}"))?;
         }
     }
+    let mut reencoded = false;
     for finding in findings {
         if let MaintenanceFinding::LegacyLayout { table, layout } = finding {
+            reencoded = true;
             let started = std::time::Instant::now();
             let (progress, bar) = optimize_progress_bar();
             let result = store
@@ -6734,7 +6742,15 @@ async fn run_full_optimize(
     if pond::embed::embeddings_enabled() {
         output(&stage_line(started.elapsed(), "embed", "backlog complete"))?;
     }
-    for finding in findings {
+    // The re-encode's own index phase consolidates piled-up segments, so a
+    // pileup found before it may be gone; re-read the (cached) manifests rather
+    // than rebuild a large index a second time.
+    let pileups = if reencoded {
+        store.manifest_findings().await?
+    } else {
+        findings.to_vec()
+    };
+    for finding in &pileups {
         if let MaintenanceFinding::DeltaPileup { index, .. } = finding {
             if model_swapped && index == MESSAGES_VECTOR_INDEX {
                 continue;

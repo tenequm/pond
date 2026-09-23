@@ -2720,8 +2720,9 @@ impl Handle {
     }
 
     /// Fragments of `table` still carrying the tiny-page layout of a pre-#285
-    /// binary-copy compaction. Reads each data file's footer - about one GET
-    /// per fragment - so only the on-demand surfaces (`pond optimize`, `pond
+    /// binary-copy compaction. Reads each data file's column metadata - one
+    /// tail GET per healthy fragment, a second for a legacy one's larger
+    /// metadata - so only the on-demand surfaces (`pond optimize`, `pond
     /// status`) call it, never `pond sync`.
     pub async fn legacy_layout(&self, table: Table) -> Result<LegacyLayout> {
         use futures::{StreamExt, TryStreamExt};
@@ -2759,7 +2760,7 @@ impl Handle {
             }
         });
         let flagged: Vec<Option<(u64, u64)>> = futures::stream::iter(probes)
-            .buffer_unordered(16)
+            .buffer_unordered(LEGACY_LAYOUT_PROBE_CONCURRENCY)
             .try_collect()
             .await?;
         let mut layout = LegacyLayout::default();
@@ -3497,6 +3498,9 @@ pub struct LegacyLayout {
 
 const LEGACY_LAYOUT_MIN_PAGES: usize = 16;
 const LEGACY_LAYOUT_MAX_ROWS_PER_PAGE: u64 = 32;
+/// Footer reads in flight per table, well under the object store's own
+/// request parallelism so a status run leaves room for its other reads.
+const LEGACY_LAYOUT_PROBE_CONCURRENCY: usize = 16;
 
 /// Binary-copy compaction kept one page per per-sync append (~10 rows/page
 /// measured in #285), while the re-encoding writer flushes a column only at

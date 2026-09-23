@@ -3730,7 +3730,24 @@ impl Store {
         self.handle.drop_index(owner, name).await
     }
 
-    /// [`Self::reencode_fragments`] over every fragment of `table`.
+    /// Drop an index `diagnose` found orphaned on `table`. Returns `false` when
+    /// it is already gone (another host healed it since the diagnosis).
+    pub async fn drop_orphan_index(&self, table: Table, name: &str) -> Result<bool> {
+        match self.handle.drop_index(table, name).await {
+            Ok(()) => Ok(true),
+            Err(error)
+                if error
+                    .downcast_ref::<lance::Error>()
+                    .is_some_and(|err| matches!(err, lance::Error::IndexNotFound { .. })) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`Self::reencode_fragments`] over every fragment of `table` (a re-run
+    /// rewrites every fragment again).
     pub async fn reencode_table(
         &self,
         table: Table,
@@ -3779,20 +3796,28 @@ impl Store {
     }
 
     /// Every expensive condition `pond optimize --full` heals. Adds a LIMIT-1
-    /// model probe and the footer sweep (~1 GET per `sessions`/`messages`
-    /// fragment) to [`Self::manifest_findings`], so it is on-demand only.
+    /// model probe and the footer sweep (one GET per healthy `sessions` /
+    /// `messages` fragment, two plus the full column metadata per legacy one)
+    /// to [`Self::manifest_findings`], so it is on-demand only.
     pub async fn diagnose(&self) -> Result<Vec<MaintenanceFinding>> {
-        let mut findings = Vec::new();
-        if embed::embeddings_enabled() && self.embedding_model_swapped().await? {
-            findings.push(MaintenanceFinding::ModelSwap {
-                messages: self.handle.count_rows(Table::Messages).await? as u64,
-            });
-        }
-        findings.extend(self.manifest_findings().await?);
+        let model_swap = async {
+            if !embed::embeddings_enabled() || !self.embedding_model_swapped().await? {
+                return Ok(None);
+            }
+            let messages = self.handle.count_rows(Table::Messages).await? as u64;
+            Ok::<_, anyhow::Error>(Some(MaintenanceFinding::ModelSwap { messages }))
+        };
         // `parts` is skipped: its blob column already forces every compaction
         // to re-encode, so it never took the binary-copied layout.
-        for table in [Table::Sessions, Table::Messages] {
-            let layout = self.handle.legacy_layout(table).await?;
+        let (model_swap, manifest, sessions, messages) = tokio::try_join!(
+            model_swap,
+            self.manifest_findings(),
+            self.handle.legacy_layout(Table::Sessions),
+            self.handle.legacy_layout(Table::Messages),
+        )?;
+        let mut findings: Vec<MaintenanceFinding> = model_swap.into_iter().collect();
+        findings.extend(manifest);
+        for (table, layout) in [(Table::Sessions, sessions), (Table::Messages, messages)] {
             if !layout.fragment_ids.is_empty() {
                 findings.push(MaintenanceFinding::LegacyLayout { table, layout });
             }
@@ -3811,12 +3836,20 @@ impl Store {
         let mut findings = Vec::new();
         for (table, intents) in intents.all() {
             let (segments, table_rows) = self.handle.index_segments(table).await?;
-            for mut finding in index_findings(table, intents, &segments) {
-                if let MaintenanceFinding::DeltaPileup { rows, .. } = &mut finding {
-                    *rows = table_rows;
-                }
-                findings.push(finding);
-            }
+            findings.extend(
+                index_findings(table, intents, &segments, table_rows)
+                    .into_iter()
+                    // Leaving the vector index alone also means never
+                    // rebuilding it, which `rebuild_indices` refuses anyway.
+                    .filter(|finding| {
+                        embed::embeddings_enabled()
+                            || !matches!(
+                                finding,
+                                MaintenanceFinding::DeltaPileup { index, .. }
+                                    if index == MESSAGES_VECTOR_INDEX
+                            )
+                    }),
+            );
         }
         Ok(findings)
     }
@@ -5438,11 +5471,12 @@ pub enum MaintenanceFinding {
 const DELTA_PILEUP_SEGMENTS: usize = 2 * crate::substrate::DELTA_MERGE_THRESHOLD;
 
 /// Classify one table's `(index name, segment count)` manifest listing
-/// against its intents. `DeltaPileup` rows are left 0 for the caller to fill.
+/// against its intents; `table_rows` is what a pileup's rebuild re-indexes.
 fn index_findings(
     table: Table,
     intents: &[IndexIntent],
     segments: &[(String, usize)],
+    table_rows: u64,
 ) -> Vec<MaintenanceFinding> {
     segments
         .iter()
@@ -5459,7 +5493,7 @@ fn index_findings(
                     table,
                     index: name.clone(),
                     segments: *count,
-                    rows: 0,
+                    rows: table_rows,
                 })
             } else {
                 None
@@ -8283,7 +8317,7 @@ mod tests {
             ("__lance_frag_reuse", 1),
         ]);
         assert_eq!(
-            index_findings(Table::Messages, &intents.messages, &healthy),
+            index_findings(Table::Messages, &intents.messages, &healthy, 100),
             vec![]
         );
 
@@ -8292,13 +8326,13 @@ mod tests {
             ("messages_retired_btree", 1),
         ]);
         assert_eq!(
-            index_findings(Table::Messages, &intents.messages, &broken),
+            index_findings(Table::Messages, &intents.messages, &broken, 100),
             vec![
                 MaintenanceFinding::DeltaPileup {
                     table: Table::Messages,
                     index: MESSAGES_FTS_INDEX.to_owned(),
                     segments: DELTA_PILEUP_SEGMENTS,
-                    rows: 0,
+                    rows: 100,
                 },
                 MaintenanceFinding::OrphanIndex {
                     table: Table::Messages,
