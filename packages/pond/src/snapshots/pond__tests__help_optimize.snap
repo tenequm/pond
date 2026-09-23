@@ -4,7 +4,7 @@ expression: sub.render_long_help().to_string()
 ---
 Keep the lake queryable: embed the backlog, then fold the search indexes.
 
-The maintenance verb. `embed` fills vectors for every message with a null `vector` (idempotent: a re-run resumes exactly where it stopped); `index` folds trailing fragments into the text + semantic indexes and runs the `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds inline and folds by default; this is the on-demand maintenance run and the model-swap re-embed (`--force-embed`).
+The maintenance verb. `embed` fills vectors for every message with a null `vector` (idempotent: a re-run resumes exactly where it stopped); `index` folds trailing fragments into the text + semantic indexes and runs the `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds inline and folds by default; this is the on-demand maintenance run. It also diagnoses the expensive conditions it does not fix - a model swap, piled-up index segments, orphaned indexes, the legacy tiny-page layout - and names the cost of healing them with `--full`.
 
 Usage: pond optimize [OPTIONS]
 
@@ -33,6 +33,9 @@ Options:
           
           [possible values: sessions, messages]
 
+      --full
+          Heal everything the diagnosis finds, costs printed first: drop orphaned indexes, re-encode legacy-layout fragments, re-embed after a model swap, rebuild piled-up indexes, then the normal embed + fold. Idempotent: a re-run heals only what is still found. Rewrites grow the store until version cleanup reclaims the old files
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -56,7 +59,8 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond optimize                      embed any backlog, then fold indexes
+  pond optimize                      embed any backlog, fold indexes, report what --full would heal
+  pond optimize --full               also heal everything the report names
   pond optimize --only index         fold indexes only
   pond optimize --only embed         embed only
   pond optimize --force-embed        re-embed stale rows after a model change

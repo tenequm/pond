@@ -22,7 +22,8 @@ use pond::{
     handlers::{self, IngestSummary, SessionOutcome, SyncEvent, SyncStatus},
     sessions::{
         EmbeddingProgress, LanceArchiveCounts, LanceArchiveExport, LanceArchiveImport,
-        MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, OptimizeOutcome, RowTotals, Store,
+        MESSAGES_FTS_INDEX, MESSAGES_VECTOR_INDEX, MaintenanceFinding, OptimizeOutcome, RowTotals,
+        Store,
     },
     substrate::{
         self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
@@ -941,10 +942,13 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
     /// `vector` (idempotent: a re-run resumes exactly where it stopped); `index`
     /// folds trailing fragments into the text + semantic indexes and runs the
     /// `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds
-    /// inline and folds by default; this is the on-demand maintenance run and
-    /// the model-swap re-embed (`--force-embed`).
+    /// inline and folds by default; this is the on-demand maintenance run. It
+    /// also diagnoses the expensive conditions it does not fix - a model swap,
+    /// piled-up index segments, orphaned indexes, the legacy tiny-page layout -
+    /// and names the cost of healing them with `--full`.
     #[command(after_long_help = "Examples:
-  pond optimize                      embed any backlog, then fold indexes
+  pond optimize                      embed any backlog, fold indexes, report what --full would heal
+  pond optimize --full               also heal everything the report names
   pond optimize --only index         fold indexes only
   pond optimize --only embed         embed only
   pond optimize --force-embed        re-embed stale rows after a model change
@@ -983,6 +987,13 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
         /// date-filtered searches fail until the run finishes.
         #[arg(long, value_enum, value_name = "TABLE", conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index"])]
         reencode: Option<ReencodeTable>,
+        /// Heal everything the diagnosis finds, costs printed first: drop
+        /// orphaned indexes, re-encode legacy-layout fragments, re-embed after
+        /// a model swap, rebuild piled-up indexes, then the normal embed + fold.
+        /// Idempotent: a re-run heals only what is still found. Rewrites grow
+        /// the store until version cleanup reclaims the old files.
+        #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index", "reencode"])]
+        full: bool,
     },
 }
 
@@ -1418,6 +1429,7 @@ async fn run() -> anyhow::Result<()> {
                     embedding,
                     searchable_only,
                     host_activity,
+                    findings,
                 ) = tokio::try_join!(
                     store.table_sizes(),
                     store.row_counts(),
@@ -1426,7 +1438,14 @@ async fn run() -> anyhow::Result<()> {
                     embedding_fut,
                     searchable_fut,
                     hosts_fut,
+                    // A failed footer read must not take the health surface
+                    // down with it; the other checks still render.
+                    async { Ok(store.diagnose().await) },
                 )?;
+                let findings = findings.unwrap_or_else(|error| {
+                    tracing::warn!("maintenance diagnosis skipped: {error:#}");
+                    Vec::new()
+                });
                 let totals = RowTotals {
                     sessions: sessions as u64,
                     messages: messages as u64,
@@ -1441,6 +1460,7 @@ async fn run() -> anyhow::Result<()> {
                         .map(|e| e.total as u64)
                         .or(searchable_only.map(|n| n as u64)),
                     embedding,
+                    findings: &findings,
                 };
                 // One scheduler probe (a launchctl/systemctl spawn) serves
                 // both the rendered line and the next-run estimate.
@@ -1527,6 +1547,7 @@ async fn run() -> anyhow::Result<()> {
             rebuild,
             drop_index,
             reencode,
+            full,
         } => {
             let cmd_started = std::time::Instant::now();
             let loaded = Config::load(config_path(config))?;
@@ -1572,9 +1593,42 @@ async fn run() -> anyhow::Result<()> {
                     .await
                     .context("cleanup after rebuild failed")?;
                 output("optimize: indexes rebuilt, old segments reclaimed")?;
+            } else if full {
+                let policy = configured_maintenance_policy(&loaded, None)?;
+                let findings = store.diagnose().await.context("diagnosis failed")?;
+                if findings.is_empty() {
+                    output("optimize --full: nothing to heal beyond routine maintenance")?;
+                } else {
+                    output("optimize --full: healing")?;
+                    render_findings(&findings, false)?;
+                    if crate::schedule::status_snapshot().active {
+                        output(&pond::output::paint(
+                            "warn      a sync schedule is active on this host, and syncs committing \
+                             during these heals are untested - Ctrl-C now (safe, each rewrite \
+                             commits per fragment), run `pond schedule stop` on every host syncing \
+                             this store, re-run, then `pond schedule start`",
+                            pond::output::yellow(),
+                        ))?;
+                    }
+                }
+                let outcome = run_full_optimize(&store, &policy, &findings).await?;
+                if outcome.any_indices_failed() {
+                    std::process::exit(1);
+                }
             } else {
                 let stages = OptimizeStages::resolve(only, &skip)?;
                 let policy = configured_maintenance_policy(&loaded, None)?;
+                // Bare `pond optimize` only: a scoped `--only`/`--skip` run is
+                // asked for one stage and should not pay the footer sweep.
+                if only.is_none() && skip.is_empty() {
+                    match store.diagnose().await {
+                        Ok(findings) => render_findings(&findings, true)?,
+                        Err(error) => output(&pond::output::paint(
+                            &format!("warn      diagnosis skipped: {error:#}"),
+                            pond::output::yellow(),
+                        ))?,
+                    }
+                }
                 let outcome = if stages.embed && stages.index {
                     // Full optimize: the same finalize seam sync and copy use.
                     let started = std::time::Instant::now();
@@ -5810,6 +5864,10 @@ async fn render_sync_summary(store: &Store) -> anyhow::Result<()> {
         format_thousands(stored_sessions as u64),
         format_thousands(stored_messages as u64),
     ))?;
+    // Manifest-level findings only, read after `index_status` loaded the same
+    // index sections so they cost no request. Legacy layout needs data-file
+    // footers, which no sync phase holds, so it stays on the on-demand surfaces.
+    render_findings(&store.manifest_findings().await?, true)?;
     Ok(())
 }
 
@@ -6535,6 +6593,170 @@ fn optimize_progress_bar() -> (OptimizeProgressFn, ProgressBar) {
     (callback, bar)
 }
 
+/// A finding as `(condition, heal cost)`. Shared by `pond optimize`, `pond
+/// status`, and `pond sync`.
+fn finding_parts(finding: &MaintenanceFinding) -> (String, String) {
+    match finding {
+        MaintenanceFinding::ModelSwap { messages } => (
+            "messages: embedded under a different model".to_owned(),
+            format!(
+                "re-embeds up to {} messages under {:?} and rebuilds the vector index",
+                format_thousands(*messages),
+                pond::embed::model_id(),
+            ),
+        ),
+        MaintenanceFinding::DeltaPileup {
+            table,
+            index,
+            segments,
+            rows,
+        } => (
+            format!(
+                "{}: index {index} piled up {segments} delta segments",
+                table.as_str()
+            ),
+            format!("rebuilds it over {} rows", format_thousands(*rows)),
+        ),
+        MaintenanceFinding::OrphanIndex { table, index } => (
+            format!("{}: orphaned index {index}", table.as_str()),
+            "drops it, manifest-only".to_owned(),
+        ),
+        MaintenanceFinding::LegacyLayout { table, layout } => {
+            let fragments = layout.fragment_ids.len();
+            (
+                format!(
+                    "{}: legacy page layout detected in {} fragment{}",
+                    table.as_str(),
+                    format_thousands(fragments as u64),
+                    if fragments == 1 { "" } else { "s" },
+                ),
+                format!(
+                    "~{} rewrite, the store grows by that much until version cleanup",
+                    format_bytes(layout.bytes)
+                ),
+            )
+        }
+    }
+}
+
+/// One `heal` line per finding. `pending` names the command that heals it;
+/// `pond optimize --full` itself prints only the costs it is about to pay.
+fn render_findings(findings: &[MaintenanceFinding], pending: bool) -> anyhow::Result<()> {
+    use pond::output::{paint, yellow};
+    for finding in findings {
+        let (condition, cost) = finding_parts(finding);
+        let line = if pending {
+            format!("{condition} -> run `pond optimize --full` ({cost})")
+        } else {
+            format!("{condition} ({cost})")
+        };
+        output(&format!("{}      {line}", paint("heal", yellow())))?;
+    }
+    Ok(())
+}
+
+/// `pond status --format json` shape of one finding.
+fn finding_json(finding: &MaintenanceFinding) -> serde_json::Value {
+    let mut doc = match finding {
+        MaintenanceFinding::ModelSwap { messages } => serde_json::json!({
+            "kind": "model_swap",
+            "table": "messages",
+            "rows": messages,
+        }),
+        MaintenanceFinding::DeltaPileup {
+            table,
+            index,
+            segments,
+            rows,
+        } => serde_json::json!({
+            "kind": "delta_pileup",
+            "table": table.as_str(),
+            "index": index,
+            "segments": segments,
+            "rows": rows,
+        }),
+        MaintenanceFinding::OrphanIndex { table, index } => serde_json::json!({
+            "kind": "orphan_index",
+            "table": table.as_str(),
+            "index": index,
+        }),
+        MaintenanceFinding::LegacyLayout { table, layout } => serde_json::json!({
+            "kind": "legacy_layout",
+            "table": table.as_str(),
+            "fragments": layout.fragment_ids.len(),
+            "rewrite_bytes": layout.bytes,
+        }),
+    };
+    doc["fix"] = "pond optimize --full".into();
+    doc
+}
+
+/// `pond optimize --full`: heal every finding, then run the routine embed +
+/// fold. Order avoids wasted work: orphan drops are manifest-only; re-encode
+/// precedes any rebuild (its own index phase re-folds what the rewrite
+/// touched); the forced re-embed drops the vector index before a rebuild could
+/// waste a pass on it; the final fold recreates it and cleans versions.
+async fn run_full_optimize(
+    store: &Store,
+    policy: &MaintenancePolicy,
+    findings: &[MaintenanceFinding],
+) -> anyhow::Result<OptimizeOutcome> {
+    for finding in findings {
+        if let MaintenanceFinding::OrphanIndex { index, .. } = finding {
+            store
+                .drop_index_by_name(index)
+                .await
+                .with_context(|| format!("drop_index({index}) failed"))?;
+            output(&format!("optimize: dropped orphaned index {index}"))?;
+        }
+    }
+    for finding in findings {
+        if let MaintenanceFinding::LegacyLayout { table, layout } = finding {
+            let started = std::time::Instant::now();
+            let (progress, bar) = optimize_progress_bar();
+            let result = store
+                .reencode_fragments(*table, layout.fragment_ids.clone(), Some(progress))
+                .await;
+            bar.finish_and_clear();
+            let rewritten = result?;
+            output(&stage_line(
+                started.elapsed(),
+                "rewrite",
+                &format!("{rewritten} {} fragments", table.as_str()),
+            ))?;
+        }
+    }
+    let model_swapped = findings
+        .iter()
+        .any(|finding| matches!(finding, MaintenanceFinding::ModelSwap { .. }));
+    let started = std::time::Instant::now();
+    run_embed_stage(store, model_swapped).await?;
+    if pond::embed::embeddings_enabled() {
+        output(&stage_line(started.elapsed(), "embed", "backlog complete"))?;
+    }
+    for finding in findings {
+        if let MaintenanceFinding::DeltaPileup { index, .. } = finding {
+            if model_swapped && index == MESSAGES_VECTOR_INDEX {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let (progress, bar) = optimize_progress_bar();
+            let result = store.rebuild_indices(Some(index), Some(progress)).await;
+            bar.finish_and_clear();
+            result.with_context(|| format!("rebuilding {index} failed"))?;
+            output(&stage_line(started.elapsed(), "rebuild", index))?;
+        }
+    }
+    let started = std::time::Instant::now();
+    let outcome = run_update_indexes_stage(store, policy).await?;
+    output(&stage_line(
+        started.elapsed(),
+        "fold",
+        "indexes folded + compacted",
+    ))?;
+    Ok(outcome)
+}
+
 /// Deferral and failure lines only, no per-table table. Used by `pond sync`,
 /// whose summary line already carries per-table status; the table would just
 /// repeat it.
@@ -6713,7 +6935,7 @@ fn status_json(
             })
             .collect::<Vec<_>>()
     });
-    let doc = serde_json::json!({
+    let mut doc = serde_json::json!({
         "pond_version": VERSION.as_str(),
         "embeddings_enabled": pond::embed::embeddings_enabled(),
         "storage": {
@@ -6757,6 +6979,9 @@ fn status_json(
         },
         "initialized": true,
     });
+    if !checks.findings.is_empty() {
+        doc["maintenance"] = checks.findings.iter().map(finding_json).collect();
+    }
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
 }
 
@@ -6880,6 +7105,8 @@ struct StatusChecks<'a> {
     /// embedding probe when enabled, from FTS `num_docs` when disabled.
     searchable: Option<u64>,
     embedding: Option<EmbeddingProgress>,
+    /// What `pond optimize --full` would heal (`Store::diagnose`).
+    findings: &'a [MaintenanceFinding],
 }
 
 /// Render the checks that can take longer on a large corpus. The command
@@ -6921,6 +7148,7 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         paint("agents", dim()),
         checks.adapter_count,
     ))?;
+    render_findings(checks.findings, true)?;
     if checks.searchable.is_none() {
         let hint = if pond::embed::embeddings_enabled() {
             "(use -v for searchable message count + embedding backlog)"

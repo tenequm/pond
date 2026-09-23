@@ -2658,22 +2658,27 @@ impl Handle {
         }
     }
 
-    /// One-time layout repair (`pond optimize --reencode <table>`): rewrite
-    /// every fragment through the re-encoding writer, one commit per fragment
-    /// so an interrupted run leaves a valid, partly repaired table (a re-run
-    /// rewrites every fragment again). Returns fragments rewritten.
-    pub async fn reencode_table(
-        &self,
-        table: Table,
-        progress: Option<&OptimizeProgressFn>,
-    ) -> Result<usize> {
-        let fragment_ids: Vec<u64> = self
+    /// Every fragment id of `table`, in manifest order.
+    pub async fn fragment_ids(&self, table: Table) -> Result<Vec<u64>> {
+        Ok(self
             .dataset(table)
             .await?
             .get_fragments()
             .iter()
             .map(|fragment| fragment.id() as u64)
-            .collect();
+            .collect())
+    }
+
+    /// Layout repair (`pond optimize --reencode <table>` / `--full`): rewrite
+    /// the given fragments through the re-encoding writer, one commit per
+    /// fragment so an interrupted run leaves a valid, partly repaired table.
+    /// Returns fragments rewritten.
+    pub async fn reencode_fragments(
+        &self,
+        table: Table,
+        fragment_ids: Vec<u64>,
+        progress: Option<&OptimizeProgressFn>,
+    ) -> Result<usize> {
         emit(
             progress,
             OptimizeEvent::PhaseStart {
@@ -2712,6 +2717,80 @@ impl Handle {
             },
         );
         rewritten
+    }
+
+    /// Fragments of `table` still carrying the tiny-page layout of a pre-#285
+    /// binary-copy compaction. Reads each data file's footer - about one GET
+    /// per fragment - so only the on-demand surfaces (`pond optimize`, `pond
+    /// status`) call it, never `pond sync`.
+    pub async fn legacy_layout(&self, table: Table) -> Result<LegacyLayout> {
+        use futures::{StreamExt, TryStreamExt};
+        use lance_file::reader::FileReader;
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
+        let dataset = self.dataset(table).await?;
+        let object_store = dataset.object_store(None).await?;
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let data_dir = dataset.data_dir();
+        let probes = dataset.get_fragments().into_iter().map(|fragment| {
+            let scheduler = scheduler.clone();
+            let data_dir = data_dir.clone();
+            async move {
+                let metadata = fragment.metadata();
+                let mut max_column_pages = 0;
+                for file in &metadata.files {
+                    let path = data_dir.clone().join(file.path.as_str());
+                    let reader = scheduler.open_file(&path, &file.file_size_bytes).await?;
+                    let footer = FileReader::read_all_metadata(&reader)
+                        .await
+                        .with_context(|| format!("reading the footer of {}", file.path))?;
+                    for column in &footer.column_infos {
+                        max_column_pages = max_column_pages.max(column.page_infos.len());
+                    }
+                }
+                let stat = fragment_stat(metadata);
+                Ok::<_, anyhow::Error>(
+                    is_legacy_page_layout(stat.rows, max_column_pages)
+                        .then(|| (metadata.id, stat.bytes.unwrap_or(0))),
+                )
+            }
+        });
+        let flagged: Vec<Option<(u64, u64)>> = futures::stream::iter(probes)
+            .buffer_unordered(16)
+            .try_collect()
+            .await?;
+        let mut layout = LegacyLayout::default();
+        for (fragment_id, bytes) in flagged.into_iter().flatten() {
+            layout.fragment_ids.push(fragment_id);
+            layout.bytes += bytes;
+        }
+        layout.fragment_ids.sort_unstable();
+        Ok(layout)
+    }
+
+    /// Segment count per index name (delta segments share their index's
+    /// name), plus the table's physical row count. Reads the cached handle
+    /// without a freshness check and the index section from the metadata
+    /// cache, so right after an index-status pass it issues no request - the
+    /// property the `pond sync` summary relies on.
+    pub async fn index_segments(&self, table: Table) -> Result<(Vec<(String, usize)>, u64)> {
+        let dataset = self.cached(table).await?.lock().await.dataset.clone();
+        let rows = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().physical_rows.unwrap_or(0) as u64)
+            .sum();
+        let mut segments: Vec<(String, usize)> = Vec::new();
+        for index in dataset.load_indices().await?.iter() {
+            match segments.iter_mut().find(|(name, _)| *name == index.name) {
+                Some((_, count)) => *count += 1,
+                None => segments.push((index.name.clone(), 1)),
+            }
+        }
+        Ok((segments, rows))
     }
 
     pub async fn rebuild_index(
@@ -3406,6 +3485,26 @@ fn compaction_options(target_rows_per_fragment: usize) -> CompactionOptions {
         compaction_mode: Some(CompactionMode::Reencode),
         ..CompactionOptions::default()
     }
+}
+
+/// Fragments of one table flagged by [`Handle::legacy_layout`], with the
+/// data-file bytes a re-encode of them rewrites.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyLayout {
+    pub fragment_ids: Vec<u64>,
+    pub bytes: u64,
+}
+
+const LEGACY_LAYOUT_MIN_PAGES: usize = 16;
+const LEGACY_LAYOUT_MAX_ROWS_PER_PAGE: u64 = 32;
+
+/// Binary-copy compaction kept one page per per-sync append (~10 rows/page
+/// measured in #285), while the re-encoding writer flushes a column only at
+/// ~8 MiB, so a healthy column stays under 32 rows/page only if its values
+/// average over 256 KiB.
+fn is_legacy_page_layout(physical_rows: u64, max_column_pages: usize) -> bool {
+    max_column_pages >= LEGACY_LAYOUT_MIN_PAGES
+        && physical_rows < LEGACY_LAYOUT_MAX_ROWS_PER_PAGE * max_column_pages as u64
 }
 
 /// Rewrite one fragment in place through the re-encoding writer, so a fragment
@@ -5843,6 +5942,21 @@ mod tests {
             .resolve(&BTreeMap::new())
             .unwrap();
         storage_check(&resolved).await.expect("memory probe passes");
+    }
+
+    #[test]
+    fn legacy_page_layout_flags_only_tiny_pages() {
+        // #285's `sessions` fragment: 20k rows over 2,057 pages per column.
+        assert!(is_legacy_page_layout(20_000, 2_057));
+        assert!(
+            !is_legacy_page_layout(20_000, 3),
+            "re-encoded: few big pages"
+        );
+        assert!(
+            !is_legacy_page_layout(12, 12),
+            "too few pages to cost a take"
+        );
+        assert!(!is_legacy_page_layout(640, 16), "wide rows at 40 rows/page");
     }
 
     #[test]

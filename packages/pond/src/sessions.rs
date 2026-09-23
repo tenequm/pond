@@ -39,9 +39,9 @@ use crate::{
         discover_chain,
     },
     substrate::{
-        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, MaintenancePolicy,
-        OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts, Table,
-        TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
+        Handle, IndexIntent, IndexParamsKind, IndexStatus, IndexTrigger, LegacyLayout,
+        MaintenancePolicy, OptimizeProgressFn, PhaseOutcome, Predicate, ScalarValue, ScanOpts,
+        Table, TableOptimizeOutcome, TableSizes, VECTOR_INDEX_ACTIVATION_ROWS,
     },
     wire::{
         FileData, Message, Part, PartKind, ProviderOptions, Role, SUMMARY_PART_TYPES, Session,
@@ -3730,18 +3730,32 @@ impl Store {
         self.handle.drop_index(owner, name).await
     }
 
-    /// Rewrite every fragment of `table` through the re-encoding writer (see
-    /// [`crate::substrate::Handle::reencode_table`]), then run its indices
-    /// phase: a rewrite orphans address-domain indexes, and that phase is what
-    /// detects and recreates them. The phase runs even when the rewrite fails
-    /// part-way, since every fragment committed before the failure already
-    /// orphaned them. Returns fragments rewritten.
+    /// [`Self::reencode_fragments`] over every fragment of `table`.
     pub async fn reencode_table(
         &self,
         table: Table,
         progress: Option<OptimizeProgressFn>,
     ) -> Result<usize> {
-        let reencoded = self.handle.reencode_table(table, progress.as_ref()).await;
+        let fragment_ids = self.handle.fragment_ids(table).await?;
+        self.reencode_fragments(table, fragment_ids, progress).await
+    }
+
+    /// Rewrite `fragment_ids` of `table` through the re-encoding writer (see
+    /// [`crate::substrate::Handle::reencode_fragments`]), then run its indices
+    /// phase: a rewrite orphans address-domain indexes, and that phase is what
+    /// detects and recreates them. The phase runs even when the rewrite fails
+    /// part-way, since every fragment committed before the failure already
+    /// orphaned them. Returns fragments rewritten.
+    pub async fn reencode_fragments(
+        &self,
+        table: Table,
+        fragment_ids: Vec<u64>,
+        progress: Option<OptimizeProgressFn>,
+    ) -> Result<usize> {
+        let reencoded = self
+            .handle
+            .reencode_fragments(table, fragment_ids, progress.as_ref())
+            .await;
         let policy = pond_index_intents();
         let Some((_, intents)) = policy.all().into_iter().find(|(owner, _)| *owner == table) else {
             return reencoded;
@@ -3762,6 +3776,49 @@ impl Store {
             ),
             PhaseOutcome::Ok | PhaseOutcome::Noop | PhaseOutcome::NotAttempted => Ok(rewritten),
         }
+    }
+
+    /// Every expensive condition `pond optimize --full` heals. Adds a LIMIT-1
+    /// model probe and the footer sweep (~1 GET per `sessions`/`messages`
+    /// fragment) to [`Self::manifest_findings`], so it is on-demand only.
+    pub async fn diagnose(&self) -> Result<Vec<MaintenanceFinding>> {
+        let mut findings = Vec::new();
+        if embed::embeddings_enabled() && self.embedding_model_swapped().await? {
+            findings.push(MaintenanceFinding::ModelSwap {
+                messages: self.handle.count_rows(Table::Messages).await? as u64,
+            });
+        }
+        findings.extend(self.manifest_findings().await?);
+        // `parts` is skipped: its blob column already forces every compaction
+        // to re-encode, so it never took the binary-copied layout.
+        for table in [Table::Sessions, Table::Messages] {
+            let layout = self.handle.legacy_layout(table).await?;
+            if !layout.fragment_ids.is_empty() {
+                findings.push(MaintenanceFinding::LegacyLayout { table, layout });
+            }
+        }
+        Ok(findings)
+    }
+
+    /// The findings readable from the manifests' index sections alone - delta
+    /// pileups and orphaned indexes - so `pond sync` reports them at no extra
+    /// request cost (its index-status read already loaded those sections; see
+    /// [`crate::substrate::Handle::index_segments`]).
+    pub async fn manifest_findings(&self) -> Result<Vec<MaintenanceFinding>> {
+        // Vector intent included regardless of the embedding switch: a disabled
+        // instance leaves the vector index alone, it is not an orphan.
+        let intents = pond_index_intents_with_vector_threshold(VECTOR_INDEX_ACTIVATION_ROWS, true);
+        let mut findings = Vec::new();
+        for (table, intents) in intents.all() {
+            let (segments, table_rows) = self.handle.index_segments(table).await?;
+            for mut finding in index_findings(table, intents, &segments) {
+                if let MaintenanceFinding::DeltaPileup { rows, .. } = &mut finding {
+                    *rows = table_rows;
+                }
+                findings.push(finding);
+            }
+        }
+        Ok(findings)
     }
 
     pub async fn index_status(&self) -> Result<Vec<IndexStatus>> {
@@ -5353,6 +5410,63 @@ pub const MESSAGES_VECTOR_INDEX: &str = "messages_vector_ivfpq";
 /// - cosine metric (e5 vectors are L2-normalized)
 const IVF_SQ_NUM_BITS: u16 = 8;
 const IVF_SQ_MAX_ITERS: usize = 15;
+
+/// An expensive storage condition only `pond optimize --full` heals: the
+/// routine maintenance paths leave it alone because pond never self-initiates
+/// a large rewrite (spec.md#lance-index-maintenance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintenanceFinding {
+    /// `messages` embedded under a model other than the configured one;
+    /// `messages` is the table's row count, the re-embed's upper bound.
+    ModelSwap { messages: u64 },
+    /// An index whose delta segments piled up past what the fold consolidates;
+    /// `rows` is the table size a rebuild re-indexes.
+    DeltaPileup {
+        table: Table,
+        index: String,
+        segments: usize,
+        rows: u64,
+    },
+    /// An index no current intent names, e.g. a renamed intent's old name.
+    OrphanIndex { table: Table, index: String },
+    /// Fragments still in the tiny-page layout of a pre-#285 compaction.
+    LegacyLayout { table: Table, layout: LegacyLayout },
+}
+
+/// The fold consolidates at `DELTA_MERGE_THRESHOLD`, and concurrent hosts
+/// appending in the same window overshoot it by only a segment or two.
+const DELTA_PILEUP_SEGMENTS: usize = 2 * crate::substrate::DELTA_MERGE_THRESHOLD;
+
+/// Classify one table's `(index name, segment count)` manifest listing
+/// against its intents. `DeltaPileup` rows are left 0 for the caller to fill.
+fn index_findings(
+    table: Table,
+    intents: &[IndexIntent],
+    segments: &[(String, usize)],
+) -> Vec<MaintenanceFinding> {
+    segments
+        .iter()
+        // `__`-prefixed names are Lance's own system indexes.
+        .filter(|(name, _)| !name.starts_with("__"))
+        .filter_map(|(name, count)| {
+            if !intents.iter().any(|intent| intent.name == name.as_str()) {
+                Some(MaintenanceFinding::OrphanIndex {
+                    table,
+                    index: name.clone(),
+                })
+            } else if *count >= DELTA_PILEUP_SEGMENTS {
+                Some(MaintenanceFinding::DeltaPileup {
+                    table,
+                    index: name.clone(),
+                    segments: *count,
+                    rows: 0,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 /// Pond's production IndexIntents: the per-table intent set the maintenance
 /// paths (sync/optimize/copy) reconcile against the store.
@@ -8152,6 +8266,46 @@ mod tests {
         assert_eq!(sessions.count_rows(None).await?, 12);
         assert_eq!(max_pages_per_column(&sessions).await?, 1);
         Ok(())
+    }
+
+    #[test]
+    fn index_findings_flag_orphans_and_pileups_only() {
+        let intents = pond_index_intents_with_vector_threshold(1, true);
+        let segments = |pairs: &[(&str, usize)]| -> Vec<(String, usize)> {
+            pairs
+                .iter()
+                .map(|(name, count)| ((*name).to_owned(), *count))
+                .collect()
+        };
+        let healthy = segments(&[
+            (MESSAGES_FTS_INDEX, crate::substrate::DELTA_MERGE_THRESHOLD),
+            (MESSAGES_VECTOR_INDEX, 1),
+            ("__lance_frag_reuse", 1),
+        ]);
+        assert_eq!(
+            index_findings(Table::Messages, &intents.messages, &healthy),
+            vec![]
+        );
+
+        let broken = segments(&[
+            (MESSAGES_FTS_INDEX, DELTA_PILEUP_SEGMENTS),
+            ("messages_retired_btree", 1),
+        ]);
+        assert_eq!(
+            index_findings(Table::Messages, &intents.messages, &broken),
+            vec![
+                MaintenanceFinding::DeltaPileup {
+                    table: Table::Messages,
+                    index: MESSAGES_FTS_INDEX.to_owned(),
+                    segments: DELTA_PILEUP_SEGMENTS,
+                    rows: 0,
+                },
+                MaintenanceFinding::OrphanIndex {
+                    table: Table::Messages,
+                    index: "messages_retired_btree".to_owned(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]

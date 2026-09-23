@@ -24,6 +24,8 @@ mod index_fold;
 mod lance_smoke;
 #[path = "integration/missing_source.rs"]
 mod missing_source;
+#[path = "integration/optimize_full.rs"]
+mod optimize_full;
 #[path = "integration/optimize_under_contention.rs"]
 mod optimize_under_contention;
 #[path = "integration/recovery.rs"]
