@@ -12,7 +12,7 @@ use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::index::DatasetIndexRemapperOptions;
 use lance::dataset::optimize::{
-    CompactionMode, CompactionOptions, commit_compaction, plan_compaction,
+    CompactionMode, CompactionOptions, CompactionTask, TaskData, commit_compaction, plan_compaction,
 };
 pub use lance::dataset::write::merge_insert::MergeStats;
 use lance::dataset::write::merge_insert::SourceDedupeBehavior;
@@ -2658,6 +2658,57 @@ impl Handle {
         }
     }
 
+    /// One-time layout repair (`pond optimize --reencode <table>`): rewrite
+    /// every fragment through the re-encoding writer, one commit per fragment
+    /// so an interrupted run keeps its progress. Returns fragments rewritten.
+    pub async fn reencode_table(
+        &self,
+        table: Table,
+        progress: Option<&OptimizeProgressFn>,
+    ) -> Result<usize> {
+        let fragment_ids: Vec<u64> = {
+            let mut guard = self.cached(table).await?.lock().await;
+            let dataset = guard.latest().await?;
+            dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u64)
+                .collect()
+        };
+        emit(
+            progress,
+            OptimizeEvent::PhaseStart {
+                table,
+                phase: OptimizePhase::Compact,
+                detail: None,
+            },
+        );
+        let started = Instant::now();
+        let mut rewritten = 0;
+        for fragment_id in fragment_ids {
+            let did_rewrite = self
+                .retry_lance(table.label(), || async {
+                    let mut guard = self.cached(table).await?.lock().await;
+                    let mut dataset = guard.latest().await?;
+                    let did_rewrite = reencode_fragment(&mut dataset, fragment_id).await?;
+                    guard.replace(dataset);
+                    Ok::<_, anyhow::Error>(did_rewrite)
+                })
+                .await
+                .with_context(|| format!("re-encoding {} fragment {fragment_id}", table.label()))?;
+            rewritten += usize::from(did_rewrite);
+        }
+        emit(
+            progress,
+            OptimizeEvent::PhaseDone {
+                table,
+                phase: OptimizePhase::Compact,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
+        Ok(rewritten)
+    }
+
     pub async fn rebuild_index(
         &self,
         table: Table,
@@ -3224,17 +3275,7 @@ async fn optimize_table_compact(
         .iter()
         .map(|fragment| fragment_stat(fragment.metadata()))
         .collect();
-    let compaction = CompactionOptions {
-        target_rows_per_fragment: derived_target_rows(&stats),
-        max_bytes_per_file: Some(TARGET_FRAGMENT_BYTES as usize),
-        defer_index_remap: false,
-        // Binary-copy eligible fragments (concatenate encoded pages, no
-        // decode/re-encode) and fall back to Reencode automatically for blob
-        // (parts), deletion-bearing, or schema-varied fragments. ~27% faster on
-        // the messages/sessions reencode path, safe everywhere else.
-        compaction_mode: Some(CompactionMode::TryBinaryCopy),
-        ..CompactionOptions::default()
-    };
+    let compaction = compaction_options(derived_target_rows(&stats));
 
     let mut plan = plan_compaction(dataset, &compaction).await?;
     if policy.compaction_fragment_cap > 0 {
@@ -3343,6 +3384,51 @@ async fn optimize_table_compact(
     }
 
     Ok(())
+}
+
+/// Always `Reencode`, never binary copy: binary copy concatenates the input
+/// pages, so every tiny per-sync append survives as its own page, and lance 12
+/// reads each page's metadata on every take of a projected column (#285: a
+/// 20k-row `sessions` fragment with 2,057 pages/column cost 11,300 GETs per
+/// one-row take, 15 after a re-encode). Re-encoding is ~27% slower to compact.
+/// `parts` never binary-copied anyway: lance refuses it for blob columns.
+fn compaction_options(target_rows_per_fragment: usize) -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment,
+        max_bytes_per_file: Some(TARGET_FRAGMENT_BYTES as usize),
+        defer_index_remap: false,
+        compaction_mode: Some(CompactionMode::Reencode),
+        ..CompactionOptions::default()
+    }
+}
+
+/// Rewrite one fragment in place through the re-encoding writer, so a fragment
+/// an older binary-copy compaction left with thousands of tiny pages collapses
+/// to few. One fragment per task keeps the layout the compaction veto settled.
+/// Returns `false` when the fragment is gone (a concurrent compaction took it).
+async fn reencode_fragment(dataset: &mut Dataset, fragment_id: u64) -> Result<bool> {
+    let Some(fragment) = dataset.get_fragment(fragment_id as usize) else {
+        return Ok(false);
+    };
+    // Unbounded row target: exactly one output per input, byte cap permitting.
+    let options = compaction_options(usize::MAX);
+    let rewritten = CompactionTask {
+        task: TaskData {
+            fragments: vec![fragment.metadata().clone()],
+        },
+        read_version: dataset.version().version,
+        options: options.clone(),
+    }
+    .execute(dataset)
+    .await?;
+    commit_compaction(
+        dataset,
+        vec![rewritten],
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Gate for the version-cleanup walk: interval `<= 1` cleans every optimize,
@@ -5751,6 +5837,16 @@ mod tests {
             .resolve(&BTreeMap::new())
             .unwrap();
         storage_check(&resolved).await.expect("memory probe passes");
+    }
+
+    #[test]
+    fn compaction_never_binary_copies() {
+        for target_rows in [1, 50_000, usize::MAX] {
+            assert_eq!(
+                compaction_options(target_rows).compaction_mode,
+                Some(CompactionMode::Reencode),
+            );
+        }
     }
 
     fn fragment(bytes: u64, rows: u64, deleted_rows: u64) -> FragmentStat {
