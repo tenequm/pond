@@ -2741,20 +2741,25 @@ impl Handle {
             let data_dir = data_dir.clone();
             async move {
                 let metadata = fragment.metadata();
-                let mut max_column_pages = 0;
+                // Any one data file paged in every column marks the fragment.
+                let mut min_column_pages = 0;
                 for file in &metadata.files {
                     let path = data_dir.clone().join(file.path.as_str());
                     let reader = scheduler.open_file(&path, &file.file_size_bytes).await?;
                     let footer = FileReader::read_all_metadata(&reader)
                         .await
                         .with_context(|| format!("reading the footer of {}", file.path))?;
-                    for column in &footer.column_infos {
-                        max_column_pages = max_column_pages.max(column.page_infos.len());
-                    }
+                    let file_min = footer
+                        .column_infos
+                        .iter()
+                        .map(|column| column.page_infos.len())
+                        .min()
+                        .unwrap_or(0);
+                    min_column_pages = min_column_pages.max(file_min);
                 }
                 let stat = fragment_stat(metadata);
                 Ok::<_, anyhow::Error>(
-                    is_legacy_page_layout(stat.rows, max_column_pages)
+                    is_legacy_page_layout(min_column_pages)
                         .then(|| (metadata.id, stat.bytes.unwrap_or(0))),
                 )
             }
@@ -3497,18 +3502,16 @@ pub struct LegacyLayout {
 }
 
 const LEGACY_LAYOUT_MIN_PAGES: usize = 16;
-const LEGACY_LAYOUT_MAX_ROWS_PER_PAGE: u64 = 32;
 /// Footer reads in flight per table, well under the object store's own
 /// request parallelism so a status run leaves room for its other reads.
 const LEGACY_LAYOUT_PROBE_CONCURRENCY: usize = 16;
 
-/// Binary-copy compaction kept one page per per-sync append (~10 rows/page
-/// measured in #285), while the re-encoding writer flushes a column only at
-/// ~8 MiB, so a healthy column stays under 32 rows/page only if its values
-/// average over 256 KiB.
-fn is_legacy_page_layout(physical_rows: u64, max_column_pages: usize) -> bool {
-    max_column_pages >= LEGACY_LAYOUT_MIN_PAGES
-        && physical_rows < LEGACY_LAYOUT_MAX_ROWS_PER_PAGE * max_column_pages as u64
+/// Judged on a file's narrowest column: the re-encoding writer flushes a
+/// column only at ~8 MiB, so a healthy fragment's narrowest column (ids,
+/// roles) holds one page, while binary-copy compaction kept one page per
+/// sync append in every column, however wide its rows.
+fn is_legacy_page_layout(min_column_pages: usize) -> bool {
+    min_column_pages >= LEGACY_LAYOUT_MIN_PAGES
 }
 
 /// Rewrite one fragment in place through the re-encoding writer, so a fragment
@@ -6196,16 +6199,16 @@ mod tests {
     #[test]
     fn legacy_page_layout_flags_only_tiny_pages() {
         // #285's `sessions` fragment: 20k rows over 2,057 pages per column.
-        assert!(is_legacy_page_layout(20_000, 2_057));
+        assert!(is_legacy_page_layout(2_057));
         assert!(
-            !is_legacy_page_layout(20_000, 3),
-            "re-encoded: few big pages"
+            is_legacy_page_layout(478),
+            "binary-copied messages at ~3,600 rows/page"
         );
         assert!(
-            !is_legacy_page_layout(12, 12),
-            "too few pages to cost a take"
+            !is_legacy_page_layout(1),
+            "re-encoded, even with wide rows paging the widest column 16 times"
         );
-        assert!(!is_legacy_page_layout(640, 16), "wide rows at 40 rows/page");
+        assert!(!is_legacy_page_layout(12), "too few pages to cost a take");
     }
 
     #[test]
