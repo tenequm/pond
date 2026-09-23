@@ -21,7 +21,10 @@ use pond::{
 use tempfile::TempDir;
 
 const ORPHAN: &str = "sessions_retired_btree";
-const SESSIONS: usize = 20;
+const APPENDS: usize = 16;
+/// Over 32 rows per page, the case a rows/page threshold missed on `messages`.
+const SESSIONS_PER_APPEND: usize = 40;
+const SESSIONS: usize = APPENDS * SESSIONS_PER_APPEND;
 
 fn session(id: &str) -> Session {
     Session {
@@ -35,15 +38,15 @@ fn session(id: &str) -> Session {
     }
 }
 
-/// One commit per session, then the binary-copy compaction old pond ran: one
+/// One commit per append, then the binary-copy compaction old pond ran: one
 /// fragment holding one page per append. Plus an index no intent names.
 async fn plant_legacy_store(store_dir: &Path) {
     let store = Store::open_local(store_dir).await.unwrap();
-    for index in 0..SESSIONS {
-        store
-            .upsert_sessions(&[session(&format!("session-{index}"))])
-            .await
-            .unwrap();
+    for append in 0..APPENDS {
+        let batch: Vec<Session> = (0..SESSIONS_PER_APPEND)
+            .map(|index| session(&format!("session-{append}-{index}")))
+            .collect();
+        store.upsert_sessions(&batch).await.unwrap();
     }
     store.build_indices_only(None).await.unwrap();
     assert_eq!(
@@ -168,7 +171,7 @@ async fn bare_optimize_reports_and_full_heals() {
     assert_eq!(findings(&temp).await, vec![], "--full heals every finding");
     let store = Store::open_local(temp.path().join("store")).await.unwrap();
     assert_eq!(store.row_counts().await.unwrap().0, SESSIONS);
-    assert!(store.get_session("session-7").await.unwrap().is_some());
+    assert!(store.get_session("session-7-7").await.unwrap().is_some());
     drop(store);
 
     let again = pond(&temp, &["optimize", "--full"]);
