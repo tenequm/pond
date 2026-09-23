@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.19.0](https://github.com/tenequm/pond/compare/v0.18.0...v0.19.0) - 2026-09-23
+
+### <!-- 0 -->🛠 Breaking Changes
+- **optimize:** [**breaking**] make bare optimize diagnose and add --full heal-all ([#306](https://github.com/tenequm/pond/pull/306)) ([210d509](https://github.com/tenequm/pond/commit/210d509fe70a626199116ee69beb52bfa47e3224))
+  `pond optimize` now reports costly storage conditions it leaves alone
+  (model swap, index segment pileup, orphaned indexes, legacy page layout)
+  with their heal cost, and `pond status` shows the same; run `pond
+  optimize --full` to heal them all.
+
+### <!-- 1 -->🎉 New Features
+- **trace:** io-trace instrumentation for read-path diagnostics ([#303](https://github.com/tenequm/pond/pull/303)) ([c15e27a](https://github.com/tenequm/pond/commit/c15e27ad7b206f94c833eda7cc4e92f08155d913))
+  A new opt-in `io-trace` build feature prints per-command object-store
+  request counts, bytes and per-path breakdowns to stderr when
+  `POND_IO_TRACE=1`. Default builds are unchanged.
+- upgrade Lance to 12.0.0 ([#289](https://github.com/tenequm/pond/pull/289)) ([9d43f85](https://github.com/tenequm/pond/commit/9d43f85238a395a83bc8cd1f4f135c4b80ee6ac4))
+  Pond now runs on Lance 12.0.0 (upgraded from 11.0.0). The on-disk
+  storage format is unchanged (2.1 stays pinned), so existing stores keep
+  working with no migration and no action is required.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **maintenance:** make the compaction veto row-aware to stop the rewrite loop ([#290](https://github.com/tenequm/pond/pull/290)) ([fc798a1](https://github.com/tenequm/pond/commit/fc798a1e5938d9a2f111316b502ed97e24a9c4cd))
+  Automatic compaction no longer rewrites fragments it cannot actually
+  merge, and defers absorbing small appends until the merge pays for the
+  copy, so `pond sync` stops re-uploading the same data every run. Version
+  cleanup also runs twice as often. No action needed.
+
+### <!-- 3 -->🚀 Performance
+- **maintenance:** re-encode on compaction so appends stop planting tiny pages ([#302](https://github.com/tenequm/pond/pull/302)) ([c94845d](https://github.com/tenequm/pond/commit/c94845dd7d08c9ff5e9c73f9130b83ef74f7b2b2))
+  Compaction now re-encodes pages instead of binary-copying them, so point
+  reads stop paying one request per tiny page. Existing stores: run `pond
+  optimize --reencode sessions` and `pond optimize --reencode messages`
+  once, with scheduled syncs paused.
+- **ci:** kache 0.22, moon 2.5.5 + moon ci, and an overlapped Windows warm pull ([#264](https://github.com/tenequm/pond/pull/264)) ([1c47a6f](https://github.com/tenequm/pond/commit/1c47a6f39a3b5441a2045a3917abe13b8a7ad35e))
+  CI is both faster and simpler to pin: the Linux test leg now runs only
+  the suites a change actually affects, the Windows build cache warms up
+  alongside the compile instead of blocking it for minutes first, and moon
+  takes node, npm and rust from the environment rather than its own
+  version pins.
+
+### <!-- 4 -->🚜 Refactor
+- **bench:** unify bench-gate and mem-gate into one cargo bench target ([#299](https://github.com/tenequm/pond/pull/299)) ([8c7d209](https://github.com/tenequm/pond/commit/8c7d20985531b1c5e6cc4a18e76217bd07d9d263))
+
+### <!-- 6 -->🧹 Chores
+- **skills:** manage agent skills with kasetto ([#248](https://github.com/tenequm/pond/pull/248)) ([deb580e](https://github.com/tenequm/pond/commit/deb580e96380de3765ec211ec9c7b38ca29676cd))
+- **nix:** phase 5 - enter the devshell in CI and delete the bootstrap ([#265](https://github.com/tenequm/pond/pull/265)) ([6a74625](https://github.com/tenequm/pond/commit/6a746252d9aab8c72788c6990dfabedeba55c999))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.18.0...v0.19.0
+
 ## [0.18.0](https://github.com/tenequm/pond/compare/v0.17.3...v0.18.0) - 2026-09-17
 
 This release raises the minimum supported Rust version and refreshes the
