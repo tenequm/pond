@@ -1296,10 +1296,6 @@ fn arm_io_trace() {
     }
 }
 
-/// Range samples printed per path; the tracker keeps more than it shows.
-#[cfg(feature = "io-trace")]
-const IO_TRACE_SAMPLES_SHOWN: usize = 12;
-
 /// Report and reset the IO accumulated since the last call, under `label`:
 /// aggregate counts, then the per-path and per-range detail that names WHICH
 /// object a read storm hits. Silent unless [`arm_io_trace`] armed the tracker.
@@ -1317,9 +1313,8 @@ fn io_trace_report(label: &str) {
         use std::collections::BTreeMap;
 
         let mut by_bucket: BTreeMap<String, (u64, u64, u64, usize)> = BTreeMap::new();
-        // `get_ranges` records carry `range: None`, so the tracker's own request
-        // list cannot attribute bytes - the byte columns come from the
-        // per-path wrapper, and the two are merged on the same bucket key.
+        // `get_ranges` records carry `range: None`, so bytes come from the
+        // per-path wrapper, not the tracker's request list.
         for ((path, method), (calls, ranges, bytes)) in bytes_by_path::take() {
             let entry = by_bucket
                 .entry(format!("{method:>10} {}", bucket(&path)))
@@ -1341,14 +1336,10 @@ fn io_trace_report(label: &str) {
         for (path, ranges) in bytes_by_path::take_samples() {
             let text = ranges
                 .iter()
-                .take(IO_TRACE_SAMPLES_SHOWN)
                 .map(|(method, offset, len)| format!("{method}@{offset}+{len}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            eprintln!(
-                "IOTRACE {label} SAMPLE n={:<4} {path}\n    {text}",
-                ranges.len()
-            );
+            eprintln!("IOTRACE {label} SAMPLE {path}\n    {text}");
         }
     }
 }

@@ -3912,17 +3912,6 @@ async fn index_status(
     Ok(statuses)
 }
 
-/// Open the table at `table_name` via the namespace; create + initialize on
-/// `TableNotFound`. Schema-checks the on-disk dataset against pond's
-/// expectation so a stale data dir surfaces early.
-///
-/// Probes via `nm.describe_table` directly rather than `DatasetBuilder::from_namespace`:
-/// the builder re-wraps an already-`Namespace`-wrapped error
-/// (lance/src/dataset/builder.rs:142), so going through it would force a
-/// chain-walk to classify `TableNotFound`. The direct probe stays at one
-/// wrap level and downcasts cleanly. Managed-versioning hookup (REST
-/// namespace external-manifest commits) is not wired here; v1 ships
-/// Directory v2 only.
 /// Diagnostic S3 IO tracing. Inert unless [`io_trace::enable`] is called
 /// before the store opens; then a shared `IOTracker` is injected as the
 /// object-store wrapper on every dataset read open, counting exactly how many
@@ -4032,7 +4021,7 @@ pub mod io_trace {
         /// Per-path cap on sampled ranges: enough to read the shape of a read
         /// (sequential mini-ranges vs. the same offset repeatedly vs. a stride)
         /// without holding a record of every request.
-        const SAMPLE_LIMIT: usize = 200;
+        const SAMPLE_LIMIT: usize = 12;
         static SAMPLES: OnceLock<Mutex<BTreeMap<String, Vec<Sample>>>> = OnceLock::new();
 
         fn samples() -> &'static Mutex<BTreeMap<String, Vec<Sample>>> {
@@ -4884,6 +4873,17 @@ fn store_wrapper(
     }
 }
 
+/// Open the table at `table_name` via the namespace; create + initialize on
+/// `TableNotFound`. Schema-checks the on-disk dataset against pond's
+/// expectation so a stale data dir surfaces early.
+///
+/// Probes via `nm.describe_table` directly rather than `DatasetBuilder::from_namespace`:
+/// the builder re-wraps an already-`Namespace`-wrapped error
+/// (lance/src/dataset/builder.rs:142), so going through it would force a
+/// chain-walk to classify `TableNotFound`. The direct probe stays at one
+/// wrap level and downcasts cleanly. Managed-versioning hookup (REST
+/// namespace external-manifest commits) is not wired here; v1 ships
+/// Directory v2 only.
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
