@@ -496,27 +496,6 @@ fn percentile(values: &[u128], p: f64) -> u128 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Classify an S3 object path into a coarse bucket so the io-trace request
-/// histogram shows *what* each GET is for: a specific index file (FTS posting
-/// segment, IVF partition store), a data fragment, the manifest, or the
-/// transaction log.
-#[cfg(feature = "io-trace")]
-fn io_bucket(path: &str) -> String {
-    if let Some(pos) = path.find("/_indices/") {
-        let after = &path[pos + "/_indices/".len()..];
-        let file = after.rsplit('/').next().unwrap_or(after);
-        format!("index/{file}")
-    } else if path.contains("/data/") {
-        "data".to_string()
-    } else if path.contains("manifest") || path.contains("/_versions/") {
-        "manifest".to_string()
-    } else if path.contains("_transactions") {
-        "txn".to_string()
-    } else {
-        path.rsplit('/').next().unwrap_or(path).to_string()
-    }
-}
-
 fn first_hit_message_id(response: &SearchResponse) -> Option<String> {
     response
         .sessions
@@ -1077,7 +1056,7 @@ async fn main() -> Result<()> {
                         "{:<14}{:>11}  {}",
                         labels[$idx],
                         r.method,
-                        io_bucket(&r.path.to_string())
+                        io_trace::bucket(&r.path.to_string())
                     );
                     let entry = hist.entry(key).or_insert((0u64, 0u64));
                     entry.0 += 1;

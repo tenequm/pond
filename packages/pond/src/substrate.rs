@@ -3836,7 +3836,9 @@ async fn index_status(
 /// object-store wrapper on every dataset read open, counting exactly how many
 /// GETs (and bytes, and - under the `io-trace` feature - which paths) each
 /// query issues against a remote store. Used by `serve_mem_bench --io-trace`
-/// to attribute the per-query S3 request load. Not a production code path.
+/// to attribute the per-query S3 request load, and by the `pond get-session` /
+/// `get-message` commands under `POND_IO_TRACE=1` in an `io-trace` build.
+/// Never armed otherwise.
 pub mod io_trace {
     use lance_io::utils::tracking_store::{IOTracker, IoStats};
     use std::sync::{Arc, OnceLock};
@@ -3857,6 +3859,239 @@ pub mod io_trace {
     /// Read and reset the IO accumulated since the last call.
     pub fn take() -> Option<IoStats> {
         TRACKER.get().map(IOTracker::incremental_stats)
+    }
+
+    /// Coarse attribution bucket for an object-store path: which table's data,
+    /// which index file, or which piece of table metadata a read landed on.
+    /// Shared so every io-trace surface groups the same way.
+    #[cfg(feature = "io-trace")]
+    #[must_use]
+    pub fn bucket(path: &str) -> String {
+        if let Some(pos) = path.find("/_indices/") {
+            let after = &path[pos + "/_indices/".len()..];
+            let file = after.rsplit('/').next().unwrap_or(after);
+            format!("index/{file}")
+        } else if path.contains("/data/") {
+            let table = path.split('/').find(|segment| segment.ends_with(".lance"));
+            format!("data/{}", table.unwrap_or("?"))
+        } else if path.contains("manifest") || path.contains("/_versions/") {
+            "manifest".to_string()
+        } else if path.contains("_transactions") {
+            "txn".to_string()
+        } else {
+            path.rsplit('/').next().unwrap_or(path).to_string()
+        }
+    }
+
+    /// Per-path byte attribution, the one thing the lance-io tracker cannot
+    /// give: an `IoRequestRecord` for a `get_ranges` call carries `range: None`,
+    /// so its bytes land in the aggregate and nowhere else. This wrapper sits
+    /// inside the tracker - the tracker's request records stay the reference
+    /// count - and accumulates `(path, method) -> (calls, ranges, bytes)`, which
+    /// is what turned "a warm get issues ~9,900 GETs" into "9,652 of them are
+    /// 126-byte reads of `sessions.lance` fragments" (#285).
+    ///
+    /// Diagnostic only, and gated with the `io-trace` feature that arms the rest
+    /// of the per-path tracing: a shipped build contains none of it.
+    #[cfg(feature = "io-trace")]
+    pub mod bytes_by_path {
+        use bytes::Bytes;
+        use futures::stream::BoxStream;
+        use lance_io::object_store::WrappingObjectStore;
+        use object_store::list::PaginatedListStore;
+        use object_store::path::Path as ObjPath;
+        use object_store::{
+            CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+            ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+            Result as OsResult,
+        };
+        use std::collections::BTreeMap;
+        use std::ops::Range;
+        use std::sync::{Arc, Mutex, OnceLock};
+
+        /// `(calls, ranges, bytes)` for one `(path, method)`.
+        pub type Row = (u64, u64, u64);
+        type Table = BTreeMap<(String, &'static str), Row>;
+
+        static STATS: OnceLock<Mutex<Table>> = OnceLock::new();
+
+        fn stats() -> &'static Mutex<Table> {
+            STATS.get_or_init(|| Mutex::new(Table::new()))
+        }
+
+        fn record(path: &ObjPath, method: &'static str, ranges: u64, bytes: u64) {
+            let mut guard = stats().lock().unwrap_or_else(|poison| poison.into_inner());
+            let entry = guard.entry((path.to_string(), method)).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 += ranges;
+            entry.2 += bytes;
+        }
+
+        /// Read and reset the per-path totals.
+        #[must_use]
+        pub fn take() -> Vec<((String, &'static str), Row)> {
+            let mut guard = stats().lock().unwrap_or_else(|poison| poison.into_inner());
+            std::mem::take(&mut *guard).into_iter().collect()
+        }
+
+        /// One sampled `(method, offset, length)`.
+        pub type Sample = (&'static str, u64, u64);
+
+        /// Per-path cap on sampled ranges: enough to read the shape of a read
+        /// (sequential mini-ranges vs. the same offset repeatedly vs. a stride)
+        /// without holding a record of every request.
+        const SAMPLE_LIMIT: usize = 200;
+        static SAMPLES: OnceLock<Mutex<BTreeMap<String, Vec<Sample>>>> = OnceLock::new();
+
+        fn samples() -> &'static Mutex<BTreeMap<String, Vec<Sample>>> {
+            SAMPLES.get_or_init(|| Mutex::new(BTreeMap::new()))
+        }
+
+        fn sample(path: &ObjPath, method: &'static str, ranges: &[Range<u64>]) {
+            let text = path.to_string();
+            let mut guard = samples()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let entry = guard.entry(text).or_default();
+            for range in ranges {
+                if entry.len() >= SAMPLE_LIMIT {
+                    break;
+                }
+                entry.push((method, range.start, range.end - range.start));
+            }
+        }
+
+        /// Read and reset the range samples.
+        #[must_use]
+        pub fn take_samples() -> Vec<(String, Vec<Sample>)> {
+            let mut guard = samples()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            std::mem::take(&mut *guard).into_iter().collect()
+        }
+
+        #[derive(Debug)]
+        pub struct Factory;
+
+        impl WrappingObjectStore for Factory {
+            fn wrap(
+                &self,
+                _store_prefix: &str,
+                inner: Arc<dyn ObjectStore>,
+            ) -> Arc<dyn ObjectStore> {
+                Arc::new(Counting { inner })
+            }
+
+            /// Keeps the listing pushdown: this wrapper only counts reads and
+            /// delegates every `list*` call to `inner`, so a listing that goes
+            /// around it reads the same directory either way.
+            fn wrap_paginated(
+                &self,
+                _store_prefix: &str,
+                original: Arc<dyn PaginatedListStore>,
+            ) -> Option<Arc<dyn PaginatedListStore>> {
+                Some(original)
+            }
+        }
+
+        #[derive(Debug)]
+        struct Counting {
+            inner: Arc<dyn ObjectStore>,
+        }
+
+        impl std::fmt::Display for Counting {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "ByteCounting({})", self.inner)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for Counting {
+            async fn get_opts(
+                &self,
+                location: &ObjPath,
+                options: GetOptions,
+            ) -> OsResult<GetResult> {
+                let result = self.inner.get_opts(location, options).await?;
+                let bytes = result.range.end - result.range.start;
+                record(location, "get_opts", 1, bytes);
+                sample(location, "get_opts", std::slice::from_ref(&result.range));
+                Ok(result)
+            }
+
+            async fn get_ranges(
+                &self,
+                location: &ObjPath,
+                ranges: &[Range<u64>],
+            ) -> OsResult<Vec<Bytes>> {
+                let result = self.inner.get_ranges(location, ranges).await?;
+                let bytes = result.iter().map(|chunk| chunk.len() as u64).sum();
+                record(location, "get_ranges", ranges.len() as u64, bytes);
+                sample(location, "get_ranges", ranges);
+                Ok(result)
+            }
+
+            async fn put_opts(
+                &self,
+                location: &ObjPath,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> OsResult<PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjPath,
+                opts: PutMultipartOptions,
+            ) -> OsResult<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            fn delete_stream(
+                &self,
+                locations: BoxStream<'static, OsResult<ObjPath>>,
+            ) -> BoxStream<'static, OsResult<ObjPath>> {
+                self.inner.delete_stream(locations)
+            }
+
+            fn list(&self, prefix: Option<&ObjPath>) -> BoxStream<'static, OsResult<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+
+            fn list_with_offset(
+                &self,
+                prefix: Option<&ObjPath>,
+                offset: &ObjPath,
+            ) -> BoxStream<'static, OsResult<ObjectMeta>> {
+                self.inner.list_with_offset(prefix, offset)
+            }
+
+            async fn list_with_delimiter(&self, prefix: Option<&ObjPath>) -> OsResult<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy_opts(
+                &self,
+                from: &ObjPath,
+                to: &ObjPath,
+                opts: CopyOptions,
+            ) -> OsResult<()> {
+                self.inner.copy_opts(from, to, opts).await
+            }
+
+            /// Delegated, not left to the trait default: that degrades a rename
+            /// to copy+delete and bypasses `FsyncStore::rename_opts`'s terminal
+            /// error on a published commit.
+            async fn rename_opts(
+                &self,
+                from: &ObjPath,
+                to: &ObjPath,
+                opts: RenameOptions,
+            ) -> OsResult<()> {
+                self.inner.rename_opts(from, to, opts).await
+            }
+        }
     }
 }
 
@@ -4538,6 +4773,10 @@ fn store_wrapper(
         }
     }
     if let Some(tracker) = io_trace::wrapper() {
+        // Inside the tracker, so the tracker's own request records stay the
+        // reference count and this one only adds per-path bytes.
+        #[cfg(feature = "io-trace")]
+        wrappers.push(Arc::new(io_trace::bytes_by_path::Factory));
         wrappers.push(tracker);
     }
     match wrappers.len() {
