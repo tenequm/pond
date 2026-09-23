@@ -2,6 +2,12 @@
 
 ## [0.19.0](https://github.com/tenequm/pond/compare/v0.18.0...v0.19.0) - 2026-09-23
 
+Remote reads are ~10x faster: on S3, `pond get-session` drops from ~30 s to
+~2.5 s and `pond get-message` from ~90 s to ~10 s.
+
+**Upgrading:** run once from one host (~20 min on a large store):
+`pond schedule stop && pond optimize --full && pond schedule start`
+
 ### <!-- 0 -->🛠 Breaking Changes
 - **optimize:** [**breaking**] make bare optimize diagnose and add --full heal-all ([#306](https://github.com/tenequm/pond/pull/306)) ([210d509](https://github.com/tenequm/pond/commit/210d509fe70a626199116ee69beb52bfa47e3224))
   `pond optimize` now reports costly storage conditions it leaves alone
@@ -29,9 +35,8 @@
 ### <!-- 3 -->🚀 Performance
 - **maintenance:** re-encode on compaction so appends stop planting tiny pages ([#302](https://github.com/tenequm/pond/pull/302)) ([c94845d](https://github.com/tenequm/pond/commit/c94845dd7d08c9ff5e9c73f9130b83ef74f7b2b2))
   Compaction now re-encodes pages instead of binary-copying them, so point
-  reads stop paying one request per tiny page. Existing stores: run `pond
-  optimize --reencode sessions` and `pond optimize --reencode messages`
-  once, with scheduled syncs paused.
+  reads stop paying one request per tiny page. Existing stores: see
+  **Upgrading** above.
 - **ci:** kache 0.22, moon 2.5.5 + moon ci, and an overlapped Windows warm pull ([#264](https://github.com/tenequm/pond/pull/264)) ([1c47a6f](https://github.com/tenequm/pond/commit/1c47a6f39a3b5441a2045a3917abe13b8a7ad35e))
   CI is both faster and simpler to pin: the Linux test leg now runs only
   the suites a change actually affects, the Windows build cache warms up
