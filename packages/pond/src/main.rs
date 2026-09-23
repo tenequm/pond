@@ -944,10 +944,10 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
     /// inline and folds by default; this is the on-demand maintenance run and
     /// the model-swap re-embed (`--force-embed`).
     #[command(after_long_help = "Examples:
-  pond optimize                    embed any backlog, then fold indexes
-  pond optimize --only index       fold indexes only
-  pond optimize --only embed       embed only
-  pond optimize --force-embed      re-embed stale rows after a model change
+  pond optimize                      embed any backlog, then fold indexes
+  pond optimize --only index         fold indexes only
+  pond optimize --only embed         embed only
+  pond optimize --force-embed        re-embed stale rows after a model change
   pond optimize --reencode sessions  rewrite a table's pages (one-time layout repair)")]
     #[command(display_order = 8)]
     Optimize {
@@ -978,7 +978,9 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
         /// One-time layout repair: rewrite every fragment of one table through
         /// the re-encoding writer, collapsing the tiny pages older pond
         /// compactions left behind (each one costs a GET on every point read).
-        /// Rewrites the whole table; old files go at the next version cleanup.
+        /// Rewrites the whole table (a re-run starts over); old files go at the
+        /// next version cleanup. Pause scheduled syncs first: on `messages`,
+        /// date-filtered searches fail until the run finishes.
         #[arg(long, value_enum, value_name = "TABLE", conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index"])]
         reencode: Option<ReencodeTable>,
     },

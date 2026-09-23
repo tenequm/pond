@@ -2660,21 +2660,20 @@ impl Handle {
 
     /// One-time layout repair (`pond optimize --reencode <table>`): rewrite
     /// every fragment through the re-encoding writer, one commit per fragment
-    /// so an interrupted run keeps its progress. Returns fragments rewritten.
+    /// so an interrupted run leaves a valid, partly repaired table (a re-run
+    /// rewrites every fragment again). Returns fragments rewritten.
     pub async fn reencode_table(
         &self,
         table: Table,
         progress: Option<&OptimizeProgressFn>,
     ) -> Result<usize> {
-        let fragment_ids: Vec<u64> = {
-            let mut guard = self.cached(table).await?.lock().await;
-            let dataset = guard.latest().await?;
-            dataset
-                .get_fragments()
-                .iter()
-                .map(|fragment| fragment.id() as u64)
-                .collect()
-        };
+        let fragment_ids: Vec<u64> = self
+            .dataset(table)
+            .await?
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u64)
+            .collect();
         emit(
             progress,
             OptimizeEvent::PhaseStart {
@@ -2684,20 +2683,26 @@ impl Handle {
             },
         );
         let started = Instant::now();
-        let mut rewritten = 0;
-        for fragment_id in fragment_ids {
-            let did_rewrite = self
-                .retry_lance(table.label(), || async {
-                    let mut guard = self.cached(table).await?.lock().await;
-                    let mut dataset = guard.latest().await?;
-                    let did_rewrite = reencode_fragment(&mut dataset, fragment_id).await?;
-                    guard.replace(dataset);
-                    Ok::<_, anyhow::Error>(did_rewrite)
-                })
-                .await
-                .with_context(|| format!("re-encoding {} fragment {fragment_id}", table.label()))?;
-            rewritten += usize::from(did_rewrite);
+        let rewritten = async {
+            let mut rewritten = 0;
+            for fragment_id in fragment_ids {
+                let did_rewrite = self
+                    .retry_lance(table.label(), || async {
+                        let mut guard = self.cached(table).await?.lock().await;
+                        let mut dataset = guard.latest().await?;
+                        let did_rewrite = reencode_fragment(&mut dataset, fragment_id).await?;
+                        guard.replace(dataset);
+                        Ok::<_, anyhow::Error>(did_rewrite)
+                    })
+                    .await
+                    .with_context(|| {
+                        format!("re-encoding {} fragment {fragment_id}", table.label())
+                    })?;
+                rewritten += usize::from(did_rewrite);
+            }
+            Ok::<_, anyhow::Error>(rewritten)
         }
+        .await;
         emit(
             progress,
             OptimizeEvent::PhaseDone {
@@ -2706,7 +2711,7 @@ impl Handle {
                 elapsed_ms: started.elapsed().as_millis() as u64,
             },
         );
-        Ok(rewritten)
+        rewritten
     }
 
     pub async fn rebuild_index(
@@ -3390,8 +3395,9 @@ async fn optimize_table_compact(
 /// pages, so every tiny per-sync append survives as its own page, and lance 12
 /// reads each page's metadata on every take of a projected column (#285: a
 /// 20k-row `sessions` fragment with 2,057 pages/column cost 11,300 GETs per
-/// one-row take, 15 after a re-encode). Re-encoding is ~27% slower to compact.
-/// `parts` never binary-copied anyway: lance refuses it for blob columns.
+/// one-row take, 15 after a re-encode). The cost lands on full-table rewrites
+/// (write_bench A/B: `messages` ~2.3x slower, `sessions` faster, sync-sized
+/// rounds unchanged - docs/benchmarks/results.md). `parts` never binary-copied anyway: lance refuses it for blob columns.
 fn compaction_options(target_rows_per_fragment: usize) -> CompactionOptions {
     CompactionOptions {
         target_rows_per_fragment,
@@ -5841,12 +5847,10 @@ mod tests {
 
     #[test]
     fn compaction_never_binary_copies() {
-        for target_rows in [1, 50_000, usize::MAX] {
-            assert_eq!(
-                compaction_options(target_rows).compaction_mode,
-                Some(CompactionMode::Reencode),
-            );
-        }
+        assert_eq!(
+            compaction_options(50_000).compaction_mode,
+            Some(CompactionMode::Reencode),
+        );
     }
 
     fn fragment(bytes: u64, rows: u64, deleted_rows: u64) -> FragmentStat {

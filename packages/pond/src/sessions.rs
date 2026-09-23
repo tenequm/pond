@@ -3733,22 +3733,25 @@ impl Store {
     /// Rewrite every fragment of `table` through the re-encoding writer (see
     /// [`crate::substrate::Handle::reencode_table`]), then run its indices
     /// phase: a rewrite orphans address-domain indexes, and that phase is what
-    /// detects and recreates them. Returns fragments rewritten.
+    /// detects and recreates them. The phase runs even when the rewrite fails
+    /// part-way, since every fragment committed before the failure already
+    /// orphaned them. Returns fragments rewritten.
     pub async fn reencode_table(
         &self,
         table: Table,
         progress: Option<OptimizeProgressFn>,
     ) -> Result<usize> {
-        let rewritten = self.handle.reencode_table(table, progress.as_ref()).await?;
+        let reencoded = self.handle.reencode_table(table, progress.as_ref()).await;
         let policy = pond_index_intents();
         let Some((_, intents)) = policy.all().into_iter().find(|(owner, _)| *owner == table) else {
-            return Ok(rewritten);
+            return reencoded;
         };
-        match self
+        let indices = self
             .handle
             .optimize_table_indices_only(table, intents, progress.as_ref())
-            .await
-        {
+            .await;
+        let rewritten = reencoded?;
+        match indices {
             PhaseOutcome::Failed(error) => Err(error.context(format!(
                 "{} re-encoded; index fold failed, run `pond optimize --only index`",
                 table.as_str()
@@ -3757,7 +3760,7 @@ impl Store {
                 "{} re-encoded; index fold lost to a concurrent writer, run `pond optimize --only index`",
                 table.as_str()
             ),
-            _ => Ok(rewritten),
+            PhaseOutcome::Ok | PhaseOutcome::Noop | PhaseOutcome::NotAttempted => Ok(rewritten),
         }
     }
 
@@ -8101,11 +8104,10 @@ mod tests {
 
     /// Most pages any column holds in any data file of one table - the count
     /// lance 12 pays one metadata GET per page for on every take (#285).
-    async fn max_pages_per_column(root: &std::path::Path, table: &str) -> anyhow::Result<usize> {
+    async fn max_pages_per_column(dataset: &Dataset) -> anyhow::Result<usize> {
         use lance_file::reader::FileReader;
         use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
-        let dataset = Dataset::open(root.join(table).to_str().unwrap()).await?;
         let object_store = dataset.object_store(None).await?;
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -8145,13 +8147,10 @@ mod tests {
             .await?
             .into_result()?;
 
-        let sessions = Dataset::open(temp.path().join("sessions.lance").to_str().unwrap()).await?;
+        let sessions = store.handle.dataset(Table::Sessions).await?;
         assert_eq!(sessions.get_fragments().len(), 1);
         assert_eq!(sessions.count_rows(None).await?, 12);
-        assert_eq!(
-            max_pages_per_column(temp.path(), "sessions.lance").await?,
-            1
-        );
+        assert_eq!(max_pages_per_column(&sessions).await?, 1);
         Ok(())
     }
 
@@ -8164,8 +8163,8 @@ mod tests {
         drop(store);
 
         // Plant the pre-#285 layout the way old pond compactions did.
-        let uri = temp.path().join("sessions.lance");
-        let mut sessions = Dataset::open(uri.to_str().unwrap()).await?;
+        let mut sessions =
+            Dataset::open(temp.path().join("sessions.lance").to_str().unwrap()).await?;
         lance::dataset::optimize::compact_files(
             &mut sessions,
             lance::dataset::optimize::CompactionOptions {
@@ -8176,19 +8175,13 @@ mod tests {
         )
         .await?;
         assert_eq!(sessions.get_fragments().len(), 1);
-        assert_eq!(
-            max_pages_per_column(temp.path(), "sessions.lance").await?,
-            12
-        );
+        assert_eq!(max_pages_per_column(&sessions).await?, 12);
 
         let store = Store::open_local(temp.path()).await?;
         assert_eq!(store.reencode_table(Table::Sessions, None).await?, 1);
 
-        assert_eq!(
-            max_pages_per_column(temp.path(), "sessions.lance").await?,
-            1
-        );
-        let sessions = Dataset::open(uri.to_str().unwrap()).await?;
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        assert_eq!(max_pages_per_column(&sessions).await?, 1);
         assert_eq!(sessions.get_fragments().len(), 1);
         assert_eq!(sessions.count_rows(None).await?, 12);
         let statuses = store.index_status().await?;
