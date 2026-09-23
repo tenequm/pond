@@ -75,6 +75,23 @@ enum OptimizeStage {
     Index,
 }
 
+/// Tables `pond optimize --reencode` accepts. `parts` is absent on purpose:
+/// its blob column already forces lance to re-encode on every compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReencodeTable {
+    Sessions,
+    Messages,
+}
+
+impl From<ReencodeTable> for substrate::Table {
+    fn from(table: ReencodeTable) -> Self {
+        match table {
+            ReencodeTable::Sessions => Self::Sessions,
+            ReencodeTable::Messages => Self::Messages,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ServeTransport {
     Http,
@@ -927,10 +944,11 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
     /// inline and folds by default; this is the on-demand maintenance run and
     /// the model-swap re-embed (`--force-embed`).
     #[command(after_long_help = "Examples:
-  pond optimize                    embed any backlog, then fold indexes
-  pond optimize --only index       fold indexes only
-  pond optimize --only embed       embed only
-  pond optimize --force-embed      re-embed stale rows after a model change")]
+  pond optimize                      embed any backlog, then fold indexes
+  pond optimize --only index         fold indexes only
+  pond optimize --only embed         embed only
+  pond optimize --force-embed        re-embed stale rows after a model change
+  pond optimize --reencode sessions  rewrite a table's pages (one-time layout repair)")]
     #[command(display_order = 8)]
     Optimize {
         /// Run exactly one stage: embed or index.
@@ -957,6 +975,14 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
         /// errors when no table has an index by that name.
         #[arg(long, value_name = "NAME", conflicts_with_all = ["only", "skip", "force_embed", "rebuild"])]
         drop_index: Option<String>,
+        /// One-time layout repair: rewrite every fragment of one table through
+        /// the re-encoding writer, collapsing the tiny pages older pond
+        /// compactions left behind (each one costs a GET on every point read).
+        /// Rewrites the whole table (a re-run starts over); old files go at the
+        /// next version cleanup. Pause scheduled syncs first: on `messages`,
+        /// date-filtered searches fail until the run finishes.
+        #[arg(long, value_enum, value_name = "TABLE", conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index"])]
+        reencode: Option<ReencodeTable>,
     },
 }
 
@@ -1573,6 +1599,7 @@ async fn run() -> anyhow::Result<()> {
             force_embed,
             rebuild,
             drop_index,
+            reencode,
         } => {
             let cmd_started = std::time::Instant::now();
             let loaded = Config::load(config_path(config))?;
@@ -1589,6 +1616,16 @@ async fn run() -> anyhow::Result<()> {
                     .await
                     .with_context(|| format!("drop_index({name}) failed"))?;
                 output(&format!("optimize: dropped index {name}"))?;
+            } else if let Some(table) = reencode {
+                let table = substrate::Table::from(table);
+                let (progress, bar) = optimize_progress_bar();
+                let result = store.reencode_table(table, Some(progress)).await;
+                bar.finish_and_clear();
+                let rewritten = result?;
+                output(&format!(
+                    "optimize: re-encoded {rewritten} {} fragments",
+                    table.as_str()
+                ))?;
             } else if rebuild {
                 // Recovery/migration path: fill the embed backlog, rebuild
                 // every index from scratch so it adopts current params, then

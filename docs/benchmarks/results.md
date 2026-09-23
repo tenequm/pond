@@ -682,3 +682,21 @@ pair   old decode   new decode   old wall   new wall   note
 ```
 
 Reconciliation: min decode old 0.32 s vs new 0.34 s; the quiet pairs (1, 2, 5, 8) differ by 0.00-0.03 s on ~20k rows, below the run-to-run spread of either side under this load (old alone ranged 0.32-1.22 s). Validator (the merge_insert fan-out) is 85-90% of wall on both sides and unchanged. Pair 3 onward carries the slim index (the first cut cloned each `CommandExecution` item whole, stdout/stderr included; the index now keeps only `command` / `cwd` / `exit_code`) - pairs 5 and 8 are the cleanest read of the shipped code: parity. Nothing here is a release-profile number; rerun with `cargo bench --bench ingest_bench -- --adapter codex-cli --source-dir <codex 0.151+ corpus>` on a quiet host if a release-profile row is ever needed.
+
+## write_bench profile-optimize: re-encoding compaction (#285, M3c)
+
+### 2026-09-23 - ws-pond-01 (x86_64, 16 vCPU), local TempDir stores, main fc798a1 vs perf/285-compaction-reencode 62c85f8
+
+`cargo bench --bench write_bench -- --profile-optimize <dir> --sessions 40000 --messages 8 --grown 12`, release bench binaries snapshotted per side, 4 pairs interleaved main/branch, each run on a fresh store directory. `build` is optimize #1 over the seeded base (320k message rows); `rounds` sums the compact phase over the 12 sync-like fold rounds (veto on). Medians of 4:
+
+```
+metric (ms)              main    branch   delta
+build compact sessions    366      152    -58%
+build compact messages    558     1273    +128%
+build compact parts      1030      904    noise (path unchanged: blob column already re-encodes)
+build total              3457     3724    +8%
+rounds compact messages   239      240    0%
+rounds total (12)        2521     2360    -6% (noise)
+```
+
+Re-encoding costs messages compaction ~2.3x on the full-base rewrite, which lands once per compaction of a table, not per sync: the sync-like rounds are unchanged. Sessions compacts faster re-encoded (binary copy reads every input file's footer first). The payoff is on the read side, measured on the live-store lab copy in the campaign doc: a one-row `sessions` take went from 11,300 GETs / ~21 s to 15 GETs / ~0.8 s.

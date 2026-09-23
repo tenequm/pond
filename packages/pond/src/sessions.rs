@@ -3730,6 +3730,40 @@ impl Store {
         self.handle.drop_index(owner, name).await
     }
 
+    /// Rewrite every fragment of `table` through the re-encoding writer (see
+    /// [`crate::substrate::Handle::reencode_table`]), then run its indices
+    /// phase: a rewrite orphans address-domain indexes, and that phase is what
+    /// detects and recreates them. The phase runs even when the rewrite fails
+    /// part-way, since every fragment committed before the failure already
+    /// orphaned them. Returns fragments rewritten.
+    pub async fn reencode_table(
+        &self,
+        table: Table,
+        progress: Option<OptimizeProgressFn>,
+    ) -> Result<usize> {
+        let reencoded = self.handle.reencode_table(table, progress.as_ref()).await;
+        let policy = pond_index_intents();
+        let Some((_, intents)) = policy.all().into_iter().find(|(owner, _)| *owner == table) else {
+            return reencoded;
+        };
+        let indices = self
+            .handle
+            .optimize_table_indices_only(table, intents, progress.as_ref())
+            .await;
+        let rewritten = reencoded?;
+        match indices {
+            PhaseOutcome::Failed(error) => Err(error.context(format!(
+                "{} re-encoded; index fold failed, run `pond optimize --only index`",
+                table.as_str()
+            ))),
+            PhaseOutcome::SkippedConflict => anyhow::bail!(
+                "{} re-encoded; index fold lost to a concurrent writer, run `pond optimize --only index`",
+                table.as_str()
+            ),
+            PhaseOutcome::Ok | PhaseOutcome::Noop | PhaseOutcome::NotAttempted => Ok(rewritten),
+        }
+    }
+
     pub async fn index_status(&self) -> Result<Vec<IndexStatus>> {
         self.index_status_with(false).await
     }
@@ -8065,6 +8099,103 @@ mod tests {
             .await?
             .into_result()?;
 
+        Ok(())
+    }
+
+    /// Most pages any column holds in any data file of one table - the count
+    /// lance 12 pays one metadata GET per page for on every take (#285).
+    async fn max_pages_per_column(dataset: &Dataset) -> anyhow::Result<usize> {
+        use lance_file::reader::FileReader;
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+
+        let object_store = dataset.object_store(None).await?;
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let mut max_pages = 0;
+        for fragment in dataset.get_fragments() {
+            for file in &fragment.metadata().files {
+                let path = dataset.data_dir().join(file.path.as_str());
+                let file = scheduler.open_file(&path, &file.file_size_bytes).await?;
+                let metadata = FileReader::read_all_metadata(&file).await?;
+                for column in &metadata.column_infos {
+                    max_pages = max_pages.max(column.page_infos.len());
+                }
+            }
+        }
+        Ok(max_pages)
+    }
+
+    async fn upsert_one_session_per_commit(store: &Store, count: usize) -> anyhow::Result<()> {
+        for index in 0..count {
+            store
+                .upsert_sessions(&[synthetic_session(&format!("session-{index}"))])
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// #285: binary-copy compaction kept every per-sync append as its own page.
+    #[tokio::test]
+    async fn compaction_merges_tiny_append_pages() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        upsert_one_session_per_commit(&store, 12).await?;
+        store
+            .optimize_indices(None, &MaintenancePolicy::always_compact())
+            .await?
+            .into_result()?;
+
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        assert_eq!(sessions.get_fragments().len(), 1);
+        assert_eq!(sessions.count_rows(None).await?, 12);
+        assert_eq!(max_pages_per_column(&sessions).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reencode_table_repairs_a_binary_copied_layout() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        upsert_one_session_per_commit(&store, 12).await?;
+        store.build_indices_only(None).await?.into_result()?;
+        drop(store);
+
+        // Plant the pre-#285 layout the way old pond compactions did.
+        let mut sessions =
+            Dataset::open(temp.path().join("sessions.lance").to_str().unwrap()).await?;
+        lance::dataset::optimize::compact_files(
+            &mut sessions,
+            lance::dataset::optimize::CompactionOptions {
+                compaction_mode: Some(lance::dataset::optimize::CompactionMode::TryBinaryCopy),
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+        assert_eq!(sessions.get_fragments().len(), 1);
+        assert_eq!(max_pages_per_column(&sessions).await?, 12);
+
+        let store = Store::open_local(temp.path()).await?;
+        assert_eq!(store.reencode_table(Table::Sessions, None).await?, 1);
+
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        assert_eq!(max_pages_per_column(&sessions).await?, 1);
+        assert_eq!(sessions.get_fragments().len(), 1);
+        assert_eq!(sessions.count_rows(None).await?, 12);
+        let statuses = store.index_status().await?;
+        let sessions_indexes = statuses
+            .iter()
+            .filter(|status| status.table == Table::Sessions);
+        for status in sessions_indexes {
+            assert!(
+                status.exists && status.unindexed_rows == 0,
+                "{} left unindexed after re-encode: {status:?}",
+                status.intent_name,
+            );
+        }
+        assert!(store.get_session("session-7").await?.is_some());
         Ok(())
     }
 

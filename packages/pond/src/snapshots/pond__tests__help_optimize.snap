@@ -28,6 +28,11 @@ Options:
       --drop-index <NAME>
           One-shot orphan cleanup: drop a single named index from whichever table owns it. Used after renaming an intent (the old name is orphaned in the manifest until dropped). Tries every table in turn; errors when no table has an index by that name
 
+      --reencode <TABLE>
+          One-time layout repair: rewrite every fragment of one table through the re-encoding writer, collapsing the tiny pages older pond compactions left behind (each one costs a GET on every point read). Rewrites the whole table (a re-run starts over); old files go at the next version cleanup. Pause scheduled syncs first: on `messages`, date-filtered searches fail until the run finishes
+          
+          [possible values: sessions, messages]
+
   -h, --help
           Print help (see a summary with '-h')
 
@@ -51,7 +56,8 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond optimize                    embed any backlog, then fold indexes
-  pond optimize --only index       fold indexes only
-  pond optimize --only embed       embed only
-  pond optimize --force-embed      re-embed stale rows after a model change
+  pond optimize                      embed any backlog, then fold indexes
+  pond optimize --only index         fold indexes only
+  pond optimize --only embed         embed only
+  pond optimize --force-embed        re-embed stale rows after a model change
+  pond optimize --reencode sessions  rewrite a table's pages (one-time layout repair)
