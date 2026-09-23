@@ -4104,7 +4104,13 @@ pub mod io_trace {
                 location: &ObjPath,
                 options: GetOptions,
             ) -> OsResult<GetResult> {
+                let head = options.head;
                 let result = self.inner.get_opts(location, options).await?;
+                // A HEAD reports the whole object as its range but reads no body.
+                if head {
+                    record(location, "head", 1, 0);
+                    return Ok(result);
+                }
                 let bytes = result.range.end - result.range.start;
                 record(location, "get_opts", 1, bytes);
                 sample(location, "get_opts", std::slice::from_ref(&result.range));

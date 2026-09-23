@@ -1046,21 +1046,37 @@ async fn main() -> Result<()> {
         macro_rules! meas {
             ($idx:expr, $body:expr) => {{
                 io_trace::take();
+                #[cfg(feature = "io-trace")]
+                let _ = (
+                    io_trace::bytes_by_path::take(),
+                    io_trace::bytes_by_path::take_samples(),
+                );
                 $body;
                 let s = io_trace::take().unwrap_or_default();
                 iops[$idx].push(u128::from(s.read_iops));
                 rbytes[$idx].push(u128::from(s.read_bytes));
                 #[cfg(feature = "io-trace")]
-                for r in &s.requests {
-                    let key = format!(
-                        "{:<14}{:>11}  {}",
-                        labels[$idx],
-                        r.method,
-                        io_trace::bucket(&r.path.to_string())
-                    );
-                    let entry = hist.entry(key).or_insert((0u64, 0u64));
-                    entry.0 += 1;
-                    entry.1 += r.range.as_ref().map_or(0, |x| x.end - x.start);
+                {
+                    let key = |method: &str, path: &str| {
+                        format!(
+                            "{:<14}{:>11}  {}",
+                            labels[$idx],
+                            method,
+                            io_trace::bucket(path)
+                        )
+                    };
+                    for r in &s.requests {
+                        hist.entry(key(r.method, &r.path.to_string()))
+                            .or_insert((0u64, 0u64))
+                            .0 += 1;
+                    }
+                    // `get_ranges` records carry `range: None`, so bytes come
+                    // from the per-path wrapper instead.
+                    for ((path, method), (_, _, bytes)) in io_trace::bytes_by_path::take() {
+                        if bytes > 0 {
+                            hist.entry(key(method, &path)).or_insert((0u64, 0u64)).1 += bytes;
+                        }
+                    }
                 }
             }};
         }
