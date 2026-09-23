@@ -124,7 +124,8 @@ Conclusion: blob v2 is a **bandwidth** fix only. `get_message` latency is
 | M0 | #282 | lance 11 -> 12 upgrade | PR #289 MERGED 2026-09-22 (main `9d43f85`); verified on a full S3 copy of the real corpus (read parity vs lance 11 byte-identical; sync/optimize/storage check exit 0); lance-12 bench/mem baselines pending |
 | M1 | #283 | MCP via long-lived `pond serve` | PR #292 open, green, conflict-free post-#289; merge decision pending (topology vs deeper-caching discussion, 2026-09-22) |
 | M2 | #284 | derived preview / `body_text` columns + local summary map | PR #293 open; polished 2026-09-22 (22 findings applied incl 6 correctness bugs, head `38b8b1e`); bench gate still to run before merge |
-| M3a | #285 | warm-get fast path: `find_session` fan-out diagnosis and fix, straddle-fallback delta extension, io-trace instrumentation kept behind a feature flag | diagnosis DONE (see section 4); fix implemented as PR #298 2026-09-22 (sessions fold threshold 0 + straddle delta extension; keymap deferred as follow-up); windows-verify CI pending at last check |
+| M3a | #285 | warm-get fast path: `find_session` fan-out diagnosis and fix, straddle-fallback delta extension, io-trace instrumentation kept behind a feature flag | fix implemented as PR #298 and polished (`18ab06f`) 2026-09-22, but full-corpus validation REFUTED the premise - see section 5; #298 disposition pending (correct, byte-equivalent, but does not move warm-get latency); keymap follow-up DROPPED |
+| M3c | #285 | compaction re-encode: stop `TryBinaryCopy` planting tiny pages in `sessions`/`messages`, one-time re-encode of existing data | the actual warm-get fix, measured 11,300 -> 15 GETs / ~21 s -> ~0.8 s on the sessions take (section 5); implementation started 2026-09-23 |
 | M3b | #286 | blob v2 bandwidth pass | GATED on a re-measure after M2 + M3a; preconditioned on #288 and on a storage-version guard (`classify_schema` compares names only) |
 | M4 | #287 | `pond_sql` just-works + params-only ngram (backlog) | #284 |
 
@@ -132,10 +133,15 @@ Filed alongside, outside the campaign scope but blocking M3b: **#288**
 `bug(maintenance): parts compaction rewrite loop - ~80 GiB/day rewritten for a
 4.5 GiB table` (root cause and proposed fix in the issue). Hotfixed the same
 evening as PR #290 (row-aware veto floor, settled-fragment absorb veto,
-cleanup interval 16 -> 8). Polished 2026-09-22 (`babfa76`: single-pass settled
-sum, cleanup-pacing docs corrected - the exact-multiple gate paces, it does not
-bound the gap); pre-merge verification against a server-side duplicate of the
-live store (`pondarium/pond-fix288-verify`) in progress. A second polish pass
+cleanup interval 16 -> 8). Polished and MERGED 2026-09-22: rebased onto lance
+12 with the row floor aligned to lance 12's writer (floor, not ceil - the
+writer spreads rows evenly). A/B-verified on server-side duplicates of the
+live store: both old and new veto no-op identically on lance 12 (0 rewrites,
+same 31 vetoes, live rows intact), so the fix costs no merges. Copies deleted
+after verification. Open observation: the planner re-plans the same vetoed
+tasks every run (starvation, harmless); durable cleanup bound deferred -
+re-check live "pending cleanup" ~2026-09-25 after Lance's 7-day age threshold
+passes before filing a follow-up. A second polish pass
 the same day (`e990a46`) flagged a lance-12 divergence: the branch's `div_ceil`
 output-count formula matches lance 11, while lance 12 (now on main) uses
 `max(1, floor(live_rows/target))`, so post-merge the veto over-predicts by one
@@ -149,7 +155,11 @@ Implementation starts with **M1, M2 and M3a only**.
 Each is owned by one of the issues above. Three were resolved later the same
 day (evidence in the linked issues):
 
-- `find_session` fan-out mechanism: RESOLVED - one small GET per
+- `find_session` fan-out mechanism: RESOLVED 2026-09-17, then CORRECTED
+  2026-09-23 - the un-indexed-fragment fan-out below is real but was never the
+  dominant cost on a compacted store; the 9/17 "collapsed to 2-3 s" observation
+  probed a same-day message in a small fresh fragment. The dominant mechanism is
+  the per-page metadata storm in section 5. Original 9/17 finding: one small GET per
   `sessions.lance` fragment not covered by `sessions_id_btree`'s
   fragment_bitmap, paid on every `find_session` (pond never sets
   `fast_search`, so un-indexed fragments are loaded and refined). Linear in
@@ -170,3 +180,56 @@ day (evidence in the linked issues):
 - Part-group atomicity across appends: RESOLVED - groups DO split (grown-session
   re-sync and intra-commit fragment straddle), so M2's union-across-segments
   design is mandatory; details in the #284 discussion context.
+
+## 5. 2026-09-23 update - full-corpus validation and the real mechanism
+
+PR #298 (M3a) was A/B-validated against a byte-identical 33 GiB copy of the
+live store (`pond-pr298-copy`, 20,332 sessions / 4.10M messages), main
+`fc798a1` vs PR `026dd6b`, re-checked on the polished tip `18ab06f`.
+
+### What validation showed
+
+- The sessions index fold works but changes nothing measurable: the btree
+  already covered 20,326/20,332 rows, and warm `get_message` stays at ~11.5k
+  GETs / 20-45 s on BOTH binaries. The #285 acceptance (warm get < 10 s, GETs
+  in the low hundreds) is met by neither.
+- The straddle delta is real but narrow: mid-run straddle drops 196 GETs /
+  9.9 MB (~6 s) to 11 GETs / 17 KB (~1.4 s); a one-shot CLI with a stale
+  trailing chain never engages it (chain loads only at exact version match).
+- Byte-equivalence held on every probe across 6 binary/state combinations;
+  old binary reads the folded store cleanly. #298 is correct - its premise
+  was wrong.
+
+### The real mechanism (evidence in the 2026-09-23 #285 comment)
+
+Two facts combine:
+
+1. Pond's compaction uses `CompactionMode::TryBinaryCopy`
+   (`substrate.rs` ~3234), which joins fragments WITHOUT re-encoding pages.
+   Each 5-min sync appends ~10 sessions = one tiny page; the compacted
+   `sessions.lance` fragment holds 20,200 rows in 2,057 pages per column
+   (~10 rows/page), 14,401 pages across the 7 columns.
+2. lance 12 initializes the metadata of EVERY page of every projected column
+   before a take (`StructuralPrimitiveFieldScheduler::initialize`), one tiny
+   GET per page (9,699 of the GETs are 2 bytes). 11,277 of the 11,298 traced
+   byte ranges match page-metadata buffers exactly. Structural, not a
+   coalescing bug; per-column cost is ~2,060 GETs regardless of which column.
+
+Projection narrowing and every scan/config knob measured: no effect. The two
+large binary-copied `messages` files have the same disease (476-758
+pages/column, est. 5-8k GETs per take).
+
+### The fix (M3c) and its measurements
+
+- Re-encoding compaction on a lab sub-copy: 1 page per column; the same take
+  went from 11,300 GETs / ~21 s to 15 GETs / 0.75-1.06 s cold, 0.08 s warm.
+- Regrowth guard required: under `TryBinaryCopy` at ~288 syncs/day the storm
+  rebuilds to ~1.7k GETs/take within a day. Re-encode costs the ~27% slower
+  compaction already noted in the code.
+- lance v13 makes take cost independent of page count (measured on the
+  untouched bad layout: 14 GETs / 0.76 s with 13.0.0-beta.9) via upstream
+  #7465/#9278, but has no final crates.io release yet - upgrade later, layout
+  fix now.
+- The resident sessions keymap is NOT needed for this problem: after the
+  rewrite it would save only ~0.7 s (mostly cold btree load) and would need
+  persistence to help one-shot CLI calls. Dropped from the plan.
