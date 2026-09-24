@@ -334,9 +334,8 @@ pub mod http {
     /// the full typed error; the status is the coarse signal.
     fn status_for(code: &ErrorCode) -> StatusCode {
         match code {
-            ErrorCode::ValidationFailed
-            | ErrorCode::VersionUnsupported
-            | ErrorCode::NamespaceUnknown => StatusCode::BAD_REQUEST,
+            ErrorCode::ValidationFailed | ErrorCode::VersionUnsupported => StatusCode::BAD_REQUEST,
+            ErrorCode::NamespaceUnknown => StatusCode::FORBIDDEN,
             ErrorCode::NotFound => StatusCode::NOT_FOUND,
             ErrorCode::Conflict => StatusCode::CONFLICT,
             ErrorCode::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,

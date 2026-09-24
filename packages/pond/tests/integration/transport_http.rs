@@ -508,5 +508,18 @@ async fn error_envelopes_carry_typed_codes_and_statuses() -> anyhow::Result<()> 
     };
     assert_eq!(error.error.code, ErrorCode::NotFound);
 
+    // namespace_unknown -> 403.
+    let (status, _headers, body) = post(
+        &app,
+        "/v1/search",
+        &json!({ "protocol_version": PROTOCOL_VERSION, "namespace": "nope", "query": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let SearchEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::NamespaceUnknown);
+
     Ok(())
 }
