@@ -6,8 +6,8 @@
 //! is driven via `tower::ServiceExt::oneshot` - no HTTP client dependency. The
 //! exceptions bind a socket: `shutdown_completes_while_an_mcp_stream_is_open`,
 //! because the hang it covers is in the connection drain and `oneshot` never
-//! opens a connection to drain, and `port_file_publishes_the_live_bound_address`,
-//! which is about the bind itself.
+//! opens a connection to drain, and `unix_socket_serves_sql_and_is_removed_on_shutdown`,
+//! which is about the socket's lifecycle.
 
 use std::{
     net::SocketAddr,
@@ -33,7 +33,7 @@ use pond::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tower::ServiceExt;
@@ -217,7 +217,10 @@ async fn mcp_session(addr: SocketAddr) -> anyhow::Result<String> {
 /// Write one raw HTTP/1.1 request and read back just the response head. Raw
 /// rather than through a client crate: the point is to own the socket and
 /// decide when it closes, which is what this test is about.
-async fn request(stream: &mut TcpStream, raw: &str) -> anyhow::Result<String> {
+async fn request(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    raw: &str,
+) -> anyhow::Result<String> {
     // Deadlined: the read below has no natural end, so a regression that stalls
     // before emitting headers would hang this test until the CI runner's limit
     // instead of failing it.
@@ -820,39 +823,42 @@ async fn sql_route_maps_an_encoder_failure_to_internal() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--port-file` publishes the actual bound address - with `--port 0`, the
-/// OS-assigned port - only once the socket is live, as bare `host:port`.
+/// `--socket` serves the same router over a Unix socket: a supervisor's first
+/// successful connect gets a real answer, and a clean stop removes the socket
+/// file so the path is free for the next run.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn port_file_publishes_the_live_bound_address() -> anyhow::Result<()> {
+async fn unix_socket_serves_sql_and_is_removed_on_shutdown() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let state = empty_state(&temp).await?;
-    let port_file = temp.path().join("serve.addr");
-    let server = tokio::spawn(http::serve(
-        state,
-        "127.0.0.1".to_owned(),
-        0,
-        Vec::new(),
-        Some(port_file.clone()),
-    ));
+    let sockets = TempDir::new()?;
+    let path = sockets.path().join("pond.sock");
+    http::clear_stale_socket(&path)?;
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let path = path.clone();
+        async move {
+            http::serve_unix(state, &path, &[], async move {
+                let _ = stopped.await;
+            })
+            .await
+        }
+    });
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let published = loop {
-        if let Ok(text) = std::fs::read_to_string(&port_file) {
-            break text;
+    let mut stream = loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+            break stream;
         }
-        assert!(Instant::now() < deadline, "port file never appeared");
-        assert!(!server.is_finished(), "serve exited before publishing");
+        assert!(
+            Instant::now() < deadline,
+            "socket never accepted a connection"
+        );
+        assert!(!server.is_finished(), "serve exited before accepting");
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    let addr: SocketAddr = published
-        .parse()
-        .unwrap_or_else(|_| panic!("bare host:port, no newline: {published:?}"));
-    assert_eq!(addr.ip().to_string(), "127.0.0.1");
-    assert_ne!(addr.port(), 0, "the real port, not the requested 0");
-
     let body =
         json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1 AS ready"}).to_string();
-    let mut stream = TcpStream::connect(addr).await?;
     let head = request(
         &mut stream,
         &format!(
@@ -863,6 +869,81 @@ async fn port_file_publishes_the_live_bound_address() -> anyhow::Result<()> {
     )
     .await?;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    server.abort();
+    drop(stream);
+
+    stop.send(()).expect("server still running");
+    tokio::time::timeout(Duration::from_secs(30), server).await???;
+    assert!(!path.exists(), "shutdown removes the socket file");
+    Ok(())
+}
+
+/// The binary end to end, as a supervisor runs it: `--socket` wins over an
+/// inherited POND_HOST/POND_PORT instead of failing the parse as a conflict,
+/// the first successful connect is answered, and SIGTERM removes the socket.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("pond.sock");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pond"))
+        .arg("serve")
+        .arg("--storage-path")
+        .arg(temp.path().join("store"))
+        .arg("--socket")
+        .arg(&path)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_STATE_HOME", temp.path().join("state"))
+        .env("POND_HOST", "0.0.0.0")
+        .env("POND_PORT", "1")
+        .env_remove("POND_CONFIG_FILE")
+        .env("NO_COLOR", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stream = loop {
+        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+            break stream;
+        }
+        if let Some(status) = child.try_wait()? {
+            panic!("pond serve exited before accepting: {status}");
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            panic!("socket never accepted a connection");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let body =
+        json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1 AS ready"}).to_string();
+    let head = request(
+        &mut stream,
+        &format!(
+            "POST /v1/x/sql HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await?;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    drop(stream);
+
+    let signalled = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()?;
+    assert!(signalled.success());
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output()).await??;
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("serve: http listening on unix:{}\n", path.display())
+    );
+    assert!(!path.exists(), "SIGTERM removes the socket file");
     Ok(())
 }

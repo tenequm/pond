@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use anyhow::{Context, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets::NOTHING};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
@@ -414,6 +414,20 @@ const CONFIG_EXAMPLES_HELP_UNIX: &str = "Examples:
 const CONFIG_EXAMPLES_HELP_WINDOWS: &str = r"Examples:
   pond config show                 every setting, its value, and where it came from
   pond config schema | Out-File -Encoding utf8 $env:APPDATA\pond\config.toml   start from the annotated template";
+const SERVE_EXAMPLES_HELP: &str = if cfg!(unix) {
+    "Examples:
+  pond serve                       HTTP on 127.0.0.1:9797
+  pond serve --port 8080
+  pond serve --transport stdio     same as `pond mcp`
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name
+  pond serve --socket /run/user/1000/pond.sock   owner-only Unix socket, ready once it accepts"
+} else {
+    "Examples:
+  pond serve                       HTTP on 127.0.0.1:9797
+  pond serve --port 8080
+  pond serve --transport stdio     same as `pond mcp`
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name"
+};
 const CONFIG_EXAMPLES_HELP: &str = if cfg!(windows) {
     CONFIG_EXAMPLES_HELP_WINDOWS
 } else {
@@ -750,12 +764,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// Serves the wire protocol over HTTP on --host:--port. Most agent
     /// setups want `pond mcp` instead; `serve` is for the HTTP transport and
     /// for supervised deployments.
-    #[command(after_long_help = "Examples:
-  pond serve                       HTTP on 127.0.0.1:9797
-  pond serve --port 8080
-  pond serve --transport stdio     same as `pond mcp`
-  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name
-  pond serve --port 0 --port-file /tmp/pond.addr   OS-picked port, published once bound")]
+    #[command(after_long_help = SERVE_EXAMPLES_HELP)]
     #[command(display_order = 16)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
@@ -777,6 +786,16 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
             default_value_t = 9797
         )]
         port: u16,
+        /// Serve HTTP on a Unix socket at this path instead of --host:--port.
+        ///
+        /// The socket is owner-only (0600), so no other local user can reach
+        /// it, and a successful connect means the server is ready (the store
+        /// opens before the bind). A dead socket left at the path is replaced;
+        /// any other file there is refused. Removed on shutdown. Excludes
+        /// --host/--port; POND_HOST/POND_PORT in the environment are ignored.
+        #[cfg(unix)]
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
         /// Public Host value the MCP route also accepts, on top of localhost.
         ///
         /// MCP over streamable HTTP validates the Host header against an
@@ -808,12 +827,6 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         /// nothing, serve still starts and logs the `pond init` fix.
         #[arg(long, value_name = "ADAPTER")]
         bootstrap: Option<String>,
-        /// Once the HTTP socket is bound, write its `host:port` here
-        /// (atomically, no trailing newline). The readiness signal for a
-        /// supervisor - the store opens before the bind - and, with `--port 0`,
-        /// how it learns the OS-assigned port.
-        #[arg(long, value_name = "PATH")]
-        port_file: Option<PathBuf>,
     },
     /// Serve the MCP tools over stdio (for agent clients).
     ///
@@ -1373,7 +1386,13 @@ async fn run() -> anyhow::Result<()> {
 
     human_panic::setup_panic!();
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    #[cfg(unix)]
+    if let Err(error) = reject_tcp_bind_beside_socket(&matches) {
+        error.exit();
+    }
+    let cli = Cli::from_arg_matches(&matches)
+        .unwrap_or_else(|error| error.format(&mut Cli::command()).exit());
     init_tracing(cli.verbose.tracing_level_filter());
     if let Err(error) = try_raise_fd_limit(65_536) {
         tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
@@ -1756,15 +1775,12 @@ async fn run() -> anyhow::Result<()> {
             with_sync,
             sync_every,
             bootstrap,
-            port_file,
+            #[cfg(unix)]
+            socket,
         } => {
-            if let Some(path) = &port_file {
-                if matches!(transport, ServeTransport::Stdio) {
-                    bail!(
-                        "--port-file applies to the HTTP transport; drop it or use --transport http"
-                    );
-                }
-                clear_port_file(path)?;
+            #[cfg(unix)]
+            if let Some(path) = &socket {
+                prepare_serve_socket(transport, path)?;
             }
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
@@ -1807,7 +1823,13 @@ async fn run() -> anyhow::Result<()> {
             }
             match transport {
                 ServeTransport::Http => {
-                    transport::http::serve(state, host, port, allowed_host, port_file).await?;
+                    #[cfg(unix)]
+                    if let Some(path) = socket {
+                        let stop = transport::http::shutdown_signal();
+                        return transport::http::serve_unix(state, &path, &allowed_host, stop)
+                            .await;
+                    }
+                    transport::http::serve(state, host, port, allowed_host).await?;
                 }
                 ServeTransport::Stdio => {
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
@@ -2084,25 +2106,40 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
         .init();
 }
 
-/// Runs before the store opens, so a supervisor polling `--port-file` never
-/// reads a previous run's port, and a bad path fails before any slow work.
-fn clear_port_file(path: &Path) -> anyhow::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !dir.is_dir() {
-        bail!(
-            "--port-file {}: directory {} does not exist; create it or pick another path",
-            path.display(),
-            dir.display()
-        );
+/// Only a `--host`/`--port` typed beside `--socket` is a conflict: the same
+/// values from POND_HOST/POND_PORT are ambient, and a supervisor spawning a
+/// socket server should not fail on whatever TCP settings it inherited.
+#[cfg(unix)]
+fn reject_tcp_bind_beside_socket(matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    use clap::parser::ValueSource;
+
+    let Some(("serve", serve)) = matches.subcommand() else {
+        return Ok(());
+    };
+    if !serve.contains_id("socket") {
+        return Ok(());
     }
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error)
-            .with_context(|| format!("failed to remove stale --port-file {}", path.display())),
-        _ => Ok(()),
+    for flag in ["host", "port"] {
+        if serve.value_source(flag) == Some(ValueSource::CommandLine) {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "--socket replaces the TCP bind; drop --{flag} to serve on the socket, \
+                     or drop --socket to serve on --host:--port"
+                ),
+            ));
+        }
     }
+    Ok(())
+}
+
+/// Runs before the store opens, so a bad `--socket` fails before any slow work.
+#[cfg(unix)]
+fn prepare_serve_socket(transport: ServeTransport, path: &Path) -> anyhow::Result<()> {
+    if transport == ServeTransport::Stdio {
+        bail!("--socket serves HTTP; drop --socket or drop --transport stdio");
+    }
+    transport::http::clear_stale_socket(path)
 }
 
 #[allow(clippy::print_stdout)]
@@ -7981,24 +8018,40 @@ mod tests {
         assert!(full.embed && full.index);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn clear_port_file_drops_a_stale_file_and_names_a_missing_dir() -> anyhow::Result<()> {
-        let temp = tempfile::TempDir::new()?;
-        let stale = temp.path().join("serve.addr");
-        std::fs::write(&stale, "127.0.0.1:1")?;
-        clear_port_file(&stale)?;
-        assert!(
-            !stale.exists(),
-            "a previous run's port is never left to read"
-        );
-        clear_port_file(&stale)?;
+    fn serve_socket_excludes_tcp_bind_flags_and_stdio() {
+        for tcp in [["--port", "0"], ["--host", "127.0.0.1"]] {
+            let matches = Cli::command()
+                .try_get_matches_from(
+                    ["pond", "serve", "--socket", "/tmp/pond.sock"]
+                        .into_iter()
+                        .chain(tcp),
+                )
+                .unwrap();
+            let error = reject_tcp_bind_beside_socket(&matches)
+                .expect_err("--socket replaces the TCP bind");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(
+                error.to_string().contains(&format!("drop {}", tcp[0])),
+                "{error}"
+            );
+        }
+        for args in [
+            &["pond", "serve", "--socket", "/tmp/pond.sock"][..],
+            &["pond", "serve", "--port", "0"],
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).unwrap();
+            reject_tcp_bind_beside_socket(&matches).unwrap();
+        }
 
-        let orphan = temp.path().join("missing").join("serve.addr");
-        let error = clear_port_file(&orphan)
-            .expect_err("no parent dir")
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("pond.sock");
+        let error = prepare_serve_socket(ServeTransport::Stdio, &path)
+            .expect_err("stdio has no socket to bind")
             .to_string();
-        assert!(error.contains(&orphan.display().to_string()), "{error}");
-        Ok(())
+        assert!(error.contains("--transport stdio"), "{error}");
+        prepare_serve_socket(ServeTransport::Http, &path).unwrap();
     }
 
     #[test]
@@ -8718,6 +8771,10 @@ mod tests {
             .map(|sub| sub.get_name().to_owned())
             .collect();
         for name in visible {
+            // `--socket` is unix-only, so the reviewed serve help is the unix one.
+            if cfg!(not(unix)) && name == "serve" {
+                continue;
+            }
             let sub = root
                 .find_subcommand_mut(&name)
                 .expect("visible subcommand exists");

@@ -65,12 +65,14 @@ impl Drop for ActivityGuard {
 pub mod http {
     //! axum HTTP+JSON server: `POST /v1/search`, `POST /v1/get-session`,
     //! `POST /v1/get-message`, `POST /v1/ingest`, `POST /v1/x/sql`, and the
-    //! `/mcp` route carrying rmcp's streamable-HTTP MCP transport.
+    //! `/mcp` route carrying rmcp's streamable-HTTP MCP transport - on TCP, or
+    //! on unix an owner-only Unix socket.
 
+    #[cfg(unix)]
+    use std::path::Path;
     use std::{
         future::Future,
         net::{IpAddr, SocketAddr},
-        path::{Path, PathBuf},
         sync::Arc,
         time::Duration,
     };
@@ -83,6 +85,7 @@ pub mod http {
         middleware::{self, Next},
         response::{IntoResponse, Response},
         routing::post,
+        serve::Listener,
     };
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -215,15 +218,12 @@ pub mod http {
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
     /// `allowed_hosts` names the public authorities `/mcp` and `/v1/x/sql`
-    /// accept (see [`mcp_allowed_hosts`]). Once the socket is live it prints
-    /// the bound address and, when `port_file` is set, publishes it there (see
-    /// [`write_port_file`]).
+    /// accept (see [`mcp_allowed_hosts`]).
     pub async fn serve(
         state: AppState,
         host: String,
         port: u16,
         allowed_hosts: Vec<String>,
-        port_file: Option<PathBuf>,
     ) -> anyhow::Result<()> {
         let ip: IpAddr = host
             .parse()
@@ -241,42 +241,125 @@ pub mod http {
         let local = listener
             .local_addr()
             .context("failed to read bound address")?;
-        // The port file is the authoritative readiness signal, so it lands last:
-        // `output::line` exits on a closed stdout and must not strand a live-looking file.
         crate::output::line(&format!("serve: http listening on http://{local}"))?;
-        if let Some(path) = &port_file {
-            write_port_file(path, local)?;
-        }
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
         serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
     }
 
-    /// Temp file + rename in the same directory, so a poller never reads a partial address.
-    fn write_port_file(path: &Path, local: SocketAddr) -> anyhow::Result<()> {
-        let mut tmp = path.as_os_str().to_owned();
-        tmp.push(format!(".{}.tmp", std::process::id()));
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, local.to_string())
-            .with_context(|| format!("failed to write --port-file {}", tmp.display()))?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("failed to install --port-file {}", path.display()))
+    /// Serve the same router on a Unix socket at `path` until `stop`, then
+    /// remove the socket file. Access control is the file's owner-only mode,
+    /// and readiness is a connect that succeeds - there is nothing to publish.
+    /// Run [`clear_stale_socket`] first, before the slow store open.
+    #[cfg(unix)]
+    pub async fn serve_unix(
+        state: AppState,
+        path: &Path,
+        allowed_hosts: &[String],
+        stop: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        let listener = bind_owner_only(path)?;
+        let served = async {
+            crate::output::line(&format!("serve: http listening on unix:{}", path.display()))?;
+            tracing::info!(path = %path.display(), "pond serve listening (HTTP /v1/*, MCP /mcp)");
+            serve_with_shutdown(listener, state, allowed_hosts, stop).await
+        }
+        .await;
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, path = %path.display(), "failed to remove the socket file");
+        }
+        served
     }
 
-    /// The serving half of [`serve`], with the stop trigger injected. Public so
-    /// the integration test can drive a real socket and a real MCP stream
-    /// without raising a process signal.
+    /// Checks `--socket` before the store opens, so a bad path fails before any
+    /// slow work. A socket nothing answers on is a previous run's leftover and is
+    /// removed; a live socket or any other file is refused, never deleted.
+    #[cfg(unix)]
+    pub fn clear_stale_socket(path: &Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = socket_dir(path);
+        if !dir.is_dir() {
+            anyhow::bail!(
+                "--socket {}: directory {} does not exist; create it or pick another path",
+                path.display(),
+                dir.display()
+            );
+        }
+        let metadata = match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            result => {
+                result.with_context(|| format!("failed to inspect --socket {}", path.display()))?
+            }
+        };
+        if !metadata.file_type().is_socket() {
+            anyhow::bail!(
+                "--socket {} exists and is not a socket; remove it or pick another path",
+                path.display()
+            );
+        }
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            anyhow::bail!(
+                "--socket {}: a server is already listening there; stop it or pick another path",
+                path.display()
+            );
+        }
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error)
+                .with_context(|| format!("failed to remove stale --socket {}", path.display())),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn socket_dir(path: &Path) -> &Path {
+        path.parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+    }
+
+    /// Binds inside a fresh 0700 staging dir, narrows the socket to 0600, then
+    /// hard-links it into place: it is never connectable by another user, the
+    /// process-wide umask is left alone, and unlike a rename the link refuses
+    /// to replace a socket another process bound at `path` meanwhile.
+    #[cfg(unix)]
+    fn bind_owner_only(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
+        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
+        let staging = tempfile::Builder::new()
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir_in(socket_dir(path))
+            .with_context(|| format!("failed to stage --socket {}", path.display()))?;
+        let staged = staging.path().join("s");
+        let listener = tokio::net::UnixListener::bind(&staged)
+            .with_context(|| format!("failed to bind --socket {}", path.display()))?;
+        std::fs::set_permissions(&staged, Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to restrict --socket {}", path.display()))?;
+        std::fs::hard_link(&staged, path)
+            .with_context(|| format!("failed to install --socket {}", path.display()))?;
+        Ok(listener)
+    }
+
+    /// The serving half of [`serve`] and [`serve_unix`], with the stop trigger
+    /// injected. Public so the integration test can drive a real socket and a
+    /// real MCP stream without raising a process signal.
     ///
     /// Stopping is two-stage, because axum's graceful shutdown waits for every
     /// in-flight connection and an MCP client holds its `GET /mcp` stream open
     /// for the life of the session: cancelling the token the streamable-HTTP
     /// service was built with ends those sessions so the drain can finish, and
     /// [`SHUTDOWN_DRAIN`] then bounds the wait for anything that ignored it.
-    pub async fn serve_with_shutdown(
-        listener: TcpListener,
+    pub async fn serve_with_shutdown<L>(
+        listener: L,
         state: AppState,
         allowed_hosts: &[String],
         stop: impl Future<Output = ()> + Send + 'static,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        L: Listener,
+        L::Addr: std::fmt::Debug,
+    {
         let mcp_shutdown = CancellationToken::new();
         let server = axum::serve(listener, router(state, allowed_hosts, mcp_shutdown.clone()))
             .with_graceful_shutdown({
@@ -310,7 +393,7 @@ pub mod http {
     /// and a server running as PID 1 gets no default disposition for a signal
     /// it has not handled - so without this arm `serve` ignored the stop
     /// outright and was killed when the supervisor's grace period ran out.
-    async fn shutdown_signal() {
+    pub async fn shutdown_signal() {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -453,6 +536,55 @@ pub mod http {
                     "pond.internal:9797".to_owned()
                 ]
             );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn clear_stale_socket_removes_only_a_dead_socket() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            clear_stale_socket(&path).unwrap();
+
+            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            clear_stale_socket(&path).unwrap();
+            assert!(!path.exists(), "a dead run's socket is cleared");
+
+            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let error = clear_stale_socket(&path).unwrap_err().to_string();
+            assert!(error.contains("already listening"), "{error}");
+            assert!(path.exists(), "a live server's socket is never unlinked");
+            drop(live);
+            std::fs::remove_file(&path).unwrap();
+
+            std::fs::write(&path, "not a socket").unwrap();
+            let error = clear_stale_socket(&path).unwrap_err().to_string();
+            assert!(error.contains("is not a socket"), "{error}");
+            assert!(path.exists(), "a non-socket file is refused, never deleted");
+
+            let orphan = temp.path().join("missing").join("pond.sock");
+            let error = clear_stale_socket(&orphan).unwrap_err().to_string();
+            assert!(error.contains(&orphan.display().to_string()), "{error}");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn bound_socket_is_owner_only_and_leaves_no_staging() {
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let _listener = bind_owner_only(&path).unwrap();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(metadata.file_type().is_socket());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            let entries: Vec<_> = std::fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(entries, ["pond.sock"]);
+
+            let error = bind_owner_only(&path).unwrap_err().to_string();
+            assert!(error.contains("failed to install"), "{error}");
         }
     }
 }

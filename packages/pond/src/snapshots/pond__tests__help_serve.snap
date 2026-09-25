@@ -27,6 +27,11 @@ Options:
           [env: POND_PORT]
           [default: 9797]
 
+      --socket <PATH>
+          Serve HTTP on a Unix socket at this path instead of --host:--port.
+          
+          The socket is owner-only (0600), so no other local user can reach it, and a successful connect means the server is ready (the store opens before the bind). A dead socket left at the path is replaced; any other file there is refused. Removed on shutdown. Excludes --host/--port; POND_HOST/POND_PORT in the environment are ignored.
+
       --allowed-host <HOST>
           Public Host value the MCP route also accepts, on top of localhost.
           
@@ -44,9 +49,6 @@ Options:
 
       --bootstrap <ADAPTER>
           On startup, when NO adapters are configured yet, discover and enable this one (an init-equivalent step for supervised deploys). Never touches an existing [adapters.*] config; if discovery finds nothing, serve still starts and logs the `pond init` fix
-
-      --port-file <PATH>
-          Once the HTTP socket is bound, write its `host:port` here (atomically, no trailing newline). The readiness signal for a supervisor - the store opens before the bind - and, with `--port 0`, how it learns the OS-assigned port
 
   -h, --help
           Print help (see a summary with '-h')
@@ -75,4 +77,4 @@ Examples:
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`
   pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name
-  pond serve --port 0 --port-file /tmp/pond.addr   OS-picked port, published once bound
+  pond serve --socket /run/user/1000/pond.sock   owner-only Unix socket, ready once it accepts
