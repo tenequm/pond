@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
@@ -25,8 +26,8 @@ const PROBE_TIMEOUT_SECS: u64 = 5;
 const FALLBACK_GRACE: Duration = Duration::from_secs(2);
 const PORT_POLL: Duration = Duration::from_millis(100);
 const TERMINATE_POLL: Duration = Duration::from_millis(25);
-/// clap's usage-error exit: a pond from before `--port-file` rejects the flag
-/// with it, before binding anything.
+/// clap's usage-error exit, for any bad flag or env value; only a rejection
+/// naming `--port-file` marks a pond from before the flag.
 const USAGE_ERROR_EXIT: i32 = 2;
 
 /// `STATE_DIR/serve/<sockhash>/`: herdr keys plugin state by plugin id only,
@@ -144,6 +145,8 @@ pub(crate) struct ServeChild {
     child: Child,
     port_file: PathBuf,
     log: PathBuf,
+    /// Where this child's output starts in the shared `log`.
+    log_start: u64,
     grace: Duration,
 }
 
@@ -158,17 +161,18 @@ impl ServeChild {
         grace: Duration,
     ) -> std::io::Result<Self> {
         let _ = fs::remove_file(&port_file);
-        let child = log_stdio(
-            Command::new(pond)
-                .args(["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"])
-                .arg(&port_file),
-            &log,
-        )?
-        .spawn()?;
+        let mut command = Command::new(pond);
+        command
+            .args(["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"])
+            .arg(&port_file);
+        log_stdio(&mut command, &log)?;
+        let log_start = fs::metadata(&log).map_or(0, |meta| meta.len());
+        let child = command.spawn()?;
         Ok(Self {
             child,
             port_file,
             log,
+            log_start,
             grace,
         })
     }
@@ -194,7 +198,7 @@ impl ServeChild {
                 return Ok(addr);
             }
             if let Ok(Some(status)) = self.child.try_wait() {
-                if status.code() == Some(USAGE_ERROR_EXIT) {
+                if status.code() == Some(USAGE_ERROR_EXIT) && self.rejected_port_file() {
                     return Err(ApiError::PondTooOld);
                 }
                 return Err(ApiError::Unreachable(format!(
@@ -211,6 +215,15 @@ impl ServeChild {
             }
             tokio::time::sleep(PORT_POLL).await;
         }
+    }
+
+    fn rejected_port_file(&self) -> bool {
+        fs::read(&self.log).is_ok_and(|log| {
+            usize::try_from(self.log_start)
+                .ok()
+                .and_then(|start| log.get(start..))
+                .is_some_and(|output| String::from_utf8_lossy(output).contains("--port-file"))
+        })
     }
 }
 
@@ -311,12 +324,17 @@ pub(crate) async fn connect(
 }
 
 async fn spawn_fallback(origin: &Origin) -> Result<Fallback, ApiError> {
+    // One file per spawn: a retiring fallback removes its own on drop, while
+    // its successor may already have published there.
+    static SPAWNED: AtomicU32 = AtomicU32::new(0);
     let log = origin.dir.desk_log();
     let pond = Config::pond(&origin.config_dir, &log)
         .map_err(|error| ApiError::Unreachable(format!("{error:#}")))?;
-    let port_file = origin
-        .dir
-        .port_file(&format!("desk.{}", std::process::id()));
+    let port_file = origin.dir.port_file(&format!(
+        "desk.{}.{}",
+        std::process::id(),
+        SPAWNED.fetch_add(1, Ordering::Relaxed)
+    ));
     log_line(&log, &format!("desk: starting fallback {}", pond.display()));
     let mut serve = ServeChild::spawn(&pond, port_file, log, FALLBACK_GRACE).map_err(|error| {
         ApiError::Unreachable(format!("cannot start {}: {error}", pond.display()))
@@ -499,6 +517,51 @@ mod tests {
         sandbox.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
         let result = connect(&client().unwrap(), &sandbox.origin(), None).await;
         assert!(matches!(result, Err(ApiError::PondTooOld)));
+    }
+
+    #[tokio::test]
+    async fn another_usage_error_is_not_too_old() {
+        let sandbox = Sandbox::new();
+        let pond = write_script(
+            &sandbox.path("bin/pond"),
+            "echo \"error: invalid value 'x' for '--storage-path <PATH>'\" >&2; exit 2",
+        );
+        sandbox.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
+        let origin = sandbox.origin();
+        let log = origin.dir.desk_log();
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "error: unexpected argument '--port-file' found\n").unwrap();
+        let Err(ApiError::Unreachable(reason)) = connect(&client().unwrap(), &origin, None).await
+        else {
+            panic!("expected Unreachable");
+        };
+        assert!(reason.contains("desk-serve.log"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_retired_fallback_keeps_its_successors_port_file() {
+        let sandbox = Sandbox::new();
+        let client = client().unwrap();
+        let origin = sandbox.origin();
+        let first_pond = ready_pond().await;
+        sandbox.fake_serve(Some(first_pond.addr()), "trap '' TERM; exec sleep 30");
+        let first = connect(&client, &origin, None).await.unwrap();
+        let retired = first.fallback.as_ref().unwrap().serve.id();
+
+        drop(first_pond);
+        let second_pond = ready_pond().await;
+        sandbox.fake_serve(Some(second_pond.addr()), "exec sleep 30");
+        let second = connect(&client, &origin, first.fallback).await.unwrap();
+        assert_eq!(second.base_url, second_pond.base_url);
+        let port_file = second.fallback.as_ref().unwrap().serve.port_file.clone();
+
+        let deadline = Instant::now() + FALLBACK_GRACE * 3;
+        while alive(retired) {
+            assert!(Instant::now() < deadline, "the retired fallback survived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(port_file.exists(), "the retired fallback removed it");
     }
 
     #[tokio::test]

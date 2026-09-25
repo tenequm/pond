@@ -593,11 +593,32 @@ mod tests {
     #[tokio::test]
     async fn a_pond_without_port_file_is_named_too_old() {
         let setup = Setup::new().await;
-        let pond = setup.fake_pond(false, "exit 2");
+        let pond = setup.fake_pond(
+            false,
+            "echo \"error: unexpected argument '--port-file' found\" >&2; exit 2",
+        );
         let _listener = UnixListener::bind(&setup.socket).unwrap();
         setup.own(&pond).await.unwrap();
         assert!(setup.log().contains("too old"), "{}", setup.log());
         assert!(setup.log().contains("upgrade pond"), "{}", setup.log());
+    }
+
+    #[tokio::test]
+    async fn another_usage_error_names_the_log_not_an_upgrade() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(
+            false,
+            "echo \"error: invalid value 'x' for '--storage-path <PATH>'\" >&2; exit 2",
+        );
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        let log = setup.log();
+        assert!(!log.contains("too old"), "{log}");
+        assert!(
+            log.contains("exited (exit status: 2) before listening - see")
+                && log.contains("daemon.log"),
+            "{log}"
+        );
     }
 
     #[test]
