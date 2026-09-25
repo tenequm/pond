@@ -1,9 +1,13 @@
 //! A canned-response stand-in for `pond serve`, so the HTTP client is tested
 //! against real bytes on a real socket - trait mocks alone would let the
-//! client's serialization drift while every test stays green.
+//! client's serialization drift while every test stays green. Also the
+//! sandbox dirs and fake `pond`/`herdr` scripts the shell-level tests run.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -202,4 +206,55 @@ async fn serve_one(
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.shutdown().await;
+}
+
+/// A throwaway directory standing in for the plugin's config and state dirs,
+/// removed on drop.
+pub(crate) struct Sandbox {
+    root: PathBuf,
+}
+
+impl Sandbox {
+    pub(crate) fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "herdr-pond-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    pub(crate) fn path(&self, relative: &str) -> PathBuf {
+        self.root.join(relative)
+    }
+
+    pub(crate) fn config_dir(&self) -> PathBuf {
+        self.path("config")
+    }
+
+    pub(crate) fn state_dir(&self) -> PathBuf {
+        self.path("state")
+    }
+
+    pub(crate) fn write_config(&self, text: &str) {
+        std::fs::create_dir_all(self.config_dir()).unwrap();
+        std::fs::write(self.config_dir().join("config.toml"), text).unwrap();
+    }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Writes an executable `/bin/sh` script, the stand-in for `pond` or `herdr`.
+pub(crate) fn write_script(path: &Path, body: &str) -> PathBuf {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_path_buf()
 }
