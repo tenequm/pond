@@ -62,7 +62,7 @@ pub(super) enum Host {
 }
 
 impl Known {
-    /// The whole-session count, if one is known for the current `last_ts`.
+    /// The whole-session count, if one is known at or past the current `last_ts`.
     pub(super) fn count(&self) -> Option<u64> {
         self.count
             .filter(|counted| counted.last_ts >= self.last_ts)

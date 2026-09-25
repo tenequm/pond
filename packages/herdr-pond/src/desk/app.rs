@@ -1017,9 +1017,17 @@ impl App {
         }
     }
 
+    /// A clipped toast leaves its full text in `desk.log`.
     fn toast(&mut self, error: &ApiError) -> Vec<Effect> {
-        self.toast = Some(ui::error_text(error));
-        Vec::new()
+        let shown = ui::error_text(error);
+        let full = error.to_string();
+        let effects = if shown == full {
+            Vec::new()
+        } else {
+            vec![Effect::Log(format!("desk: {full}"))]
+        };
+        self.toast = Some(shown);
+        effects
     }
 
     fn on_listing(
@@ -1658,10 +1666,17 @@ mod tests {
         assert_eq!(app.fatal, None, "a loaded desk keeps its rows");
         let compact = "pond validation_failed: sql error: query exceeded the 25s limit";
         assert_eq!(app.toast.as_deref(), Some(compact));
+        assert_eq!(
+            app.toast(&error),
+            [Effect::Log(format!("desk: {error}"))],
+            "the clipped text reaches desk.log"
+        );
         assert!(screen(&mut app).contains("pond validation_failed: sql error"));
         press(&mut app, &failing, KeyCode::Esc);
         assert_eq!(app.toast, None);
         assert_eq!(app.listing().map(<[SessionRow]>::len), Some(2));
+        let whole = ApiError::Request("timed out".to_owned());
+        assert!(app.toast(&whole).is_empty(), "nothing was clipped");
     }
 
     #[test]
