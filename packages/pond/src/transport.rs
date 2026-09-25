@@ -299,11 +299,21 @@ pub mod http {
                 path.display()
             );
         }
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            anyhow::bail!(
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => anyhow::bail!(
                 "--socket {}: a server is already listening there; stop it or pick another path",
                 path.display()
-            );
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "--socket {}: cannot tell whether the socket there is live; \
+                         remove it or pick another path",
+                        path.display()
+                    )
+                });
+            }
         }
         match std::fs::remove_file(path) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error)
@@ -541,6 +551,8 @@ pub mod http {
         #[cfg(unix)]
         #[test]
         fn clear_stale_socket_removes_only_a_dead_socket() {
+            use std::os::unix::fs::PermissionsExt;
+
             let temp = tempfile::TempDir::new().unwrap();
             let path = temp.path().join("pond.sock");
             clear_stale_socket(&path).unwrap();
@@ -560,6 +572,16 @@ pub mod http {
             let error = clear_stale_socket(&path).unwrap_err().to_string();
             assert!(error.contains("is not a socket"), "{error}");
             assert!(path.exists(), "a non-socket file is refused, never deleted");
+            std::fs::remove_file(&path).unwrap();
+
+            // Non-root gets EACCES, root connects; neither may unlink a live socket.
+            let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let error = format!("{:#}", clear_stale_socket(&path).unwrap_err());
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            assert!(path.exists(), "an unreachable socket is never deleted");
+            drop(live);
+            std::fs::remove_file(&path).unwrap();
 
             let orphan = temp.path().join("missing").join("pond.sock");
             let error = clear_stale_socket(&orphan).unwrap_err().to_string();
