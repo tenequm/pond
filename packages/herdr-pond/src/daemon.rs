@@ -534,7 +534,17 @@ mod tests {
         };
         let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
         owner.unwrap();
-        assert!(!setup.log().contains("probe failed"), "{}", setup.log());
+        assert!(!setup.log().contains("did not answer"), "{}", setup.log());
+        let probes = setup
+            .pond
+            .recorded()
+            .iter()
+            .filter(|request| request.body.contains("SELECT 1"))
+            .count();
+        assert!(
+            probes >= 3,
+            "two refused probes, then a passing one: {probes}"
+        );
     }
 
     #[tokio::test]

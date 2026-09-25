@@ -368,9 +368,29 @@ pub(crate) fn endpoint(socket: &Path, token: &str) -> Endpoint {
 }
 
 /// Writes an executable `/bin/sh` script, the stand-in for `pond` or `herdr`.
+/// A child another test forks while the script is open for writing holds
+/// that fd until it execs, and exec fails with ETXTBSY meanwhile - so the
+/// script is dry-run (it exits at once under [`DRY_RUN`]) until it execs.
 pub(crate) fn write_script(path: &Path, body: &str) -> PathBuf {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\n[ -z \"${DRY_RUN}\" ] || exit 0\n{body}\n"),
+    )
+    .unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..100 {
+        match std::process::Command::new(path).env(DRY_RUN, "1").status() {
+            Err(error) if error.raw_os_error() == Some(nix::libc::ETXTBSY) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            status => {
+                assert!(status.unwrap().success());
+                break;
+            }
+        }
+    }
     path.to_path_buf()
 }
+
+const DRY_RUN: &str = "HERDR_POND_TEST_DRY_RUN";
