@@ -48,6 +48,8 @@ mod session_scoped_pk;
 mod sql;
 #[path = "integration/store_concurrency.rs"]
 mod store_concurrency;
+#[path = "integration/support.rs"]
+mod support;
 #[path = "integration/sync.rs"]
 mod sync;
 #[path = "integration/sync_cursor.rs"]

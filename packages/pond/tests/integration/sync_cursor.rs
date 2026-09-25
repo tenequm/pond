@@ -3,39 +3,17 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use pond::sessions::Store;
 
+use crate::support::{ChildGuard, sandboxed_pond};
+
 const CLAUDE_CODE_FIXTURE: &str =
     "tests/fixtures/adapter/claude_code/projects/-Users-user-Projects-myproject-a";
-
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn sandbox_command(temp: &TempDir) -> Command {
-    let home = temp.path().join("home");
-    std::fs::create_dir_all(&home).expect("home");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pond"));
-    command
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("XDG_CONFIG_HOME", temp.path().join("config"))
-        .env("XDG_DATA_HOME", temp.path().join("data"))
-        .env("XDG_CACHE_HOME", temp.path().join("cache"))
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("NO_COLOR", "1");
-    command
-}
 
 fn copy_one_session(root: &Path) {
     let project = root.join("project");
@@ -92,7 +70,7 @@ fn state_dir(temp: &TempDir) -> std::path::PathBuf {
 }
 
 fn run_one_serve_sync(temp: &TempDir) -> String {
-    let mut command = sandbox_command(temp);
+    let mut command = sandboxed_pond(temp);
     command
         .args([
             "serve",
@@ -151,7 +129,7 @@ fn serve_restart_uses_persisted_cursor_when_rowmap_is_busy() {
     copy_one_session(&source);
     write_config(&temp, &source);
 
-    let initial = sandbox_command(&temp)
+    let initial = sandboxed_pond(&temp)
         .arg("sync")
         .output()
         .expect("run initial sync");
@@ -186,7 +164,7 @@ fn serve_restart_uses_persisted_cursor_when_rowmap_is_busy() {
     // A no-op sync proves only that nothing was re-inserted, which an idempotent
     // full re-read also achieves. The preview resolves the same oracle and
     // reports the gate's verdict, so it is what proves the session was SKIPPED.
-    let preview = sandbox_command(&temp)
+    let preview = sandboxed_pond(&temp)
         .args(["sync", "--dry-run"])
         .output()
         .expect("preview with the rowmap busy");
@@ -217,7 +195,7 @@ async fn rebuilt_store_rejects_and_replaces_the_old_cursor() {
     copy_one_session(&source);
     write_config(&temp, &source);
 
-    let initial = sandbox_command(&temp)
+    let initial = sandboxed_pond(&temp)
         .arg("sync")
         .output()
         .expect("run initial sync");
@@ -232,7 +210,7 @@ async fn rebuilt_store_rejects_and_replaces_the_old_cursor() {
         File::create(cache.join(format!("rowmetamap-{store_key}.lock"))).expect("rowmap lock file");
     rowmap_lock.lock().expect("hold rowmap build lock");
 
-    let rebuilt = sandbox_command(&temp)
+    let rebuilt = sandboxed_pond(&temp)
         .arg("sync")
         .output()
         .expect("sync rebuilt store");
@@ -257,7 +235,7 @@ async fn rebuilt_store_rejects_and_replaces_the_old_cursor() {
     drop(store);
     drop(rowmap_lock);
 
-    let reseed = sandbox_command(&temp)
+    let reseed = sandboxed_pond(&temp)
         .arg("sync")
         .output()
         .expect("reseed cursor");
@@ -274,7 +252,7 @@ async fn rebuilt_store_rejects_and_replaces_the_old_cursor() {
     let rowmap_lock =
         File::create(cache.join(format!("rowmetamap-{store_key}.lock"))).expect("rowmap lock file");
     rowmap_lock.lock().expect("hold rowmap build lock");
-    let resumed = sandbox_command(&temp)
+    let resumed = sandboxed_pond(&temp)
         .arg("sync")
         .output()
         .expect("resume with replacement cursor");
