@@ -1017,17 +1017,11 @@ impl App {
         }
     }
 
-    /// A clipped toast leaves its full text in `desk.log`.
+    /// The toast is clipped and capped when drawn, so `desk.log` keeps the
+    /// whole error.
     fn toast(&mut self, error: &ApiError) -> Vec<Effect> {
-        let shown = ui::error_text(error);
-        let full = error.to_string();
-        let effects = if shown == full {
-            Vec::new()
-        } else {
-            vec![Effect::Log(format!("desk: {full}"))]
-        };
-        self.toast = Some(shown);
-        effects
+        self.toast = Some(ui::error_text(error));
+        vec![Effect::Log(format!("desk: {error}"))]
     }
 
     fn on_listing(
@@ -1669,14 +1663,18 @@ mod tests {
         assert_eq!(
             app.toast(&error),
             [Effect::Log(format!("desk: {error}"))],
-            "the clipped text reaches desk.log"
+            "the whole text reaches desk.log"
         );
         assert!(screen(&mut app).contains("pond validation_failed: sql error"));
         press(&mut app, &failing, KeyCode::Esc);
         assert_eq!(app.toast, None);
         assert_eq!(app.listing().map(<[SessionRow]>::len), Some(2));
-        let whole = ApiError::Request("timed out".to_owned());
-        assert!(app.toast(&whole).is_empty(), "nothing was clipped");
+        let unclipped = ApiError::Request("timed out".to_owned());
+        assert_eq!(
+            app.toast(&unclipped),
+            [Effect::Log(format!("desk: {unclipped}"))],
+            "every toast reaches desk.log"
+        );
     }
 
     #[test]
