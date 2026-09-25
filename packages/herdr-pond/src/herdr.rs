@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-use crate::config::{Config, log_line, open_log};
+use crate::config::{Config, log_line, log_stdio};
 use crate::types::LiveAgent;
 
 const PLUGIN_ID: &str = "pond";
@@ -17,7 +17,7 @@ const DESK_ENTRYPOINT: &str = "desk";
 const DESK_LABEL: &str = "pond desk";
 
 /// A plugin-runtime path herdr sets for every plugin process.
-pub(crate) fn plugin_env(var: &str) -> anyhow::Result<PathBuf> {
+fn plugin_env(var: &str) -> anyhow::Result<PathBuf> {
     std::env::var_os(var)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -59,12 +59,8 @@ fn project_from_context(json: &str) -> Option<String> {
 /// end goes to /dev/null or `log`. The child calls [`detach`] itself - a
 /// pre-exec `setsid` would need `unsafe`.
 pub(crate) fn spawn_detached(mut command: Command, log: &Path) -> anyhow::Result<()> {
-    let out = open_log(log).with_context(|| format!("opening {}", log.display()))?;
-    let err = out.try_clone()?;
-    command
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err)
+    log_stdio(&mut command, log)
+        .with_context(|| format!("opening {}", log.display()))?
         .spawn()
         .with_context(|| format!("spawning {:?}", command.get_program()))?;
     Ok(())
@@ -78,13 +74,12 @@ pub(crate) fn detach() {
 /// Resolves `pond` for a headless leg. A failure is logged and toasted once;
 /// the toast re-arms after the next successful resolution.
 pub(crate) fn resolve_pond_or_toast(
-    config: &Config,
     config_dir: &Path,
     state_dir: &Path,
     log: &Path,
 ) -> Option<PathBuf> {
     let marker = state_dir.join("pond-missing.toasted");
-    match config.resolve_pond(config_dir) {
+    match Config::pond(config_dir, log) {
         Ok(pond) => {
             let _ = fs::remove_file(&marker);
             Some(pond)
@@ -105,8 +100,6 @@ pub(crate) struct Pane {
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
-    pub agent: Option<String>,
-    #[serde(default)]
     pub agent_session: Option<AgentSession>,
 }
 
@@ -124,7 +117,6 @@ pub(crate) fn live_agents(panes: Vec<Pane>) -> Vec<LiveAgent> {
             Some(LiveAgent {
                 session: pane.agent_session?.value,
                 pane_id: pane.pane_id,
-                agent: pane.agent,
             })
         })
         .collect()
@@ -253,14 +245,6 @@ esac"#,
         Herdr::new(bin)
     }
 
-    fn calls(sandbox: &Sandbox) -> Vec<String> {
-        fs::read_to_string(sandbox.path("calls"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-
     #[test]
     fn context_prefers_the_focused_pane_cwd() {
         let both = r#"{"workspace_cwd":"/w","focused_pane_cwd":"/p","focused_pane_id":"x"}"#;
@@ -280,7 +264,6 @@ esac"#,
             live,
             vec![LiveAgent {
                 pane_id: "wD:pS".to_owned(),
-                agent: Some("claude".to_owned()),
                 session: "0a1d69bd".to_owned(),
             }]
         );
@@ -293,7 +276,7 @@ esac"#,
             .open_desk(Some("wD"))
             .unwrap();
         assert_eq!(
-            calls(&sandbox),
+            sandbox.lines("calls"),
             ["pane list --workspace wD", "plugin pane focus wD:pU"]
         );
     }
@@ -314,7 +297,7 @@ esac"#,
             fake_herdr(&sandbox, panes, focus_exit)
                 .open_desk(None)
                 .unwrap();
-            assert_eq!(calls(&sandbox), expected);
+            assert_eq!(sandbox.lines("calls"), expected);
         }
     }
 

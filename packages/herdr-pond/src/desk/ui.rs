@@ -13,7 +13,7 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, Lane};
-use crate::types::{SearchSession, SessionRow, TranscriptMessage};
+use crate::types::{LISTING_WINDOW_DAYS, SearchSession, SessionRow, TranscriptMessage};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TAB_STOP: usize = 4;
@@ -23,6 +23,7 @@ const AGE: usize = 4;
 const COUNT: usize = 7;
 /// The preview wraps on every frame, so one huge message must not reach it whole.
 const PREVIEW_CHARS: usize = 2000;
+pub(super) const NO_TITLE: &str = "(no user message)";
 pub(super) const PAGER_FOOTER: &str = "conversation only - tool bodies via pond_sql/get_session";
 
 pub(super) struct DeskAreas {
@@ -134,7 +135,7 @@ fn window_label(app: &App) -> String {
     if app.all_time {
         "all time".to_owned()
     } else {
-        format!("last {} days", crate::types::LISTING_WINDOW_DAYS)
+        format!("last {LISTING_WINDOW_DAYS} days")
     }
 }
 
@@ -212,12 +213,7 @@ fn render_rows(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_spacing(HighlightSpacing::Always)
         .highlight_style(Style::new().reversed())
         .scroll_padding(1);
-    let state = if app.search.is_some() {
-        &mut app.search_state
-    } else {
-        &mut app.listing_state
-    };
-    frame.render_stateful_widget(list, area, state);
+    frame.render_stateful_widget(list, area, app.state_mut());
 }
 
 /// The rows of the current view, or the sentence that stands in for them.
@@ -283,7 +279,7 @@ fn listing_item(app: &App, row: &SessionRow) -> ListItem<'static> {
         Some(detail) => detail
             .title
             .as_deref()
-            .map_or_else(|| "(no user message)".dim(), |t| Span::raw(one_line(t))),
+            .map_or_else(|| NO_TITLE.dim(), |t| Span::raw(one_line(t))),
         None => "...".dim(),
     };
     ListItem::new(Line::from(vec![
@@ -365,12 +361,14 @@ fn footer(app: &App) -> Line<'static> {
     };
     let mut spans = Vec::new();
     if app.is_loading() {
-        spans.push(
-            Span::raw(format!("{} ", SPINNER[app.spinner % SPINNER.len()])).fg(Color::Yellow),
-        );
+        spans.push(Span::raw(format!("{} ", spinner_frame(app))).fg(Color::Yellow));
     }
     spans.push(Span::raw(help).dim());
     Line::from(spans)
+}
+
+fn spinner_frame(app: &App) -> &'static str {
+    SPINNER[app.spinner % SPINNER.len()]
 }
 
 fn render_pager(frame: &mut Frame, app: &App) {
@@ -406,7 +404,7 @@ fn render_pager(frame: &mut Frame, app: &App) {
         );
     }
     let status = if app.lane_loading(Lane::Page) {
-        format!("{} loading", SPINNER[app.spinner % SPINNER.len()])
+        format!("{} loading", spinner_frame(app))
     } else if pager.eof {
         "end".to_owned()
     } else {

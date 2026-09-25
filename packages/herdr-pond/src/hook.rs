@@ -9,13 +9,13 @@
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use serde::Deserialize;
 
-use crate::config::{Config, log_line, open_log, try_lock};
+use crate::config::{Config, log_line, log_stdio, try_lock};
 use crate::herdr;
 
 const SYNC_LOG: &str = "sync.log";
@@ -45,7 +45,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
             herdr::detach();
             worker(adapter)
         }
-        _ => bail!("usage: herdr-pond hook [--worker <adapter>]"),
+        _ => bail!(crate::USAGE),
     }
 }
 
@@ -129,8 +129,7 @@ fn worker(adapter: &str) -> anyhow::Result<()> {
     let state_dir = herdr::state_dir()?;
     let config_dir = herdr::config_dir()?;
     let log = state_dir.join(SYNC_LOG);
-    let config = Config::load(&config_dir, &log);
-    let Some(pond) = herdr::resolve_pond_or_toast(&config, &config_dir, &state_dir, &log) else {
+    let Some(pond) = herdr::resolve_pond_or_toast(&config_dir, &state_dir, &log) else {
         return Ok(());
     };
     work(adapter, &state_dir, &pond, COALESCE)
@@ -165,15 +164,8 @@ fn work(adapter: &str, state_dir: &Path, pond: &Path, coalesce: Duration) -> any
 /// instead of exiting "skipped" and silently dropping the idle event.
 fn sync(adapter: &str, pond: &Path, log: &Path) {
     let started = Instant::now();
-    let status = open_log(log).and_then(|out| {
-        let err = out.try_clone()?;
-        Command::new(pond)
-            .args(["sync", adapter, "-q"])
-            .stdin(Stdio::null())
-            .stdout(out)
-            .stderr(err)
-            .status()
-    });
+    let status =
+        log_stdio(Command::new(pond).args(["sync", adapter, "-q"]), log).and_then(Command::status);
     let outcome = match status {
         Ok(status) => status.to_string(),
         Err(error) => format!("cannot run {}: {error}", pond.display()),
@@ -192,6 +184,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use std::io::Read;
+    use std::process::Stdio;
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
 
@@ -200,6 +193,13 @@ mod tests {
 
     const TEST_COALESCE: Duration = Duration::from_millis(50);
     const ROLE: &str = "HERDR_POND_TEST_ROLE";
+    /// Re-runs this test binary as exactly [`self_exec_role`].
+    const SELF_EXEC_ARGS: [&str; 4] = [
+        "--exact",
+        "hook::tests::self_exec_role",
+        "--test-threads=1",
+        "-q",
+    ];
 
     fn idle(agent: &str) -> String {
         format!(
@@ -224,14 +224,6 @@ echo "end $2" >> '{events}'"#,
                 lock = sandbox.path("store.lock").display(),
             ),
         )
-    }
-
-    fn lines(path: &Path) -> Vec<String> {
-        fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
     }
 
     fn wait_for(what: &str, condition: impl Fn() -> bool) {
@@ -287,7 +279,7 @@ echo "end $2" >> '{events}'"#,
         }
 
         fn events(&self) -> Vec<String> {
-            lines(&self.sandbox.path("events"))
+            self.sandbox.lines("events")
         }
 
         fn has_event(&self, event: &str) -> bool {
@@ -391,12 +383,10 @@ echo "end $2" >> '{events}'"#,
         fs::remove_file(harness.sandbox.path("store.lock")).unwrap();
         harness.join();
         assert_eq!(harness.events().len(), 4, "{:?}", harness.events());
+        let calls = harness.sandbox.lines("calls");
         assert!(
-            lines(&harness.sandbox.path("calls"))
-                .iter()
-                .all(|call| call == "sync claude-code -q"),
-            "{:?}",
-            lines(&harness.sandbox.path("calls"))
+            calls.iter().all(|call| call == "sync claude-code -q"),
+            "{calls:?}"
         );
     }
 
@@ -419,12 +409,7 @@ echo "end $2" >> '{events}'"#,
     fn self_exec(role: &str, sandbox: &Sandbox) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args([
-                "--exact",
-                "hook::tests::self_exec_role",
-                "--test-threads=1",
-                "-q",
-            ])
+            .args(SELF_EXEC_ARGS)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env(ROLE, role)
@@ -454,14 +439,7 @@ echo "end $2" >> '{events}'"#,
         let log = state_dir.join(SYNC_LOG);
         handle_event(&event, &state_dir, &config_dir, |_| {
             let mut command = Command::new(std::env::current_exe()?);
-            command
-                .args([
-                    "--exact",
-                    "hook::tests::self_exec_role",
-                    "--test-threads=1",
-                    "-q",
-                ])
-                .env(ROLE, "worker");
+            command.args(SELF_EXEC_ARGS).env(ROLE, "worker");
             herdr::spawn_detached(command, &log)
         })
         .unwrap();
@@ -491,14 +469,16 @@ echo "end $2" >> '{events}'"#,
         let eof_after = started.elapsed();
         assert!(hook.wait().unwrap().success(), "{text}{stderr_text}");
 
-        let events = sandbox.path("events");
+        let ended = || {
+            sandbox
+                .lines("events")
+                .contains(&"end claude-code".to_owned())
+        };
         assert!(
-            !lines(&events).contains(&"end claude-code".to_owned()),
+            !ended(),
             "pipes stayed open for the whole sync ({eof_after:?})"
         );
-        wait_for("the detached sync to finish", || {
-            lines(&events).contains(&"end claude-code".to_owned())
-        });
-        assert_eq!(lines(&sandbox.path("calls")), ["sync claude-code -q"]);
+        wait_for("the detached sync to finish", ended);
+        assert_eq!(sandbox.lines("calls"), ["sync claude-code -q"]);
     }
 }

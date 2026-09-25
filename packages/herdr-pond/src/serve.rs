@@ -7,17 +7,17 @@ use std::fs;
 use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
-use crate::api::{SQL_PATH, post, sql_request};
-use crate::config::{Config, log_line, open_log, write_atomic};
+use crate::api::{SQL_PATH, post};
+use crate::config::{Config, log_line, log_stdio, write_atomic};
 use crate::herdr;
-use crate::types::{ApiError, READY_SQL, SqlResponse};
+use crate::types::{ApiError, READY_SQL, SqlRequest, SqlResponse};
 
 /// Store open (seconds on S3) happens before `pond serve` binds.
 pub(crate) const PORT_DEADLINE: Duration = Duration::from_secs(180);
@@ -85,9 +85,7 @@ fn sockhash(socket: &Path) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Endpoint {
     pub port: u16,
-    pub pid: u32,
     pub token: String,
-    pub pond_version: String,
 }
 
 impl Endpoint {
@@ -111,10 +109,16 @@ pub(crate) fn remove_endpoint_if_owned(path: &Path, token: &str) -> bool {
         && fs::remove_file(path).is_ok()
 }
 
+/// The published endpoint's base URL, if it answers the probe.
+pub(crate) async fn live_endpoint(client: &reqwest::Client, dir: &ServeDir) -> Option<String> {
+    let base_url = read_endpoint(&dir.endpoint())?.base_url();
+    probe(client, &base_url).await.ok().map(|()| base_url)
+}
+
 /// `SELECT 1` over `/v1/x/sql`: proves both a live pond and one new enough
 /// for the desk. A 405 from `/v1/search` would prove neither.
 pub(crate) async fn probe(client: &reqwest::Client, base_url: &str) -> Result<(), ApiError> {
-    let request = sql_request(READY_SQL.to_owned(), 1, PROBE_TIMEOUT_SECS);
+    let request = SqlRequest::new(READY_SQL.to_owned(), 1, PROBE_TIMEOUT_SECS);
     let response: SqlResponse = post(client, base_url, SQL_PATH, &request, PROBE_DEADLINE).await?;
     if response.rows.is_empty() {
         return Err(ApiError::Decode(format!(
@@ -129,15 +133,13 @@ pub(crate) async fn probe(client: &reqwest::Client, base_url: &str) -> Result<()
 /// `log` because serve's output would corrupt the TUI or pin a herdr slot.
 pub(crate) fn spawn_serve(pond: &Path, port_file: &Path, log: &Path) -> std::io::Result<Child> {
     let _ = fs::remove_file(port_file);
-    let out = open_log(log)?;
-    let err = out.try_clone()?;
-    Command::new(pond)
-        .args(["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"])
-        .arg(port_file)
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err)
-        .spawn()
+    log_stdio(
+        Command::new(pond)
+            .args(["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"])
+            .arg(port_file),
+        log,
+    )?
+    .spawn()
 }
 
 /// The base URL from a `--port-file` (`host:port`, written atomically after bind).
@@ -208,14 +210,11 @@ pub(crate) async fn connect(
     origin: &Origin,
     fallback: Option<ServeChild>,
 ) -> Result<Connection, ApiError> {
-    if let Some(endpoint) = read_endpoint(&origin.dir.endpoint()) {
-        let base_url = endpoint.base_url();
-        if probe(client, &base_url).await.is_ok() {
-            return Ok(Connection {
-                base_url,
-                fallback: None,
-            });
-        }
+    if let Some(base_url) = live_endpoint(client, &origin.dir).await {
+        return Ok(Connection {
+            base_url,
+            fallback: None,
+        });
     }
     if let Some(fallback) = fallback
         && probe(client, &fallback.base_url).await.is_ok()
@@ -235,8 +234,7 @@ pub(crate) async fn connect(
 
 async fn spawn_fallback(origin: &Origin) -> Result<ServeChild, ApiError> {
     let log = origin.dir.desk_log();
-    let pond = Config::load(&origin.config_dir, &log)
-        .resolve_pond(&origin.config_dir)
+    let pond = Config::pond(&origin.config_dir, &log)
         .map_err(|error| ApiError::Unreachable(format!("{error:#}")))?;
     let port_file = origin
         .dir
@@ -279,29 +277,9 @@ mod tests {
 
     use super::*;
     use crate::api::client;
-    use crate::fake_pond::{FakePond, Reply, Sandbox, golden, write_script};
-
-    fn endpoint(port: u16, token: &str) -> Endpoint {
-        Endpoint {
-            port,
-            pid: 1,
-            token: token.to_owned(),
-            pond_version: "pond 0.20.0".to_owned(),
-        }
-    }
-
-    fn port_of(base_url: &str) -> u16 {
-        base_url.rsplit(':').next().unwrap().parse().unwrap()
-    }
-
-    /// A port nothing listens on: bound, then released.
-    fn dead_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
+    use crate::fake_pond::{
+        FakePond, Reply, Sandbox, alive, dead_port, dead_url, endpoint, golden, write_script,
+    };
 
     async fn ready_pond() -> FakePond {
         FakePond::with_sql(
@@ -311,29 +289,10 @@ mod tests {
         .await
     }
 
-    /// A fake `pond serve` that records its argv, prints to both streams,
-    /// publishes `addr` through `--port-file` and stays up.
+    /// A fake serve publishing `addr` that stays up.
     fn fake_serve(sandbox: &Sandbox, addr: &str) -> Origin {
-        let pond = write_script(
-            &sandbox.path("bin/pond"),
-            &format!(
-                r#"printf '%s\n' "$*" >> '{calls}'
-echo "serve stdout"; echo "serve stderr" >&2
-eval "port_file=\${{$#}}"
-printf '%s' '{addr}' > "$port_file.tmp" && mv "$port_file.tmp" "$port_file"
-exec sleep 30"#,
-                calls = sandbox.path("calls").display(),
-            ),
-        );
-        sandbox.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
-        Origin {
-            dir: ServeDir::new(&sandbox.state_dir(), &sandbox.path("herdr.sock")),
-            config_dir: sandbox.config_dir(),
-        }
-    }
-
-    fn alive(pid: u32) -> bool {
-        kill(Pid::from_raw(i32::try_from(pid).unwrap()), None).is_ok()
+        sandbox.fake_serve(Some(addr), "exec sleep 30");
+        sandbox.origin()
     }
 
     #[test]
@@ -393,9 +352,8 @@ exec sleep 30"#,
             Err(ApiError::PondTooOld)
         );
 
-        let dead = format!("http://127.0.0.1:{}", dead_port());
         assert!(matches!(
-            probe(&client, &dead).await,
+            probe(&client, &dead_url()).await,
             Err(ApiError::Unreachable(_))
         ));
     }
@@ -405,11 +363,7 @@ exec sleep 30"#,
         let sandbox = Sandbox::new();
         let pond = ready_pond().await;
         let origin = fake_serve(&sandbox, "127.0.0.1:1");
-        write_endpoint(
-            &origin.dir.endpoint(),
-            &endpoint(port_of(&pond.base_url), "t"),
-        )
-        .unwrap();
+        write_endpoint(&origin.dir.endpoint(), &endpoint(pond.port(), "t")).unwrap();
         let connection = connect(&client().unwrap(), &origin, None).await.unwrap();
         assert_eq!(connection.base_url, pond.base_url);
         assert!(connection.fallback.is_none());
@@ -420,16 +374,16 @@ exec sleep 30"#,
     async fn dead_endpoint_falls_back_to_an_owned_child() {
         let sandbox = Sandbox::new();
         let pond = ready_pond().await;
-        let origin = fake_serve(&sandbox, pond.base_url.trim_start_matches("http://"));
+        let origin = fake_serve(&sandbox, pond.addr());
         write_endpoint(&origin.dir.endpoint(), &endpoint(dead_port(), "t")).unwrap();
 
         let connection = connect(&client().unwrap(), &origin, None).await.unwrap();
         assert_eq!(connection.base_url, pond.base_url);
         let fallback = connection.fallback.expect("fallback child");
-        let calls = fs::read_to_string(sandbox.path("calls")).unwrap();
+        let calls = sandbox.lines("calls");
         assert!(
-            calls.starts_with("serve --host 127.0.0.1 --port 0 --port-file "),
-            "{calls}"
+            calls[0].starts_with("serve --host 127.0.0.1 --port 0 --port-file "),
+            "{calls:?}"
         );
         let log = fs::read_to_string(origin.dir.desk_log()).unwrap();
         assert!(log.contains("serve stdout") && log.contains("serve stderr"));
@@ -446,19 +400,13 @@ exec sleep 30"#,
     async fn a_live_fallback_is_kept_on_reconnect() {
         let sandbox = Sandbox::new();
         let pond = ready_pond().await;
-        let origin = fake_serve(&sandbox, pond.base_url.trim_start_matches("http://"));
+        let origin = fake_serve(&sandbox, pond.addr());
         let client = client().unwrap();
         let first = connect(&client, &origin, None).await.unwrap();
         let pid = first.fallback.as_ref().unwrap().child.id();
         let second = connect(&client, &origin, first.fallback).await.unwrap();
         assert_eq!(second.fallback.as_ref().unwrap().child.id(), pid);
-        assert_eq!(
-            fs::read_to_string(sandbox.path("calls"))
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
+        assert_eq!(sandbox.lines("calls").len(), 1);
     }
 
     #[tokio::test]
@@ -466,10 +414,7 @@ exec sleep 30"#,
         let sandbox = Sandbox::new();
         let pond = write_script(&sandbox.path("bin/pond"), "echo 'no store' >&2; exit 3");
         sandbox.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
-        let origin = Origin {
-            dir: ServeDir::new(&sandbox.state_dir(), &sandbox.path("herdr.sock")),
-            config_dir: sandbox.config_dir(),
-        };
+        let origin = sandbox.origin();
         let Err(ApiError::Unreachable(reason)) = connect(&client().unwrap(), &origin, None).await
         else {
             panic!("expected Unreachable");
@@ -486,10 +431,7 @@ exec sleep 30"#,
     async fn missing_pond_names_the_config_key() {
         let sandbox = Sandbox::new();
         sandbox.write_config("pond_bin = \"/nonexistent/pond\"\n");
-        let origin = Origin {
-            dir: ServeDir::new(&sandbox.state_dir(), &sandbox.path("herdr.sock")),
-            config_dir: sandbox.config_dir(),
-        };
+        let origin = sandbox.origin();
         let Err(ApiError::Unreachable(reason)) = connect(&client().unwrap(), &origin, None).await
         else {
             panic!("expected Unreachable");

@@ -26,9 +26,7 @@ const SPINNER_TICK: Duration = Duration::from_millis(100);
 /// Builds its own current-thread runtime and owns the terminal until it
 /// returns; the terminal is restored on every return path.
 pub(crate) fn run(api: Arc<dyn Api>, context: DeskContext) -> anyhow::Result<DeskExit> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = crate::runtime()?;
     let mut terminal = ratatui::try_init().inspect_err(|_| ratatui::restore())?;
     let result = runtime.block_on(async {
         let mut terminate = signal(SignalKind::terminate())?;
@@ -188,12 +186,10 @@ pub(super) mod tests {
     }
 
     pub(in crate::desk) fn sql_rows<T: DeserializeOwned>(body: &str) -> Vec<T> {
-        let response: SqlResponse = serde_json::from_str(body).unwrap();
-        response
-            .rows
-            .into_iter()
-            .map(|row| serde_json::from_value(row).unwrap())
-            .collect()
+        serde_json::from_str::<SqlResponse>(body)
+            .unwrap()
+            .into_rows()
+            .unwrap()
     }
 
     pub(in crate::desk) fn message(id: &str, ts: DateTime<Utc>, text: &str) -> TranscriptMessage {
@@ -228,7 +224,6 @@ pub(super) mod tests {
                 transcript: sql_rows(golden::SQL_PAGE),
                 live: vec![LiveAgent {
                     pane_id: "p7".to_owned(),
-                    agent: Some("claude".to_owned()),
                     session: "s-live".to_owned(),
                 }],
                 ..Self::default()
@@ -280,9 +275,7 @@ pub(super) mod tests {
                 .map_or(Duration::ZERO, |delay| delay(&request.query));
             let response = self.search.clone().unwrap_or_else(|| SearchResponse {
                 sessions: Vec::new(),
-                matched_total: 0,
                 searchable_in_scope: 100,
-                has_more: false,
             });
             self.reply(Call::Search(request), delay, Ok(response))
         }

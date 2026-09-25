@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use crate::types::{DeskContext, DeskExit};
 
+const USAGE: &str = "usage: herdr-pond open|tui|hook [--worker <adapter>]|serve-daemon [--owner]";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (command, rest) = args
@@ -30,9 +32,7 @@ fn main() -> ExitCode {
         "tui" => desk_main(),
         "hook" => hook::run(rest),
         "serve-daemon" => daemon::run(rest),
-        _ => Err(anyhow::anyhow!(
-            "usage: herdr-pond open|tui|hook [--worker <adapter>]|serve-daemon [--owner]"
-        )),
+        _ => Err(anyhow::anyhow!(USAGE)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -41,6 +41,14 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The single-threaded runtime the daemon and the desk build by hand: the hook
+/// path must never pay for one.
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
 }
 
 /// Runs the desk, then performs a jump only after it has restored the

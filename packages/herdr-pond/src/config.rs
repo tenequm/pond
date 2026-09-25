@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
 use nix::errno::Errno;
@@ -59,6 +60,11 @@ impl Config {
         })
     }
 
+    /// [`Self::load`] then [`Self::resolve_pond`]: the `pond` to spawn right now.
+    pub(crate) fn pond(config_dir: &Path, log: &Path) -> anyhow::Result<PathBuf> {
+        Self::load(config_dir, log).resolve_pond(config_dir)
+    }
+
     /// The `pond` every spawn runs: `pond_bin` when set, else a PATH lookup.
     /// herdr's PATH is the server's from whenever it started, so a lookup
     /// failure names the config key that fixes it.
@@ -104,13 +110,19 @@ fn is_executable(path: &Path) -> bool {
 /// Opens `path` for appending, creating parents, and starts it over once it
 /// passes the cap. Children handed this file append at its live end.
 pub(crate) fn open_log(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
     if fs::metadata(path).is_ok_and(|meta| meta.len() > LOG_CAP_BYTES) {
         OpenOptions::new().write(true).open(path)?.set_len(0)?;
     }
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Points every stdio end of `command` at /dev/null or `log`: an inherited
+/// pipe would pin a herdr command slot, or corrupt the desk's terminal.
+pub(crate) fn log_stdio<'a>(command: &'a mut Command, log: &Path) -> io::Result<&'a mut Command> {
+    let out = open_log(log)?;
+    let err = out.try_clone()?;
+    Ok(command.stdin(Stdio::null()).stdout(out).stderr(err))
 }
 
 /// Best effort: a headless leg has nowhere else to report a failed log write.
@@ -124,9 +136,7 @@ pub(crate) fn log_line(path: &Path, message: &str) {
 /// A non-blocking exclusive flock on `path`, held until the guard drops.
 /// `None` means another process holds it.
 pub(crate) fn try_lock(path: &Path) -> io::Result<Option<Flock<File>>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -141,9 +151,7 @@ pub(crate) fn try_lock(path: &Path) -> io::Result<Option<Flock<File>>> {
 
 /// Temp file + rename, so a reader never sees a half-written file.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent(path)?;
     let mut temp = path.as_os_str().to_owned();
     temp.push(format!(".tmp.{}", std::process::id()));
     let temp = PathBuf::from(temp);
@@ -151,6 +159,10 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::rename(&temp, path).inspect_err(|_| {
         let _ = fs::remove_file(&temp);
     })
+}
+
+fn ensure_parent(path: &Path) -> io::Result<()> {
+    path.parent().map_or(Ok(()), fs::create_dir_all)
 }
 
 #[cfg(test)]

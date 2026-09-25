@@ -9,23 +9,22 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use chrono::Utc;
 
-use crate::api::{SEARCH_PATH, SQL_PATH, client, post, sql_deadline, sql_request};
-use crate::config::{Config, log_line, try_lock};
-use crate::herdr;
+use crate::api::{QUERY_TIMEOUT_SECS, SEARCH_PATH, SQL_PATH, client, post, sql_deadline};
+use crate::config::{log_line, try_lock};
 use crate::serve::{
-    Endpoint, PORT_DEADLINE, ServeDir, probe, read_endpoint, read_port_file,
+    Endpoint, PORT_DEADLINE, ServeDir, live_endpoint, probe, read_port_file,
     remove_endpoint_if_owned, spawn_serve, terminate, write_endpoint,
 };
 use crate::types::{
-    LISTING_ROWS, LISTING_WINDOW_DAYS, ListingScope, PROTOCOL_VERSION, SearchFilters,
-    SearchRequest, SearchResponse, SqlResponse, listing_sql,
+    LISTING_ROWS, ListingScope, SearchRequest, SearchResponse, SqlRequest, SqlResponse, listing_sql,
 };
+use crate::{herdr, runtime};
 
 struct Timing {
     tick: Duration,
@@ -56,14 +55,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
             herdr::detach();
             owner()
         }
-        _ => bail!("usage: herdr-pond serve-daemon [--owner]"),
+        _ => bail!(crate::USAGE),
     }
-}
-
-fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
 }
 
 /// The startup hook: exits at once, failures go to `daemon.log`.
@@ -93,12 +86,10 @@ async fn start(
     let Some(lock) = try_lock(&dir.lock())? else {
         return Ok(());
     };
-    if let Some(endpoint) = read_endpoint(&dir.endpoint())
-        && probe(&client()?, &endpoint.base_url()).await.is_ok()
-    {
+    if let Some(base_url) = live_endpoint(&client()?, dir).await {
         log_line(
             &dir.daemon_log(),
-            &format!("adopted live endpoint {}", endpoint.base_url()),
+            &format!("adopted live endpoint {base_url}"),
         );
         return Ok(());
     }
@@ -113,8 +104,7 @@ fn owner() -> anyhow::Result<()> {
     let config_dir = herdr::config_dir()?;
     let log = dir.daemon_log();
     runtime()?.block_on(own(&dir, &socket, &TIMING, || {
-        let config = Config::load(&config_dir, &log);
-        herdr::resolve_pond_or_toast(&config, &config_dir, &state_dir, &log)
+        herdr::resolve_pond_or_toast(&config_dir, &state_dir, &log)
     }))
 }
 
@@ -129,26 +119,22 @@ async fn own(
         return Ok(());
     };
     let client = client()?;
-    if let Some(endpoint) = read_endpoint(&dir.endpoint())
-        && probe(&client, &endpoint.base_url()).await.is_ok()
-    {
+    if live_endpoint(&client, dir).await.is_some() {
         return Ok(());
     }
     let Some(pond) = resolve_pond() else {
         return Ok(());
     };
-    let pond_version = pond_version(&pond);
     let port_file = dir.port_file("owner");
     let mut child = spawn_serve(&pond, &port_file, &log)?;
     log_line(
         &log,
-        &format!("owner: started {pond_version} (pid {})", child.id()),
+        &format!("owner: started {} (pid {})", pond.display(), child.id()),
     );
     let serve = Serve {
         client,
         child: &mut child,
         port_file: &port_file,
-        pond_version,
         socket,
         log: &log,
     };
@@ -160,18 +146,6 @@ async fn own(
     let _ = std::fs::remove_file(&port_file);
     log_line(&log, "owner: stopped");
     Ok(())
-}
-
-fn pond_version(pond: &Path) -> String {
-    Command::new(pond)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .filter(|version| !version.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn random_token() -> String {
@@ -187,7 +161,6 @@ struct Serve<'a> {
     client: reqwest::Client,
     child: &'a mut Child,
     port_file: &'a Path,
-    pond_version: String,
     socket: &'a Path,
     log: &'a Path,
 }
@@ -230,9 +203,7 @@ impl Serve<'_> {
                     }
                     let endpoint = Endpoint {
                         port: addr.port(),
-                        pid: self.child.id(),
                         token: random_token(),
-                        pond_version: self.pond_version.clone(),
                     };
                     if let Err(error) = write_endpoint(&dir.endpoint(), &endpoint) {
                         break format!("cannot publish the endpoint: {error}");
@@ -266,24 +237,14 @@ impl Serve<'_> {
 /// cost lands here instead of on the first desk open. Failure is not fatal.
 async fn warm_up(client: reqwest::Client, base_url: String, log: PathBuf, deadline: Duration) {
     let started = Instant::now();
-    let scope = ListingScope {
-        project: None,
-        since: Some(Utc::now() - chrono::TimeDelta::days(LISTING_WINDOW_DAYS)),
-        limit: LISTING_ROWS,
-    };
-    let listing = sql_request(
-        listing_sql(&scope),
+    let listing = SqlRequest::new(
+        listing_sql(&ListingScope::recent(None, Utc::now())),
         LISTING_ROWS,
-        crate::api::QUERY_TIMEOUT_SECS,
+        QUERY_TIMEOUT_SECS,
     );
-    let search = SearchRequest {
-        protocol_version: PROTOCOL_VERSION,
-        query: WARMUP_QUERY.to_owned(),
-        filters: SearchFilters::default(),
-        limit: 1,
-    };
+    let search = SearchRequest::new(WARMUP_QUERY.to_owned(), 1);
     let result = tokio::time::timeout(deadline, async {
-        let deadline = sql_deadline(crate::api::QUERY_TIMEOUT_SECS);
+        let deadline = sql_deadline(QUERY_TIMEOUT_SECS);
         post::<_, SqlResponse>(&client, &base_url, SQL_PATH, &listing, deadline).await?;
         post::<_, SearchResponse>(&client, &base_url, SEARCH_PATH, &search, deadline).await
     })
@@ -309,11 +270,9 @@ mod tests {
     use std::fs;
     use std::os::unix::net::UnixListener;
 
-    use nix::sys::signal::kill;
-    use nix::unistd::Pid;
-
     use super::*;
-    use crate::fake_pond::{FakePond, Reply, Sandbox, golden, write_script};
+    use crate::fake_pond::{FakePond, Reply, Sandbox, alive, endpoint, golden};
+    use crate::serve::read_endpoint;
 
     const FAST: Timing = Timing {
         tick: Duration::from_millis(20),
@@ -351,28 +310,11 @@ mod tests {
             }
         }
 
-        /// A fake `pond` whose `serve` publishes the fake server's address,
-        /// then runs `after` (default: stays up).
+        /// A fake `pond serve` that publishes the fake server's address when
+        /// `publish`, then runs `after`.
         fn fake_pond(&self, publish: bool, after: &str) -> PathBuf {
-            let publish = if publish {
-                format!(
-                    r#"printf '%s' '{}' > "$port_file.tmp" && mv "$port_file.tmp" "$port_file""#,
-                    self.pond.base_url.trim_start_matches("http://")
-                )
-            } else {
-                String::new()
-            };
-            write_script(
-                &self.sandbox.path("bin/pond"),
-                &format!(
-                    r#"[ "$1" = --version ] && {{ echo 'pond 9.9.9'; exit 0; }}
-printf '%s\n' "$*" >> '{calls}'
-eval "port_file=\${{$#}}"
-{publish}
-{after}"#,
-                    calls = self.sandbox.path("calls").display(),
-                ),
-            )
+            let addr = publish.then(|| self.pond.addr());
+            self.sandbox.fake_serve(addr, after)
         }
 
         async fn own(&self, pond: &Path) -> anyhow::Result<()> {
@@ -381,9 +323,9 @@ eval "port_file=\${{$#}}"
         }
 
         fn serve_calls(&self) -> usize {
-            fs::read_to_string(self.sandbox.path("calls"))
-                .unwrap_or_default()
-                .lines()
+            self.sandbox
+                .lines("calls")
+                .iter()
                 .filter(|line| line.starts_with("serve --host 127.0.0.1 --port 0 --port-file "))
                 .count()
         }
@@ -401,10 +343,6 @@ eval "port_file=\${{$#}}"
         }
     }
 
-    fn alive(pid: u32) -> bool {
-        kill(Pid::from_raw(i32::try_from(pid).unwrap()), None).is_ok()
-    }
-
     #[tokio::test]
     async fn one_owner_serves_until_herdr_goes_away() {
         let setup = Setup::new().await;
@@ -416,12 +354,10 @@ eval "port_file=\${{$#}}"
                     && setup.pond.recorded().iter().any(|r| r.path == SEARCH_PATH)
             })
             .await;
-            let endpoint = read_endpoint(&setup.dir.endpoint()).unwrap();
-            assert!(alive(endpoint.pid));
+            assert!(alive(setup.sandbox.serve_pid()));
             drop(listener);
-            endpoint
         };
-        let ((first, second), endpoint) = tokio::join!(
+        let ((first, second), ()) = tokio::join!(
             async { tokio::join!(setup.own(&pond), setup.own(&pond)) },
             herdr_stops
         );
@@ -429,12 +365,14 @@ eval "port_file=\${{$#}}"
         second.unwrap();
 
         assert_eq!(setup.serve_calls(), 1, "{}", setup.log());
-        assert_eq!(endpoint.pond_version, "pond 9.9.9");
         assert!(
             !setup.dir.endpoint().exists(),
             "endpoint outlived its serve"
         );
-        assert!(!alive(endpoint.pid), "pond serve outlived herdr");
+        assert!(
+            !alive(setup.sandbox.serve_pid()),
+            "pond serve outlived herdr"
+        );
         assert!(setup.log().contains("herdr server is gone"));
         let warmup = &setup.pond.recorded()[1];
         assert_eq!(warmup.path, SQL_PATH);
@@ -486,16 +424,11 @@ eval "port_file=\${{$#}}"
     #[tokio::test]
     async fn a_serve_that_never_listens_is_killed_at_the_deadline() {
         let setup = Setup::new().await;
-        let pid_file = setup.sandbox.path("pid");
-        let pond = setup.fake_pond(
-            false,
-            &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
-        );
+        let pond = setup.fake_pond(false, "exec sleep 30");
         let _listener = UnixListener::bind(&setup.socket).unwrap();
         setup.own(&pond).await.unwrap();
         assert!(setup.log().contains("did not listen"), "{}", setup.log());
-        let pid = fs::read_to_string(pid_file).unwrap();
-        assert!(!alive(pid.trim().parse().unwrap()));
+        assert!(!alive(setup.sandbox.serve_pid()));
         assert!(!setup.dir.endpoint().exists());
     }
 
@@ -520,21 +453,7 @@ eval "port_file=\${{$#}}"
         assert_eq!(spawned.get(), 2, "an owner holds the lock");
         drop(held);
 
-        let port = setup
-            .pond
-            .base_url
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let live = Endpoint {
-            port,
-            pid: 1,
-            token: "t".to_owned(),
-            pond_version: "pond".to_owned(),
-        };
-        write_endpoint(&setup.dir.endpoint(), &live).unwrap();
+        write_endpoint(&setup.dir.endpoint(), &endpoint(setup.pond.port(), "t")).unwrap();
         start(&setup.dir, spawn).await.unwrap();
         assert_eq!(spawned.get(), 2, "live endpoint is adopted");
         assert!(setup.log().contains("adopted"));

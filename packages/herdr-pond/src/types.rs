@@ -6,7 +6,8 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
@@ -37,9 +38,20 @@ pub(crate) trait Api: Send + Sync {
 pub(crate) struct ListingScope {
     /// Exact project path; sessions in its subdirectories match too.
     pub project: Option<String>,
-    /// `None` is the all-time listing - the slow query family.
+    /// `None` is the all-time listing, an unbounded scan of every message.
     pub since: Option<DateTime<Utc>>,
     pub limit: usize,
+}
+
+impl ListingScope {
+    /// The opening view: the last [`LISTING_WINDOW_DAYS`], at most [`LISTING_ROWS`].
+    pub(crate) fn recent(project: Option<String>, now: DateTime<Utc>) -> Self {
+        Self {
+            project,
+            since: Some(now - TimeDelta::days(LISTING_WINDOW_DAYS)),
+            limit: LISTING_ROWS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -100,7 +112,6 @@ impl Cursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveAgent {
     pub pane_id: String,
-    pub agent: Option<String>,
     /// herdr's `agent_session` value: a session id, or a path whose file name
     /// contains one.
     pub session: String,
@@ -169,23 +180,42 @@ impl std::error::Error for ApiError {}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct SqlRequest {
-    pub protocol_version: u16,
+    protocol_version: u16,
     pub query: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
+    /// Always the query's own SQL `LIMIT`, so the server's default 100-row
+    /// cap never cuts a page.
+    pub limit: usize,
+    pub timeout_seconds: u64,
+}
+
+impl SqlRequest {
+    pub(crate) fn new(query: String, limit: usize, timeout_seconds: u64) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            query,
+            limit,
+            timeout_seconds,
+        }
+    }
 }
 
 /// NULL fields are omitted from `rows`: decode with `#[serde(default)]`,
 /// never by key presence.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct SqlResponse {
-    pub columns: Vec<String>,
     pub rows: Vec<serde_json::Value>,
-    pub row_count: usize,
     pub truncated: bool,
-    pub elapsed_ms: u64,
+}
+
+impl SqlResponse {
+    pub(crate) fn into_rows<T: DeserializeOwned>(self) -> Result<Vec<T>, ApiError> {
+        self.rows
+            .into_iter()
+            .map(|row| {
+                serde_json::from_value(row).map_err(|error| ApiError::Decode(error.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -201,10 +231,32 @@ pub(crate) struct ErrorBody {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct SearchRequest {
-    pub protocol_version: u16,
+    protocol_version: u16,
     pub query: String,
     pub filters: SearchFilters,
     pub limit: usize,
+}
+
+impl SearchRequest {
+    pub(crate) fn new(query: String, limit: usize) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            query,
+            filters: SearchFilters::default(),
+            limit,
+        }
+    }
+
+    /// The listing's scope as search filters; `from_date` is a calendar day.
+    pub(crate) fn within(mut self, scope: &ListingScope) -> Self {
+        self.filters = SearchFilters {
+            project: scope.project.clone().map(ProjectFilter::Contains),
+            from_date: scope
+                .since
+                .map(|since| since.format("%Y-%m-%d").to_string()),
+        };
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
@@ -224,18 +276,15 @@ pub(crate) enum ProjectFilter {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct SearchResponse {
     pub sessions: Vec<SearchSession>,
-    pub matched_total: usize,
     /// 0 means the filters excluded everything before retrieval - distinct
     /// from "nothing matched".
     #[serde(default)]
     pub searchable_in_scope: usize,
-    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct SearchSession {
     pub session_id: String,
-    pub project: String,
     pub source_agent: String,
     pub session_messages_count: usize,
     pub matched_message_count: usize,
@@ -244,17 +293,14 @@ pub(crate) struct SearchSession {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct SearchMatch {
-    pub message_id: String,
-    pub role: String,
     pub timestamp: DateTime<Utc>,
     pub text: String,
-    pub score: f64,
 }
 
 // ---- SQL ----
 //
-// Discipline (read-latency campaign): every query carries an explicit LIMIT,
-// since the server's row caps apply only after full collection; the listing
+// Every query carries an explicit LIMIT, since the server's row caps apply
+// only after full collection and do not bound the scan; the listing
 // scans narrow columns with a literal `timestamp >=` bound the zonemap can
 // prune; JSON getters run only in page-scoped (`session_id IN (...)`) queries.
 // Every interpolated value goes through `quote` - no other escaping exists.
@@ -350,11 +396,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
     use super::*;
-    use crate::fake_pond::golden;
-
-    fn ts(raw: &str) -> DateTime<Utc> {
-        raw.parse().unwrap()
-    }
+    use crate::fake_pond::{golden, ts};
 
     #[test]
     fn quote_escapes_single_quotes() {
@@ -419,40 +461,23 @@ mod tests {
 
     #[test]
     fn golden_sql_response_decodes() {
-        let response: SqlResponse = serde_json::from_str(golden::SQL_LISTING).unwrap();
-        let rows: Vec<SessionRow> = response
-            .rows
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<Result<_, _>>()
-            .unwrap();
+        let decode = |body| serde_json::from_str::<SqlResponse>(body).unwrap();
+        let rows: Vec<SessionRow> = decode(golden::SQL_LISTING).into_rows().unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].last_ts, ts("2026-09-25T04:00:02.384123Z"));
 
-        let details: SqlResponse = serde_json::from_str(golden::SQL_HYDRATE).unwrap();
-        let details: Vec<SessionDetail> = details
-            .rows
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<Result<_, _>>()
-            .unwrap();
+        let details: Vec<SessionDetail> = decode(golden::SQL_HYDRATE).into_rows().unwrap();
         assert_eq!(details[1].host, None);
         assert_eq!(details[1].title, None);
 
-        let page: SqlResponse = serde_json::from_str(golden::SQL_PAGE).unwrap();
-        let messages: Vec<TranscriptMessage> = page
-            .rows
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<Result<_, _>>()
-            .unwrap();
+        let messages: Vec<TranscriptMessage> = decode(golden::SQL_PAGE).into_rows().unwrap();
         assert_eq!(messages[0].timestamp, messages[1].timestamp);
     }
 
     #[test]
     fn golden_search_and_error_decode() {
         let search: SearchResponse = serde_json::from_str(golden::SEARCH).unwrap();
-        assert_eq!(search.sessions[0].matches[0].role, "user");
+        assert_eq!(search.sessions[0].matches[1].text, "timer fixed");
         let empty: SearchResponse = serde_json::from_str(golden::SEARCH_OUT_OF_SCOPE).unwrap();
         assert_eq!(empty.searchable_in_scope, 0);
         let error: ErrorEnvelope = serde_json::from_str(golden::SQL_ERROR).unwrap();
@@ -463,7 +488,6 @@ mod tests {
     fn live_agent_matches_id_or_path() {
         let by_id = LiveAgent {
             pane_id: "p1".to_owned(),
-            agent: Some("claude".to_owned()),
             session: "abc".to_owned(),
         };
         let by_path = LiveAgent {

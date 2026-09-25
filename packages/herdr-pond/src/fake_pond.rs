@@ -11,8 +11,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+use crate::api::{SEARCH_PATH, SQL_PATH};
+use crate::config::CONFIG_FILE;
+use crate::serve::{Endpoint, Origin, ServeDir};
 
 /// Golden bodies: the frozen `/v1/x/sql` and `/v1/search` contract.
 pub(crate) mod golden {
@@ -55,10 +62,10 @@ pub(crate) mod golden {
 /// One canned reply, chosen per request by [`FakePond`]'s router closure.
 #[derive(Debug, Clone)]
 pub(crate) struct Reply {
-    pub status: u16,
-    pub body: String,
-    pub content_type: &'static str,
-    pub delay: Duration,
+    status: u16,
+    body: String,
+    content_type: &'static str,
+    delay: Duration,
 }
 
 impl Reply {
@@ -99,7 +106,7 @@ type Router = dyn Fn(&str, &str) -> Reply + Send + Sync;
 /// body)`. Every request is recorded, so tests can assert on the SQL sent.
 pub(crate) struct FakePond {
     pub base_url: String,
-    pub requests: Arc<Mutex<Vec<Recorded>>>,
+    requests: Arc<Mutex<Vec<Recorded>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -132,14 +139,14 @@ impl FakePond {
     /// body; anything else is a 404 like an old pond.
     pub(crate) async fn with_sql(routes: Vec<(&'static str, Reply)>, search: Reply) -> Self {
         Self::start(move |path, body| match path {
-            "/v1/x/sql" => routes
+            SQL_PATH => routes
                 .iter()
                 .find(|(needle, _)| body.contains(needle))
                 .map_or_else(
                     || Reply::status(400, golden::SQL_ERROR),
                     |(_, reply)| reply.clone(),
                 ),
-            "/v1/search" => search.clone(),
+            SEARCH_PATH => search.clone(),
             _ => Reply::plain(404, ""),
         })
         .await
@@ -147,6 +154,15 @@ impl FakePond {
 
     pub(crate) fn recorded(&self) -> Vec<Recorded> {
         self.requests.lock().unwrap().clone()
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.base_url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    /// The `host:port` a fake serve publishes through `--port-file`.
+    pub(crate) fn addr(&self) -> &str {
+        self.base_url.trim_start_matches("http://")
     }
 }
 
@@ -241,13 +257,88 @@ impl Sandbox {
 
     pub(crate) fn write_config(&self, text: &str) {
         std::fs::create_dir_all(self.config_dir()).unwrap();
-        std::fs::write(self.config_dir().join("config.toml"), text).unwrap();
+        std::fs::write(self.config_dir().join(CONFIG_FILE), text).unwrap();
+    }
+
+    pub(crate) fn origin(&self) -> Origin {
+        Origin {
+            dir: ServeDir::new(&self.state_dir(), &self.path("herdr.sock")),
+            config_dir: self.config_dir(),
+        }
+    }
+
+    /// The lines of a sandbox file; a missing file has none.
+    pub(crate) fn lines(&self, relative: &str) -> Vec<String> {
+        std::fs::read_to_string(self.path(relative))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A fake `pond serve` at `bin/pond`, set as `pond_bin`: records its argv
+    /// in `calls` and its pid in `pid`, prints to both streams, publishes
+    /// `addr` through `--port-file` when given, then runs `after`.
+    pub(crate) fn fake_serve(&self, addr: Option<&str>, after: &str) -> PathBuf {
+        let publish = addr.map_or_else(String::new, |addr| {
+            format!(
+                r#"printf '%s' '{addr}' > "$port_file.tmp" && mv "$port_file.tmp" "$port_file""#
+            )
+        });
+        let pond = write_script(
+            &self.path("bin/pond"),
+            &format!(
+                r#"printf '%s\n' "$*" >> '{calls}'
+echo $$ > '{pid}'
+echo "serve stdout"; echo "serve stderr" >&2
+eval "port_file=\${{$#}}"
+{publish}
+{after}"#,
+                calls = self.path("calls").display(),
+                pid = self.path("pid").display(),
+            ),
+        );
+        self.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
+        pond
+    }
+
+    /// The pid [`Self::fake_serve`] recorded.
+    pub(crate) fn serve_pid(&self) -> u32 {
+        self.lines("pid")[0].parse().unwrap()
     }
 }
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+pub(crate) fn ts(raw: &str) -> DateTime<Utc> {
+    raw.parse().unwrap()
+}
+
+pub(crate) fn alive(pid: u32) -> bool {
+    kill(Pid::from_raw(i32::try_from(pid).unwrap()), None).is_ok()
+}
+
+/// A port nothing listens on: bound, then released.
+pub(crate) fn dead_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+pub(crate) fn dead_url() -> String {
+    format!("http://127.0.0.1:{}", dead_port())
+}
+
+pub(crate) fn endpoint(port: u16, token: &str) -> Endpoint {
+    Endpoint {
+        port,
+        token: token.to_owned(),
     }
 }
 

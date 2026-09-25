@@ -12,8 +12,8 @@ use crate::herdr::{self, Herdr};
 use crate::serve::{self, Origin, ServeChild};
 use crate::types::{
     Api, ApiError, ApiFuture, Cursor, ErrorEnvelope, ListingScope, LiveAgent, PAGE_ROWS,
-    PREVIEW_ROWS, PROTOCOL_VERSION, SearchRequest, SearchResponse, SessionDetail, SessionRow,
-    SqlRequest, SqlResponse, TranscriptMessage, TranscriptPage, hydrate_sql, listing_sql, page_sql,
+    PREVIEW_ROWS, SearchRequest, SearchResponse, SessionDetail, SessionRow, SqlRequest,
+    SqlResponse, TranscriptMessage, TranscriptPage, hydrate_sql, listing_sql, page_sql,
     preview_sql,
 };
 
@@ -35,17 +35,6 @@ pub(crate) fn client() -> anyhow::Result<reqwest::Client> {
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
         .build()?)
-}
-
-/// `limit` is always the query's own SQL `LIMIT`, so the server's default
-/// 100-row cap never cuts a page.
-pub(crate) fn sql_request(query: String, limit: usize, timeout_seconds: u64) -> SqlRequest {
-    SqlRequest {
-        protocol_version: PROTOCOL_VERSION,
-        query,
-        limit: Some(limit),
-        timeout_seconds: Some(timeout_seconds),
-    }
 }
 
 pub(crate) fn sql_deadline(timeout_seconds: u64) -> Duration {
@@ -110,14 +99,6 @@ fn decode<T: DeserializeOwned>(path: &str, status: u16, body: &str) -> Result<T,
             body: body.trim().to_owned(),
         }),
     }
-}
-
-fn rows<T: DeserializeOwned>(response: SqlResponse) -> Result<Vec<T>, ApiError> {
-    response
-        .rows
-        .into_iter()
-        .map(|row| serde_json::from_value(row).map_err(|error| ApiError::Decode(error.to_string())))
-        .collect()
 }
 
 /// The resolved serve. `base_url` stays unset until the first call, so the
@@ -202,7 +183,7 @@ impl HttpApi {
         limit: usize,
         timeout_seconds: u64,
     ) -> Result<SqlResponse, ApiError> {
-        let request = sql_request(query, limit, timeout_seconds);
+        let request = SqlRequest::new(query, limit, timeout_seconds);
         self.post(SQL_PATH, &request, sql_deadline(timeout_seconds))
             .await
     }
@@ -216,7 +197,9 @@ impl Api for HttpApi {
             } else {
                 QUERY_TIMEOUT_SECS
             };
-            rows(self.sql(listing_sql(&scope), scope.limit, timeout).await?)
+            self.sql(listing_sql(&scope), scope.limit, timeout)
+                .await?
+                .into_rows()
         })
     }
 
@@ -226,10 +209,9 @@ impl Api for HttpApi {
                 return Ok(Vec::new());
             }
             let query = hydrate_sql(&session_ids);
-            rows(
-                self.sql(query, session_ids.len(), QUERY_TIMEOUT_SECS)
-                    .await?,
-            )
+            self.sql(query, session_ids.len(), QUERY_TIMEOUT_SECS)
+                .await?
+                .into_rows()
         })
     }
 
@@ -240,7 +222,9 @@ impl Api for HttpApi {
     fn preview(&self, session_id: String) -> ApiFuture<'_, Vec<TranscriptMessage>> {
         Box::pin(async move {
             let query = preview_sql(&session_id);
-            rows(self.sql(query, PREVIEW_ROWS, QUERY_TIMEOUT_SECS).await?)
+            self.sql(query, PREVIEW_ROWS, QUERY_TIMEOUT_SECS)
+                .await?
+                .into_rows()
         })
     }
 
@@ -250,7 +234,7 @@ impl Api for HttpApi {
             let response = self.sql(query, PAGE_ROWS, QUERY_TIMEOUT_SECS).await?;
             Ok(TranscriptPage {
                 truncated: response.truncated,
-                messages: rows(response)?,
+                messages: response.into_rows()?,
             })
         })
     }
@@ -271,12 +255,11 @@ impl Api for HttpApi {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    use chrono::{DateTime, Utc};
-
     use super::*;
-    use crate::fake_pond::{FakePond, Reply, Sandbox, golden, write_script};
-    use crate::serve::{Endpoint, ServeDir, write_endpoint};
-    use crate::types::{ProjectFilter, SearchFilters};
+    use crate::fake_pond::{
+        FakePond, Reply, Sandbox, dead_url, endpoint, golden, ts, write_script,
+    };
+    use crate::serve::write_endpoint;
 
     /// An api pinned to `base_url`, re-resolving through `sandbox`'s state.
     /// `pond_bin` points nowhere, so no re-resolution can reach a real pond.
@@ -287,10 +270,7 @@ mod tests {
         ));
         HttpApi {
             client: client().unwrap(),
-            origin: Ok(Origin {
-                dir: ServeDir::new(&sandbox.state_dir(), &sandbox.path("herdr.sock")),
-                config_dir: sandbox.config_dir(),
-            }),
+            origin: Ok(sandbox.origin()),
             herdr: Herdr::new(sandbox.path("bin/herdr")),
             link: Mutex::new(Link {
                 base_url: Some(base_url.to_owned()),
@@ -304,19 +284,6 @@ mod tests {
             .iter()
             .map(|request| serde_json::from_str(&request.body).unwrap())
             .collect()
-    }
-
-    fn dead_url() -> String {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        format!("http://127.0.0.1:{port}")
-    }
-
-    fn ts(raw: &str) -> DateTime<Utc> {
-        raw.parse().unwrap()
     }
 
     #[tokio::test]
@@ -422,16 +389,13 @@ mod tests {
         let sandbox = Sandbox::new();
         let pond = FakePond::with_sql(Vec::new(), Reply::json(golden::SEARCH_OUT_OF_SCOPE)).await;
         let api = api_at(&pond.base_url, &sandbox);
+        let scope = ListingScope {
+            project: Some("/pj/pond".to_owned()),
+            since: None,
+            limit: 1,
+        };
         let response = api
-            .search(SearchRequest {
-                protocol_version: PROTOCOL_VERSION,
-                query: "timer".to_owned(),
-                filters: SearchFilters {
-                    project: Some(ProjectFilter::Contains("/pj/pond".to_owned())),
-                    from_date: None,
-                },
-                limit: 20,
-            })
+            .search(SearchRequest::new("timer".to_owned(), 20).within(&scope))
             .await
             .unwrap();
         assert_eq!(response.searchable_in_scope, 0);
@@ -466,14 +430,7 @@ mod tests {
         assert_eq!(code, "validation_failed");
         assert!(message.starts_with("sql error: query exceeded the 30s limit"));
 
-        let rejected = api
-            .search(SearchRequest {
-                protocol_version: PROTOCOL_VERSION,
-                query: "x".to_owned(),
-                filters: SearchFilters::default(),
-                limit: 1,
-            })
-            .await;
+        let rejected = api.search(SearchRequest::new("x".to_owned(), 1)).await;
         assert_eq!(
             rejected.unwrap_err(),
             ApiError::Rejected {
@@ -497,7 +454,7 @@ mod tests {
         let pond =
             FakePond::start(|_, _| Reply::json(golden::SQL_EMPTY).delayed(Duration::from_secs(5)))
                 .await;
-        let request = sql_request(preview_sql("s"), PREVIEW_ROWS, 1);
+        let request = SqlRequest::new(preview_sql("s"), PREVIEW_ROWS, 1);
         let result: Result<SqlResponse, _> = post(
             &client().unwrap(),
             &pond.base_url,
@@ -524,21 +481,8 @@ mod tests {
         )
         .await;
         let api = api_at(&dead_url(), &sandbox);
-        let port = replacement
-            .base_url
-            .rsplit(':')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
-        let endpoint = Endpoint {
-            port,
-            pid: 1,
-            token: "t".to_owned(),
-            pond_version: "pond".to_owned(),
-        };
-        let dir = ServeDir::new(&sandbox.state_dir(), &sandbox.path("herdr.sock"));
-        write_endpoint(&dir.endpoint(), &endpoint).unwrap();
+        let dir = sandbox.origin().dir;
+        write_endpoint(&dir.endpoint(), &endpoint(replacement.port(), "t")).unwrap();
 
         let messages = api.preview("s1".to_owned()).await.unwrap();
         assert_eq!(messages.len(), 2);

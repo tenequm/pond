@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Rect, Size};
 use ratatui::text::Line;
@@ -14,8 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::ui;
 use crate::types::{
-    ApiError, Cursor, DeskContext, DeskExit, LISTING_ROWS, LISTING_WINDOW_DAYS, ListingScope,
-    LiveAgent, PAGE_ROWS, PROTOCOL_VERSION, ProjectFilter, SearchFilters, SearchRequest,
+    ApiError, Cursor, DeskContext, DeskExit, ListingScope, LiveAgent, PAGE_ROWS, SearchRequest,
     SearchResponse, SessionDetail, SessionRow, TranscriptMessage, TranscriptPage,
 };
 
@@ -34,7 +33,7 @@ pub(super) enum Lane {
 }
 
 impl Lane {
-    pub(super) const COUNT: usize = 6;
+    pub(super) const COUNT: usize = Self::Page as usize + 1;
     const VIEW: [Self; 3] = [Self::Search, Self::Preview, Self::Page];
 
     /// View lanes answer for what is on screen, so a view transition makes
@@ -218,10 +217,8 @@ impl Pager {
         self.width = width;
         self.lines.clear();
         self.starts.clear();
-        for message in &self.messages {
-            self.starts.push(self.lines.len());
-            self.lines.extend(ui::message_lines(message, width));
-        }
+        let messages = std::mem::take(&mut self.messages);
+        self.append(messages);
         self.offset = self.starts.get(anchor).copied().unwrap_or(0);
     }
 
@@ -306,15 +303,14 @@ impl App {
     }
 
     pub(super) fn scope(&self) -> ListingScope {
-        ListingScope {
-            project: if self.all_projects {
-                None
-            } else {
-                self.context.project.clone()
-            },
-            since: (!self.all_time).then(|| self.now - TimeDelta::days(LISTING_WINDOW_DAYS)),
-            limit: LISTING_ROWS,
+        let project = (!self.all_projects)
+            .then(|| self.context.project.clone())
+            .flatten();
+        let mut scope = ListingScope::recent(project, self.now);
+        if self.all_time {
+            scope.since = None;
         }
+        scope
     }
 
     pub(super) fn listing(&self) -> Option<&[SessionRow]> {
@@ -352,7 +348,7 @@ impl App {
         }
     }
 
-    fn state_mut(&mut self) -> &mut ListState {
+    pub(super) fn state_mut(&mut self) -> &mut ListState {
         if self.search.is_some() {
             &mut self.search_state
         } else {
@@ -434,25 +430,15 @@ impl App {
             self.fetch(Call::Live, Duration::ZERO),
         ];
         if let Some(query) = self.search.as_ref().map(|s| s.query.clone()) {
-            effects.push(self.fetch(Call::Search(self.search_request(query)), Duration::ZERO));
+            effects.push(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.preview_selected(Duration::ZERO));
         effects
     }
 
-    fn search_request(&self, query: String) -> SearchRequest {
-        let scope = self.scope();
-        SearchRequest {
-            protocol_version: PROTOCOL_VERSION,
-            query,
-            filters: SearchFilters {
-                project: scope.project.map(ProjectFilter::Contains),
-                from_date: scope
-                    .since
-                    .map(|since| since.format("%Y-%m-%d").to_string()),
-            },
-            limit: SEARCH_LIMIT,
-        }
+    fn fetch_search(&mut self, query: String, delay: Duration) -> Effect {
+        let request = SearchRequest::new(query, SEARCH_LIMIT).within(&self.scope());
+        self.fetch(Call::Search(request), delay)
     }
 
     pub(super) fn on_event(&mut self, event: &Event) -> Vec<Effect> {
@@ -684,7 +670,7 @@ impl App {
                 self.search_state = ListState::default();
             }
         }
-        effects.push(self.fetch(Call::Search(self.search_request(query)), SEARCH_DEBOUNCE));
+        effects.push(self.fetch_search(query, SEARCH_DEBOUNCE));
         effects
     }
 
@@ -722,7 +708,7 @@ impl App {
         if let Some(search) = &mut self.search {
             search.response = None;
             let query = search.query.clone();
-            effects.push(self.fetch(Call::Search(self.search_request(query)), Duration::ZERO));
+            effects.push(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.selection_changed());
         effects
@@ -757,7 +743,7 @@ impl App {
             .details
             .get(&id)
             .and_then(|detail| detail.title.as_deref())
-            .map_or_else(|| "(no user message)".to_owned(), ui::one_line);
+            .map_or_else(|| ui::NO_TITLE.to_owned(), ui::one_line);
         let width = usize::from(self.pager_viewport().width);
         self.pager = Some(Pager::new(id, title, width));
         self.load_more()
@@ -772,7 +758,7 @@ impl App {
             .filter(|search| search.response.is_none())
             .map(|search| search.query.clone());
         if let Some(query) = stale_search {
-            effects.push(self.fetch(Call::Search(self.search_request(query)), Duration::ZERO));
+            effects.push(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.selection_changed());
         effects
@@ -945,9 +931,12 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::style::Style;
 
+    use chrono::TimeDelta;
+
     use super::*;
-    use crate::desk::tests::{MockApi, app, key, message, now, press, screen, settle};
+    use crate::desk::tests::{MockApi, app, key, message, now, press, screen, settle, sql_rows};
     use crate::fake_pond::golden;
+    use crate::types::{LISTING_ROWS, ProjectFilter};
 
     fn opened(api: &MockApi, width: u16, height: u16) -> App {
         let mut app = app(width, height);
@@ -1429,7 +1418,7 @@ mod tests {
     fn ansi_tab_and_crlf_are_cleaned_in_the_pager() {
         let mut app = opened(&MockApi::golden(), 60, 12);
         let request = open_pager(&mut app);
-        let rows = crate::desk::tests::sql_rows::<TranscriptMessage>(golden::SQL_PAGE);
+        let rows = sql_rows::<TranscriptMessage>(golden::SQL_PAGE);
         app.apply(page_reply(request, rows, false));
         let screen_text = screen(&mut app);
         assert!(
