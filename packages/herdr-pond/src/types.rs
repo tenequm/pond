@@ -23,12 +23,13 @@ pub(crate) type ApiFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiErro
 /// open; the desk shows its loading state for the whole wait.
 pub(crate) trait Api: Send + Sync {
     fn list_sessions(&self, scope: ListingScope) -> ApiFuture<'_, Vec<SessionRow>>;
-    // The page-scoped hydration queries: at most one row per id, order
-    // unspecified, and empty input returns empty without a request.
-    /// A session with no user message has no row.
+    // The page-scoped hydration queries: order unspecified, and empty input
+    // returns empty without a request.
+    /// Each session's first user message, at most one row per id; none without one.
     fn titles(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionTitle>>;
+    /// Each session's whole message count and first and last timestamps, at most one row per id.
     fn stats(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionStats>>;
-    /// Each session's origin host, read from its first message only.
+    /// Each session's origin host, read from its first message only, at most one per id.
     fn hosts(&self, starts: Vec<SessionStart>) -> ApiFuture<'_, Vec<SessionHost>>;
     fn search(&self, request: SearchRequest) -> ApiFuture<'_, SearchResponse>;
     /// Newest first, at most [`PREVIEW_ROWS`].
