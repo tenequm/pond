@@ -28,9 +28,6 @@ const TERMINATE_POLL: Duration = Duration::from_millis(25);
 /// clap's usage-error exit, for any bad flag or env value; only a rejection
 /// naming `--socket` marks a pond from before the flag.
 const USAGE_ERROR_EXIT: i32 = 2;
-/// Bind env `pond serve` reads for `--host`/`--port`: clap counts an env value
-/// as given, so an inherited one would conflict with `--socket`.
-const BIND_ENV: [&str; 2] = ["POND_HOST", "POND_PORT"];
 /// `sockaddr_un.sun_path`, NUL included: a longer path cannot be bound, so a
 /// serve spawned on one would open the store only to fail at bind.
 #[cfg(target_os = "linux")]
@@ -254,9 +251,6 @@ impl Drop for ServeChild {
 fn serve_command(pond: &Path, socket: &Path) -> Command {
     let mut command = Command::new(pond);
     command.args(["serve", "--socket"]).arg(socket);
-    for var in BIND_ENV {
-        command.env_remove(var);
-    }
     command
 }
 
@@ -500,16 +494,10 @@ mod tests {
     }
 
     #[test]
-    fn serve_gets_only_the_socket_and_never_the_bind_env() {
+    fn serve_gets_only_the_socket() {
         let command = serve_command(Path::new("/bin/pond"), Path::new("/s/owner.sock"));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["serve", "--socket", "/s/owner.sock"]);
-        let removed: Vec<_> = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(key, _)| key)
-            .collect();
-        assert_eq!(removed, BIND_ENV);
     }
 
     #[test]
