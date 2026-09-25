@@ -98,11 +98,13 @@ fn sockhash(socket: &Path) -> String {
 }
 
 /// The published record of a daemon-owned serve. The token names the owner,
-/// so an exiting owner never removes a successor's record.
+/// so an exiting owner never removes a successor's record; the pid names the
+/// serve, so a successor can stop it once its owner is gone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Endpoint {
     pub socket: PathBuf,
     pub token: String,
+    pub pid: u32,
 }
 
 /// A missing or malformed record is no record.
@@ -120,10 +122,11 @@ pub(crate) fn remove_endpoint_if_owned(path: &Path, token: &str) -> bool {
         && fs::remove_file(path).is_ok()
 }
 
-/// The published endpoint's socket, if it answers the probe.
-pub(crate) async fn live_endpoint(dir: &ServeDir) -> Option<Socket> {
-    let socket = Socket::new(read_endpoint(&dir.endpoint())?.socket).ok()?;
-    probe(&socket).await.ok().map(|()| socket)
+/// The published endpoint and its socket, if the socket answers the probe.
+pub(crate) async fn live_endpoint(dir: &ServeDir) -> Option<(Endpoint, Socket)> {
+    let endpoint = read_endpoint(&dir.endpoint())?;
+    let socket = Socket::new(endpoint.socket.clone()).ok()?;
+    probe(&socket).await.ok().map(|()| (endpoint, socket))
 }
 
 /// `SELECT 1` over `/v1/x/sql`: proves both a live pond and one new enough
@@ -338,7 +341,7 @@ pub(crate) async fn connect(
     origin: &Origin,
     fallback: Option<Fallback>,
 ) -> Result<Connection, ApiError> {
-    if let Some(socket) = live_endpoint(&origin.dir).await {
+    if let Some((_, socket)) = live_endpoint(&origin.dir).await {
         if let Some(fallback) = fallback {
             retire(fallback.serve);
         }
@@ -436,7 +439,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"socket": socket.display().to_string(), "token": "mine"})
+            serde_json::json!({"socket": socket.display().to_string(), "token": "mine", "pid": 0})
         );
         assert_eq!(read_endpoint(&path), Some(endpoint(&socket, "mine")));
         assert!(!remove_endpoint_if_owned(&path, "theirs"));
@@ -447,14 +450,15 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_port_endpoint_is_absent() {
+    fn malformed_port_or_pidless_endpoint_is_absent() {
         let sandbox = Sandbox::new();
         let path = sandbox.path("endpoint");
         for text in [
             "",
             "{",
-            r#"{"socket":1,"token":"t"}"#,
-            r#"{"port":1,"token":"t"}"#,
+            r#"{"socket":1,"token":"t","pid":1}"#,
+            r#"{"port":1,"token":"t","pid":1}"#,
+            r#"{"socket":"/s/owner.sock","token":"t"}"#,
         ] {
             fs::write(&path, text).unwrap();
             assert_eq!(read_endpoint(&path), None, "{text}");

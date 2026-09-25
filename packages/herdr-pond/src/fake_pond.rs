@@ -303,8 +303,9 @@ impl Sandbox {
     }
 
     /// A fake `pond serve` at `bin/pond`, set as `pond_bin`: records its argv
-    /// in `calls` and its pid in `pid`, prints to both streams, creates the
-    /// `<socket>.lock` pond keeps beside its socket, and when
+    /// in `calls` and its pid in `pid`, prints to both streams, takes the
+    /// `<socket>.lock` pond keeps beside its socket (refusing while a live
+    /// pid holds it, as pond's lifetime lock does), and when
     /// given a `target` socket answers at its `--socket` path through a
     /// symlink to it (connect follows symlinks), then runs `after`.
     pub(crate) fn fake_serve(&self, target: Option<&Path>, after: &str) -> PathBuf {
@@ -318,7 +319,10 @@ impl Sandbox {
 echo $$ > '{pid}'
 echo "serve stdout"; echo "serve stderr" >&2
 eval "socket=\${{$#}}"
-: > "$socket.lock"
+if [ -s "$socket.lock" ] && kill -0 "$(cat "$socket.lock")" 2>/dev/null; then
+  echo "error: --socket $socket: another pond serve owns this path" >&2; exit 1
+fi
+echo $$ > "$socket.lock"
 {publish}
 {after}"#,
                 calls = self.path("calls").display(),
@@ -362,10 +366,12 @@ pub(crate) fn stale_socket(path: &Path) -> Socket {
     Socket::new(path.to_path_buf()).unwrap()
 }
 
+/// A record naming pid 0, which no owner ever signals.
 pub(crate) fn endpoint(socket: &Path, token: &str) -> Endpoint {
     Endpoint {
         socket: socket.to_path_buf(),
         token: token.to_owned(),
+        pid: 0,
     }
 }
 
