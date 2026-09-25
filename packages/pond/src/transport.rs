@@ -274,8 +274,12 @@ pub mod http {
         pub fn acquire(path: &Path) -> anyhow::Result<Self> {
             use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
-            let address = socket2::SockAddr::unix(path)
-                .with_context(|| format!("invalid --socket {}", path.display()))?;
+            let address = socket2::SockAddr::unix(path).map_err(|_| {
+                anyhow::anyhow!(
+                    "--socket {}: too long for a Unix socket path; pick a shorter path",
+                    path.display()
+                )
+            })?;
             let dir = path
                 .parent()
                 .filter(|dir| !dir.as_os_str().is_empty())
@@ -289,14 +293,44 @@ pub mod http {
             }
             let mut lock_path = path.as_os_str().to_owned();
             lock_path.push(".lock");
-            let lock = std::fs::OpenOptions::new()
+            let lock_path = std::path::PathBuf::from(lock_path);
+            let not_regular = || {
+                anyhow::anyhow!(
+                    "--socket lock {} is not a regular file; remove it or pick another path",
+                    lock_path.display()
+                )
+            };
+            // O_NONBLOCK: opening a FIFO planted at the lock path must fail, not hang.
+            let opened = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&lock_path)
-                .with_context(|| format!("failed to open the --socket lock {lock_path:?}"))?;
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&lock_path);
+            let lock = match opened {
+                Ok(file) => file,
+                Err(_)
+                    if std::fs::symlink_metadata(&lock_path)
+                        .is_ok_and(|metadata| !metadata.is_file()) =>
+                {
+                    return Err(not_regular());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to open the --socket lock {}", lock_path.display())
+                    });
+                }
+            };
+            let lock_metadata = lock.metadata().with_context(|| {
+                format!(
+                    "failed to inspect the --socket lock {}",
+                    lock_path.display()
+                )
+            })?;
+            if !lock_metadata.is_file() {
+                return Err(not_regular());
+            }
             match lock.try_lock() {
                 Ok(()) => {}
                 Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
@@ -305,7 +339,7 @@ pub mod http {
                 ),
                 Err(std::fs::TryLockError::Error(error)) => {
                     return Err(error)
-                        .with_context(|| format!("failed to lock --socket {lock_path:?}"));
+                        .with_context(|| format!("failed to lock {}", lock_path.display()));
                 }
             }
             let metadata =
@@ -336,22 +370,31 @@ pub mod http {
 
         /// Binds, narrows the file to 0600, and only then listens: every connect
         /// is refused until `listen`, so no other user ever reaches the socket
-        /// and the process-wide umask is left alone.
+        /// and the process-wide umask is left alone. A failure after the bind
+        /// removes the socket file again, leaving only the lock file.
         pub fn bind(&mut self) -> anyhow::Result<tokio::net::UnixListener> {
+            use socket2::{Domain, Socket, Type};
+
+            let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
+                .with_context(|| self.failed("create"))?;
+            socket
+                .bind(&self.address)
+                .with_context(|| self.failed("bind"))?;
+            let listening = self.listen(socket);
+            if listening.is_err() {
+                self.remove_socket();
+            }
+            listening
+        }
+
+        fn listen(&mut self, socket: socket2::Socket) -> anyhow::Result<tokio::net::UnixListener> {
             use std::{
                 fs::Permissions,
                 os::{fd::OwnedFd, unix::fs::PermissionsExt},
             };
 
-            use socket2::{Domain, Socket, Type};
-
             let path = &self.path;
             let context = |step: &str| format!("failed to {step} --socket {}", path.display());
-            let socket =
-                Socket::new(Domain::UNIX, Type::STREAM, None).with_context(|| context("create"))?;
-            socket
-                .bind(&self.address)
-                .with_context(|| context("bind"))?;
             self.bound = Some(socket_identity(path).with_context(|| context("inspect"))?);
             std::fs::set_permissions(path, Permissions::from_mode(0o600))
                 .with_context(|| context("restrict"))?;
@@ -363,9 +406,16 @@ pub mod http {
             tokio::net::UnixListener::from_std(listener).with_context(|| context("register"))
         }
 
+        fn failed(&self, step: &str) -> String {
+            format!("failed to {step} --socket {}", self.path.display())
+        }
+
         fn remove_socket(&self) {
             let path = &self.path;
-            if self.bound.is_none() || socket_identity(path).ok() != self.bound {
+            let Some(bound) = self.bound else {
+                return;
+            };
+            if socket_identity(path).ok() != Some(bound) {
                 return;
             }
             if let Err(error) = std::fs::remove_file(path)
@@ -385,9 +435,9 @@ pub mod http {
     }
 
     /// Serve the same router on a bound Unix socket until `stop`, then remove
-    /// the socket file if it is still the one bound, and release the claim. Access control is the file's
-    /// owner-only mode, and readiness is a connect that succeeds - there is
-    /// nothing to publish.
+    /// the socket file if it is still the one bound, and release the claim.
+    /// Access control is the file's owner-only mode, and readiness is a
+    /// connect that succeeds - there is nothing to publish.
     #[cfg(unix)]
     pub async fn serve_unix(
         listener: tokio::net::UnixListener,
@@ -634,7 +684,7 @@ pub mod http {
 
             let too_long = temp.path().join("s".repeat(200));
             let error = SocketClaim::acquire(&too_long).unwrap_err().to_string();
-            assert!(error.contains("invalid --socket"), "{error}");
+            assert!(error.contains("too long for a Unix socket path"), "{error}");
         }
 
         #[cfg(unix)]
@@ -652,6 +702,25 @@ pub mod http {
             std::os::unix::net::UnixStream::connect(&path).expect("listening once bound");
             claim.remove_socket();
             assert!(!path.exists(), "the claim's own socket is removed on stop");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_lock_path_that_is_not_a_regular_file_is_refused() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let lock = temp.path().join("pond.sock.lock");
+            std::os::unix::fs::symlink(temp.path().join("elsewhere"), &lock).unwrap();
+            let error = SocketClaim::acquire(&path).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{error}");
+            std::fs::remove_file(&lock).unwrap();
+
+            let made = std::process::Command::new("mkfifo").arg(&lock).status();
+            if !made.is_ok_and(|status| status.success()) {
+                return;
+            }
+            let error = SocketClaim::acquire(&path).unwrap_err().to_string();
+            assert!(error.contains("not a regular file"), "{error}");
         }
 
         #[cfg(unix)]

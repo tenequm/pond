@@ -2,7 +2,7 @@ version: 3
 skills:
   ./skills::pond-add-adapter:
     destination: .claude/skills/pond-add-adapter,.agents/skills/pond-add-adapter
-    hash: 2ec3e9ecd8cf4c51ed67485f13e9bd3ee954018e6735f96a48f89dc5bf7ef96e
+    hash: ba552acbbe49164a81a130e669ba9e9501832b014f8faf2a7b85a2ff5004dae0
     skill: pond-add-adapter
     description: Playbook for adding a new source-agent adapter to pond - spec the format from the upstream writer, capture a sandboxed fixture, implement the bidirectional codec, and prove conformance. Use when adding an adapter under packages/pond/src/adapter/ or reworking an existing one.
     source: ./skills
