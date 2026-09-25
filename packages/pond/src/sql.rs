@@ -167,7 +167,7 @@ pub async fn open_tables(store: &Store, sql: &str, mode: Mode) -> Result<Tables,
         open(Table::Messages),
         open(Table::Parts),
     )
-    .map_err(SqlError::Infra)?;
+    .map_err(SqlError::Storage)?;
     Ok(Tables {
         sessions,
         messages,
@@ -198,13 +198,16 @@ pub struct JsonRows {
     pub elapsed_ms: u64,
 }
 
-/// Two error channels: `Query` is caller-fixable (parse/plan/exec/limits) and
+/// Three error channels: `Query` is caller-fixable (parse/plan/exec/limits) and
 /// every surface reports it as such (an MCP `isError` result the model
-/// self-corrects from, an HTTP `validation_failed`); `Infra` is a storage or
-/// internal failure, surfaced as a protocol error.
+/// self-corrects from, an HTTP `validation_failed`); `Storage` is a transient
+/// dataset-open or object-store failure worth retrying (HTTP
+/// `storage_unavailable`); `Infra` is a deterministic internal failure that a
+/// retry would only repeat (HTTP `internal`).
 #[derive(Debug)]
 pub enum SqlError {
     Query(String),
+    Storage(anyhow::Error),
     Infra(anyhow::Error),
 }
 
@@ -213,19 +216,18 @@ fn infra(error: ArrowError) -> SqlError {
 }
 
 /// An execution failure is the store's, not the query's, when an object-store
-/// or IO error sits anywhere in its source chain. Lance reports its own as
-/// `lance::Error::IO` inside [`DataFusionError::External`].
+/// or IO error sits anywhere in its source chain. Lance boxes an
+/// `object_store::Error` as the source of its `IO` variant, which the walk
+/// reaches; `lance::Error::IO` itself is lance's catch-all (resources
+/// exhausted, join and decode errors), so it is deliberately not matched.
 fn is_storage_failure(error: &DataFusionError) -> bool {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = cause {
         if current.is::<std::io::Error>()
+            || current.is::<object_store::Error>()
             || matches!(
                 current.downcast_ref::<DataFusionError>(),
                 Some(DataFusionError::ObjectStore(_))
-            )
-            || matches!(
-                current.downcast_ref::<lance::Error>(),
-                Some(lance::Error::IO { .. })
             )
         {
             return true;
@@ -343,7 +345,7 @@ pub async fn run(
             ))
         })?
         .map_err(|error| match is_storage_failure(&error) {
-            true => SqlError::Infra(anyhow::Error::new(error).context("sql execution failed")),
+            true => SqlError::Storage(anyhow!("sql execution failed: {error}")),
             false => SqlError::Query(enrich(&format!("SQL error: {error}"))),
         })?;
     let elapsed = started.elapsed();
@@ -1892,8 +1894,15 @@ mod tests {
     fn storage_failures_are_told_apart_from_query_errors() {
         let io = || std::io::Error::other("connection reset");
         assert!(is_storage_failure(&DataFusionError::IoError(io())));
+        let timed_out = object_store::Error::Generic {
+            store: "S3",
+            source: "request timed out".into(),
+        };
         assert!(is_storage_failure(&DataFusionError::External(Box::new(
-            lance::Error::io("object store request timed out")
+            lance::Error::from(timed_out)
+        ))));
+        assert!(!is_storage_failure(&DataFusionError::External(Box::new(
+            lance::Error::io("resources exhausted")
         ))));
         assert!(is_storage_failure(&DataFusionError::Context(
             "scan".to_owned(),

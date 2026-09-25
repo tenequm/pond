@@ -1135,7 +1135,10 @@ mod sql_handler {
             Err(sql::SqlError::Query(message)) => Err(map_error(crate::Error::validation_field(
                 message, "query", None, None,
             ))),
-            Err(sql::SqlError::Infra(error)) => Err(map_storage(error)),
+            Err(sql::SqlError::Storage(error)) => Err(map_storage(error)),
+            Err(sql::SqlError::Infra(error)) => {
+                Err(map_error(crate::Error::Internal(format!("{error:#}"))))
+            }
         }
     }
 }

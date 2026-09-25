@@ -792,6 +792,34 @@ async fn sql_route_maps_a_timeout_to_validation_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A deterministic encoder fault is a 500 `internal`, never a retryable 503
+/// `storage_unavailable` a client would retry forever: arrow-json cannot
+/// encode a map with non-string keys.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_maps_an_encoder_failure_to_internal() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let (status, _, body) = post(
+        &app,
+        "/v1/x/sql",
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "query": "SELECT map([1, 2], ['a', 'b']) AS m",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::Internal);
+    Ok(())
+}
+
 /// `--port-file` publishes the actual bound address - with `--port 0`, the
 /// OS-assigned port - only once the socket is live, as bare `host:port`.
 #[tokio::test(flavor = "multi_thread")]

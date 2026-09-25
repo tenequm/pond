@@ -138,7 +138,7 @@ async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {
     .await
     .map_err(|err| match err {
         pond::sql::SqlError::Query(msg) => anyhow::anyhow!("query: {msg}"),
-        pond::sql::SqlError::Infra(err) => err,
+        pond::sql::SqlError::Storage(err) | pond::sql::SqlError::Infra(err) => err,
     })?;
     let count = match outcome {
         Outcome::Inline(_) => 0,

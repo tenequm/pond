@@ -241,10 +241,12 @@ pub mod http {
         let local = listener
             .local_addr()
             .context("failed to read bound address")?;
+        // The port file is the authoritative readiness signal, so it lands last:
+        // `output::line` exits on a closed stdout and must not strand a live-looking file.
+        crate::output::line(&format!("serve: http listening on http://{local}"))?;
         if let Some(path) = &port_file {
             write_port_file(path, local)?;
         }
-        crate::output::line(&format!("serve: http listening on http://{local}"))?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
         serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
     }
@@ -1289,6 +1291,13 @@ Examples (4 patterns the agent should recognize):
                 Err(sql::SqlError::Query(message)) => {
                     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
                 }
+                Err(sql::SqlError::Storage(error)) => Err(ErrorData::internal_error(
+                    format!(
+                        "sql failed: {error:#}; the store failed transiently - retry the \
+                         query, and run `pond status` to check the store if it persists"
+                    ),
+                    None,
+                )),
                 Err(sql::SqlError::Infra(error)) => Err(ErrorData::internal_error(
                     format!("sql failed: {error:#}"),
                     None,

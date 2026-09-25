@@ -2038,7 +2038,7 @@ async fn run() -> anyhow::Result<()> {
                     ))?;
                     std::process::exit(2);
                 }
-                Err(pond::sql::SqlError::Infra(error)) => {
+                Err(pond::sql::SqlError::Storage(error) | pond::sql::SqlError::Infra(error)) => {
                     return Err(error);
                 }
             }
