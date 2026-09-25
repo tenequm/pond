@@ -173,8 +173,19 @@ fn default_cache_dir() -> PathBuf {
 /// resident; absent or version-mismatched chains leave the store-scan
 /// fallback in place.
 async fn load_rowmap_quietly(store: &Store) {
-    if let Err(error) = store.load_rowmap_if_present(&default_cache_dir()).await {
+    let cache_dir = default_cache_dir();
+    // Different tables, so joined rather than awaited in turn: each is a cold
+    // dataset open plus an identity probe, and this sits on the critical path
+    // of every one-shot read command.
+    let (rowmap, partsmap) = futures::join!(
+        store.load_rowmap_if_present(&cache_dir),
+        store.load_partsmap_if_present(&cache_dir),
+    );
+    if let Err(error) = rowmap {
         tracing::debug!(%error, "rowmap load skipped; reads fall back to store scans");
+    }
+    if let Err(error) = partsmap {
+        tracing::debug!(%error, "parts summary map load skipped; gets fall back to parts scans");
     }
 }
 
@@ -1228,6 +1239,9 @@ fn spawn_prewarm(state: AppState) {
             tokio::time::sleep(ROWMAP_REFRESH_INTERVAL).await;
             if let Err(error) = store.ensure_rowmap(&cache_dir).await {
                 tracing::debug!(%error, "rowmap refresh skipped");
+            }
+            if let Err(error) = store.ensure_partsmap(&cache_dir).await {
+                tracing::debug!(%error, "parts summary map refresh skipped");
             }
             store.prune_index_cache(&cache_dir).await;
             if state.take_completed_activity() {
@@ -4743,6 +4757,9 @@ async fn run_sync_pipeline(
         // after a sync reports everything just ingested as still pending.
         if let Err(error) = store.ensure_rowmap(&default_cache_dir()).await {
             tracing::warn!(%error, "post-import rowmap refresh skipped");
+        }
+        if let Err(error) = store.ensure_partsmap(&default_cache_dir()).await {
+            tracing::warn!(%error, "post-import parts summary map refresh skipped");
         }
         // On an instance with embedding enabled, sync embeds inline, so
         // every row IT ingested carries its vector; rows ingested by a

@@ -443,6 +443,12 @@ pub struct PartSummary {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+    /// One-line body excerpt from [`part_preview`] - what the tool was
+    /// actually called with, so a session view distinguishes two `Bash` calls
+    /// without fetching either body. `None` for a kind with nothing to
+    /// preview, and for a store whose `preview` column is still NULL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 impl PartSummary {
@@ -457,13 +463,9 @@ impl PartSummary {
     /// (its full body is still rendered when a message is fetched by `message_id`
     /// scope). The kinds that survive are exactly [`SUMMARY_PART_TYPES`].
     pub fn for_kind(kind: &PartKind) -> Option<Self> {
+        let preview = part_preview(kind);
         let (label, call_id) = match kind {
             PartKind::Text { .. } | PartKind::Reasoning { .. } => return None,
-            PartKind::File {
-                media_type,
-                file_name,
-                ..
-            } => (file_name.clone().or_else(|| media_type.clone()), None),
             PartKind::ToolCall { name, call_id, .. } => {
                 (name.as_deref().cloned(), call_id.as_deref().cloned())
             }
@@ -482,21 +484,263 @@ impl PartSummary {
                 });
                 (label, call_id.as_deref().cloned())
             }
-            PartKind::ToolApprovalRequest { approval_id, .. } => (Some(approval_id.clone()), None),
-            PartKind::ToolApprovalResponse {
-                approval_id,
-                approved,
-                ..
-            } => {
-                let verb = if *approved { "approved" } else { "denied" };
-                (Some(format!("{approval_id} ({verb})")), None)
-            }
+            // For these the descriptor IS the label, and it must be the
+            // rendered one: [`Self::from_columns`] has only the stored
+            // `preview` to rebuild it from, so taking the raw field here would
+            // make a long or whitespace-carrying file name answer differently
+            // depending on whether the map was warm.
+            PartKind::File { .. }
+            | PartKind::ToolApprovalRequest { .. }
+            | PartKind::ToolApprovalResponse { .. } => (preview.clone(), None),
         };
         Some(Self {
             kind: kind.type_name().to_owned(),
             label,
             call_id,
+            preview,
         })
+    }
+
+    /// Rebuild a summary from the materialized `parts` columns - the local
+    /// parts-summary map's twin of [`Self::for_kind`], which has no body to
+    /// read. The two MUST agree: a page served from the map and the same page
+    /// served by a `parts` scan are the same response.
+    ///
+    /// `tool_name` is the label for the tool kinds; every other kind's label
+    /// *is* its one-line descriptor, which is exactly what `preview` stores
+    /// (see [`part_preview`]), so it doubles as the label there.
+    pub fn from_columns(
+        kind: &str,
+        tool_name: Option<&str>,
+        call_id: Option<&str>,
+        is_failure: Option<bool>,
+        preview: Option<&str>,
+    ) -> Self {
+        let label = match kind {
+            "tool_call" => tool_name.map(str::to_owned),
+            "tool_result" => tool_name.map(|name| {
+                if is_failure.unwrap_or(false) {
+                    format!("{name} (failed)")
+                } else {
+                    name.to_owned()
+                }
+            }),
+            _ => preview.map(str::to_owned),
+        };
+        Self {
+            kind: kind.to_owned(),
+            label,
+            // `call_id` rides the response for the call/result pair only, as
+            // in `for_kind` - the stored column also carries an approval
+            // request's `tool_call_id` (spec.md#5.6, one correlation key), and
+            // surfacing that here would make the map path answer differently.
+            call_id: matches!(kind, "tool_call" | "tool_result")
+                .then(|| call_id.map(str::to_owned))
+                .flatten(),
+            preview: preview.map(str::to_owned),
+        }
+    }
+}
+
+/// Bumped whenever [`part_preview`] would render a stored part differently.
+/// Stamped into the `parts` schema on the `preview` field, so a store carries
+/// the renderer that produced its column and a later pond can tell that the
+/// column needs re-deriving (spec.md#session-additive-schema-backfill - the
+/// same re-derivation seam `embedding_model` gives `vector`).
+pub const PREVIEW_RENDERER_VERSION: u32 = 1;
+
+/// Character budget for a rendered preview. Sized so a page of summaries
+/// stays a page: ~160 chars is one terminal line and two orders of magnitude
+/// under the p99 tool body.
+const PREVIEW_MAX_CHARS: usize = 160;
+
+/// Parameter keys the preview renderer reads, in render order. These are the
+/// keys that identify a call at a glance across the harnesses pond ingests -
+/// the audited hot paths (`$.params.command` alone accounts for 898 of the
+/// hand-rolled `pond_sql` previews). A params object carrying none of them
+/// falls back to compact JSON, so an unknown tool still previews.
+const PREVIEW_PARAM_KEYS: &[&str] = &[
+    "command",
+    "file_path",
+    "path",
+    "pattern",
+    "url",
+    "query",
+    "prompt",
+    "description",
+];
+
+/// The one-line descriptor materialized into `parts.preview` and served in
+/// [`PartSummary`]. `None` only for `text` and `reasoning`, whose bodies the
+/// message's own text already carries.
+///
+/// `tool_call` renders the known parameter keys it carries, else its whole
+/// params object as compact JSON; `tool_result` renders a head window of its
+/// body. For the remaining kinds the descriptor is the label itself - a file's
+/// name, an approval's identifiers - which is deliberate: it is what lets
+/// [`PartSummary::from_columns`] rebuild the summary from the stored columns
+/// with no body to read. Every arm is whitespace-collapsed to one line and
+/// truncated on a char boundary, so a preview is always safe to print inline.
+pub fn part_preview(kind: &PartKind) -> Option<String> {
+    let rendered = match kind {
+        PartKind::Text { .. } | PartKind::Reasoning { .. } => return None,
+        PartKind::File {
+            file_name,
+            media_type,
+            ..
+        } => file_name.clone().or_else(|| media_type.clone())?,
+        PartKind::ToolCall { params, .. } => render_params(params)?,
+        PartKind::ToolResult { result, .. } => preview_text(result)?,
+        PartKind::ToolApprovalRequest { approval_id, .. } => approval_id.clone(),
+        PartKind::ToolApprovalResponse {
+            approval_id,
+            approved,
+            ..
+        } => {
+            let verb = if *approved { "approved" } else { "denied" };
+            format!("{approval_id} ({verb})")
+        }
+    };
+    let one_line = collapse_whitespace(&rendered);
+    (!one_line.is_empty()).then(|| truncate_chars(&one_line, PREVIEW_MAX_CHARS))
+}
+
+/// The materialized `parts.body_text` cell: a `tool_call`'s params as text,
+/// NULL for every other kind. Result bodies are deliberately left out - they
+/// are 7.8x the params corpus and only 16 of 3,699 audited `pond_sql` calls
+/// hunted them unscoped (docs/plans/2609-17-read-latency-campaign.md).
+pub fn part_body_text(kind: &PartKind) -> Option<String> {
+    match kind {
+        PartKind::ToolCall { params, .. } => value_text(params),
+        PartKind::Text { .. }
+        | PartKind::Reasoning { .. }
+        | PartKind::File { .. }
+        | PartKind::ToolResult { .. }
+        | PartKind::ToolApprovalRequest { .. }
+        | PartKind::ToolApprovalResponse { .. } => None,
+    }
+}
+
+/// Known-param-keys renderer: `key=value` for each [`PREVIEW_PARAM_KEYS`] the
+/// object carries, else the compact-JSON fallback. A single known key renders
+/// bare - the common `{"command": "ls"}` shape reads as the command itself.
+fn render_params(params: &Value) -> Option<String> {
+    let Some(object) = params.as_object() else {
+        return preview_text(params);
+    };
+    let known: Vec<(&str, String)> = PREVIEW_PARAM_KEYS
+        .iter()
+        .filter_map(|key| {
+            let text = object.get(*key).and_then(preview_text)?;
+            Some((*key, text))
+        })
+        .collect();
+    match known.as_slice() {
+        [] => preview_text(params),
+        [(_, only)] => Some(only.clone()),
+        many => Some(
+            many.iter()
+                .map(|(key, text)| format!("{key}={text}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
+}
+
+/// Head window every preview arm renders through. Generous enough that
+/// whitespace collapse cannot pull the rendered line under
+/// [`PREVIEW_MAX_CHARS`] for any realistic body.
+const PREVIEW_HEAD_CHARS: usize = PREVIEW_MAX_CHARS * 8;
+
+/// The same window in bytes - UTF-8 is at most four bytes per char, so this
+/// can never cut a body the char window would have kept.
+const PREVIEW_HEAD_BYTES: usize = PREVIEW_HEAD_CHARS * 4;
+
+/// A JSON value as preview text, every shape through a bounded head window.
+/// Bounding the non-string shapes is the point: a claude-code `tool_result`
+/// body is an array of content blocks, so that arm is the common one, and
+/// serializing a megabyte of it to keep 160 chars would allocate the result
+/// corpus once per ingest.
+fn preview_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => {
+            let end = text
+                .char_indices()
+                .nth(PREVIEW_HEAD_CHARS)
+                .map_or(text.len(), |(at, _)| at);
+            Some(text[..end].to_owned())
+        }
+        other => compact_json_head(other, PREVIEW_HEAD_BYTES),
+    }
+}
+
+/// Compact JSON, stopped once `max` bytes are in hand. `serde_json` walks the
+/// value either way, but the sink refusing further bytes keeps the allocation
+/// at the window rather than at the body.
+fn compact_json_head(value: &Value, max: usize) -> Option<String> {
+    struct Head {
+        buffer: Vec<u8>,
+        max: usize,
+    }
+    impl std::io::Write for Head {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let room = self.max.saturating_sub(self.buffer.len());
+            if room == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            let take = room.min(bytes.len());
+            self.buffer.extend_from_slice(&bytes[..take]);
+            Ok(take)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut head = Head {
+        buffer: Vec::new(),
+        max,
+    };
+    // A write error here is the budget being spent, not a failure: whatever
+    // reached the buffer is the head this preview wanted.
+    let _ = serde_json::to_writer(&mut head, value);
+    let mut bytes = head.buffer;
+    // The cut lands anywhere, including mid-character; back off to the last
+    // boundary rather than lose the whole preview.
+    while !bytes.is_empty() && std::str::from_utf8(&bytes).is_err() {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|text| !text.is_empty())
+}
+
+/// A JSON value as text, in full: a string is its own text, anything else is
+/// compact JSON. `null` and an unrenderable value are `None`, so an absent
+/// body stays absent rather than rendering as the word "null". Unbounded on
+/// purpose - `body_text` is the whole params, which is what makes it the
+/// column a substring hunt can scan; previews go through [`preview_text`].
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => serde_json::to_string(other).ok(),
+    }
+}
+
+/// Collapse every whitespace run to one space and trim - a preview is one
+/// line, and a tool body's newlines and indentation carry nothing at this
+/// width.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncate to `max` chars (not bytes - a multibyte body must not be cut
+/// mid-character), marking the cut so a reader knows the body continues.
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}...", &text[..at]),
+        None => text.to_owned(),
     }
 }
 
@@ -881,6 +1125,243 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    fn tool_call(params: serde_json::Value) -> PartKind {
+        PartKind::ToolCall {
+            call_id: Some(crate::adapter::Extracted::from_test_value("c1".to_owned())),
+            name: Some(crate::adapter::Extracted::from_test_value(
+                "Bash".to_owned(),
+            )),
+            params,
+            provider_executed: false,
+        }
+    }
+
+    #[test]
+    fn preview_renders_one_known_param_key_bare() {
+        assert_eq!(
+            part_preview(&tool_call(json!({ "command": "ls -la /tmp" }))),
+            Some("ls -la /tmp".to_owned()),
+            "the single-key case reads as the value itself",
+        );
+    }
+
+    #[test]
+    fn preview_labels_several_known_param_keys() {
+        assert_eq!(
+            part_preview(&tool_call(json!({
+                "file_path": "/etc/hosts",
+                "command": "cat",
+                "ignored": "not a known key",
+            }))),
+            Some("command=cat file_path=/etc/hosts".to_owned()),
+            "known keys render in PREVIEW_PARAM_KEYS order, not the object's",
+        );
+    }
+
+    #[test]
+    fn preview_falls_back_to_compact_json() {
+        assert_eq!(
+            part_preview(&tool_call(json!({ "todos": [{ "id": 1 }] }))),
+            Some("{\"todos\":[{\"id\":1}]}".to_owned()),
+            "a params object with no known key still previews",
+        );
+        assert_eq!(
+            part_preview(&tool_call(json!("a bare string body"))),
+            Some("a bare string body".to_owned()),
+        );
+        assert_eq!(
+            part_preview(&tool_call(json!(null))),
+            None,
+            "an absent body previews as absent, never as the word null",
+        );
+    }
+
+    #[test]
+    fn preview_is_one_line_and_bounded() {
+        let preview = part_preview(&tool_call(json!({ "command": "echo one\n  echo two" })))
+            .expect("preview rendered");
+        assert_eq!(preview, "echo one echo two", "newlines collapse to spaces");
+
+        let long = "x".repeat(400);
+        let preview = part_preview(&tool_call(json!({ "command": long }))).expect("rendered");
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 3);
+        assert!(preview.ends_with("..."), "the cut is marked: {preview}");
+
+        // Truncation counts chars, not bytes: cutting mid-character would
+        // panic on the slice and poison the whole preview column.
+        let wide = "\u{1f300}".repeat(400);
+        let preview = part_preview(&tool_call(json!({ "command": wide }))).expect("rendered");
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 3);
+    }
+
+    #[test]
+    fn preview_covers_every_kind_that_earns_a_summary() {
+        let file = PartKind::File {
+            media_type: Some("text/plain".to_owned()),
+            file_name: Some("notes.md".to_owned()),
+            data: FileData::Bytes(Vec::new()),
+        };
+        assert_eq!(part_preview(&file), Some("notes.md".to_owned()));
+        let result = PartKind::ToolResult {
+            call_id: Some(crate::adapter::Extracted::from_test_value("c1".to_owned())),
+            name: Some(crate::adapter::Extracted::from_test_value(
+                "Bash".to_owned(),
+            )),
+            is_failure: true,
+            result: json!("exit 1: no such file"),
+        };
+        assert_eq!(
+            part_preview(&result),
+            Some("exit 1: no such file".to_owned())
+        );
+        let approval = PartKind::ToolApprovalResponse {
+            approval_id: "a1".to_owned(),
+            approved: false,
+            reason: None,
+        };
+        assert_eq!(part_preview(&approval), Some("a1 (denied)".to_owned()));
+        // text/reasoning carry their body in the message's own text.
+        assert_eq!(
+            part_preview(&PartKind::Text {
+                text: Some(crate::adapter::Extracted::from_test_value("hi".to_owned())),
+            }),
+            None,
+        );
+        assert_eq!(
+            part_preview(&PartKind::Reasoning {
+                text: Some(crate::adapter::Extracted::from_test_value("hmm".to_owned())),
+            }),
+            None,
+        );
+    }
+
+    /// A megabyte tool result renders its head; it is never serialized whole
+    /// to keep 160 chars. The array shape is the common one - a claude-code
+    /// `tool_result` body is a content-block array, not a string.
+    #[test]
+    fn preview_bounds_a_non_string_body() {
+        let huge = PartKind::ToolResult {
+            call_id: None,
+            name: None,
+            is_failure: false,
+            result: json!([{ "type": "text", "text": "y".repeat(1_000_000) }]),
+        };
+        let preview = part_preview(&huge).expect("rendered");
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 3);
+        assert!(preview.starts_with("[{\"text\":\"yyy"), "{preview}");
+        assert_eq!(
+            compact_json_head(&json!({ "a": "\u{1f300}\u{1f300}" }), 9),
+            Some("{\"a\":\"".to_owned()),
+            "a cut landing mid-character backs off to the last boundary",
+        );
+    }
+
+    #[test]
+    fn body_text_materializes_tool_call_params_only() {
+        assert_eq!(
+            part_body_text(&tool_call(json!({ "command": "ls" }))),
+            Some("{\"command\":\"ls\"}".to_owned()),
+            "params serialize in full, unlike the bounded preview",
+        );
+        let result = PartKind::ToolResult {
+            call_id: None,
+            name: None,
+            is_failure: false,
+            result: json!({ "stdout": "lots of bytes" }),
+        };
+        assert_eq!(
+            part_body_text(&result),
+            None,
+            "result bodies are deliberately not materialized",
+        );
+        assert_eq!(
+            part_body_text(&PartKind::File {
+                media_type: None,
+                file_name: Some("a.bin".to_owned()),
+                data: FileData::Bytes(Vec::new()),
+            }),
+            None,
+        );
+    }
+
+    /// The map path rebuilds a summary from the stored columns with no body to
+    /// read; it must land on exactly what the body-reading path produces, or a
+    /// page's content would depend on whether the map was warm.
+    #[test]
+    fn from_columns_reproduces_for_kind() {
+        let kinds = vec![
+            tool_call(json!({ "command": "ls -la" })),
+            PartKind::ToolResult {
+                call_id: Some(crate::adapter::Extracted::from_test_value("c1".to_owned())),
+                name: Some(crate::adapter::Extracted::from_test_value(
+                    "Bash".to_owned(),
+                )),
+                is_failure: true,
+                result: json!("exit 1"),
+            },
+            PartKind::ToolResult {
+                call_id: Some(crate::adapter::Extracted::from_test_value("c2".to_owned())),
+                name: Some(crate::adapter::Extracted::from_test_value(
+                    "Grep".to_owned(),
+                )),
+                is_failure: false,
+                result: json!("3 matches"),
+            },
+            PartKind::File {
+                media_type: Some("image/png".to_owned()),
+                file_name: None,
+                data: FileData::Bytes(Vec::new()),
+            },
+            // The label of a descriptor kind is the rendered preview, so a
+            // name the renderer collapses or truncates must still agree.
+            PartKind::File {
+                media_type: None,
+                file_name: Some(format!("a b\n{}", "x".repeat(400))),
+                data: FileData::Bytes(Vec::new()),
+            },
+            PartKind::ToolApprovalRequest {
+                approval_id: "a1".to_owned(),
+                tool_call_id: "c1".to_owned(),
+            },
+            PartKind::ToolApprovalResponse {
+                approval_id: "a1".to_owned(),
+                approved: true,
+                reason: None,
+            },
+        ];
+        for kind in kinds {
+            let expected = PartSummary::for_kind(&kind).expect("kind earns a summary");
+            // Exactly the cells `parts` materializes for this part.
+            let (tool_name, call_id, is_failure) = match &kind {
+                PartKind::ToolCall { name, call_id, .. } => {
+                    (name.as_deref().cloned(), call_id.as_deref().cloned(), None)
+                }
+                PartKind::ToolResult {
+                    name,
+                    call_id,
+                    is_failure,
+                    ..
+                } => (
+                    name.as_deref().cloned(),
+                    call_id.as_deref().cloned(),
+                    Some(*is_failure),
+                ),
+                PartKind::ToolApprovalRequest { tool_call_id, .. } => {
+                    (None, Some(tool_call_id.clone()), None)
+                }
+                _ => (None, None, None),
+            };
+            let rebuilt = PartSummary::from_columns(
+                kind.type_name(),
+                tool_name.as_deref(),
+                call_id.as_deref(),
+                is_failure,
+                part_preview(&kind).as_deref(),
+            );
+            assert_eq!(rebuilt, expected, "{} summary diverged", kind.type_name());
+        }
+    }
 
     #[test]
     fn wire_envelope_carries_conflict_code_and_attempts_detail() {

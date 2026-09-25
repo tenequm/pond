@@ -1,10 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 //! In-place additive schema migration: a store written before the
-//! materialized tool columns (#89) upgrades on first open via the
-//! `add_columns` backfill - values derive from stored `variant_data`, no
-//! re-ingest (spec.md#session-durable-copy). The pre-#89 store is simulated
-//! faithfully by dropping the materialized columns with raw Lance.
+//! materialized tool columns (#89) or the derived `body_text` / `preview`
+//! columns (#284) upgrades on first open via the `add_columns` backfill -
+//! values derive from stored `variant_data`, no re-ingest
+//! (spec.md#session-durable-copy). The older store is simulated faithfully by
+//! dropping the materialized columns with raw Lance.
 
 use chrono::Utc;
 use lance::index::DatasetIndexExt;
@@ -19,6 +20,9 @@ use serde_json::json;
 use tempfile::TempDir;
 
 const SESSION_ID: &str = "migration-test-session";
+
+/// Every column the backfill derives from stored `variant_data`.
+const DERIVED_COLUMNS: [&str; 5] = ["tool_name", "call_id", "is_failure", "body_text", "preview"];
 
 fn s(value: &str) -> Option<pond::adapter::Extracted<String>> {
     pond::adapter::extract_str(&json!({ "x": value }), "x")
@@ -84,6 +88,18 @@ async fn ingest_session(store: &Store, session_id: &str, tool: &str) -> anyhow::
                 result: json!("exit 1"),
             },
         )),
+        // Carries no tool identity but does earn a `preview`, which is what
+        // keeps the backfill's decoded-kind list honest: derive it from the
+        // tool columns alone and this row's preview stays NULL forever.
+        IngestEvent::Part(part(
+            "p-approval",
+            3,
+            PartKind::ToolApprovalResponse {
+                approval_id: "ap-1".to_owned(),
+                approved: false,
+                reason: None,
+            },
+        )),
     ];
     let envelope = pond_ingest(
         store,
@@ -123,9 +139,7 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
     // `variant_data` is once again the only carrier of tool identity.
     let parts_uri = temp.path().join("parts.lance");
     let mut dataset = lance::dataset::Dataset::open(parts_uri.to_str().unwrap()).await?;
-    dataset
-        .drop_columns(&["tool_name", "call_id", "is_failure"])
-        .await?;
+    dataset.drop_columns(&DERIVED_COLUMNS).await?;
     let stripped = lance::deps::arrow_schema::Schema::from(dataset.schema());
     assert!(
         stripped.field_with_name("tool_name").is_err(),
@@ -137,7 +151,7 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
     let store = Store::open_local(temp.path()).await?;
     let migrated = store.dataset(Table::Parts).await?;
     let schema = lance::deps::arrow_schema::Schema::from(migrated.schema());
-    for column in ["tool_name", "call_id", "is_failure"] {
+    for column in DERIVED_COLUMNS {
         assert!(
             schema.field_with_name(column).is_ok(),
             "backfill must restore {column}: {schema:?}",
@@ -161,14 +175,51 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
     .await?;
     assert!(text.contains("true"), "is_failure backfilled: {text}");
 
+    // The derived text columns come back from the same decode the write path
+    // uses: params in full for `body_text`, the one-line renderer for
+    // `preview` (a tool_result previews its body, a text part neither).
+    let text = run_sql(
+        &store,
+        "SELECT type, body_text, preview FROM parts ORDER BY ordinal",
+    )
+    .await?;
+    assert!(
+        text.contains(r#"{"command":"false"}"#),
+        "body_text backfilled from the stored params: {text}",
+    );
+    assert!(text.contains("exit 1"), "tool_result previews: {text}");
+    assert!(
+        text.contains("ap-1 (denied)"),
+        "a kind with no tool identity still previews - the backfill decodes \
+         every summary-earning kind, not just the tool ones: {text}",
+    );
+    let text = run_sql(
+        &store,
+        "SELECT COUNT(*) AS n FROM parts WHERE body_text IS NOT NULL",
+    )
+    .await?;
+    assert!(
+        text.contains("| 1 |"),
+        "only the tool_call row materializes body_text: {text}",
+    );
+
     let text = run_sql(
         &store,
         "SELECT COUNT(*) AS n FROM parts WHERE tool_name IS NULL",
     )
     .await?;
     assert!(
-        text.contains("| 1 |"),
-        "non-tool parts stay NULL (the text part): {text}",
+        text.contains("| 2 |"),
+        "non-tool parts stay NULL (text and the approval response): {text}",
+    );
+
+    // The renderer stamp is field metadata, and `add_columns` is the path it
+    // was designed for - a migrated store that lost it would read as "unknown
+    // renderer" while a fresh one reads the current version.
+    assert_eq!(
+        store.preview_renderer_version().await?,
+        Some(pond::wire::PREVIEW_RENDERER_VERSION),
+        "the backfilled preview column keeps its renderer stamp",
     );
 
     // The declared scalar index on the backfilled column builds through the
@@ -205,7 +256,7 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
     ingest_session(&store, "post-migration-session", "Grep").await?;
     let text = run_sql(
         &store,
-        "SELECT tool_name, call_id FROM parts \
+        "SELECT tool_name, call_id, preview FROM parts \
          WHERE session_id = 'post-migration-session' AND type = 'tool_call'",
     )
     .await?;
@@ -216,6 +267,10 @@ async fn old_schema_store_backfills_tool_columns_on_open() -> anyhow::Result<()>
     assert!(
         text.contains("call-1"),
         "post-migration ingest materializes call_id: {text}",
+    );
+    assert!(
+        text.contains("false"),
+        "post-migration ingest materializes preview: {text}",
     );
     Ok(())
 }
@@ -234,9 +289,7 @@ async fn old_schema_archive_restores_with_derived_columns() -> anyhow::Result<()
     }
     let parts_uri = archive.path().join("parts.lance");
     let mut dataset = lance::dataset::Dataset::open(parts_uri.to_str().unwrap()).await?;
-    dataset
-        .drop_columns(&["tool_name", "call_id", "is_failure"])
-        .await?;
+    dataset.drop_columns(&DERIVED_COLUMNS).await?;
     let archive_version = dataset.version().version;
     drop(dataset);
 
@@ -245,15 +298,19 @@ async fn old_schema_archive_restores_with_derived_columns() -> anyhow::Result<()
     let restored_dir = TempDir::new()?;
     let store = Store::open_local(restored_dir.path()).await?;
     let imported = store.import_clean_lance_datasets(archive.path()).await?;
-    assert_eq!(imported.rows.parts, 3, "all archive parts imported");
+    assert_eq!(imported.rows.parts, 4, "all archive parts imported");
 
     let text = run_sql(
         &store,
-        "SELECT tool_name, call_id FROM parts WHERE type = 'tool_call'",
+        "SELECT tool_name, call_id, body_text FROM parts WHERE type = 'tool_call'",
     )
     .await?;
     assert!(text.contains("Bash"), "tool_name derived on import: {text}");
     assert!(text.contains("call-1"), "call_id derived on import: {text}");
+    assert!(
+        text.contains(r#"{"command":"false"}"#),
+        "body_text derived on import: {text}",
+    );
 
     let untouched = lance::dataset::Dataset::open(parts_uri.to_str().unwrap()).await?;
     assert_eq!(

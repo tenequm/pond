@@ -440,7 +440,7 @@ This section is how the canonical model of Section 4 persists on the substrate o
 
 ### 5.1 Three datasets
 
-The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type plus a small, named set of derived storage columns with no canonical counterpart: `messages` carries the message's derived embedding (5.5), and `parts` carries the materialized tool-identity columns (5.6). Nothing else is projected or promoted.
+The sessions consumer registers three Lance tables: `sessions`, `messages`, and `parts`. Each is a direct serialization of its canonical type plus a small, named set of derived storage columns with no canonical counterpart: `messages` carries the message's derived embedding (5.5), and `parts` carries the materialized tool-identity and tool-body columns (5.6). Nothing else is projected or promoted.
 
 `sessions` - one row per Session:
 
@@ -479,6 +479,8 @@ The sessions consumer registers three Lance tables: `sessions`, `messages`, and 
 | `tool_name` | derived tool-identity column (5.6); scalar-indexed - tool analytics run on the narrow columns instead of scanning `variant_data` |
 | `call_id` | derived tool-call correlation id (5.6) |
 | `is_failure` | derived ToolResult flag (5.6); non-null only on `tool_result` rows |
+| `body_text` | derived tool-call params as text (5.6); non-null only on `tool_call` rows |
+| `preview` | derived one-line part descriptor (5.6); the renderer version is stamped on the column |
 | `variant_data` | JSON (Lance `pa.json_()`, stored as JSONB); the variant-specific fields |
 | `data` | Lance blob; FilePart payload only |
 | `options` | JSON (Lance `pa.json_()`, stored as JSONB) |
@@ -517,7 +519,11 @@ Re-embedding rewrites only `vector` and `embedding_model`; no canonical column i
 
 ### 5.6 Derived analytics columns and additive schema migration
 
-`parts` carries three nullable columns materialized at ingest from the tool Part bodies: `tool_name`, `call_id` (also carrying the approval request's `tool_call_id` - the same correlation key), and `is_failure` (non-null only on tool results). NULL means the part is not a tool part or the source did not carry the field (`model-no-synthesis`). They exist because analytics must run on narrow native columns: a JSON getter over `variant_data` reads the whole multi-GB column, which on an object store cannot finish inside the query timeout. `variant_data` remains the verbatim record; the materialized columns are projections of it, never independently writable.
+`parts` carries five nullable columns materialized at ingest from the Part bodies. Three are tool identity: `tool_name`, `call_id` (also carrying the approval request's `tool_call_id` - the same correlation key), and `is_failure` (non-null only on tool results). Two are body text: `body_text`, a ToolCall's `params` as text, and `preview`, a bounded one-line descriptor of any Part that earns a `parts_summary` entry (7.5) - the tool call's known parameter keys or its compact-JSON fallback, a tool result's head window, a file's label, an approval's identifiers. NULL means the part is not of that kind or the source did not carry the field (`model-no-synthesis`).
+
+They exist because analytics must run on narrow native columns: a JSON getter over `variant_data` reads the whole multi-GB column, which on an object store cannot finish inside the query timeout. `preview` additionally lets a summary be assembled without any tool body at all, which is what a local summary map serves `get_session` from. Result bodies are deliberately NOT materialized: they are several times the params corpus and are reached under a session scope through `variant_data`. `variant_data` remains the verbatim record; the materialized columns are projections of it, never independently writable.
+
+`preview` is the one derived column whose values depend on a rendering choice rather than on a stored field alone, so the renderer's version is stamped on the column's schema metadata. A store therefore records which renderer produced its previews, which is what lets a changed renderer be re-derived over that one column - never a re-ingest, and never a schema change (the column's name and type do not move). The stamp records; it does not itself trigger a re-derivation.
 
 #### `session-additive-schema-backfill`
 
@@ -669,7 +675,7 @@ Retryability is conveyed by the code; there is no separate field. `conflict` is 
 ### 7.5 Operations
 
 1. **`pond_search`** (`POST /v1/search`) - search; Section 8 specifies retrieval. Returns ranked message hits grouped by session, with the top-scoring matches per session. Takes a `format`: `text` (the default - a rendered transcript of the ranked hits) or `json` (the same hits as structured data).
-2. **`pond_get_session`** (`POST /v1/get-session`) - fetch a whole session as the conversational view (human/model text, with a compact `parts_summary` per message). Takes one `id`: a session id reads that session; a message id resolves up to its parent session with the page anchored at that message, and the response records the resolution (`resolved_from_message_id`) - intent comes from the operation, so upcasting is always safe. `from`: `start` (the default - oldest messages first) or `end` (the most recent messages, still in chronological order - e.g. recovering recent context after compaction). Pages are bounded by `limit` and a size budget and never cut mid-message; the caller pages on with `after_message_id` / `before_message_id` using the id a page marker shows. Not for bulk export - that is the restore/export path.
+2. **`pond_get_session`** (`POST /v1/get-session`) - fetch a whole session as the conversational view (human/model text, with a compact `parts_summary` per message - one line per Part that earns one, carrying the materialized `preview` (5.6) so two calls to the same tool are distinguishable without fetching either body). Takes one `id`: a session id reads that session; a message id resolves up to its parent session with the page anchored at that message, and the response records the resolution (`resolved_from_message_id`) - intent comes from the operation, so upcasting is always safe. `from`: `start` (the default - oldest messages first) or `end` (the most recent messages, still in chronological order - e.g. recovering recent context after compaction). Pages are bounded by `limit` and a size budget and never cut mid-message; the caller pages on with `after_message_id` / `before_message_id` using the id a page marker shows. Not for bulk export - that is the restore/export path.
 3. **`pond_get_message`** (`POST /v1/get-message`) - fetch one message with surrounding context: the target's full Parts (budget-bounded, `target_parts_remaining` signals the cut) plus `context_before` / `context_after` conversational sibling messages each side - siblings stay conversational so system/tool carriers do not crowd the conversation out of the window, while the target itself returns regardless of role. The reverse of the get_session resolution never happens: a session id cannot pick one message, so it is rejected with a hint naming `pond_get_session`.
 4. **`pond_ingest`** (`POST /v1/ingest`) - accept a batch of canonical events. Always batched, bounded by an event count and a body-size cap. Events are grouped by session and applied per session; partial success across sessions is normal and reported per row.
 
@@ -755,7 +761,7 @@ Every search response MUST report how many searchable messages the caller's filt
 
 ### 8.4 Hit payload
 
-A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. A user-role hit additionally carries a compact `parts_summary` (the same per-Part descriptor the get operations return), so a prompt that attached files is distinguishable from a plain-text one without a second fetch; other roles omit it. The full message - including the parts excluded from the indexed text - remains available through `pond_get_message`.
+A search hit carries enough of the matched message to judge relevance without a second fetch: the message's indexed text in full when it is small, and when it is large a bounded prefix of that text plus a match-windowed snippet drawn around the query terms. The size bounds are tuning constants and live in the code, not this document. A user-role hit additionally carries a compact `parts_summary` (the same per-Part descriptor the get operations return, `preview` included), so a prompt that attached files is distinguishable from a plain-text one without a second fetch; other roles omit it. The full message - including the parts excluded from the indexed text - remains available through `pond_get_message`.
 
 ### 8.5 The embedding seam
 
