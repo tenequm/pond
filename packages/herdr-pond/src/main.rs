@@ -16,6 +16,9 @@ mod serve;
 mod types;
 
 use std::process::ExitCode;
+use std::sync::Arc;
+
+use crate::types::{DeskContext, DeskExit};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,7 +31,7 @@ fn main() -> ExitCode {
         "hook" => hook::run(rest),
         "serve-daemon" => daemon::run(rest),
         _ => Err(anyhow::anyhow!(
-            "usage: herdr-pond open|tui|hook|serve-daemon"
+            "usage: herdr-pond open|tui|hook [--worker <adapter>]|serve-daemon [--owner]"
         )),
     };
     match result {
@@ -40,7 +43,16 @@ fn main() -> ExitCode {
     }
 }
 
-/// Runs the desk, then performs a jump only after it has restored the terminal.
+/// Runs the desk, then performs a jump only after it has restored the
+/// terminal. The api (and any fallback serve it owns) is dropped when
+/// `desk::run` returns, before herdr's CLI runs.
 fn desk_main() -> anyhow::Result<()> {
-    anyhow::bail!("not implemented")
+    let context = DeskContext {
+        project: herdr::context_project(),
+    };
+    let api = Arc::new(api::HttpApi::from_env()?);
+    match desk::run(api, context)? {
+        DeskExit::Quit => Ok(()),
+        DeskExit::Jump { pane_id } => herdr::Herdr::from_env().agent_focus(&pane_id),
+    }
 }
