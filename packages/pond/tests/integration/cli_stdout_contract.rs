@@ -10,10 +10,7 @@
 //! byte-for-byte identical.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::{
-    io::{BufRead, BufReader},
-    process::{Command, Stdio},
-};
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 /// A `pond` invocation confined to `temp`: no host config, store, or sources.
@@ -120,7 +117,10 @@ fn closed_stdout_exits_quietly() {
 #[cfg(unix)]
 #[test]
 fn serve_survives_sigpipe() {
-    use std::{io::Write, os::unix::process::ExitStatusExt};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::process::ExitStatusExt,
+    };
 
     let temp = TempDir::new().expect("temp dir");
     std::fs::create_dir_all(temp.path().join("home")).expect("create home");
