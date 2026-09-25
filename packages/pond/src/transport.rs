@@ -258,18 +258,24 @@ pub mod http {
     #[derive(Debug)]
     pub struct SocketClaim {
         path: std::path::PathBuf,
+        address: socket2::SockAddr,
         _lock: std::fs::File,
+        /// `(dev, ino)` of the socket this claim bound: the lock file can be
+        /// deleted from outside, so shutdown still checks it removes its own.
+        bound: Option<(u64, u64)>,
     }
 
     #[cfg(unix)]
     impl SocketClaim {
         /// Runs before the store opens, so a bad or taken path fails before any
-        /// slow work. Holding the lock means no live server owns the path, so a
-        /// socket left there is a dead run's and is removed; any other file is
-        /// refused, never deleted.
+        /// slow work. Holding the lock means no pond server owns the path, so
+        /// any socket there is treated as a dead run's and removed; any other
+        /// file is refused, never deleted.
         pub fn acquire(path: &Path) -> anyhow::Result<Self> {
             use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 
+            let address = socket2::SockAddr::unix(path)
+                .with_context(|| format!("invalid --socket {}", path.display()))?;
             let dir = path
                 .parent()
                 .filter(|dir| !dir.as_os_str().is_empty())
@@ -288,6 +294,7 @@ pub mod http {
                 .create(true)
                 .truncate(false)
                 .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&lock_path)
                 .with_context(|| format!("failed to open the --socket lock {lock_path:?}"))?;
             match lock.try_lock() {
@@ -321,27 +328,31 @@ pub mod http {
             }
             Ok(Self {
                 path: path.to_owned(),
+                address,
                 _lock: lock,
+                bound: None,
             })
         }
 
         /// Binds, narrows the file to 0600, and only then listens: every connect
         /// is refused until `listen`, so no other user ever reaches the socket
         /// and the process-wide umask is left alone.
-        pub fn bind(&self) -> anyhow::Result<tokio::net::UnixListener> {
+        pub fn bind(&mut self) -> anyhow::Result<tokio::net::UnixListener> {
             use std::{
                 fs::Permissions,
                 os::{fd::OwnedFd, unix::fs::PermissionsExt},
             };
 
-            use socket2::{Domain, SockAddr, Socket, Type};
+            use socket2::{Domain, Socket, Type};
 
             let path = &self.path;
             let context = |step: &str| format!("failed to {step} --socket {}", path.display());
             let socket =
                 Socket::new(Domain::UNIX, Type::STREAM, None).with_context(|| context("create"))?;
-            let address = SockAddr::unix(path).with_context(|| context("address"))?;
-            socket.bind(&address).with_context(|| context("bind"))?;
+            socket
+                .bind(&self.address)
+                .with_context(|| context("bind"))?;
+            self.bound = Some(socket_identity(path).with_context(|| context("inspect"))?);
             std::fs::set_permissions(path, Permissions::from_mode(0o600))
                 .with_context(|| context("restrict"))?;
             socket.listen(1024).with_context(|| context("listen on"))?;
@@ -351,10 +362,30 @@ pub mod http {
             let listener = std::os::unix::net::UnixListener::from(OwnedFd::from(socket));
             tokio::net::UnixListener::from_std(listener).with_context(|| context("register"))
         }
+
+        fn remove_socket(&self) {
+            let path = &self.path;
+            if self.bound.is_none() || socket_identity(path).ok() != self.bound {
+                return;
+            }
+            if let Err(error) = std::fs::remove_file(path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%error, path = %path.display(), "failed to remove the socket file");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn socket_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     /// Serve the same router on a bound Unix socket until `stop`, then remove
-    /// the socket file and release the claim. Access control is the file's
+    /// the socket file if it is still the one bound, and release the claim. Access control is the file's
     /// owner-only mode, and readiness is a connect that succeeds - there is
     /// nothing to publish.
     #[cfg(unix)]
@@ -372,11 +403,7 @@ pub mod http {
             serve_with_shutdown(listener, state, allowed_hosts, stop).await
         }
         .await;
-        if let Err(error) = std::fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, path = %path.display(), "failed to remove the socket file");
-        }
+        claim.remove_socket();
         served
     }
 
@@ -604,6 +631,10 @@ pub mod http {
             let orphan = temp.path().join("missing").join("pond.sock");
             let error = SocketClaim::acquire(&orphan).unwrap_err().to_string();
             assert!(error.contains(&orphan.display().to_string()), "{error}");
+
+            let too_long = temp.path().join("s".repeat(200));
+            let error = SocketClaim::acquire(&too_long).unwrap_err().to_string();
+            assert!(error.contains("invalid --socket"), "{error}");
         }
 
         #[cfg(unix)]
@@ -613,12 +644,28 @@ pub mod http {
 
             let temp = tempfile::TempDir::new().unwrap();
             let path = temp.path().join("pond.sock");
-            let claim = SocketClaim::acquire(&path).unwrap();
+            let mut claim = SocketClaim::acquire(&path).unwrap();
             let _listener = claim.bind().unwrap();
             let metadata = std::fs::symlink_metadata(&path).unwrap();
             assert!(metadata.file_type().is_socket());
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
             std::os::unix::net::UnixStream::connect(&path).expect("listening once bound");
+            claim.remove_socket();
+            assert!(!path.exists(), "the claim's own socket is removed on stop");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_replaced_socket_is_not_removed_on_stop() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let path = temp.path().join("pond.sock");
+            let mut claim = SocketClaim::acquire(&path).unwrap();
+            let _listener = claim.bind().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let _successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            claim.remove_socket();
+            std::os::unix::net::UnixStream::connect(&path)
+                .expect("a socket bound at the path after this claim is left alone");
         }
     }
 }

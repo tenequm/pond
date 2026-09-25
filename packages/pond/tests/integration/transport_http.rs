@@ -833,7 +833,7 @@ async fn unix_socket_serves_sql_and_is_removed_on_shutdown() -> anyhow::Result<(
     let state = empty_state(&temp).await?;
     let sockets = TempDir::new()?;
     let path = sockets.path().join("pond.sock");
-    let claim = http::SocketClaim::acquire(&path)?;
+    let mut claim = http::SocketClaim::acquire(&path)?;
     let listener = claim.bind()?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
@@ -942,10 +942,9 @@ async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow:
     assert!(!second.status.success(), "{:?}", second.status);
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(stderr.contains("another pond serve owns"), "{stderr}");
-    assert!(
-        path.exists(),
-        "the refused server leaves the live socket alone"
-    );
+    tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("the refused server leaves the live socket alone");
 
     let signalled = std::process::Command::new("kill")
         .args(["-TERM", &child.id().to_string()])

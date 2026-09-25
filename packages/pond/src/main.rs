@@ -792,9 +792,10 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         /// it, and a successful connect means the server is ready (the store
         /// opens before the bind). Put it in a directory only you can write:
         /// the mode is set by path, so a shared one lets another user swap it.
-        /// A `<path>.lock` beside it keeps a second server off the path; a
-        /// dead socket left there is replaced, any other file is refused, and
-        /// a clean stop removes the socket. Excludes --host/--port;
+        /// A `<path>.lock` beside it keeps a second server off the path; once
+        /// that lock is held, any socket already at the path is treated as a
+        /// dead run's and replaced, any other file is refused, and a clean
+        /// stop removes the socket. Excludes --host/--port;
         /// POND_HOST/POND_PORT in the environment are ignored.
         #[cfg(unix)]
         #[arg(long, value_name = "PATH")]
@@ -1833,7 +1834,7 @@ async fn run() -> anyhow::Result<()> {
             match transport {
                 ServeTransport::Http => {
                     #[cfg(unix)]
-                    if let Some(claim) = socket {
+                    if let Some(mut claim) = socket {
                         let listener = claim.bind()?;
                         start_sync();
                         let stop = transport::http::shutdown_signal();
