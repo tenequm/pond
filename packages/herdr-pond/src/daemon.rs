@@ -1,35 +1,46 @@
 //! The per-herdr-server `pond serve` owner: startup hook and detached
-//! watchdog (plan 5.6).
+//! watchdog.
 //!
 //! Startup hooks are one-shot and unserialized, so the hook only decides and
 //! detaches; the `--owner` watchdog holds `lock` for its whole life, so at
-//! most one serve exists per herdr server, and it never outlives that server.
+//! most one supervised serve exists per herdr server, and it never outlives
+//! that server.
 
 use std::collections::hash_map::RandomState;
+use std::future::Future;
 use std::hash::BuildHasher;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use chrono::Utc;
 
 use crate::api::{QUERY_TIMEOUT_SECS, SEARCH_PATH, SQL_PATH, client, post, sql_deadline};
-use crate::config::{log_line, try_lock};
+use crate::config::{cap_log, log_line, try_lock};
 use crate::serve::{
-    Endpoint, PORT_DEADLINE, ServeDir, live_endpoint, probe, read_port_file,
-    remove_endpoint_if_owned, spawn_serve, terminate, write_endpoint,
+    Endpoint, PORT_DEADLINE, ServeChild, ServeDir, live_endpoint, probe, remove_endpoint_if_owned,
+    retire, write_endpoint,
 };
 use crate::types::{
-    LISTING_ROWS, ListingScope, SearchRequest, SearchResponse, SqlRequest, SqlResponse, listing_sql,
+    ApiError, LISTING_ROWS, ListingScope, SearchRequest, SearchResponse, SqlRequest, SqlResponse,
+    listing_sql,
 };
-use crate::{herdr, runtime};
+use crate::{herdr, runtime, shutdown_signal};
 
 struct Timing {
     tick: Duration,
     liveness_every: Duration,
+    /// A live handoff swaps herdr's socket, and the new server waits up to 5s
+    /// for the old one to close before binding: only misses spanning longer
+    /// than this mean herdr is gone.
+    handoff_window: Duration,
     port_deadline: Duration,
+    /// A serve that has just bound may still be settling, so a failed
+    /// capability probe is retried for this long.
+    probe_window: Duration,
+    probe_retry: Duration,
     /// The historical 47-300s cold FTS load is paid here, not by the desk.
     warmup_deadline: Duration,
     grace: Duration,
@@ -38,7 +49,10 @@ struct Timing {
 const TIMING: Timing = Timing {
     tick: Duration::from_millis(500),
     liveness_every: Duration::from_secs(20),
+    handoff_window: Duration::from_secs(10),
     port_deadline: PORT_DEADLINE,
+    probe_window: Duration::from_secs(30),
+    probe_retry: Duration::from_secs(5),
     warmup_deadline: Duration::from_secs(300),
     grace: Duration::from_secs(10),
 };
@@ -65,35 +79,22 @@ fn startup() {
         return;
     };
     let log = dir.daemon_log();
-    let result = runtime().map_err(anyhow::Error::from).and_then(|runtime| {
-        runtime.block_on(start(&dir, || {
-            let mut command = Command::new(std::env::current_exe()?);
-            command.args(["serve-daemon", "--owner"]);
-            herdr::spawn_detached(command, &log)
-        }))
+    let result = start(&dir, || {
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args(["serve-daemon", "--owner"]);
+        herdr::spawn_detached(command, &log)
     });
     if let Err(error) = result {
         log_line(&log, &format!("serve-daemon: {error:#}"));
     }
 }
 
-/// Spawns an owner unless one is alive (lock held) or the published
-/// endpoint still answers the probe (adopted).
-async fn start(
-    dir: &ServeDir,
-    spawn_owner: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    let Some(lock) = try_lock(&dir.lock())? else {
-        return Ok(());
-    };
-    if let Some(base_url) = live_endpoint(&client()?, dir).await {
-        log_line(
-            &dir.daemon_log(),
-            &format!("adopted live endpoint {base_url}"),
-        );
+/// Spawns an owner unless a live one holds the lock. A free lock means no
+/// owner supervises whatever the endpoint names, so the owner replaces it.
+fn start(dir: &ServeDir, spawn_owner: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if try_lock(&dir.lock())?.is_none() {
         return Ok(());
     }
-    drop(lock);
     spawn_owner()
 }
 
@@ -103,47 +104,61 @@ fn owner() -> anyhow::Result<()> {
     let state_dir = herdr::state_dir()?;
     let config_dir = herdr::config_dir()?;
     let log = dir.daemon_log();
-    runtime()?.block_on(own(&dir, &socket, &TIMING, || {
-        herdr::resolve_pond_or_toast(&config_dir, &state_dir, &log)
-    }))
+    runtime()?.block_on(async {
+        let shutdown = shutdown_signal()?;
+        own(
+            &dir,
+            &socket,
+            &TIMING,
+            || herdr::resolve_pond_or_toast(&config_dir, &state_dir, &log),
+            shutdown,
+        )
+        .await
+    })
 }
 
+/// Holds the lock and supervises one serve until the serve dies, herdr goes
+/// away, or `shutdown` fires; every ending tears down the same way.
 async fn own(
     dir: &ServeDir,
     socket: &Path,
     timing: &Timing,
     resolve_pond: impl FnOnce() -> Option<PathBuf>,
+    shutdown: impl Future<Output = &'static str>,
 ) -> anyhow::Result<()> {
     let log = dir.daemon_log();
     let Some(_lock) = try_lock(&dir.lock())? else {
         return Ok(());
     };
     let client = client()?;
-    if live_endpoint(&client, dir).await.is_some() {
-        return Ok(());
+    if let Some(base_url) = live_endpoint(&client, dir).await {
+        log_line(
+            &log,
+            &format!(
+                "owner: {base_url} answers but no owner supervises it (a dead owner's orphan, \
+                 or another process on that port) - starting a fresh serve"
+            ),
+        );
     }
     let Some(pond) = resolve_pond() else {
         return Ok(());
     };
-    let port_file = dir.port_file("owner");
-    let mut child = spawn_serve(&pond, &port_file, &log)?;
+    let mut serve = ServeChild::spawn(&pond, dir.port_file("owner"), log.clone(), timing.grace)?;
     log_line(
         &log,
-        &format!("owner: started {} (pid {})", pond.display(), child.id()),
+        &format!("owner: started {} (pid {})", pond.display(), serve.id()),
     );
-    let serve = Serve {
-        client,
-        child: &mut child,
-        port_file: &port_file,
-        socket,
-        log: &log,
+    let mut token = None;
+    let reason = tokio::select! {
+        reason = supervise(&mut serve, &client, dir, timing, &mut token) => reason,
+        reason = herdr_gone(socket, &log, timing) => reason,
+        signal = shutdown => format!("received {signal}"),
     };
-    let token = serve.supervise(dir, timing).await;
-    terminate(&mut child, timing.grace);
+    log_line(&log, &format!("owner: stopping - {reason}"));
+    let _ = retire(serve).await;
     if let Some(token) = token {
         remove_endpoint_if_owned(&dir.endpoint(), &token);
     }
-    let _ = std::fs::remove_file(&port_file);
     log_line(&log, "owner: stopped");
     Ok(())
 }
@@ -157,85 +172,102 @@ fn random_token() -> String {
     )
 }
 
-struct Serve<'a> {
-    client: reqwest::Client,
-    child: &'a mut Child,
-    port_file: &'a Path,
-    socket: &'a Path,
-    log: &'a Path,
+/// Publishes the endpoint once serve listens and passes the probe, warms it
+/// up, and returns why the owner must stop. `token` is set on publish.
+async fn supervise(
+    serve: &mut ServeChild,
+    client: &reqwest::Client,
+    dir: &ServeDir,
+    timing: &Timing,
+    token: &mut Option<String>,
+) -> String {
+    let addr = match serve.listening(timing.port_deadline).await {
+        Ok(addr) => addr,
+        Err(error) => return error.to_string(),
+    };
+    let base_url = format!("http://{addr}");
+    if let Err(reason) = probe_until_ready(serve, client, &base_url, timing).await {
+        return reason;
+    }
+    let endpoint = Endpoint {
+        port: addr.port(),
+        token: random_token(),
+    };
+    if let Err(error) = write_endpoint(&dir.endpoint(), &endpoint) {
+        return format!("cannot publish the endpoint: {error}");
+    }
+    let log = dir.daemon_log();
+    log_line(&log, &format!("owner: published {base_url}"));
+    *token = Some(endpoint.token);
+    let ((), reason) = tokio::join!(
+        warm_up(client, &base_url, &log, timing.warmup_deadline),
+        exited(serve, timing.tick)
+    );
+    reason
 }
 
-impl Serve<'_> {
-    /// Watches the child, herdr and the port deadline until one ends the
-    /// owner; publishes the endpoint once serve listens and passes the probe.
-    /// Returns the published token, if any.
-    async fn supervise(self, dir: &ServeDir, timing: &Timing) -> Option<String> {
-        let started = Instant::now();
-        let mut next_liveness = started + timing.liveness_every;
-        let mut herdr_missed = false;
-        let mut token = None;
-        let mut warmup = None;
-        let reason = loop {
-            match self.child.try_wait() {
-                Ok(Some(status)) => break format!("pond serve exited unexpectedly ({status})"),
-                Err(error) => break format!("cannot watch pond serve: {error}"),
-                Ok(None) => {}
+/// Retries within `probe_window`, except for a pond too old for the desk,
+/// which no retry fixes.
+async fn probe_until_ready(
+    serve: &mut ServeChild,
+    client: &reqwest::Client,
+    base_url: &str,
+    timing: &Timing,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match probe(client, base_url).await {
+            Ok(()) => return Ok(()),
+            Err(error @ ApiError::PondTooOld) => return Err(error.to_string()),
+            Err(error) if started.elapsed() >= timing.probe_window => {
+                return Err(format!("capability probe failed: {error}"));
             }
-            // Two misses a tick apart, so a live handoff's socket swap is not a death.
-            if Instant::now() >= next_liveness {
-                match UnixStream::connect(self.socket) {
-                    Err(error) if herdr_missed => break format!("herdr server is gone ({error})"),
-                    Err(_) => {
-                        herdr_missed = true;
-                        next_liveness = Instant::now() + timing.tick;
-                    }
-                    Ok(_) => {
-                        herdr_missed = false;
-                        next_liveness = Instant::now() + timing.liveness_every;
-                    }
-                }
-            }
-            if token.is_none() {
-                if let Some(addr) = read_port_file(self.port_file) {
-                    let base_url = format!("http://{addr}");
-                    if let Err(error) = probe(&self.client, &base_url).await {
-                        break format!("capability probe failed: {error}");
-                    }
-                    let endpoint = Endpoint {
-                        port: addr.port(),
-                        token: random_token(),
-                    };
-                    if let Err(error) = write_endpoint(&dir.endpoint(), &endpoint) {
-                        break format!("cannot publish the endpoint: {error}");
-                    }
-                    log_line(self.log, &format!("owner: published {base_url}"));
-                    warmup = Some(tokio::spawn(warm_up(
-                        self.client.clone(),
-                        base_url,
-                        self.log.to_path_buf(),
-                        timing.warmup_deadline,
-                    )));
-                    token = Some(endpoint.token);
-                } else if started.elapsed() > timing.port_deadline {
-                    break format!(
-                        "pond serve did not listen within {}s",
-                        timing.port_deadline.as_secs()
-                    );
-                }
-            }
-            tokio::time::sleep(timing.tick).await;
-        };
-        log_line(self.log, &format!("owner: stopping - {reason}"));
-        if let Some(warmup) = warmup {
-            warmup.abort();
+            Err(_) => {}
         }
-        token
+        if let Some(reason) = serve.exited() {
+            return Err(reason);
+        }
+        tokio::time::sleep(timing.probe_retry).await;
+    }
+}
+
+async fn exited(serve: &mut ServeChild, tick: Duration) -> String {
+    loop {
+        if let Some(reason) = serve.exited() {
+            return reason;
+        }
+        tokio::time::sleep(tick).await;
+    }
+}
+
+/// Returns once herdr's socket has refused connections for longer than a live
+/// handoff takes. Each check also caps `daemon.log`, which the long-lived
+/// serve appends to.
+async fn herdr_gone(socket: &Path, log: &Path, timing: &Timing) -> String {
+    let mut first_miss: Option<Instant> = None;
+    loop {
+        let _ = cap_log(log);
+        match UnixStream::connect(socket) {
+            Ok(_) => first_miss = None,
+            Err(error) => {
+                if first_miss.get_or_insert_with(Instant::now).elapsed() > timing.handoff_window {
+                    return format!("herdr server is gone ({error})");
+                }
+            }
+        }
+        let next = if first_miss.is_some() {
+            timing.tick
+        } else {
+            timing.liveness_every
+        };
+        tokio::time::sleep(next).await;
     }
 }
 
 /// The desk's opening listing and a first FTS search, once, so their cold
-/// cost lands here instead of on the first desk open. Failure is not fatal.
-async fn warm_up(client: reqwest::Client, base_url: String, log: PathBuf, deadline: Duration) {
+/// cost lands here instead of on the first desk open. The search gets what
+/// is left of `budget`. Failure is not fatal.
+async fn warm_up(client: &reqwest::Client, base_url: &str, log: &Path, budget: Duration) {
     let started = Instant::now();
     let listing = SqlRequest::new(
         listing_sql(&ListingScope::recent(None, Utc::now())),
@@ -243,19 +275,19 @@ async fn warm_up(client: reqwest::Client, base_url: String, log: PathBuf, deadli
         QUERY_TIMEOUT_SECS,
     );
     let search = SearchRequest::new(WARMUP_QUERY.to_owned(), 1);
-    let result = tokio::time::timeout(deadline, async {
-        let deadline = sql_deadline(QUERY_TIMEOUT_SECS);
-        post::<_, SqlResponse>(&client, &base_url, SQL_PATH, &listing, deadline).await?;
-        post::<_, SearchResponse>(&client, &base_url, SEARCH_PATH, &search, deadline).await
-    })
+    let listing_deadline = sql_deadline(QUERY_TIMEOUT_SECS);
+    let result = async {
+        post::<_, SqlResponse>(client, base_url, SQL_PATH, &listing, listing_deadline).await?;
+        let search_deadline = budget.saturating_sub(started.elapsed());
+        post::<_, SearchResponse>(client, base_url, SEARCH_PATH, &search, search_deadline).await
+    }
     .await;
     let outcome = match result {
-        Ok(Ok(_)) => "done".to_owned(),
-        Ok(Err(error)) => format!("failed: {error}"),
-        Err(_) => format!("gave up after {}s", deadline.as_secs()),
+        Ok(_) => "done".to_owned(),
+        Err(error) => format!("failed: {error}"),
     };
     log_line(
-        &log,
+        log,
         &format!(
             "owner: warm-up {outcome} ({:.1}s)",
             started.elapsed().as_secs_f64()
@@ -269,6 +301,8 @@ mod tests {
 
     use std::fs;
     use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::fake_pond::{FakePond, Reply, Sandbox, alive, endpoint, golden};
@@ -277,7 +311,10 @@ mod tests {
     const FAST: Timing = Timing {
         tick: Duration::from_millis(20),
         liveness_every: Duration::from_millis(100),
+        handoff_window: Duration::from_millis(300),
         port_deadline: Duration::from_millis(500),
+        probe_window: Duration::from_millis(300),
+        probe_retry: Duration::from_millis(20),
         warmup_deadline: Duration::from_secs(5),
         grace: Duration::from_secs(2),
     };
@@ -291,15 +328,20 @@ mod tests {
 
     impl Setup {
         async fn new() -> Self {
-            let sandbox = Sandbox::new();
-            let pond = FakePond::with_sql(
-                vec![
-                    ("SELECT 1", Reply::json(golden::SQL_READY)),
-                    ("GROUP BY session_id", Reply::json(golden::SQL_LISTING)),
-                ],
-                Reply::json(golden::SEARCH),
+            Self::with(
+                FakePond::with_sql(
+                    vec![
+                        ("SELECT 1", Reply::json(golden::SQL_READY)),
+                        ("GROUP BY session_id", Reply::json(golden::SQL_LISTING)),
+                    ],
+                    Reply::json(golden::SEARCH),
+                )
+                .await,
             )
-            .await;
+        }
+
+        fn with(pond: FakePond) -> Self {
+            let sandbox = Sandbox::new();
             let socket = sandbox.path("herdr.sock");
             let dir = ServeDir::new(&sandbox.state_dir(), &socket);
             Self {
@@ -318,8 +360,16 @@ mod tests {
         }
 
         async fn own(&self, pond: &Path) -> anyhow::Result<()> {
+            self.own_until(pond, std::future::pending()).await
+        }
+
+        async fn own_until(
+            &self,
+            pond: &Path,
+            shutdown: impl Future<Output = &'static str>,
+        ) -> anyhow::Result<()> {
             let pond = pond.to_path_buf();
-            own(&self.dir, &self.socket, &FAST, move || Some(pond)).await
+            own(&self.dir, &self.socket, &FAST, move || Some(pond), shutdown).await
         }
 
         fn serve_calls(&self) -> usize {
@@ -332,6 +382,14 @@ mod tests {
 
         fn log(&self) -> String {
             fs::read_to_string(self.dir.daemon_log()).unwrap_or_default()
+        }
+
+        fn endpoint(&self) -> Option<Endpoint> {
+            read_endpoint(&self.dir.endpoint())
+        }
+
+        async fn published(&self) {
+            wait_until("the endpoint", || self.endpoint().is_some()).await;
         }
     }
 
@@ -350,7 +408,7 @@ mod tests {
         let listener = UnixListener::bind(&setup.socket).unwrap();
         let herdr_stops = async {
             wait_until("the endpoint and warm-up", || {
-                read_endpoint(&setup.dir.endpoint()).is_some()
+                setup.endpoint().is_some()
                     && setup.pond.recorded().iter().any(|r| r.path == SEARCH_PATH)
             })
             .await;
@@ -365,10 +423,7 @@ mod tests {
         second.unwrap();
 
         assert_eq!(setup.serve_calls(), 1, "{}", setup.log());
-        assert!(
-            !setup.dir.endpoint().exists(),
-            "endpoint outlived its serve"
-        );
+        assert!(setup.endpoint().is_none(), "endpoint outlived its serve");
         assert!(
             !alive(setup.sandbox.serve_pid()),
             "pond serve outlived herdr"
@@ -384,26 +439,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_handoff_gap_is_not_herdr_leaving() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let old_server = UnixListener::bind(&setup.socket).unwrap();
+        let handoff = async {
+            setup.published().await;
+            drop(old_server);
+            fs::remove_file(&setup.socket).unwrap();
+            tokio::time::sleep(FAST.handoff_window / 2).await;
+            let new_server = UnixListener::bind(&setup.socket).unwrap();
+            fs::write(setup.dir.daemon_log(), vec![b'x'; 2 << 20]).unwrap();
+            tokio::time::sleep(FAST.handoff_window * 2).await;
+            assert!(setup.endpoint().is_some(), "{}", setup.log());
+            assert!(alive(setup.sandbox.serve_pid()));
+            let log_len = fs::metadata(setup.dir.daemon_log()).unwrap().len();
+            assert!(log_len < 1 << 20, "daemon.log not capped: {log_len}");
+            drop(new_server);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), handoff);
+        owner.unwrap();
+        assert!(setup.log().contains("herdr server is gone"));
+        assert!(setup.endpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_signal_tears_down_like_herdr_leaving() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        let signal = async {
+            setup.published().await;
+            "SIGTERM"
+        };
+        setup.own_until(&pond, signal).await.unwrap();
+        assert!(setup.log().contains("received SIGTERM"), "{}", setup.log());
+        assert!(setup.endpoint().is_none());
+        assert!(!alive(setup.sandbox.serve_pid()));
+    }
+
+    #[tokio::test]
     async fn teardown_keeps_a_successors_endpoint() {
         let setup = Setup::new().await;
         let pond = setup.fake_pond(true, "exec sleep 30");
         let listener = UnixListener::bind(&setup.socket).unwrap();
         let successor = async {
-            wait_until("the endpoint", || {
-                read_endpoint(&setup.dir.endpoint()).is_some()
-            })
-            .await;
-            let mut endpoint = read_endpoint(&setup.dir.endpoint()).unwrap();
+            setup.published().await;
+            let mut endpoint = setup.endpoint().unwrap();
             endpoint.token = "successor".to_owned();
             write_endpoint(&setup.dir.endpoint(), &endpoint).unwrap();
             drop(listener);
         };
         let (owner, ()) = tokio::join!(setup.own(&pond), successor);
         owner.unwrap();
-        assert_eq!(
-            read_endpoint(&setup.dir.endpoint()).unwrap().token,
-            "successor"
+        assert_eq!(setup.endpoint().unwrap().token, "successor");
+    }
+
+    #[tokio::test]
+    async fn an_unsupervised_live_endpoint_is_replaced() {
+        let setup = Setup::new().await;
+        let orphan = FakePond::with_sql(
+            vec![("SELECT 1", Reply::json(golden::SQL_READY))],
+            Reply::json(golden::SEARCH),
+        )
+        .await;
+        write_endpoint(&setup.dir.endpoint(), &endpoint(orphan.port(), "orphan")).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            wait_until("the fresh endpoint", || {
+                setup.endpoint().is_some_and(|e| e.token != "orphan")
+            })
+            .await;
+            assert_eq!(setup.endpoint().unwrap().port, setup.pond.port());
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert_eq!(setup.serve_calls(), 1);
+        assert!(
+            setup.log().contains("no owner supervises"),
+            "{}",
+            setup.log()
         );
+    }
+
+    #[tokio::test]
+    async fn a_probe_failing_while_serve_settles_is_retried() {
+        let unready = Arc::new(AtomicUsize::new(2));
+        let setup = Setup::with(
+            FakePond::start(move |_, body| {
+                let settling = body.contains("SELECT 1")
+                    && unready
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                if settling {
+                    Reply::plain(503, "starting")
+                } else {
+                    Reply::json(golden::SQL_READY)
+                }
+            })
+            .await,
+        );
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            setup.published().await;
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(!setup.log().contains("probe failed"), "{}", setup.log());
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_passes_gives_up() {
+        let setup = Setup::with(FakePond::start(|_, _| Reply::plain(503, "starting")).await);
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        assert!(
+            setup.log().contains("capability probe failed"),
+            "{}",
+            setup.log()
+        );
+        assert!(setup.pond.recorded().len() > 1, "never retried");
+        assert!(!alive(setup.sandbox.serve_pid()));
+        assert!(setup.endpoint().is_none());
     }
 
     #[tokio::test]
@@ -412,12 +574,8 @@ mod tests {
         let pond = setup.fake_pond(true, "sleep 0.3; exit 1");
         let _listener = UnixListener::bind(&setup.socket).unwrap();
         setup.own(&pond).await.unwrap();
-        assert!(
-            setup.log().contains("exited unexpectedly"),
-            "{}",
-            setup.log()
-        );
-        assert!(!setup.dir.endpoint().exists());
+        assert!(setup.log().contains("pond serve exited"), "{}", setup.log());
+        assert!(setup.endpoint().is_none());
         assert_eq!(setup.serve_calls(), 1);
     }
 
@@ -429,34 +587,35 @@ mod tests {
         setup.own(&pond).await.unwrap();
         assert!(setup.log().contains("did not listen"), "{}", setup.log());
         assert!(!alive(setup.sandbox.serve_pid()));
-        assert!(!setup.dir.endpoint().exists());
+        assert!(setup.endpoint().is_none());
     }
 
     #[tokio::test]
-    async fn start_spawns_an_owner_only_when_needed() {
+    async fn a_pond_without_port_file_is_named_too_old() {
         let setup = Setup::new().await;
+        let pond = setup.fake_pond(false, "exit 2");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        assert!(setup.log().contains("too old"), "{}", setup.log());
+        assert!(setup.log().contains("upgrade pond"), "{}", setup.log());
+    }
+
+    #[test]
+    fn start_spawns_an_owner_unless_the_lock_is_held() {
+        let sandbox = Sandbox::new();
+        let dir = sandbox.origin().dir;
         let spawned = std::cell::Cell::new(0);
         let spawn = || {
             spawned.set(spawned.get() + 1);
             Ok(())
         };
+        start(&dir, spawn).unwrap();
+        assert_eq!(spawned.get(), 1);
 
-        start(&setup.dir, spawn).await.unwrap();
-        assert_eq!(spawned.get(), 1, "no endpoint");
-
-        fs::write(setup.dir.endpoint(), "{not json").unwrap();
-        start(&setup.dir, spawn).await.unwrap();
-        assert_eq!(spawned.get(), 2, "malformed endpoint");
-
-        let held = try_lock(&setup.dir.lock()).unwrap().unwrap();
-        start(&setup.dir, spawn).await.unwrap();
-        assert_eq!(spawned.get(), 2, "an owner holds the lock");
+        let held = try_lock(&dir.lock()).unwrap().unwrap();
+        start(&dir, spawn).unwrap();
+        assert_eq!(spawned.get(), 1, "an owner holds the lock");
         drop(held);
-
-        write_endpoint(&setup.dir.endpoint(), &endpoint(setup.pond.port(), "t")).unwrap();
-        start(&setup.dir, spawn).await.unwrap();
-        assert_eq!(spawned.get(), 2, "live endpoint is adopted");
-        assert!(setup.log().contains("adopted"));
     }
 
     #[test]

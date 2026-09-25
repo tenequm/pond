@@ -14,17 +14,20 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
-use crate::api::{SQL_PATH, post};
+use crate::api::{SQL_PATH, post, sql_deadline};
 use crate::config::{Config, log_line, log_stdio, write_atomic};
 use crate::herdr;
 use crate::types::{ApiError, READY_SQL, SqlRequest, SqlResponse};
 
 /// Store open (seconds on S3) happens before `pond serve` binds.
 pub(crate) const PORT_DEADLINE: Duration = Duration::from_secs(180);
-const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT_SECS: u64 = 5;
 const FALLBACK_GRACE: Duration = Duration::from_secs(2);
 const PORT_POLL: Duration = Duration::from_millis(100);
+const TERMINATE_POLL: Duration = Duration::from_millis(25);
+/// clap's usage-error exit: a pond from before `--port-file` rejects the flag
+/// with it, before binding anything.
+const USAGE_ERROR_EXIT: i32 = 2;
 
 /// `STATE_DIR/serve/<sockhash>/`: herdr keys plugin state by plugin id only,
 /// so two herdr servers on one machine share the state dir - everything a
@@ -119,7 +122,8 @@ pub(crate) async fn live_endpoint(client: &reqwest::Client, dir: &ServeDir) -> O
 /// for the desk. A 405 from `/v1/search` would prove neither.
 pub(crate) async fn probe(client: &reqwest::Client, base_url: &str) -> Result<(), ApiError> {
     let request = SqlRequest::new(READY_SQL.to_owned(), 1, PROBE_TIMEOUT_SECS);
-    let response: SqlResponse = post(client, base_url, SQL_PATH, &request, PROBE_DEADLINE).await?;
+    let deadline = sql_deadline(PROBE_TIMEOUT_SECS);
+    let response: SqlResponse = post(client, base_url, SQL_PATH, &request, deadline).await?;
     if response.rows.is_empty() {
         return Err(ApiError::Decode(format!(
             "{base_url} answered the readiness probe with no rows"
@@ -128,28 +132,103 @@ pub(crate) async fn probe(client: &reqwest::Client, base_url: &str) -> Result<()
     Ok(())
 }
 
-/// `pond serve` bound to loopback on a free port. `--host` is explicit
-/// because an inherited `POND_HOST` would otherwise rebind it; stdio goes to
-/// `log` because serve's output would corrupt the TUI or pin a herdr slot.
-pub(crate) fn spawn_serve(pond: &Path, port_file: &Path, log: &Path) -> std::io::Result<Child> {
-    let _ = fs::remove_file(port_file);
-    log_stdio(
-        Command::new(pond)
-            .args(["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"])
-            .arg(port_file),
-        log,
-    )?
-    .spawn()
-}
-
-/// The base URL from a `--port-file` (`host:port`, written atomically after bind).
+/// The address from a `--port-file` (`host:port`, written atomically after bind).
 pub(crate) fn read_port_file(path: &Path) -> Option<SocketAddr> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// A spawned `pond serve`, terminated (and its port file removed) on drop.
+/// Termination blocks for up to `grace`, so async code drops one through
+/// [`retire`].
+pub(crate) struct ServeChild {
+    child: Child,
+    port_file: PathBuf,
+    log: PathBuf,
+    grace: Duration,
+}
+
+impl ServeChild {
+    /// `pond serve` bound to loopback on a free port. `--host` is explicit
+    /// because an inherited `POND_HOST` would otherwise rebind it; stdio goes
+    /// to `log` because serve's output would corrupt the TUI or pin a herdr slot.
+    pub(crate) fn spawn(
+        pond: &Path,
+        port_file: PathBuf,
+        log: PathBuf,
+        grace: Duration,
+    ) -> std::io::Result<Self> {
+        let _ = fs::remove_file(&port_file);
+        let child = log_stdio(
+            Command::new(pond)
+                .args(["serve", "--host", "127.0.0.1", "--port", "0", "--port-file"])
+                .arg(&port_file),
+            &log,
+        )?
+        .spawn()?;
+        Ok(Self {
+            child,
+            port_file,
+            log,
+            grace,
+        })
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Why serve is gone, once it has exited.
+    pub(crate) fn exited(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(None) => None,
+            Ok(Some(status)) => Some(format!("pond serve exited ({status})")),
+            Err(error) => Some(format!("cannot watch pond serve: {error}")),
+        }
+    }
+
+    /// Waits for serve to bind and publish its port.
+    pub(crate) async fn listening(&mut self, deadline: Duration) -> Result<SocketAddr, ApiError> {
+        let started = Instant::now();
+        loop {
+            if let Some(addr) = read_port_file(&self.port_file) {
+                return Ok(addr);
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                if status.code() == Some(USAGE_ERROR_EXIT) {
+                    return Err(ApiError::PondTooOld);
+                }
+                return Err(ApiError::Unreachable(format!(
+                    "pond serve exited ({status}) before listening - see {}",
+                    self.log.display()
+                )));
+            }
+            if started.elapsed() > deadline {
+                return Err(ApiError::Unreachable(format!(
+                    "pond serve did not listen within {}s - see {}",
+                    deadline.as_secs(),
+                    self.log.display()
+                )));
+            }
+            tokio::time::sleep(PORT_POLL).await;
+        }
+    }
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        terminate(&mut self.child, self.grace);
+        let _ = fs::remove_file(&self.port_file);
+    }
+}
+
+/// Drops `serve` on the blocking pool; await the handle to know it is gone.
+pub(crate) fn retire(serve: ServeChild) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || drop(serve))
+}
+
 /// SIGTERM, a bounded wait, then SIGKILL and reap: serve's own drain bounds
 /// only the HTTP side, not process teardown.
-pub(crate) fn terminate(child: &mut Child, grace: Duration) {
+fn terminate(child: &mut Child, grace: Duration) {
     if !matches!(child.try_wait(), Ok(None)) {
         return;
     }
@@ -161,7 +240,7 @@ pub(crate) fn terminate(child: &mut Child, grace: Duration) {
         if !matches!(child.try_wait(), Ok(None)) {
             return;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(TERMINATE_POLL);
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -169,17 +248,9 @@ pub(crate) fn terminate(child: &mut Child, grace: Duration) {
 
 /// A desk-owned `pond serve`, torn down when the desk drops it - on every
 /// graceful exit. A SIGKILLed desk orphans it (accepted v1 risk, README).
-pub(crate) struct ServeChild {
-    child: Child,
-    port_file: PathBuf,
+pub(crate) struct Fallback {
+    serve: ServeChild,
     base_url: String,
-}
-
-impl Drop for ServeChild {
-    fn drop(&mut self) {
-        terminate(&mut self.child, FALLBACK_GRACE);
-        let _ = fs::remove_file(&self.port_file);
-    }
 }
 
 /// Where the desk finds its serve: this herdr server's state plus the plugin
@@ -200,7 +271,7 @@ impl Origin {
 
 pub(crate) struct Connection {
     pub base_url: String,
-    pub fallback: Option<ServeChild>,
+    pub fallback: Option<Fallback>,
 }
 
 /// The daemon's endpoint when it probes live, else the desk's existing
@@ -208,31 +279,38 @@ pub(crate) struct Connection {
 pub(crate) async fn connect(
     client: &reqwest::Client,
     origin: &Origin,
-    fallback: Option<ServeChild>,
+    fallback: Option<Fallback>,
 ) -> Result<Connection, ApiError> {
     if let Some(base_url) = live_endpoint(client, &origin.dir).await {
+        if let Some(fallback) = fallback {
+            retire(fallback.serve);
+        }
         return Ok(Connection {
             base_url,
             fallback: None,
         });
     }
-    if let Some(fallback) = fallback
-        && probe(client, &fallback.base_url).await.is_ok()
-    {
-        return Ok(Connection {
-            base_url: fallback.base_url.clone(),
-            fallback: Some(fallback),
-        });
+    if let Some(fallback) = fallback {
+        if probe(client, &fallback.base_url).await.is_ok() {
+            return Ok(Connection {
+                base_url: fallback.base_url.clone(),
+                fallback: Some(fallback),
+            });
+        }
+        retire(fallback.serve);
     }
     let fallback = spawn_fallback(origin).await?;
-    probe(client, &fallback.base_url).await?;
+    if let Err(error) = probe(client, &fallback.base_url).await {
+        retire(fallback.serve);
+        return Err(error);
+    }
     Ok(Connection {
         base_url: fallback.base_url.clone(),
         fallback: Some(fallback),
     })
 }
 
-async fn spawn_fallback(origin: &Origin) -> Result<ServeChild, ApiError> {
+async fn spawn_fallback(origin: &Origin) -> Result<Fallback, ApiError> {
     let log = origin.dir.desk_log();
     let pond = Config::pond(&origin.config_dir, &log)
         .map_err(|error| ApiError::Unreachable(format!("{error:#}")))?;
@@ -240,34 +318,18 @@ async fn spawn_fallback(origin: &Origin) -> Result<ServeChild, ApiError> {
         .dir
         .port_file(&format!("desk.{}", std::process::id()));
     log_line(&log, &format!("desk: starting fallback {}", pond.display()));
-    let child = spawn_serve(&pond, &port_file, &log).map_err(|error| {
+    let mut serve = ServeChild::spawn(&pond, port_file, log, FALLBACK_GRACE).map_err(|error| {
         ApiError::Unreachable(format!("cannot start {}: {error}", pond.display()))
     })?;
-    let mut serve = ServeChild {
-        child,
-        port_file,
-        base_url: String::new(),
-    };
-    let started = Instant::now();
-    loop {
-        if let Some(addr) = read_port_file(&serve.port_file) {
-            serve.base_url = format!("http://{addr}");
-            return Ok(serve);
+    match serve.listening(PORT_DEADLINE).await {
+        Ok(addr) => Ok(Fallback {
+            serve,
+            base_url: format!("http://{addr}"),
+        }),
+        Err(error) => {
+            retire(serve);
+            Err(error)
         }
-        if let Ok(Some(status)) = serve.child.try_wait() {
-            return Err(ApiError::Unreachable(format!(
-                "pond serve exited ({status}) before listening - see {}",
-                log.display()
-            )));
-        }
-        if started.elapsed() > PORT_DEADLINE {
-            return Err(ApiError::Unreachable(format!(
-                "pond serve did not listen within {}s - see {}",
-                PORT_DEADLINE.as_secs(),
-                log.display()
-            )));
-        }
-        tokio::time::sleep(PORT_POLL).await;
     }
 }
 
@@ -388,8 +450,8 @@ mod tests {
         let log = fs::read_to_string(origin.dir.desk_log()).unwrap();
         assert!(log.contains("serve stdout") && log.contains("serve stderr"));
 
-        let pid = fallback.child.id();
-        let port_file = fallback.port_file.clone();
+        let pid = fallback.serve.id();
+        let port_file = fallback.serve.port_file.clone();
         assert!(alive(pid));
         drop(fallback);
         assert!(!alive(pid), "fallback serve survived the desk");
@@ -403,9 +465,9 @@ mod tests {
         let origin = fake_serve(&sandbox, pond.addr());
         let client = client().unwrap();
         let first = connect(&client, &origin, None).await.unwrap();
-        let pid = first.fallback.as_ref().unwrap().child.id();
+        let pid = first.fallback.as_ref().unwrap().serve.id();
         let second = connect(&client, &origin, first.fallback).await.unwrap();
-        assert_eq!(second.fallback.as_ref().unwrap().child.id(), pid);
+        assert_eq!(second.fallback.as_ref().unwrap().serve.id(), pid);
         assert_eq!(sandbox.lines("calls").len(), 1);
     }
 
@@ -425,6 +487,18 @@ mod tests {
                 .unwrap()
                 .contains("no store")
         );
+    }
+
+    #[tokio::test]
+    async fn a_pond_that_rejects_port_file_is_too_old() {
+        let sandbox = Sandbox::new();
+        let pond = write_script(
+            &sandbox.path("bin/pond"),
+            "echo \"error: unexpected argument '--port-file' found\" >&2; exit 2",
+        );
+        sandbox.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
+        let result = connect(&client().unwrap(), &sandbox.origin(), None).await;
+        assert!(matches!(result, Err(ApiError::PondTooOld)));
     }
 
     #[tokio::test]

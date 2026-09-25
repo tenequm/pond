@@ -2,6 +2,8 @@
 //! (`/v1/x/sql`, `/v1/search`), plus herdr's pane list for live agents.
 //! Tested against [`crate::fake_pond`].
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -9,7 +11,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
 use crate::herdr::{self, Herdr};
-use crate::serve::{self, Origin, ServeChild};
+use crate::serve::{self, Fallback, Origin};
 use crate::types::{
     Api, ApiError, ApiFuture, Cursor, ErrorEnvelope, ListingScope, LiveAgent, PAGE_ROWS,
     PREVIEW_ROWS, SearchRequest, SearchResponse, SessionDetail, SessionRow, SqlRequest,
@@ -65,8 +67,9 @@ where
     decode(path, status, &body)
 }
 
-/// reqwest's own message is only "error sending request"; the cause chain
-/// says refused vs timed out.
+/// Only a failed connect proves the serve gone; a timeout or a dropped
+/// response may come from a live serve that is merely slow. reqwest's own
+/// message is only "error sending request", so the cause chain is appended.
 fn transport(error: reqwest::Error) -> ApiError {
     let mut message = error.to_string();
     let mut source = std::error::Error::source(&error);
@@ -75,7 +78,11 @@ fn transport(error: reqwest::Error) -> ApiError {
         message.push_str(&cause.to_string());
         source = cause.source();
     }
-    ApiError::Unreachable(message)
+    if error.is_connect() {
+        ApiError::Unreachable(message)
+    } else {
+        ApiError::Request(message)
+    }
 }
 
 fn decode<T: DeserializeOwned>(path: &str, status: u16, body: &str) -> Result<T, ApiError> {
@@ -106,30 +113,44 @@ fn decode<T: DeserializeOwned>(path: &str, status: u16, body: &str) -> Result<T,
 #[derive(Default)]
 struct Link {
     base_url: Option<String>,
-    fallback: Option<ServeChild>,
-    failed_over: bool,
+    fallback: Option<Fallback>,
 }
 
-pub(crate) struct HttpApi {
+/// A URL that just refused a connection, and why.
+struct Stale {
+    url: String,
+    reason: String,
+}
+
+/// Owned by the api and by each resolution task, so resolution survives the
+/// request that started it: the desk aborts a lane on every new fetch, and a
+/// cancelled resolution would kill a half-open fallback serve mid store-open.
+struct Resolver {
     client: reqwest::Client,
     /// Why no serve can be found at all (not running under herdr), reported
     /// on first use rather than before the desk can draw.
     origin: Result<Origin, String>,
-    herdr: Herdr,
     link: Mutex<Link>,
+    /// Set by a failover, cleared by the next successful request: while set,
+    /// a refused connection is an error instead of another failover.
+    failed_over: AtomicBool,
 }
 
-impl HttpApi {
-    pub(crate) fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
-            client: client()?,
-            origin: Origin::from_env().map_err(|error| format!("{error:#}")),
-            herdr: Herdr::from_env(),
-            link: Mutex::default(),
-        })
-    }
-
-    async fn resolve(&self, link: &mut Link) -> Result<String, ApiError> {
+impl Resolver {
+    /// Runs with `link` locked, so concurrent callers queue behind one
+    /// resolution and then reuse its result.
+    async fn resolve(&self, stale: Option<Stale>) -> Result<String, ApiError> {
+        let mut link = self.link.lock().await;
+        if let Some(current) = &link.base_url {
+            match &stale {
+                None => return Ok(current.clone()),
+                Some(stale) if *current != stale.url => return Ok(current.clone()),
+                Some(stale) if self.failed_over.load(Ordering::Relaxed) => {
+                    return Err(ApiError::Unreachable(stale.reason.clone()));
+                }
+                Some(_) => {}
+            }
+        }
         let origin = self
             .origin
             .as_ref()
@@ -137,44 +158,70 @@ impl HttpApi {
         let connection = serve::connect(&self.client, origin, link.fallback.take()).await?;
         link.fallback = connection.fallback;
         link.base_url = Some(connection.base_url.clone());
+        if let Some(stale) = stale {
+            if connection.base_url == stale.url {
+                return Err(ApiError::Unreachable(stale.reason));
+            }
+            self.failed_over.store(true, Ordering::Relaxed);
+        }
         Ok(connection.base_url)
     }
+}
 
-    /// Sends to the resolved serve. The first time a serve becomes unreachable
+pub(crate) struct HttpApi {
+    resolver: Arc<Resolver>,
+    herdr: Herdr,
+}
+
+impl HttpApi {
+    pub(crate) fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            resolver: Arc::new(Resolver {
+                client: client()?,
+                origin: Origin::from_env().map_err(|error| format!("{error:#}")),
+                link: Mutex::default(),
+                failed_over: AtomicBool::new(false),
+            }),
+            herdr: Herdr::from_env(),
+        })
+    }
+
+    /// The current serve, else a resolution run in its own task.
+    async fn resolve(&self, stale: Option<Stale>) -> Result<String, ApiError> {
+        if stale.is_none() {
+            let current = self.resolver.link.lock().await.base_url.clone();
+            if let Some(url) = current {
+                return Ok(url);
+            }
+        }
+        let resolver = Arc::clone(&self.resolver);
+        tokio::spawn(async move { resolver.resolve(stale).await })
+            .await
+            .map_err(|error| ApiError::Unreachable(format!("resolving pond serve: {error}")))?
+    }
+
+    /// Sends to the resolved serve. When the serve refuses the connection,
     /// the endpoint is resolved again (daemon record, else a fallback child)
-    /// and the request retried there; after that, errors stand.
+    /// and the request retried there once; a second refusal in a row, with
+    /// no success in between, stands as an error.
     async fn post<B, T>(&self, path: &str, body: &B, deadline: Duration) -> Result<T, ApiError>
     where
         B: Serialize + ?Sized + Sync,
         T: DeserializeOwned,
     {
-        let url = {
-            let mut link = self.link.lock().await;
-            match link.base_url.clone() {
-                Some(url) => url,
-                None => self.resolve(&mut link).await?,
+        let client = &self.resolver.client;
+        let url = self.resolve(None).await?;
+        let result = match post(client, &url, path, body, deadline).await {
+            Err(ApiError::Unreachable(reason)) => {
+                let retry = self.resolve(Some(Stale { url, reason })).await?;
+                post(client, &retry, path, body, deadline).await
             }
+            other => other,
         };
-        let reason = match post(&self.client, &url, path, body, deadline).await {
-            Err(ApiError::Unreachable(reason)) => reason,
-            other => return other,
-        };
-        let retry = {
-            let mut link = self.link.lock().await;
-            match link.base_url.clone() {
-                Some(current) if current != url => current,
-                _ if link.failed_over => return Err(ApiError::Unreachable(reason)),
-                _ => {
-                    let fresh = self.resolve(&mut link).await?;
-                    if fresh == url {
-                        return Err(ApiError::Unreachable(reason));
-                    }
-                    link.failed_over = true;
-                    fresh
-                }
-            }
-        };
-        post(&self.client, &retry, path, body, deadline).await
+        if result.is_ok() {
+            self.resolver.failed_over.store(false, Ordering::Relaxed);
+        }
+        result
     }
 
     async fn sql(
@@ -261,22 +308,42 @@ mod tests {
     };
     use crate::serve::write_endpoint;
 
-    /// An api pinned to `base_url`, re-resolving through `sandbox`'s state.
-    /// `pond_bin` points nowhere, so no re-resolution can reach a real pond.
+    /// An api resolving through `sandbox`'s state, pinned to `base_url` if given.
+    fn api(sandbox: &Sandbox, base_url: Option<&str>) -> HttpApi {
+        HttpApi {
+            resolver: Arc::new(Resolver {
+                client: client().unwrap(),
+                origin: Ok(sandbox.origin()),
+                link: Mutex::new(Link {
+                    base_url: base_url.map(str::to_owned),
+                    fallback: None,
+                }),
+                failed_over: AtomicBool::new(false),
+            }),
+            herdr: Herdr::new(sandbox.path("bin/herdr")),
+        }
+    }
+
+    /// Pinned to `base_url`, with a `pond_bin` that points nowhere, so no
+    /// re-resolution can reach a real pond.
     fn api_at(base_url: &str, sandbox: &Sandbox) -> HttpApi {
         sandbox.write_config(&format!(
             "pond_bin = \"{}\"\n",
             sandbox.path("bin/no-pond").display()
         ));
-        HttpApi {
-            client: client().unwrap(),
-            origin: Ok(sandbox.origin()),
-            herdr: Herdr::new(sandbox.path("bin/herdr")),
-            link: Mutex::new(Link {
-                base_url: Some(base_url.to_owned()),
-                ..Link::default()
-            }),
-        }
+        api(sandbox, Some(base_url))
+    }
+
+    /// Answers the probe and the preview query.
+    async fn preview_pond() -> FakePond {
+        FakePond::with_sql(
+            vec![
+                ("SELECT 1", Reply::json(golden::SQL_READY)),
+                ("DESC LIMIT", Reply::json(golden::SQL_PAGE)),
+            ],
+            Reply::json(golden::SEARCH),
+        )
+        .await
     }
 
     fn sent(pond: &FakePond) -> Vec<serde_json::Value> {
@@ -450,60 +517,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stalled_server_is_unreachable() {
-        let pond =
+    async fn a_timeout_is_an_error_without_failover() {
+        let sandbox = Sandbox::new();
+        let stalled =
             FakePond::start(|_, _| Reply::json(golden::SQL_EMPTY).delayed(Duration::from_secs(5)))
                 .await;
-        let request = SqlRequest::new(preview_sql("s"), PREVIEW_ROWS, 1);
-        let result: Result<SqlResponse, _> = post(
-            &client().unwrap(),
-            &pond.base_url,
-            SQL_PATH,
-            &request,
-            Duration::from_millis(200),
+        let ready = preview_pond().await;
+        write_endpoint(
+            &sandbox.origin().dir.endpoint(),
+            &endpoint(ready.port(), "t"),
         )
-        .await;
-        let Err(ApiError::Unreachable(reason)) = result else {
-            panic!("expected Unreachable, got {result:?}");
+        .unwrap();
+        let api = api_at(&stalled.base_url, &sandbox);
+        let request = SqlRequest::new(preview_sql("s"), PREVIEW_ROWS, 1);
+        let result: Result<SqlResponse, _> = api
+            .post(SQL_PATH, &request, Duration::from_millis(200))
+            .await;
+        let Err(ApiError::Request(reason)) = result else {
+            panic!("expected a request error, got {result:?}");
         };
         assert!(reason.contains("timed out"), "{reason}");
+        assert!(
+            ready.recorded().is_empty(),
+            "a timeout re-resolved the serve"
+        );
     }
 
     #[tokio::test]
-    async fn a_dead_serve_fails_over_once() {
+    async fn a_success_rearms_failover() {
         let sandbox = Sandbox::new();
-        let replacement = FakePond::with_sql(
-            vec![
-                ("SELECT 1", Reply::json(golden::SQL_READY)),
-                ("DESC LIMIT", Reply::json(golden::SQL_PAGE)),
-            ],
-            Reply::json(golden::SEARCH),
-        )
-        .await;
+        let endpoint_path = sandbox.origin().dir.endpoint();
+        let first = preview_pond().await;
+        write_endpoint(&endpoint_path, &endpoint(first.port(), "t")).unwrap();
         let api = api_at(&dead_url(), &sandbox);
-        let dir = sandbox.origin().dir;
-        write_endpoint(&dir.endpoint(), &endpoint(replacement.port(), "t")).unwrap();
+        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
 
-        let messages = api.preview("s1".to_owned()).await.unwrap();
-        assert_eq!(messages.len(), 2);
-
-        drop(replacement);
+        drop(first);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        std::fs::remove_file(dir.endpoint()).unwrap();
-        let pond = write_script(&sandbox.path("bin/pond"), "exit 9");
-        sandbox.write_config(&format!("pond_bin = \"{}\"\n", pond.display()));
+        let second = preview_pond().await;
+        write_endpoint(&endpoint_path, &endpoint(second.port(), "t")).unwrap();
+        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
+        assert_eq!(
+            second.recorded().len(),
+            2,
+            "probe, then the retried preview"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_right_after_a_failover_stands() {
+        let sandbox = Sandbox::new();
+        let ready = preview_pond().await;
+        write_endpoint(
+            &sandbox.origin().dir.endpoint(),
+            &endpoint(ready.port(), "t"),
+        )
+        .unwrap();
+        let api = api_at(&dead_url(), &sandbox);
+        api.resolver.failed_over.store(true, Ordering::Relaxed);
         assert!(matches!(
             api.preview("s1".to_owned()).await,
             Err(ApiError::Unreachable(_))
         ));
-        assert!(
-            !sandbox
-                .state_dir()
-                .join("serve")
-                .read_dir()
-                .unwrap()
-                .any(|entry| { entry.unwrap().path().join("desk-serve.log").exists() }),
-            "a second failover spawned a fallback"
+        assert!(ready.recorded().is_empty(), "failed over twice in a row");
+    }
+
+    #[tokio::test]
+    async fn an_aborted_request_leaves_the_fallback_spawn_running() {
+        let sandbox = Sandbox::new();
+        let pond = preview_pond().await;
+        let script = write_script(
+            &sandbox.path("bin/pond"),
+            &format!(
+                r#"printf '%s\n' "$*" >> '{calls}'
+sleep 0.3
+eval "port_file=\${{$#}}"
+printf '%s' '{addr}' > "$port_file.tmp" && mv "$port_file.tmp" "$port_file"
+exec sleep 30"#,
+                calls = sandbox.path("calls").display(),
+                addr = pond.addr(),
+            ),
+        );
+        sandbox.write_config(&format!("pond_bin = \"{}\"\n", script.display()));
+        let api = Arc::new(api(&sandbox, None));
+
+        let request = tokio::spawn({
+            let api = Arc::clone(&api);
+            async move { api.preview("s1".to_owned()).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while sandbox.lines("calls").is_empty() {
+            assert!(tokio::time::Instant::now() < deadline, "no serve spawned");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
+        assert_eq!(
+            sandbox.lines("calls").len(),
+            1,
+            "the abort killed the spawn"
         );
     }
 

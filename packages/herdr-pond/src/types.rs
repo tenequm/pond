@@ -149,10 +149,12 @@ pub(crate) enum ApiError {
     Pond { code: String, message: String },
     /// A non-envelope rejection (axum's plain-text JSON/route errors).
     Rejected { status: u16, body: String },
-    /// `/v1/x/sql` is missing: the installed pond predates the endpoint.
+    /// The installed pond predates `/v1/x/sql` or `pond serve --port-file`.
     PondTooOld,
-    /// Refused, timed out, or no serve could be started.
+    /// Connection refused (the serve is gone), or no serve could be started.
     Unreachable(String),
+    /// Timed out or cut off mid-response; the serve may still be alive.
+    Request(String),
     /// The response did not match the contract.
     Decode(String),
     /// A herdr CLI call failed.
@@ -165,9 +167,10 @@ impl fmt::Display for ApiError {
             Self::Pond { code, message } => write!(f, "pond {code}: {message}"),
             Self::Rejected { status, body } => write!(f, "HTTP {status}: {body}"),
             Self::PondTooOld => f.write_str(
-                "this pond has no /v1/x/sql - upgrade pond (`brew upgrade pond` / `cargo install pond-db`)",
+                "this pond is too old for the desk (needs /v1/x/sql and `pond serve --port-file`) - upgrade pond (`brew upgrade pond` / `cargo install pond-db`)",
             ),
             Self::Unreachable(reason) => write!(f, "pond serve unreachable: {reason}"),
+            Self::Request(reason) => write!(f, "request to pond serve failed: {reason}"),
             Self::Decode(reason) => write!(f, "unexpected response from pond: {reason}"),
             Self::Herdr(reason) => write!(f, "herdr: {reason}"),
         }

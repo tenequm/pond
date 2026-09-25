@@ -14,7 +14,6 @@ use crossterm::event::{Event, EventStream};
 use futures_util::{Stream, StreamExt};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -22,24 +21,32 @@ use self::app::{App, Call, Effect, Lane, Msg, Reply};
 use crate::types::{Api, DeskContext, DeskExit};
 
 const SPINNER_TICK: Duration = Duration::from_millis(100);
+/// How long exit waits for in-flight blocking calls (herdr's CLI) to finish.
+const EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// Builds its own current-thread runtime and owns the terminal until it
-/// returns; the terminal is restored on every return path.
+/// returns; the terminal is restored on every return path, before the api -
+/// and any fallback serve it owns, whose teardown blocks - is dropped.
 pub(crate) fn run(api: Arc<dyn Api>, context: DeskContext) -> anyhow::Result<DeskExit> {
     let runtime = crate::runtime()?;
     let mut terminal = ratatui::try_init().inspect_err(|_| ratatui::restore())?;
     let result = runtime.block_on(async {
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut hangup = signal(SignalKind::hangup())?;
-        let shutdown = async move {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = hangup.recv() => {}
-            }
+        let shutdown = crate::shutdown_signal()?;
+        let shutdown = async {
+            shutdown.await;
         };
-        event_loop(&mut terminal, api, context, EventStream::new(), shutdown).await
+        event_loop(
+            &mut terminal,
+            Arc::clone(&api),
+            context,
+            EventStream::new(),
+            shutdown,
+        )
+        .await
     });
     ratatui::restore();
+    runtime.shutdown_timeout(EXIT_GRACE);
+    drop(api);
     result
 }
 

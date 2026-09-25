@@ -111,10 +111,17 @@ fn is_executable(path: &Path) -> bool {
 /// passes the cap. Children handed this file append at its live end.
 pub(crate) fn open_log(path: &Path) -> io::Result<File> {
     ensure_parent(path)?;
+    cap_log(path)?;
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Starts `path` over once it passes the cap. Writers holding it open in
+/// append mode, like a long-lived serve, carry on at the new end.
+pub(crate) fn cap_log(path: &Path) -> io::Result<()> {
     if fs::metadata(path).is_ok_and(|meta| meta.len() > LOG_CAP_BYTES) {
         OpenOptions::new().write(true).open(path)?.set_len(0)?;
     }
-    OpenOptions::new().create(true).append(true).open(path)
+    Ok(())
 }
 
 /// Points every stdio end of `command` at /dev/null or `log`: an inherited

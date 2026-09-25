@@ -15,8 +15,11 @@ mod hook;
 mod serve;
 mod types;
 
+use std::future::Future;
 use std::process::ExitCode;
 use std::sync::Arc;
+
+use tokio::signal::unix::{SignalKind, signal};
 
 use crate::types::{DeskContext, DeskExit};
 
@@ -49,6 +52,22 @@ fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
+}
+
+/// Resolves with the name of the first SIGTERM, SIGINT or SIGHUP. Registering
+/// replaces the default die-at-once, so install it before anything needs
+/// tearing down.
+fn shutdown_signal() -> std::io::Result<impl Future<Output = &'static str>> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut hangup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+            _ = hangup.recv() => "SIGHUP",
+        }
+    })
 }
 
 /// Runs the desk, then performs a jump only after it has restored the
