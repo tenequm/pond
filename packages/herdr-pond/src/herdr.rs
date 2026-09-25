@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -146,9 +146,9 @@ impl Herdr {
         }
     }
 
-    /// Runs one CLI call, killed past the deadline, and returns its `result`
-    /// object. herdr reports errors on stderr with a nonzero exit, never in
-    /// the stdout JSON.
+    /// Runs one CLI call, bounded by the deadline end to end, and returns its
+    /// `result` object. herdr reports errors on stderr with a nonzero exit,
+    /// never in the stdout JSON.
     fn call(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
         let command = args.iter().take(3).copied().collect::<Vec<_>>().join(" ");
         let mut child = Command::new(&self.bin)
@@ -162,24 +162,39 @@ impl Herdr {
         let stderr = drain(child.stderr.take());
         let started = Instant::now();
         let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            if started.elapsed() > self.deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("herdr {command} timed out after {:?}", self.deadline);
-            }
-            std::thread::sleep(CALL_POLL);
+            let failure = match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() > self.deadline => {
+                    format!("timed out after {:?}", self.deadline)
+                }
+                Ok(None) => {
+                    std::thread::sleep(CALL_POLL);
+                    continue;
+                }
+                Err(error) => format!("could not be waited on: {error}"),
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("herdr {command} {failure}");
         };
-        let stdout = stdout.join().unwrap_or_default();
+        // A process herdr left behind can hold the pipes open past its exit;
+        // its reader thread is then abandoned rather than joined.
+        let drained = |pipe: Receiver<Vec<u8>>| {
+            pipe.recv_timeout(self.deadline.saturating_sub(started.elapsed()))
+        };
         if !status.success() {
-            let stderr = stderr.join().unwrap_or_default();
+            let stderr = drained(stderr).unwrap_or_default();
             bail!(
                 "herdr {command} failed ({status}): {}",
                 String::from_utf8_lossy(&stderr).trim()
             );
         }
+        let stdout = drained(stdout).map_err(|_| {
+            anyhow::anyhow!(
+                "herdr {command} exited but its output stayed open past {:?}",
+                self.deadline
+            )
+        })?;
         let mut response: serde_json::Value = serde_json::from_slice(&stdout)
             .with_context(|| format!("herdr {command} printed no JSON response"))?;
         Ok(response["result"].take())
@@ -234,14 +249,16 @@ impl Herdr {
 
 /// Reads a child's pipe to EOF on its own thread, so a large reply cannot
 /// fill the pipe and stall the child before it exits.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut bytes);
         }
-        bytes
-    })
+        let _ = sender.send(bytes);
+    });
+    receiver
 }
 
 /// The `open` action: herdr sets `HERDR_WORKSPACE_ID` from the invocation
@@ -353,6 +370,23 @@ esac"#,
         let error = herdr.pane_list(None).unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn output_held_open_after_exit_is_bounded() {
+        let sandbox = Sandbox::new();
+        let bin = write_script(
+            &sandbox.path("bin/herdr"),
+            r#"echo '{"result":{"panes":[]}}'; sleep 3 & exit 0"#,
+        );
+        let herdr = Herdr {
+            deadline: Duration::from_millis(300),
+            ..Herdr::new(bin)
+        };
+        let started = Instant::now();
+        let error = herdr.pane_list(None).unwrap_err();
+        assert!(error.to_string().contains("output stayed open"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
