@@ -1,4 +1,5 @@
-# kache's remote for the windows-verify leg, in a committed file rather than in
+# kache's remote for the build-and-test-windows job (manifest key
+# windows-verify, which names this file), in a committed file rather than in
 # the job's environment because a daemon cannot watch an environment: kache
 # strips KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
 # spawns itself (src/daemon.rs, AMBIENT_REMOTE_ENV_VARS) and keeps KACHE_CONFIG,

@@ -1,4 +1,4 @@
-# kache's remote for the Linux dist-build leg. Same shape and same reasoning as
+# kache's remote for the dist-build-unix job. Same shape and same reasoning as
 # .github/kache/windows-verify.toml - see that file's header, or
 # docs/plans/2608-24-ci-caching-architecture.md, for why the remote lives in a
 # file and the credentials do not.
@@ -10,7 +10,7 @@
 # bucket and leaned on the job's KACHE_S3_* env - the env a kache daemon
 # spawn no longer inherits.
 #
-# The CLI still reads KACHE_S3_PREFIX ahead of this file, so the dist-build job
+# The CLI still reads KACHE_S3_PREFIX ahead of this file, so dist-build-unix
 # asserts the two agree before anything runs; a split would put the daemon on
 # one prefix and the CLI on another.
 
