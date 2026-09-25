@@ -32,6 +32,12 @@ git_release_name = "v{{ version }}"
 # where check-changelog-headers.sh and the pre-commit hook already read it.
 changelog_path = "CHANGELOG.md"
 
+# Workspace member that never ships: `publish = false` alone still gets tags and
+# a release PR entry from release-plz.
+[[package]]
+name = "herdr-pond"
+release = false
+
 # Lance-style release notes: emoji-grouped sections, scope-bolded entries, PR
 # links, breaking markers, and a per-version compare link. release-plz strips the
 # `## [version]` heading line when posting the GitHub release body (GitHub shows

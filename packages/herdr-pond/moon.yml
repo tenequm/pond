@@ -1,0 +1,31 @@
+language: rust
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cargo commands run from this project root; the workspace lockfile, manifest
+# and toolchain pin live at the repo root. The root `default-members` keeps
+# bare cargo commands pond-only, so every task names this package.
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'Cargo.toml'
+    - 'herdr-plugin.toml'
+    - 'bin/**/*'
+    - '/Cargo.toml'
+    - '/Cargo.lock'
+    - '/rust-toolchain.toml'
+    - '/.cargo/config.toml'
+  nixToolchain:
+    - '/ops/toolchain-id.json'
+
+tasks:
+  format:
+    command: 'cargo fmt -p herdr-pond --check'
+    inputs: ['@group(sources)', '@group(nixToolchain)']
+  lint:
+    command: 'cargo clippy --locked -p herdr-pond --all-targets -- -D warnings'
+    inputs: ['@group(sources)', '@group(nixToolchain)']
+  test:
+    command: 'cargo test --locked -p herdr-pond'
+    inputs: ['@group(sources)', '@group(nixToolchain)']

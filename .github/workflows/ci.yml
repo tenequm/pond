@@ -122,6 +122,7 @@ jobs:
           moon ci
           repo:check-changelog
           pond:check-package pond:format pond:lint pond:test
+          herdr-pond:format herdr-pond:lint herdr-pond:test
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
           hermes-pond:test
