@@ -1135,6 +1135,8 @@ impl App {
         }) else {
             return Vec::new();
         };
+        // A page answering means the serve does, so the header's title is
+        // asked again if the request `open` could not make is still missing.
         match result {
             Ok(page) if page.messages.is_empty() => {
                 pager.eof = true;
@@ -1144,12 +1146,14 @@ impl App {
                             .to_owned(),
                     );
                 }
-                Vec::new()
+                self.hydrate_visible()
             }
             Ok(page) => {
                 pager.eof = page.messages.len() < PAGE_ROWS && !page.truncated;
                 pager.append(page.messages);
-                self.load_more()
+                let mut effects = self.load_more();
+                effects.extend(self.hydrate_visible());
+                effects
             }
             Err(error) => self.toast(&error),
         }
@@ -2104,6 +2108,66 @@ mod tests {
                 truncated,
             })),
         }
+    }
+
+    #[test]
+    fn a_page_reply_asks_again_for_a_title_that_failed() {
+        let api = MockApi {
+            live: Vec::new(),
+            ..MockApi::golden()
+        };
+        let mut app = opened(&api, 110, 12);
+        app.known.clear();
+        app.forget_asked();
+        let Some(Effect::Fetch {
+            generation,
+            epoch,
+            call,
+            ..
+        }) = app.hydrate_visible().into_iter().find(|effect| {
+            matches!(
+                effect,
+                Effect::Fetch {
+                    call: Call::Titles(_),
+                    ..
+                }
+            )
+        })
+        else {
+            panic!("no titles asked");
+        };
+        let opening = app.on_event(&key(KeyCode::Enter));
+        assert!(
+            !fetches(&opening)
+                .iter()
+                .any(|call| matches!(call, Call::Titles(_))),
+            "the busy titles lane is not restarted: {opening:?}"
+        );
+        app.apply(Msg {
+            generation,
+            epoch,
+            call,
+            reply: Reply::Titles(Err(ApiError::Request("timed out".to_owned()))),
+        });
+        let page = opening
+            .into_iter()
+            .find(|effect| {
+                matches!(
+                    effect,
+                    Effect::Fetch {
+                        call: Call::Page { .. },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let after = app.apply(page_reply(page, vec![message("m1", now(), "hi")], false));
+        assert!(
+            fetches(&after).iter().any(
+                |call| matches!(call, Call::Titles(ids) if ids.contains(&"s-live".to_owned()))
+            ),
+            "{after:?}"
+        );
     }
 
     #[test]
