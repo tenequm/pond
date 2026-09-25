@@ -63,6 +63,6 @@ In the plugin state dir (herdr's state dir, `plugins/pond/`):
 - `sync.log` - one line per idle sync (adapter, exit status, duration) plus pond's own output.
 - `serve/<hash>/daemon.log` - the per-server serve's lifecycle and output.
 - `serve/<hash>/desk-serve.log` - a desk-started serve's output.
-- `desk.log` - the desk's own notes: a `desk-cache.json` it could not read or write.
+- `desk.log` - what the desk did not show you: a `desk-cache.json` it could not read or write, and failed background lookups of titles, counts and hosts (the rows are retried as you move).
 
 Each log starts over past 1 MiB. herdr's `plugin log list` only shows that a hook exited, not that a sync ran - `sync.log` is the record.

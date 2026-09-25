@@ -189,12 +189,11 @@ pub(super) fn load(state_dir: &Path) -> Snapshot {
         Err(error) if error.kind() == ErrorKind::NotFound => return Snapshot::default(),
         Err(error) => Err(error.to_string()),
     };
-    let log = state_dir.join(LOG_FILE);
     match loaded {
         Ok(snapshot) if snapshot.version == VERSION => snapshot,
         Ok(snapshot) => {
-            log_line(
-                &log,
+            log(
+                state_dir,
                 &format!(
                     "ignoring {}: version {}, expected {VERSION}",
                     path.display(),
@@ -204,8 +203,8 @@ pub(super) fn load(state_dir: &Path) -> Snapshot {
             Snapshot::default()
         }
         Err(error) => {
-            log_line(
-                &log,
+            log(
+                state_dir,
                 &format!("ignoring unreadable {}: {error}", path.display()),
             );
             Snapshot::default()
@@ -220,11 +219,16 @@ pub(super) fn save(state_dir: &Path, mut snapshot: Snapshot) {
         .map_err(std::io::Error::other)
         .and_then(|json| write_atomic(&path, &json, CACHE_MODE));
     if let Err(error) = written {
-        log_line(
-            &state_dir.join(LOG_FILE),
+        log(
+            state_dir,
             &format!("cannot write {}: {error}", path.display()),
         );
     }
+}
+
+/// One line in `desk.log`, the only record of what the desk did not show.
+pub(super) fn log(state_dir: &Path, message: &str) {
+    log_line(&state_dir.join(LOG_FILE), message);
 }
 
 #[cfg(test)]

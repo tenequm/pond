@@ -8,6 +8,7 @@ mod ui;
 
 use std::future::Future;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,7 +93,7 @@ where
     S: Stream<Item = io::Result<Event>> + Unpin,
 {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut runner = Runner::new(api, tx);
+    let mut runner = Runner::new(api, tx, app.context.state_dir.clone());
     let mut spinner = tokio::time::interval(SPINNER_TICK);
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
@@ -131,14 +132,17 @@ struct Runner {
     api: Arc<dyn Api>,
     tx: mpsc::UnboundedSender<Msg>,
     tasks: [Option<AbortHandle>; Lane::COUNT],
+    /// Where [`Effect::Log`] lines go; `None` drops them.
+    state_dir: Option<PathBuf>,
 }
 
 impl Runner {
-    fn new(api: Arc<dyn Api>, tx: mpsc::UnboundedSender<Msg>) -> Self {
+    fn new(api: Arc<dyn Api>, tx: mpsc::UnboundedSender<Msg>, state_dir: Option<PathBuf>) -> Self {
         Self {
             api,
             tx,
             tasks: Default::default(),
+            state_dir,
         }
     }
 
@@ -152,6 +156,11 @@ impl Runner {
         match effect {
             Effect::Exit(exit) => return Some(exit),
             Effect::Cancel(lane) => self.abort(lane),
+            Effect::Log(line) => {
+                if let Some(dir) = &self.state_dir {
+                    cache::log(dir, &line);
+                }
+            }
             Effect::Fetch {
                 generation,
                 epoch,
@@ -416,7 +425,7 @@ pub(super) mod tests {
                         reply,
                     }));
                 }
-                Effect::Cancel(_) => {}
+                Effect::Cancel(_) | Effect::Log(_) => {}
                 Effect::Exit(exit) => return Some(exit),
             }
         }
@@ -488,7 +497,7 @@ pub(super) mod tests {
     async fn search_is_debounced() {
         let api = Arc::new(MockApi::golden());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut runner = Runner::new(Arc::clone(&api) as Arc<dyn Api>, tx);
+        let mut runner = Runner::new(Arc::clone(&api) as Arc<dyn Api>, tx, None);
         let mut app = app(100, 20);
         let effects = app.start();
         perform_all(&mut runner, effects);
@@ -523,7 +532,7 @@ pub(super) mod tests {
             ..MockApi::golden()
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut runner = Runner::new(Arc::clone(&api) as Arc<dyn Api>, tx);
+        let mut runner = Runner::new(Arc::clone(&api) as Arc<dyn Api>, tx, None);
         let mut app = app(100, 20);
 
         type_text(&mut app, &mut runner, "/a");
@@ -635,6 +644,19 @@ pub(super) mod tests {
             }
         );
         assert!(screen.contains("fix the timer re-arm"), "{screen}");
+    }
+
+    #[test]
+    fn log_effects_go_to_the_desk_log() {
+        let sandbox = Sandbox::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut runner = Runner::new(Arc::new(MockApi::default()), tx, Some(sandbox.state_dir()));
+        assert_eq!(
+            runner.perform(Effect::Log("titles failed".to_owned())),
+            None
+        );
+        let log = std::fs::read_to_string(sandbox.state_dir().join("desk.log")).unwrap();
+        assert!(log.contains("titles failed"), "{log}");
     }
 
     #[test]

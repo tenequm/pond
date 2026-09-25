@@ -129,6 +129,8 @@ pub(super) enum Effect {
         call: Call,
     },
     Cancel(Lane),
+    /// A line for `desk.log`: a background failure not worth a toast.
+    Log(String),
     Exit(DeskExit),
 }
 
@@ -1016,7 +1018,7 @@ impl App {
     }
 
     fn toast(&mut self, error: &ApiError) -> Vec<Effect> {
-        self.toast = Some(error.to_string());
+        self.toast = Some(ui::error_text(error));
         Vec::new()
     }
 
@@ -1064,8 +1066,9 @@ impl App {
         }
     }
 
-    /// Learns what a hydration reply proves. A failed one un-asks its ids,
-    /// so their rows are asked again instead of waiting for the next listing.
+    /// Learns what a hydration reply proves. A failed one is only logged -
+    /// the user asked for none of it - and un-asks its ids, so their rows are
+    /// asked again instead of waiting for the next listing.
     fn on_hydration(&mut self, call: &Call, reply: Reply) -> Vec<Effect> {
         let learned = match reply {
             Reply::Titles(result) => result.map(|rows| {
@@ -1100,11 +1103,16 @@ impl App {
         match learned {
             Ok(()) => self.hydrate_visible(),
             Err(error) => {
+                let ids = call.ids();
                 let asked = &mut self.lanes[call.lane() as usize].asked;
-                for id in call.ids() {
-                    asked.remove(id);
+                for id in &ids {
+                    asked.remove(*id);
                 }
-                self.toast(&error)
+                vec![Effect::Log(format!(
+                    "desk: {:?} for {} sessions failed: {error}",
+                    call.lane(),
+                    ids.len()
+                ))]
             }
         }
     }
@@ -1340,13 +1348,17 @@ mod tests {
             panic!("no titles asked");
         };
         let error = ApiError::Request("timed out".to_owned());
-        app.apply(Msg {
+        let failed = app.apply(Msg {
             generation,
             epoch,
             call: call.clone(),
             reply: Reply::Titles(Err(error.clone())),
         });
-        assert_eq!(app.toast, Some(error.to_string()));
+        assert_eq!(app.toast, None, "the user asked for no hydration");
+        assert!(
+            matches!(&failed[..], [Effect::Log(line)] if line.contains("Titles") && line.contains(&error.to_string())),
+            "{failed:?}"
+        );
         assert!(fetches(&app.hydrate_visible()).contains(&&call));
     }
 
@@ -1630,11 +1642,13 @@ mod tests {
     }
 
     #[test]
-    fn later_errors_are_verbatim_toasts() {
+    fn later_errors_are_compact_toasts() {
         let mut app = opened(&MockApi::golden(), 100, 12);
         let error = ApiError::Pond {
             code: "validation_failed".to_owned(),
-            message: "sql error: query exceeded the 30s limit".to_owned(),
+            message: "sql error: query exceeded the 25s limit; add a narrower WHERE. \
+                      Scope-then-scan: filter by session_id first"
+                .to_owned(),
         };
         let failing = MockApi {
             listing_error: Some(error.clone()),
@@ -1642,11 +1656,28 @@ mod tests {
         };
         press(&mut app, &failing, KeyCode::Char('r'));
         assert_eq!(app.fatal, None, "a loaded desk keeps its rows");
-        assert_eq!(app.toast, Some(error.to_string()));
+        let compact = "pond validation_failed: sql error: query exceeded the 25s limit";
+        assert_eq!(app.toast.as_deref(), Some(compact));
         assert!(screen(&mut app).contains("pond validation_failed: sql error"));
         press(&mut app, &failing, KeyCode::Esc);
         assert_eq!(app.toast, None);
         assert_eq!(app.listing().map(<[SessionRow]>::len), Some(2));
+    }
+
+    #[test]
+    fn a_long_toast_is_capped_to_a_few_lines() {
+        let mut app = opened(&MockApi::golden(), 100, 20);
+        app.toast = Some(format!("{}TAIL", "word ".repeat(200)));
+        let screen_text = screen(&mut app);
+        let rows = screen_text
+            .lines()
+            .filter(|line| line.contains("word"))
+            .count();
+        assert_eq!(rows, 3, "{screen_text}");
+        assert!(screen_text.contains('…') && !screen_text.contains("TAIL"));
+
+        let unreachable = ApiError::Unreachable("x; y. z".to_owned());
+        assert_eq!(ui::error_text(&unreachable), unreachable.to_string());
     }
 
     #[test]

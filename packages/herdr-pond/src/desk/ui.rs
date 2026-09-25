@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, Lane};
 use super::cache::{Host, Known};
-use crate::types::{LISTING_WINDOW_DAYS, SearchSession, SessionRow, TranscriptMessage};
+use crate::types::{ApiError, LISTING_WINDOW_DAYS, SearchSession, SessionRow, TranscriptMessage};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TAB_STOP: usize = 4;
@@ -33,6 +33,8 @@ const COUNT: usize = 7;
 /// Below this body width the preview stacks under the list instead of beside it.
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
 const TOAST_MAX_WIDTH: u16 = 60;
+/// A toast covers the rows it reports on, so a long one ends in an ellipsis.
+const TOAST_MAX_LINES: usize = 3;
 /// The preview wraps on every frame, so one huge message must not reach it whole.
 pub(super) const PREVIEW_CHARS: usize = 2000;
 pub(super) const NO_TITLE: &str = "(no user message)";
@@ -498,12 +500,43 @@ fn render_pager(frame: &mut Frame, app: &App) {
     );
 }
 
+/// An error as a toast shows it: pond's envelope message only up to its
+/// first clause, since the rest is recovery advice written for agents.
+pub(super) fn error_text(error: &ApiError) -> String {
+    match error {
+        ApiError::Pond { code, message } => {
+            let end = [message.find(';'), message.find(". ")]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(message.len());
+            format!("pond {code}: {}", &message[..end])
+        }
+        _ => error.to_string(),
+    }
+}
+
 fn render_toast(frame: &mut Frame, text: &str) {
     let area = frame.area();
     let width = area.width.min(TOAST_MAX_WIDTH);
     let inner = usize::from(width.saturating_sub(2)).max(1);
-    let lines = u16::try_from(textwrap::wrap(text, inner).len()).unwrap_or(u16::MAX);
-    let height = lines.saturating_add(2).min(area.height);
+    let mut lines: Vec<String> = textwrap::wrap(text, inner)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    if lines.len() > TOAST_MAX_LINES {
+        lines.truncate(TOAST_MAX_LINES);
+        if let Some(last) = lines.last_mut() {
+            if last.width() >= inner {
+                last.pop();
+            }
+            last.push('…');
+        }
+    }
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
     let toast = Rect {
         x: area.right() - width,
         y: area.y + area.height.saturating_sub(height + 1),
@@ -512,8 +545,7 @@ fn render_toast(frame: &mut Frame, text: &str) {
     };
     frame.render_widget(Clear, toast);
     frame.render_widget(
-        Paragraph::new(text.to_owned())
-            .wrap(Wrap { trim: true })
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
             .block(Block::bordered().title(" esc dismiss ").fg(Color::Red)),
         toast,
     );
