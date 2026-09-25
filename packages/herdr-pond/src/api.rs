@@ -28,7 +28,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Server-side execution budgets, sent as `timeout_seconds`. The client waits
 /// [`CLIENT_SLACK`] longer so pond's enriched timeout error arrives instead of
 /// a bare client-side timeout.
-pub(crate) const QUERY_TIMEOUT_SECS: u64 = 25;
+const QUERY_TIMEOUT_SECS: u64 = 25;
 const ALL_TIME_TIMEOUT_SECS: u64 = 60;
 const CLIENT_SLACK: Duration = Duration::from_secs(5);
 pub(crate) const SEARCH_DEADLINE: Duration = Duration::from_secs(30);

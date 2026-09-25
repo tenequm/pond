@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use chrono::Utc;
 
-use crate::api::{QUERY_TIMEOUT_SECS, SEARCH_PATH, SQL_PATH, Socket, sql_deadline};
+use crate::api::{SEARCH_PATH, SQL_PATH, Socket, sql_deadline};
 use crate::config::{cap_log, log_line, try_lock};
 use crate::serve::{
     Endpoint, READY_DEADLINE, ServeChild, ServeDir, live_endpoint, remove_endpoint_if_owned,
@@ -51,6 +51,8 @@ const TIMING: Timing = Timing {
 };
 
 const WARMUP_QUERY: &str = "session";
+/// pond clamps `timeout_seconds` to this.
+const MAX_TIMEOUT_SECS: u64 = 600;
 
 pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
     match args {
@@ -231,17 +233,19 @@ async fn herdr_gone(socket: &Path, log: &Path, timing: &Timing) -> String {
 }
 
 /// The desk's opening listing and a first FTS search, once, so their cold
-/// cost lands here instead of on the first desk open. The search gets what
-/// is left of `budget`. Failure is not fatal.
+/// cost lands here instead of on the first desk open. The listing may take
+/// all of `budget` (a cold one exceeds the desk's own timeout); the search
+/// gets what is left. Failure is not fatal.
 async fn warm_up(socket: &Socket, log: &Path, budget: Duration) {
     let started = Instant::now();
+    let timeout_seconds = budget.as_secs().clamp(1, MAX_TIMEOUT_SECS);
     let listing = SqlRequest::new(
         listing_sql(&ListingScope::recent(None, Utc::now())),
         LISTING_ROWS,
-        QUERY_TIMEOUT_SECS,
+        timeout_seconds,
     );
     let search = SearchRequest::new(WARMUP_QUERY.to_owned(), 1);
-    let listing_deadline = sql_deadline(QUERY_TIMEOUT_SECS);
+    let listing_deadline = sql_deadline(timeout_seconds);
     let result = async {
         socket
             .post::<_, SqlResponse>(SQL_PATH, &listing, listing_deadline)
@@ -413,6 +417,12 @@ mod tests {
             warmup.body.contains("timestamp >= TIMESTAMP"),
             "{}",
             warmup.body
+        );
+        let body: serde_json::Value = serde_json::from_str(&warmup.body).unwrap();
+        assert_eq!(
+            body["timeout_seconds"],
+            FAST.warmup_deadline.as_secs(),
+            "the warm-up listing gets the whole budget"
         );
     }
 
