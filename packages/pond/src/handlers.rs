@@ -1081,10 +1081,7 @@ mod sql_handler {
     use crate::{
         sessions::Store,
         sql::{self, DEFAULT_INLINE_ROWS, MAX_INLINE_ROWS},
-        wire::{
-            ErrorCode, ErrorEnvelope, SqlEnvelope, SqlRequest, SqlResponse, error,
-            validate_protocol,
-        },
+        wire::{ErrorEnvelope, SqlEnvelope, SqlRequest, SqlResponse, validate_protocol},
     };
 
     use super::{map_error, map_storage};
@@ -1112,42 +1109,33 @@ mod sql_handler {
                 )));
             }
         };
-        let tables = sql::open_tables(store, &request.query)
+        let outcome = async {
+            let tables = sql::open_tables(store, &request.query, sql::Mode::Json).await?;
+            sql::run(
+                &tables,
+                &request.query,
+                sql::Mode::Json,
+                limit,
+                request.timeout_seconds,
+            )
             .await
-            .map_err(map_storage)?;
-        match sql::run(
-            &tables,
-            &request.query,
-            sql::Mode::Json,
-            limit,
-            request.timeout_seconds,
-        )
-        .await
-        {
-            Ok(sql::Outcome::Json {
-                columns,
-                rows,
-                row_count,
-                truncated,
-                elapsed_ms,
-            }) => Ok(SqlResponse {
-                columns,
-                rows,
-                row_count,
-                truncated,
-                elapsed_ms,
+        }
+        .await;
+        match outcome {
+            Ok(sql::Outcome::Json(json)) => Ok(SqlResponse {
+                columns: json.columns,
+                rows: json.rows,
+                row_count: json.row_count,
+                truncated: json.truncated,
+                elapsed_ms: json.elapsed_ms,
             }),
             Ok(sql::Outcome::Inline(_) | sql::Outcome::Export { .. }) => Err(map_error(
                 crate::Error::Internal("sql::Mode::Json returned a non-JSON outcome".to_owned()),
             )),
-            Err(sql::SqlError::Query(message)) => Err(error(
-                ErrorCode::ValidationFailed,
-                message,
-                serde_json::json!({}),
-            )),
-            Err(sql::SqlError::Infra(infra)) => Err(map_error(crate::Error::Internal(format!(
-                "sql execution failed: {infra:#}"
-            )))),
+            Err(sql::SqlError::Query(message)) => Err(map_error(crate::Error::validation_field(
+                message, "query", None, None,
+            ))),
+            Err(sql::SqlError::Infra(error)) => Err(map_storage(error)),
         }
     }
 }

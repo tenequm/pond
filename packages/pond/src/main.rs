@@ -1758,8 +1758,13 @@ async fn run() -> anyhow::Result<()> {
             bootstrap,
             port_file,
         } => {
-            if port_file.is_some() && matches!(transport, ServeTransport::Stdio) {
-                bail!("--port-file applies to the HTTP transport; drop it or use --transport http");
+            if let Some(path) = &port_file {
+                if matches!(transport, ServeTransport::Stdio) {
+                    bail!(
+                        "--port-file applies to the HTTP transport; drop it or use --transport http"
+                    );
+                }
+                clear_port_file(path)?;
             }
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
@@ -1802,7 +1807,6 @@ async fn run() -> anyhow::Result<()> {
             }
             match transport {
                 ServeTransport::Http => {
-                    output(&format!("serve: http listening on http://{host}:{port}"))?;
                     transport::http::serve(state, host, port, allowed_host, port_file).await?;
                 }
                 ServeTransport::Stdio => {
@@ -1991,9 +1995,13 @@ async fn run() -> anyhow::Result<()> {
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
                 CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
-            let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
-            let tables = pond::sql::open_tables(&store, &sql).await?;
-            match pond::sql::run(&tables, &sql, mode, inline_rows, Some(timeout)).await {
+            let max_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
+            let outcome = async {
+                let tables = pond::sql::open_tables(&store, &sql, mode).await?;
+                pond::sql::run(&tables, &sql, mode, max_rows, Some(timeout)).await
+            }
+            .await;
+            match outcome {
                 Ok(pond::sql::Outcome::Inline(text)) => {
                     output(&text)?;
                 }
@@ -2019,7 +2027,7 @@ async fn run() -> anyhow::Result<()> {
                         io::stdout().write_all(&bytes)?;
                     }
                 },
-                Ok(pond::sql::Outcome::Json { .. }) => {
+                Ok(pond::sql::Outcome::Json(_)) => {
                     bail!("internal: `pond sql` never requests JSON rows");
                 }
                 Err(pond::sql::SqlError::Query(message)) => {
@@ -2074,6 +2082,27 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
                 .with_ansi(std::env::var_os("NO_COLOR").is_none() && io::stderr().is_terminal()),
         )
         .init();
+}
+
+/// Runs before the store opens, so a supervisor polling `--port-file` never
+/// reads a previous run's port, and a bad path fails before any slow work.
+fn clear_port_file(path: &Path) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !dir.is_dir() {
+        bail!(
+            "--port-file {}: directory {} does not exist; create it or pick another path",
+            path.display(),
+            dir.display()
+        );
+    }
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error)
+            .with_context(|| format!("failed to remove stale --port-file {}", path.display())),
+        _ => Ok(()),
+    }
 }
 
 #[allow(clippy::print_stdout)]
@@ -7950,6 +7979,26 @@ mod tests {
         assert!(OptimizeStages::resolve(None, &[OptimizeStage::Index]).is_err());
         let full = OptimizeStages::resolve(None, &[]).unwrap();
         assert!(full.embed && full.index);
+    }
+
+    #[test]
+    fn clear_port_file_drops_a_stale_file_and_names_a_missing_dir() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let stale = temp.path().join("serve.addr");
+        std::fs::write(&stale, "127.0.0.1:1")?;
+        clear_port_file(&stale)?;
+        assert!(
+            !stale.exists(),
+            "a previous run's port is never left to read"
+        );
+        clear_port_file(&stale)?;
+
+        let orphan = temp.path().join("missing").join("serve.addr");
+        let error = clear_port_file(&orphan)
+            .expect_err("no parent dir")
+            .to_string();
+        assert!(error.contains(&orphan.display().to_string()), "{error}");
+        Ok(())
     }
 
     #[test]

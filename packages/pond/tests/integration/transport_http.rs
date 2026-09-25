@@ -2,11 +2,11 @@
 
 //! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
 //! `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`, and
-//! `POST /v1/x/sql` are thin adapters over the shared wire handlers. The router is driven via
-//! `tower::ServiceExt::oneshot` - no HTTP client dependency. The exception is
-//! `shutdown_completes_while_an_mcp_stream_is_open`, which does bind a socket:
-//! the hang it covers is in the connection drain, and `oneshot` never opens a
-//! connection to drain - and `port_file_publishes_the_live_bound_address`,
+//! `POST /v1/x/sql` are thin adapters over the shared wire handlers. The router
+//! is driven via `tower::ServiceExt::oneshot` - no HTTP client dependency. The
+//! exceptions bind a socket: `shutdown_completes_while_an_mcp_stream_is_open`,
+//! because the hang it covers is in the connection drain and `oneshot` never
+//! opens a connection to drain, and `port_file_publishes_the_live_bound_address`,
 //! which is about the bind itself.
 
 use std::{
@@ -243,9 +243,9 @@ const RESPONSE_HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// The `/mcp` route validates `Host` against an allowlist (the MCP spec's
 /// DNS-rebinding defence, carried by rmcp) and that list is loopback-only
 /// unless `serve` is told otherwise - so a server reached by its own public
-/// name answers `/mcp` with 403 until that name is passed in. `/v1/*` carries
-/// no such check, which is why a hosted pond can look healthy on the JSON API
-/// while every MCP client is refused.
+/// name answers `/mcp` with 403 until that name is passed in. The `/v1/*`
+/// routes other than `/v1/x/sql` carry no such check, which is why a hosted
+/// pond can look healthy on the JSON API while every MCP client is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn mcp_route_gates_on_the_host_allowlist() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -316,6 +316,7 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, HeaderMap,
     let request = Request::builder()
         .method("POST")
         .uri(path)
+        .header("host", "127.0.0.1:9797")
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
@@ -608,6 +609,74 @@ async fn sql_route_rejects_writes_and_bad_requests() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `/v1/x/sql` reads arbitrary corpus rows, so it shares the `/mcp` route's
+/// DNS-rebinding defence: loopback and the `--allowed-host` names pass, any
+/// other `Host` is refused before the body is even parsed.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_gates_on_the_host_allowlist() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &["pond.example.com".to_owned()],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let body = json!({"protocol_version": PROTOCOL_VERSION, "query": "SELECT 1"}).to_string();
+    let status = |host: &'static str| {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/x/sql")
+            .header("host", host)
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let app = app.clone();
+        async move { app.oneshot(request).await.unwrap().status() }
+    };
+    for host in [
+        "127.0.0.1:9797",
+        "localhost:9797",
+        "[::1]:9797",
+        "pond.example.com",
+    ] {
+        assert_eq!(status(host).await, StatusCode::OK, "{host}");
+    }
+    for host in ["attacker.example.com", "attacker.example.com:9797"] {
+        assert_eq!(status(host).await, StatusCode::FORBIDDEN, "{host}");
+    }
+    Ok(())
+}
+
+/// The read-only gate runs before any dataset open: a write is refused as a
+/// 400 even when the store cannot open the table it names, which a read of
+/// that same table proves.
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_route_rejects_writes_before_opening_tables() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let app = http::router(
+        empty_state(&temp).await?,
+        &[],
+        tokio_util::sync::CancellationToken::new(),
+    );
+    for entry in std::fs::read_dir(temp.path())? {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+    let sql = |query: &str| json!({"protocol_version": PROTOCOL_VERSION, "query": query});
+
+    let (status, _, body) = post(&app, "/v1/x/sql", &sql("SELECT count(*) FROM messages")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let (status, _, body) = post(&app, "/v1/x/sql", &sql("DELETE FROM messages")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let SqlEnvelope::Error(error) = serde_json::from_value(body)? else {
+        panic!("expected an error envelope");
+    };
+    assert_eq!(error.error.code, ErrorCode::ValidationFailed);
+    Ok(())
+}
+
 /// Namespace resolution runs before any dataset open, so a table-free query
 /// cannot slip an unknown namespace past it.
 #[tokio::test(flavor = "multi_thread")]
@@ -635,13 +704,23 @@ async fn sql_route_rejects_an_unknown_namespace_before_opening_tables() -> anyho
     let (status, _, body) = post(
         &app,
         "/v1/x/sql",
-        &json!({"protocol_version": PROTOCOL_VERSION, "namespace": "local", "query": "SELECT 1 AS ready"}),
+        &json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "namespace": "local",
+            "query": "SELECT 1 AS ready",
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body,
-        json!({"columns": ["ready"], "rows": [{"ready": 1}], "row_count": 1, "truncated": false, "elapsed_ms": body["elapsed_ms"]}),
+        json!({
+            "columns": ["ready"],
+            "rows": [{"ready": 1}],
+            "row_count": 1,
+            "truncated": false,
+            "elapsed_ms": body["elapsed_ms"],
+        }),
     );
     Ok(())
 }
@@ -657,7 +736,10 @@ async fn sql_route_rejects_a_malformed_body_before_the_handler() -> anyhow::Resu
         tokio_util::sync::CancellationToken::new(),
     );
     let send = |content_type: Option<&str>, body: &str| {
-        let mut request = Request::builder().method("POST").uri("/v1/x/sql");
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/x/sql")
+            .header("host", "localhost");
         if let Some(content_type) = content_type {
             request = request.header("content-type", content_type);
         }

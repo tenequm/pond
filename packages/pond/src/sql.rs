@@ -125,7 +125,7 @@ pub enum Mode {
 /// The Lance datasets a query references, fetched fresh per call so each query
 /// sees a current snapshot (the handle freshness gate runs on each
 /// `Store::dataset`). A field is `None` when the query never names that table -
-/// the caller skips opening it, avoiding the slow `parts.lance` open on the
+/// [`open_tables`] skips opening it, avoiding the slow `parts.lance` open on the
 /// common messages-only query (spec.md#search). See [`mentions_table`].
 pub struct Tables {
     pub sessions: Option<Arc<Dataset>>,
@@ -149,8 +149,10 @@ pub fn mentions_table(sql: &str, table: &str) -> bool {
 /// `parts.lance` open is pure waste for the common messages-only query. The
 /// ranked `fts('<table>', ...)` provider names its table literally, so the same
 /// scan hands it the dataset it searches. The tables have independent
-/// caches/mutexes, so their freshness/manifest fetches overlap.
-pub async fn open_tables(store: &Store, sql: &str) -> anyhow::Result<Tables> {
+/// caches/mutexes, so their freshness/manifest fetches overlap. The table-free
+/// `precheck` runs first, so a rejected query never touches storage.
+pub async fn open_tables(store: &Store, sql: &str, mode: Mode) -> Result<Tables, SqlError> {
+    precheck(sql, mode)?;
     let open = |table: Table| {
         let wanted = mentions_table(sql, table.as_str());
         async move {
@@ -164,7 +166,8 @@ pub async fn open_tables(store: &Store, sql: &str) -> anyhow::Result<Tables> {
         open(Table::Sessions),
         open(Table::Messages),
         open(Table::Parts),
-    )?;
+    )
+    .map_err(SqlError::Infra)?;
     Ok(Tables {
         sessions,
         messages,
@@ -183,21 +186,22 @@ pub enum Outcome {
         rows: usize,
         columns: Vec<String>,
     },
-    /// One JSON object per returned row, keyed by column name; NULL fields are
-    /// omitted. `columns` lists every result column even when `rows` is empty.
-    /// `truncated` is true iff the row cap or [`JSON_BUDGET_BYTES`] cut rows.
-    Json {
-        columns: Vec<String>,
-        rows: Vec<serde_json::Value>,
-        row_count: usize,
-        truncated: bool,
-        elapsed_ms: u64,
-    },
+    Json(JsonRows),
+}
+
+/// [`Mode::Json`] rows; the contract is documented on [`crate::wire::SqlResponse`].
+pub struct JsonRows {
+    pub columns: Vec<String>,
+    pub rows: Vec<serde_json::Value>,
+    pub row_count: usize,
+    pub truncated: bool,
+    pub elapsed_ms: u64,
 }
 
 /// Two error channels: `Query` is caller-fixable (parse/plan/exec/limits) and
-/// the tool surfaces it as an `isError` result so the model self-corrects;
-/// `Infra` is an internal failure surfaced as a protocol error.
+/// every surface reports it as such (an MCP `isError` result the model
+/// self-corrects from, an HTTP `validation_failed`); `Infra` is a storage or
+/// internal failure, surfaced as a protocol error.
 #[derive(Debug)]
 pub enum SqlError {
     Query(String),
@@ -208,15 +212,33 @@ fn infra(error: ArrowError) -> SqlError {
     SqlError::Infra(anyhow::Error::new(error))
 }
 
-/// Execute one read-only SQL query and return either a rendered table, a JSON
-/// payload, or encoded export bytes.
-pub async fn run(
-    tables: &Tables,
-    sql: &str,
-    mode: Mode,
-    inline_rows: usize,
-    timeout_secs: Option<u64>,
-) -> Result<Outcome, SqlError> {
+/// An execution failure is the store's, not the query's, when an object-store
+/// or IO error sits anywhere in its source chain. Lance reports its own as
+/// `lance::Error::IO` inside [`DataFusionError::External`].
+fn is_storage_failure(error: &DataFusionError) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if current.is::<std::io::Error>()
+            || matches!(
+                current.downcast_ref::<DataFusionError>(),
+                Some(DataFusionError::ObjectStore(_))
+            )
+            || matches!(
+                current.downcast_ref::<lance::Error>(),
+                Some(lance::Error::IO { .. })
+            )
+        {
+            return true;
+        }
+        cause = current.source();
+    }
+    false
+}
+
+/// The table-free checks: the read-only gate plus the misuse rejections that
+/// need only the SQL text. Microseconds, so [`run`] repeats it for callers that
+/// bypass [`open_tables`].
+fn precheck(sql: &str, mode: Mode) -> Result<StatementKind, SqlError> {
     let parsed = parse_and_gate(sql)?;
     if matches!(parsed.kind, StatementKind::Explain) && matches!(mode, Mode::Export(_)) {
         return Err(SqlError::Query(
@@ -253,6 +275,19 @@ pub async fn run(
                 .to_owned(),
         ));
     }
+    Ok(parsed.kind)
+}
+
+/// Execute one read-only SQL query and return either a rendered table, JSON
+/// rows, or encoded export bytes.
+pub async fn run(
+    tables: &Tables,
+    sql: &str,
+    mode: Mode,
+    max_rows: usize,
+    timeout_secs: Option<u64>,
+) -> Result<Outcome, SqlError> {
+    let kind = precheck(sql, mode)?;
     let ctx = build_context()?;
     register(&ctx, tables)?;
 
@@ -264,11 +299,17 @@ pub async fn run(
     let options = SQLOptions::new()
         .with_allow_ddl(false)
         .with_allow_dml(false)
-        .with_allow_statements(matches!(parsed.kind, StatementKind::Explain));
-    let df = ctx
+        .with_allow_statements(matches!(kind, StatementKind::Explain));
+    let mut df = ctx
         .sql_with_options(sql, options)
         .await
         .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
+    // One row past the cap keeps `truncated` exact while the cap pushes into the scan.
+    if matches!(mode, Mode::Json) && matches!(kind, StatementKind::Query) {
+        df = df
+            .limit(0, Some(max_rows.saturating_add(1)))
+            .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
+    }
 
     // Captured before `collect()` consumes `df`, so an empty result still
     // renders its column headers.
@@ -301,7 +342,10 @@ pub async fn run(
                 timeout.as_secs()
             ))
         })?
-        .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
+        .map_err(|error| match is_storage_failure(&error) {
+            true => SqlError::Infra(anyhow::Error::new(error).context("sql execution failed")),
+            false => SqlError::Query(enrich(&format!("SQL error: {error}"))),
+        })?;
     let elapsed = started.elapsed();
 
     let display: Vec<RecordBatch> = if collected.is_empty() {
@@ -316,9 +360,9 @@ pub async fn run(
 
     match mode {
         Mode::Inline => Ok(Outcome::Inline(
-            render_inline(&display, inline_rows, elapsed).map_err(infra)?,
+            render_inline(&display, max_rows, elapsed).map_err(infra)?,
         )),
-        Mode::Json => json_rows(&display, inline_rows, elapsed),
+        Mode::Json => Ok(Outcome::Json(json_rows(&display, max_rows, elapsed)?)),
         Mode::Export(format) => {
             let rows = display.iter().map(RecordBatch::num_rows).sum();
             let columns = column_names(&display);
@@ -1304,7 +1348,7 @@ fn json_rows(
     display: &[RecordBatch],
     max_rows: usize,
     elapsed: Duration,
-) -> Result<Outcome, SqlError> {
+) -> Result<JsonRows, SqlError> {
     let total: usize = display.iter().map(RecordBatch::num_rows).sum();
     let limited = limit_batches(display, max_rows)
         .iter()
@@ -1327,7 +1371,7 @@ fn json_rows(
                 .map_err(|error| SqlError::Infra(anyhow!("json row decode failed: {error}")))?,
         );
     }
-    Ok(Outcome::Json {
+    Ok(JsonRows {
         columns: column_names(display),
         row_count: rows.len(),
         truncated: rows.len() < total,
@@ -1347,7 +1391,7 @@ fn timestamps_as_rfc3339(batch: &RecordBatch) -> Result<RecordBatch, ArrowError>
             .map(|value| {
                 value
                     .and_then(|raw| chrono::DateTime::from_timestamp_micros(to_micros(raw)))
-                    .map(|at| at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
             })
             .collect();
         Arc::new(text)
@@ -1517,6 +1561,11 @@ mod tests {
         // EXPLAIN of a side-effecting statement: the inner statement is what
         // would matter; reject to keep the surface tight.
         assert!(rejected("EXPLAIN INSERT INTO messages VALUES ('x')"));
+        // ANALYZE executes the inner statement, so it is gated on the same shape.
+        assert!(rejected(
+            "EXPLAIN ANALYZE INSERT INTO messages VALUES ('x')"
+        ));
+        assert!(rejected("EXPLAIN ANALYZE DELETE FROM messages"));
     }
 
     #[test]
@@ -1757,16 +1806,6 @@ mod tests {
         assert_eq!(row_lines.len(), 1, "one physical line per row: {out}");
     }
 
-    #[test]
-    fn rejects_explain_analyze_of_non_query() {
-        // ANALYZE executes the inner statement, so the gate must reject it on
-        // the inner shape exactly as it does a bare EXPLAIN.
-        assert!(rejected(
-            "EXPLAIN ANALYZE INSERT INTO messages VALUES ('x')"
-        ));
-        assert!(rejected("EXPLAIN ANALYZE DELETE FROM messages"));
-    }
-
     fn no_tables() -> Tables {
         Tables {
             sessions: None,
@@ -1775,35 +1814,11 @@ mod tests {
         }
     }
 
-    struct JsonResult {
-        columns: Vec<String>,
-        rows: Vec<serde_json::Value>,
-        row_count: usize,
-        truncated: bool,
-    }
-
-    fn expect_json(outcome: Outcome) -> JsonResult {
-        match outcome {
-            Outcome::Json {
-                columns,
-                rows,
-                row_count,
-                truncated,
-                elapsed_ms: _,
-            } => JsonResult {
-                columns,
-                rows,
-                row_count,
-                truncated,
-            },
+    async fn run_json(sql: &str, limit: usize) -> Result<JsonRows, SqlError> {
+        match run(&no_tables(), sql, Mode::Json, limit, None).await? {
+            Outcome::Json(rows) => Ok(rows),
             Outcome::Inline(_) | Outcome::Export { .. } => panic!("Mode::Json yields Json"),
         }
-    }
-
-    async fn run_json(sql: &str, limit: usize) -> Result<JsonResult, SqlError> {
-        run(&no_tables(), sql, Mode::Json, limit, None)
-            .await
-            .map(expect_json)
     }
 
     #[tokio::test]
@@ -1863,6 +1878,33 @@ mod tests {
         let whole = run_json(sql, 150).await.expect("query runs");
         assert_eq!(whole.row_count, 150);
         assert!(!whole.truncated, "a cap that fits cuts nothing");
+
+        // No ORDER BY: the cap is pushed into the scan as a LIMIT, and one row
+        // past it still reports the cut.
+        let unordered = run_json("SELECT value FROM generate_series(1, 1000000)", 5)
+            .await
+            .expect("query runs");
+        assert_eq!(unordered.row_count, 5);
+        assert!(unordered.truncated);
+    }
+
+    #[test]
+    fn storage_failures_are_told_apart_from_query_errors() {
+        let io = || std::io::Error::other("connection reset");
+        assert!(is_storage_failure(&DataFusionError::IoError(io())));
+        assert!(is_storage_failure(&DataFusionError::External(Box::new(
+            lance::Error::io("object store request timed out")
+        ))));
+        assert!(is_storage_failure(&DataFusionError::Context(
+            "scan".to_owned(),
+            Box::new(DataFusionError::External(Box::new(io())))
+        )));
+        assert!(!is_storage_failure(&DataFusionError::Plan(
+            "no such column".to_owned()
+        )));
+        assert!(!is_storage_failure(&DataFusionError::Execution(
+            "division by zero".to_owned()
+        )));
     }
 
     #[tokio::test]
@@ -1907,9 +1949,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(options), Arc::new(vector)]).expect("batch");
         let display = displayable(&batch).expect("displayable");
-        let result = expect_json(
-            json_rows(&[display], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows"),
-        );
+        let result = json_rows(&[display], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows");
         assert_eq!(result.columns, ["options"], "the vector column is dropped");
         let text = result.rows[0]["options"]
             .as_str()
@@ -1933,12 +1973,10 @@ mod tests {
 
     #[test]
     fn json_budget_drops_rows_from_the_end_without_clipping_cells() {
-        let fat = "x".repeat(800 * 1024);
+        let fat = "x".repeat(JSON_BUDGET_BYTES * 2 / 5);
         let batch = text_rows(&[&fat, &fat, &fat]);
-        let result = expect_json(
-            json_rows(&[batch], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows"),
-        );
-        assert_eq!(result.row_count, 2, "a third 800 KiB row overflows 2 MiB");
+        let result = json_rows(&[batch], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows");
+        assert_eq!(result.row_count, 2, "a third row overflows the budget");
         assert!(result.truncated, "the byte budget cut the result");
         assert_eq!(
             result.rows[1]["t"].as_str().map(str::len),
@@ -1949,11 +1987,9 @@ mod tests {
 
     #[test]
     fn json_budget_always_returns_the_first_row() {
-        let huge = "y".repeat(3 * 1024 * 1024);
+        let huge = "y".repeat(JSON_BUDGET_BYTES + 1);
         let batch = text_rows(&[&huge, "small"]);
-        let result = expect_json(
-            json_rows(&[batch], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows"),
-        );
+        let result = json_rows(&[batch], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows");
         assert_eq!(result.row_count, 1, "one oversized row still pages");
         assert!(result.truncated);
         assert_eq!(result.rows[0]["t"].as_str().map(str::len), Some(huge.len()));

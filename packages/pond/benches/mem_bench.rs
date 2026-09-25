@@ -63,7 +63,7 @@ use pond::{
     },
     rowmap::rowmap_scan_fallbacks,
     sessions::{EmbeddedMessage, RowmapOracle, Store},
-    sql::{self, Mode, Tables},
+    sql::{self, Mode},
     substrate::{MaintenancePolicy, Table},
     wire::{
         GetEnvelope, GetMessageRequest, GetSessionRequest, Message, Part, PartKind, Provenance,
@@ -720,26 +720,12 @@ async fn scenario_mcp_query_growth(corpus: &Corpus, iterations: usize) -> Result
             bail!("get_message failed: {error:?}");
         }
 
-        // Mirror the MCP tool (transport.rs `pond_sql`): `Tables` is rebuilt per
-        // call (the dataset freshness gates), only the tables the query names
-        // are opened, and the query runs read-only on a fresh SessionContext.
-        // Opening all three would charge the row for `parts.lance` retention the
-        // real path never pays.
+        // The production open (`sql::open_tables`): tables rebuilt per call
+        // through the dataset freshness gates, only the ones the query names.
         let query = SQL_QUERIES[i % SQL_QUERIES.len()];
-        let tables = Tables {
-            sessions: match sql::mentions_table(query, "sessions") {
-                true => Some(store.dataset(Table::Sessions).await?),
-                false => None,
-            },
-            messages: match sql::mentions_table(query, "messages") {
-                true => Some(store.dataset(Table::Messages).await?),
-                false => None,
-            },
-            parts: match sql::mentions_table(query, "parts") {
-                true => Some(store.dataset(Table::Parts).await?),
-                false => None,
-            },
-        };
+        let tables = sql::open_tables(&store, query, Mode::Inline)
+            .await
+            .map_err(|error| anyhow::anyhow!("sql {query:?} open failed: {error:?}"))?;
         sql::run(&tables, query, Mode::Inline, sql::DEFAULT_INLINE_ROWS, None)
             .await
             .map_err(|error| anyhow::anyhow!("sql {query:?} failed: {error:?}"))?;

@@ -143,7 +143,7 @@ async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {
     let count = match outcome {
         Outcome::Inline(_) => 0,
         Outcome::Export { rows, .. } => rows,
-        Outcome::Json { row_count, .. } => row_count,
+        Outcome::Json(json) => json.row_count,
     };
     Ok(count)
 }

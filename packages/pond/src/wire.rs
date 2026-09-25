@@ -699,20 +699,28 @@ pub struct SqlRequest {
     /// One read-only SELECT/WITH (or EXPLAIN of one).
     #[serde(alias = "sql")]
     pub query: String,
-    /// Row cap on the response: default 100, at most 1000. It bounds the
-    /// response, not the scan - put a `LIMIT` in the query too.
+    /// Row cap on the response: default [`DEFAULT_INLINE_ROWS`], at most
+    /// [`MAX_INLINE_ROWS`].
+    ///
+    /// [`DEFAULT_INLINE_ROWS`]: crate::sql::DEFAULT_INLINE_ROWS
+    /// [`MAX_INLINE_ROWS`]: crate::sql::MAX_INLINE_ROWS
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Execution timeout in seconds: default 30, clamped to 600.
+    /// Execution timeout in seconds: default [`DEFAULT_QUERY_TIMEOUT_SECS`],
+    /// clamped to [`MAX_QUERY_TIMEOUT_SECS`].
+    ///
+    /// [`DEFAULT_QUERY_TIMEOUT_SECS`]: crate::sql::DEFAULT_QUERY_TIMEOUT_SECS
+    /// [`MAX_QUERY_TIMEOUT_SECS`]: crate::sql::MAX_QUERY_TIMEOUT_SECS
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
 }
 
-/// One JSON object per row keyed by column name, NULL fields omitted;
-/// `columns` names every result column even when `rows` is empty.
-/// `row_count` counts the returned rows and `truncated` is true iff the row cap
-/// or the response byte budget cut the result - never whether the query's own
-/// `LIMIT` did.
+/// One JSON object per row keyed by column name, NULL fields omitted, and
+/// timestamps as RFC3339 UTC with exactly six fractional digits (lossless
+/// keyset cursors). `columns` names every result column even when `rows` is
+/// empty. `row_count` counts the returned rows and `truncated` is true iff the
+/// row cap or the response byte budget cut the result - never whether the
+/// query's own `LIMIT` did; the budget always admits the first row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SqlResponse {
     pub columns: Vec<String>,

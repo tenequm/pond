@@ -4,9 +4,8 @@
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`,
 //! `POST /v1/ingest`, and the unstable `POST /v1/x/sql` (read-only SQL, JSON
-//! rows). MCP
-//! exposes `pond_search` / `pond_get_session` / `pond_get_message` plus
-//! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
+//! rows). MCP exposes `pond_search` / `pond_get_session` / `pond_get_message`
+//! plus `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
 use std::sync::{
     Arc,
@@ -65,21 +64,23 @@ impl Drop for ActivityGuard {
 
 pub mod http {
     //! axum HTTP+JSON server: `POST /v1/search`, `POST /v1/get-session`,
-    //! `POST /v1/get-message`, `POST /v1/ingest`, `POST /v1/x/sql`, and the `/mcp` route carrying rmcp's
-    //! streamable-HTTP MCP transport.
+    //! `POST /v1/get-message`, `POST /v1/ingest`, `POST /v1/x/sql`, and the
+    //! `/mcp` route carrying rmcp's streamable-HTTP MCP transport.
 
     use std::{
         future::Future,
         net::{IpAddr, SocketAddr},
         path::{Path, PathBuf},
+        sync::Arc,
         time::Duration,
     };
 
     use anyhow::Context;
     use axum::{
         Json, Router,
-        extract::{DefaultBodyLimit, State},
-        http::{HeaderValue, StatusCode},
+        extract::{DefaultBodyLimit, Request, State},
+        http::{HeaderValue, StatusCode, header, uri::Authority},
+        middleware::{self, Next},
         response::{IntoResponse, Response},
         routing::post,
     };
@@ -105,16 +106,54 @@ pub mod http {
     /// instead of pond's typed `validation_failed`.
     pub const HTTP_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
-    /// The `Host` authorities the `/mcp` route answers to: rmcp's loopback
-    /// defaults plus `extra`. The MCP spec (2025-06-18) makes a streamable-HTTP
-    /// server validate `Host` against an allowlist so a browser cannot reach a
-    /// local server by rebinding DNS, and rmcp's default list is loopback only.
-    /// A server reached by any other name therefore answers `/mcp` with 403
-    /// until that name is listed - `/v1/*` carries no such check.
+    /// The `Host` authorities the `/mcp` and `/v1/x/sql` routes answer to:
+    /// rmcp's loopback defaults plus `extra`. The MCP spec (2025-06-18) makes a
+    /// streamable-HTTP server validate `Host` against an allowlist so a browser
+    /// cannot reach a local server by rebinding DNS, and rmcp's default list is
+    /// loopback only. A server reached by any other name therefore answers
+    /// those two routes with 403 until that name is listed; `/v1/x/sql` shares
+    /// the gate because it reads arbitrary corpus rows. The other `/v1/*`
+    /// routes carry no such check.
     fn mcp_allowed_hosts(extra: &[String]) -> Vec<String> {
         let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
         hosts.extend(extra.iter().cloned());
         hosts
+    }
+
+    /// rmcp's matching rule, which it does not export: case-insensitive host,
+    /// brackets stripped from IPv6, and a port only when the entry names one.
+    fn host_is_allowed(host: &Authority, allowed: &[String]) -> bool {
+        let normalize = |name: &str| name.trim_matches(['[', ']']).to_ascii_lowercase();
+        let wanted = normalize(host.host());
+        allowed.iter().any(|entry| {
+            let (name, port) = match Authority::try_from(entry.trim()) {
+                Ok(authority) => (normalize(authority.host()), authority.port_u16()),
+                Err(_) => (normalize(entry.trim()), None),
+            };
+            name == wanted && port.is_none_or(|port| host.port_u16() == Some(port))
+        })
+    }
+
+    async fn require_allowed_host(
+        State(allowed): State<Arc<[String]>>,
+        request: Request,
+        next: Next,
+    ) -> Response {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Authority::try_from(value).ok())
+            .or_else(|| request.uri().authority().cloned());
+        match host {
+            Some(host) if host_is_allowed(&host, &allowed) => next.run(request).await,
+            _ => (
+                StatusCode::FORBIDDEN,
+                "Forbidden: Host header is not allowed; list this server's name with \
+                 `pond serve --allowed-host <name>`",
+            )
+                .into_response(),
+        }
     }
 
     /// How long [`serve_with_shutdown`] waits, after the MCP sessions have been
@@ -136,14 +175,15 @@ pub mod http {
 
     /// Build the axum router: the `/v1/*` JSON handlers plus the nested `/mcp`
     /// streamable-HTTP MCP service. Public so the integration test can drive it
-    /// without binding a socket. `allowed_hosts` extends the `/mcp` route's
-    /// loopback `Host` allowlist (see [`mcp_allowed_hosts`]); cancelling
+    /// without binding a socket. `allowed_hosts` extends the loopback `Host`
+    /// allowlist of `/mcp` and `/v1/x/sql` (see [`mcp_allowed_hosts`]); cancelling
     /// `mcp_shutdown` tears down live MCP sessions (see [`serve_with_shutdown`]).
     pub fn router(
         state: AppState,
         allowed_hosts: &[String],
         mcp_shutdown: CancellationToken,
     ) -> Router {
+        let hosts = mcp_allowed_hosts(allowed_hosts);
         let mcp_state = state.clone();
         let mcp = StreamableHttpService::new(
             move || Ok(super::mcp::PondMcp::new(mcp_state.clone())),
@@ -151,7 +191,7 @@ pub mod http {
             // `with_allowed_hosts` replaces the list, so the helper hands it
             // the defaults plus the extras rather than the extras alone.
             StreamableHttpServerConfig::default()
-                .with_allowed_hosts(mcp_allowed_hosts(allowed_hosts))
+                .with_allowed_hosts(hosts.clone())
                 .with_cancellation_token(mcp_shutdown),
         );
         Router::new()
@@ -159,7 +199,13 @@ pub mod http {
             .route("/v1/get-session", post(get_session))
             .route("/v1/get-message", post(get_message))
             .route("/v1/ingest", post(ingest))
-            .route("/v1/x/sql", post(sql))
+            .route(
+                "/v1/x/sql",
+                post(sql).route_layer(middleware::from_fn_with_state(
+                    Arc::<[String]>::from(hosts),
+                    require_allowed_host,
+                )),
+            )
             .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
             .nest_service("/mcp", mcp)
@@ -168,9 +214,10 @@ pub mod http {
     /// Bind and serve until ctrl-c. `--port 0` selects an OS-assigned free port;
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
-    /// `allowed_hosts` names the public authorities the `/mcp` route accepts
-    /// (see [`mcp_allowed_hosts`]). `port_file`, when set, receives the bound
-    /// address once the socket is live (see [`write_port_file`]).
+    /// `allowed_hosts` names the public authorities `/mcp` and `/v1/x/sql`
+    /// accept (see [`mcp_allowed_hosts`]). Once the socket is live it prints
+    /// the bound address and, when `port_file` is set, publishes it there (see
+    /// [`write_port_file`]).
     pub async fn serve(
         state: AppState,
         host: String,
@@ -197,14 +244,12 @@ pub mod http {
         if let Some(path) = &port_file {
             write_port_file(path, local)?;
         }
+        crate::output::line(&format!("serve: http listening on http://{local}"))?;
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
         serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
     }
 
-    /// Publish the bound `host:port` (no trailing newline) for a supervisor: it
-    /// is the readiness signal, since the store opens before the bind, and
-    /// with `--port 0` the only way to learn the port. Temp file + rename in
-    /// the same directory, so a poller never reads a partial address.
+    /// Temp file + rename in the same directory, so a poller never reads a partial address.
     fn write_port_file(path: &Path, local: SocketAddr) -> anyhow::Result<()> {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(format!(".{}.tmp", std::process::id()));
@@ -1200,25 +1245,20 @@ Examples (4 patterns the agent should recognize):
                     ))]));
                 }
             };
-            let inline_rows = sql::DEFAULT_INLINE_ROWS;
-
             let store = &self.state.store;
-            let Ok(tables) = sql::open_tables(store, &params.query).await else {
-                return Err(ErrorData::internal_error(
-                    "sql datasets unavailable".to_owned(),
-                    None,
-                ));
-            };
-
-            match sql::run(
-                &tables,
-                &params.query,
-                mode,
-                inline_rows,
-                params.timeout_seconds,
-            )
-            .await
-            {
+            let outcome = async {
+                let tables = sql::open_tables(store, &params.query, mode).await?;
+                sql::run(
+                    &tables,
+                    &params.query,
+                    mode,
+                    sql::DEFAULT_INLINE_ROWS,
+                    params.timeout_seconds,
+                )
+                .await
+            }
+            .await;
+            match outcome {
                 Ok(sql::Outcome::Inline(text)) => Ok(tool_result(text)),
                 Ok(sql::Outcome::Export {
                     bytes,
@@ -1242,7 +1282,7 @@ Examples (4 patterns the agent should recognize):
                         )),
                     }
                 }
-                Ok(sql::Outcome::Json { .. }) => Err(ErrorData::internal_error(
+                Ok(sql::Outcome::Json(_)) => Err(ErrorData::internal_error(
                     "pond_sql never requests JSON rows".to_owned(),
                     None,
                 )),
@@ -1250,7 +1290,7 @@ Examples (4 patterns the agent should recognize):
                     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
                 }
                 Err(sql::SqlError::Infra(error)) => Err(ErrorData::internal_error(
-                    format!("sql execution failed: {error}"),
+                    format!("sql failed: {error:#}"),
                     None,
                 )),
             }
