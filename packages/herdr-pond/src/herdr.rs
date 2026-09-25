@@ -1,5 +1,5 @@
 //! Every herdr CLI call (`pane list`, `agent focus`, `plugin pane open|focus`,
-//! `notification show`) and the plugin runtime env (plan 5.2, 5.4).
+//! `notification show`) and the plugin runtime env.
 
 use std::fs;
 use std::io::Read;

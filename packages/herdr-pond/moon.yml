@@ -10,8 +10,6 @@ fileGroups:
   sources:
     - 'src/**/*'
     - 'Cargo.toml'
-    - 'herdr-plugin.toml'
-    - 'bin/**/*'
     - '/Cargo.toml'
     - '/Cargo.lock'
     - '/rust-toolchain.toml'

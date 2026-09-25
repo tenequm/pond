@@ -1,4 +1,5 @@
-//! herdr plugin for pond: sync-on-idle and a read-only session desk.
+//! herdr plugin for pond: sync-on-idle and a read-only session desk. Design:
+//! `docs/plans/2609-24-herdr-pond-v1-desk-plan.md`.
 //!
 //! The desk draws with ratatui over crossterm directly - pond's CLI output
 //! stack rule covers the pond binary, not this crate. `unsafe_code` is denied,

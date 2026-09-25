@@ -1,6 +1,6 @@
 //! The plugin's own files: `HERDR_PLUGIN_CONFIG_DIR/config.toml` (re-read per
-//! run, malformed falls back to defaults - plan 5.3) and the state-dir logs,
-//! locks and atomic writes every headless leg shares.
+//! run, malformed falls back to defaults) and the state-dir logs, locks and
+//! atomic writes every headless leg shares.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

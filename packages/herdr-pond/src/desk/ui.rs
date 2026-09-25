@@ -21,6 +21,9 @@ const MACHINE: usize = 10;
 const ADAPTER: usize = 12;
 const AGE: usize = 4;
 const COUNT: usize = 7;
+/// Below this body width the preview stacks under the list instead of beside it.
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
+const TOAST_MAX_WIDTH: u16 = 60;
 /// The preview wraps on every frame, so one huge message must not reach it whole.
 pub(super) const PREVIEW_CHARS: usize = 2000;
 pub(super) const NO_TITLE: &str = "(no user message)";
@@ -45,7 +48,7 @@ pub(super) fn desk_areas(area: Rect, preview: bool) -> DeskAreas {
     ]));
     let (list, preview) = if !preview {
         (body, None)
-    } else if body.width >= 100 {
+    } else if body.width >= SIDE_BY_SIDE_MIN_WIDTH {
         let [list, preview] = body.layout(&Layout::horizontal([Constraint::Fill(1); 2]));
         (list, Some(preview))
     } else {
@@ -242,9 +245,9 @@ fn row_items(app: &App) -> Result<Vec<ListItem<'static>>, String> {
         };
     }
     match app.listing() {
-        None if app.lane_loading(Lane::Listing) && app.all_time => Err(
-            "loading the all-time listing - the slow query family, this can take ~15s".to_owned(),
-        ),
+        None if app.lane_loading(Lane::Listing) && app.all_time => {
+            Err("loading the all-time listing - this can take a while".to_owned())
+        }
         None if app.lane_loading(Lane::Listing) => Err("loading sessions...".to_owned()),
         None => Err("no listing loaded - r to retry".to_owned()),
         Some([]) => Err(format!(
@@ -421,7 +424,7 @@ fn render_pager(frame: &mut Frame, app: &App) {
 
 fn render_toast(frame: &mut Frame, text: &str) {
     let area = frame.area();
-    let width = area.width.min(60);
+    let width = area.width.min(TOAST_MAX_WIDTH);
     let inner = usize::from(width.saturating_sub(2)).max(1);
     let lines = u16::try_from(textwrap::wrap(text, inner).len()).unwrap_or(u16::MAX);
     let height = lines.saturating_add(2).min(area.height);

@@ -1,5 +1,5 @@
 //! Sync-on-idle: the millisecond event hook and its detached per-adapter
-//! worker (plan 5.5).
+//! worker.
 //!
 //! No idle event may be dropped, so the worker runs trailing-edge: the hook
 //! creates `pending.<adapter>`; the worker deletes it just before each

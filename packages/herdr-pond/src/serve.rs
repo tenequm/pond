@@ -1,7 +1,7 @@
 //! Finding a usable `pond serve` for the desk: this herdr server's published
-//! endpoint, else a desk-owned fallback child (plan 5.7), both vetted by the
-//! capability probe (plan 5.8). The per-server state layout and the serve
-//! spawn/teardown are shared with the daemon.
+//! endpoint, else a desk-owned fallback child, both vetted by the capability
+//! probe. The per-server state layout and the serve spawn/teardown are
+//! shared with the daemon.
 
 use std::fs;
 use std::net::SocketAddr;

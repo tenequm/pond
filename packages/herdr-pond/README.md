@@ -8,7 +8,7 @@ A [herdr](https://herdr.dev) plugin for pond:
 ## Prerequisites
 
 - `pond` installed and initialized: run `pond init` once, with the adapters you use enabled (`pond adapters enable <adapter>`). Sync-on-idle only syncs adapters that are already enabled; it never enables one.
-- A pond release with `/v1/x/sql` and `pond serve --port-file`. With an older pond the desk says so and names the upgrade command.
+- A pond release that includes `POST /v1/x/sql` and `pond serve --port-file` ([tenequm/pond#311](https://github.com/tenequm/pond/pull/311)). With an older pond the desk and `daemon.log` say it is too old and name the upgrade command.
 - For live rows (the running-agent marker and jump): the official herdr integration for each agent, e.g. `herdr integration install claude`. Without it herdr knows the agent but not its session id.
 
 ## Build and link
@@ -33,7 +33,7 @@ type = "plugin_action"
 command = "pond.desk"
 ```
 
-Then run `herdr server reload-config`. Pressing the key again focuses the open desk instead of opening a second one.
+Then run `herdr server reload-config`. Pressing the key in a workspace whose desk is already open focuses that desk instead of opening a second one.
 
 ## Config
 
