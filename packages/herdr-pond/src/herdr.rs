@@ -2,8 +2,11 @@
 //! `notification show`) and the plugin runtime env (plan 5.2, 5.4).
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -15,6 +18,9 @@ const PLUGIN_ID: &str = "pond";
 const DESK_ENTRYPOINT: &str = "desk";
 /// The manifest pane title, which herdr uses as the pane label.
 const DESK_LABEL: &str = "pond desk";
+/// herdr answers in milliseconds; a hung CLI must not hang a hook or the desk.
+const CALL_DEADLINE: Duration = Duration::from_secs(3);
+const CALL_POLL: Duration = Duration::from_millis(5);
 
 /// A plugin-runtime path herdr sets for every plugin process.
 fn plugin_env(var: &str) -> anyhow::Result<PathBuf> {
@@ -125,6 +131,7 @@ pub(crate) fn live_agents(panes: Vec<Pane>) -> Vec<LiveAgent> {
 #[derive(Debug, Clone)]
 pub(crate) struct Herdr {
     bin: PathBuf,
+    deadline: Duration,
 }
 
 impl Herdr {
@@ -133,26 +140,47 @@ impl Herdr {
     }
 
     pub(crate) fn new(bin: PathBuf) -> Self {
-        Self { bin }
+        Self {
+            bin,
+            deadline: CALL_DEADLINE,
+        }
     }
 
-    /// Runs one CLI call and returns its `result` object. herdr reports
-    /// errors on stderr with a nonzero exit, never in the stdout JSON.
+    /// Runs one CLI call, killed past the deadline, and returns its `result`
+    /// object. herdr reports errors on stderr with a nonzero exit, never in
+    /// the stdout JSON.
     fn call(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
-        let output = Command::new(&self.bin)
+        let command = args.iter().take(3).copied().collect::<Vec<_>>().join(" ");
+        let mut child = Command::new(&self.bin)
             .args(args)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .with_context(|| format!("running {}", self.bin.display()))?;
-        let command = args.iter().take(3).copied().collect::<Vec<_>>().join(" ");
-        if !output.status.success() {
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if started.elapsed() > self.deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("herdr {command} timed out after {:?}", self.deadline);
+            }
+            std::thread::sleep(CALL_POLL);
+        };
+        let stdout = stdout.join().unwrap_or_default();
+        if !status.success() {
+            let stderr = stderr.join().unwrap_or_default();
             bail!(
-                "herdr {command} failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                "herdr {command} failed ({status}): {}",
+                String::from_utf8_lossy(&stderr).trim()
             );
         }
-        let mut response: serde_json::Value = serde_json::from_slice(&output.stdout)
+        let mut response: serde_json::Value = serde_json::from_slice(&stdout)
             .with_context(|| format!("herdr {command} printed no JSON response"))?;
         Ok(response["result"].take())
     }
@@ -202,6 +230,18 @@ impl Herdr {
         ])
         .map(drop)
     }
+}
+
+/// Reads a child's pipe to EOF on its own thread, so a large reply cannot
+/// fill the pipe and stall the child before it exits.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        bytes
+    })
 }
 
 /// The `open` action: herdr sets `HERDR_WORKSPACE_ID` from the invocation
@@ -299,6 +339,38 @@ esac"#,
                 .unwrap();
             assert_eq!(sandbox.lines("calls"), expected);
         }
+    }
+
+    #[test]
+    fn a_hung_call_is_killed_at_the_deadline() {
+        let sandbox = Sandbox::new();
+        let bin = write_script(&sandbox.path("bin/herdr"), "exec sleep 30");
+        let herdr = Herdr {
+            deadline: Duration::from_millis(200),
+            ..Herdr::new(bin)
+        };
+        let started = Instant::now();
+        let error = herdr.pane_list(None).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_large_reply_is_read_whole() {
+        let sandbox = Sandbox::new();
+        let panes: Vec<String> = (0..2000)
+            .map(|i| format!(r#"{{"pane_id":"p{i}","label":"{}"}}"#, "x".repeat(64)))
+            .collect();
+        fs::write(
+            sandbox.path("panes.json"),
+            format!(r#"{{"result":{{"panes":[{}]}}}}"#, panes.join(",")),
+        )
+        .unwrap();
+        let bin = write_script(
+            &sandbox.path("bin/herdr"),
+            &format!("cat '{}'", sandbox.path("panes.json").display()),
+        );
+        assert_eq!(Herdr::new(bin).pane_list(None).unwrap().len(), 2000);
     }
 
     #[test]

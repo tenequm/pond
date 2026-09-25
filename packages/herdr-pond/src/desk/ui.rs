@@ -22,7 +22,7 @@ const ADAPTER: usize = 12;
 const AGE: usize = 4;
 const COUNT: usize = 7;
 /// The preview wraps on every frame, so one huge message must not reach it whole.
-const PREVIEW_CHARS: usize = 2000;
+pub(super) const PREVIEW_CHARS: usize = 2000;
 pub(super) const NO_TITLE: &str = "(no user message)";
 pub(super) const PAGER_FOOTER: &str = "conversation only - tool bodies via pond_sql/get_session";
 
@@ -91,6 +91,7 @@ pub(super) fn pager_areas(area: Rect) -> PagerAreas {
 }
 
 pub(super) fn render(frame: &mut Frame, app: &mut App) {
+    app.relayout();
     if let Some(message) = &app.fatal {
         render_fatal(frame, message);
     } else if app.pager.is_some() {
@@ -329,16 +330,11 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
             Some(messages) => messages
                 .iter()
                 .flat_map(|message| {
-                    let clipped: String = message.text.chars().take(PREVIEW_CHARS).collect();
                     let mut lines = vec![Line::from(vec![
                         Span::styled(message.role.clone(), role_style(&message.role)),
                         Span::raw(format!(" {} ago", age(app.now, message.timestamp))).dim(),
                     ])];
-                    lines.extend(
-                        sanitize(&clipped)
-                            .split('\n')
-                            .map(|l| Line::raw(l.to_owned())),
-                    );
+                    lines.extend(message.text.split('\n').map(|l| Line::raw(l.to_owned())));
                     lines.push(Line::default());
                     lines
                 })
@@ -360,7 +356,7 @@ fn footer(app: &App) -> Line<'static> {
         "/ search  enter open  space preview  p projects  t time  r refresh  q quit"
     };
     let mut spans = Vec::new();
-    if app.is_loading() {
+    if app.spinner_visible() {
         spans.push(Span::raw(format!("{} ", spinner_frame(app))).fg(Color::Yellow));
     }
     spans.push(Span::raw(help).dim());
@@ -544,6 +540,11 @@ pub(super) fn sanitize(text: &str) -> String {
         };
     }
     out
+}
+
+/// A preview message's text as the cache keeps it: clipped, then sanitized.
+pub(super) fn preview_text(text: &str) -> String {
+    sanitize(&text.chars().take(PREVIEW_CHARS).collect::<String>())
 }
 
 /// A clean single line: sanitized, whitespace runs collapsed.

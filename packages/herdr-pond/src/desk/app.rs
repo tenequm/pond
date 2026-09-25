@@ -14,8 +14,8 @@ use unicode_width::UnicodeWidthStr;
 
 use super::ui;
 use crate::types::{
-    ApiError, Cursor, DeskContext, DeskExit, ListingScope, LiveAgent, PAGE_ROWS, SearchRequest,
-    SearchResponse, SessionDetail, SessionRow, TranscriptMessage, TranscriptPage,
+    ApiError, Cursor, DeskContext, DeskExit, LISTING_ROWS, ListingScope, LiveAgent, PAGE_ROWS,
+    SearchRequest, SearchResponse, SessionDetail, SessionRow, TranscriptMessage, TranscriptPage,
 };
 
 pub(super) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -67,6 +67,14 @@ impl Call {
             Self::Page { .. } => Lane::Page,
         }
     }
+
+    /// A listing's `since` moves with the clock, so listings match by scope.
+    fn same_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Listing(a), Self::Listing(b)) => scope_key(a) == scope_key(b),
+            _ => self == other,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -102,10 +110,10 @@ pub(super) enum Effect {
     Exit(DeskExit),
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default)]
 struct LaneState {
     generation: u64,
-    loading: bool,
+    in_flight: Option<Call>,
 }
 
 #[derive(Debug, Default)]
@@ -254,6 +262,8 @@ pub(super) struct App {
     pub(super) fatal: Option<String>,
     pub(super) spinner: usize,
     pub(super) dirty: bool,
+    /// Set by a resize, so a burst of them re-wraps the pager once, at draw.
+    resized: bool,
 }
 
 impl App {
@@ -263,7 +273,7 @@ impl App {
             context,
             size,
             epoch: 0,
-            lanes: [LaneState::default(); Lane::COUNT],
+            lanes: Default::default(),
             all_projects: false,
             all_time: false,
             listings: HashMap::new(),
@@ -282,6 +292,7 @@ impl App {
             fatal: None,
             spinner: 0,
             dirty: true,
+            resized: false,
         }
     }
 
@@ -289,14 +300,22 @@ impl App {
         self.refresh()
     }
 
-    pub(super) fn is_loading(&self) -> bool {
-        self.lanes.iter().any(|lane| lane.loading)
-    }
-
     pub(super) fn lane_loading(&self, lane: Lane) -> bool {
-        self.lanes[lane as usize].loading
+        self.lanes[lane as usize].in_flight.is_some()
     }
 
+    /// The pager shows only its own page load; the error screen, none.
+    pub(super) fn spinner_visible(&self) -> bool {
+        if self.fatal.is_some() {
+            false
+        } else if self.pager.is_some() {
+            self.lane_loading(Lane::Page)
+        } else {
+            self.lanes.iter().any(|lane| lane.in_flight.is_some())
+        }
+    }
+
+    /// Called only while [`Self::spinner_visible`].
     pub(super) fn tick(&mut self) {
         self.spinner = self.spinner.wrapping_add(1);
         self.dirty = true;
@@ -391,22 +410,31 @@ impl App {
         ui::pager_areas(self.area()).text
     }
 
-    fn fetch(&mut self, call: Call, delay: Duration) -> Effect {
+    /// Single-flight: a call for what its lane is already fetching joins
+    /// that request instead of restarting it.
+    fn fetch(&mut self, call: Call, delay: Duration) -> Option<Effect> {
         let lane = &mut self.lanes[call.lane() as usize];
+        if lane
+            .in_flight
+            .as_ref()
+            .is_some_and(|pending| pending.same_target(&call))
+        {
+            return None;
+        }
         lane.generation += 1;
-        lane.loading = true;
-        Effect::Fetch {
+        lane.in_flight = Some(call.clone());
+        Some(Effect::Fetch {
             generation: lane.generation,
             epoch: self.epoch,
             delay,
             call,
-        }
+        })
     }
 
     fn cancel(&mut self, lane: Lane) -> Effect {
         let state = &mut self.lanes[lane as usize];
         state.generation += 1;
-        state.loading = false;
+        state.in_flight = None;
         Effect::Cancel(lane)
     }
 
@@ -425,18 +453,19 @@ impl App {
 
     fn refresh(&mut self) -> Vec<Effect> {
         self.previews.clear();
-        let mut effects = vec![
-            self.fetch(Call::Listing(self.scope()), Duration::ZERO),
-            self.fetch(Call::Live, Duration::ZERO),
-        ];
+        let mut effects: Vec<Effect> = self
+            .fetch(Call::Listing(self.scope()), Duration::ZERO)
+            .into_iter()
+            .chain(self.fetch(Call::Live, Duration::ZERO))
+            .collect();
         if let Some(query) = self.search.as_ref().map(|s| s.query.clone()) {
-            effects.push(self.fetch_search(query, Duration::ZERO));
+            effects.extend(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.preview_selected(Duration::ZERO));
         effects
     }
 
-    fn fetch_search(&mut self, query: String, delay: Duration) -> Effect {
+    fn fetch_search(&mut self, query: String, delay: Duration) -> Option<Effect> {
         let request = SearchRequest::new(query, SEARCH_LIMIT).within(&self.scope());
         self.fetch(Call::Search(request), delay)
     }
@@ -452,14 +481,22 @@ impl App {
     fn resize(&mut self, width: u16, height: u16) -> Vec<Effect> {
         self.size = Size::new(width, height);
         self.dirty = true;
+        self.resized = true;
+        let mut effects: Vec<Effect> = self.hydrate_visible().into_iter().collect();
+        effects.extend(self.load_more());
+        effects
+    }
+
+    /// Re-wraps the pager for the latest size, once per drawn frame.
+    pub(super) fn relayout(&mut self) {
+        if !std::mem::take(&mut self.resized) {
+            return;
+        }
         let viewport = self.pager_viewport();
         if let Some(pager) = &mut self.pager {
             pager.rewrap(usize::from(viewport.width));
             pager.scroll(0, usize::from(viewport.height));
         }
-        let mut effects: Vec<Effect> = self.hydrate_visible().into_iter().collect();
-        effects.extend(self.load_more());
-        effects
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -632,7 +669,7 @@ impl App {
             return None;
         }
         self.hydrated.extend(missing.iter().cloned());
-        Some(self.fetch(Call::Hydrate(missing), Duration::ZERO))
+        self.fetch(Call::Hydrate(missing), Duration::ZERO)
     }
 
     fn preview_selected(&mut self, delay: Duration) -> Option<Effect> {
@@ -641,7 +678,7 @@ impl App {
             .filter(|id| self.preview_open && !self.previews.contains_key(*id))
             .map(str::to_owned);
         match wanted {
-            Some(id) => Some(self.fetch(Call::Preview(id), delay)),
+            Some(id) => self.fetch(Call::Preview(id), delay),
             None => self
                 .lane_loading(Lane::Preview)
                 .then(|| self.cancel(Lane::Preview)),
@@ -670,7 +707,7 @@ impl App {
                 self.search_state = ListState::default();
             }
         }
-        effects.push(self.fetch_search(query, SEARCH_DEBOUNCE));
+        effects.extend(self.fetch_search(query, SEARCH_DEBOUNCE));
         effects
     }
 
@@ -698,17 +735,14 @@ impl App {
         }
         let mut effects = self.transition();
         if self.listing().is_some() {
-            if self.lane_loading(Lane::Listing) {
-                effects.push(self.cancel(Lane::Listing));
-            }
             self.restore_listing_selection(selected.as_deref());
         } else {
-            effects.push(self.fetch(Call::Listing(self.scope()), Duration::ZERO));
+            effects.extend(self.fetch(Call::Listing(self.scope()), Duration::ZERO));
         }
         if let Some(search) = &mut self.search {
             search.response = None;
             let query = search.query.clone();
-            effects.push(self.fetch_search(query, Duration::ZERO));
+            effects.extend(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.selection_changed());
         effects
@@ -758,7 +792,7 @@ impl App {
             .filter(|search| search.response.is_none())
             .map(|search| search.query.clone());
         if let Some(query) = stale_search {
-            effects.push(self.fetch_search(query, Duration::ZERO));
+            effects.extend(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.selection_changed());
         effects
@@ -781,7 +815,7 @@ impl App {
             session_id: pager.session_id.clone(),
             after: pager.next_cursor(),
         };
-        vec![self.fetch(call, Duration::ZERO)]
+        self.fetch(call, Duration::ZERO).into_iter().collect()
     }
 
     pub(super) fn apply(&mut self, msg: Msg) -> Vec<Effect> {
@@ -791,7 +825,7 @@ impl App {
         {
             return Vec::new();
         }
-        self.lanes[lane as usize].loading = false;
+        self.lanes[lane as usize].in_flight = None;
         self.dirty = true;
         match (msg.call, msg.reply) {
             (Call::Listing(scope), Reply::Listing(result)) => self.on_listing(&scope, result),
@@ -819,7 +853,17 @@ impl App {
                 }
                 match result {
                     Ok(messages) => {
-                        self.previews.insert(id, messages);
+                        if self.previews.len() >= LISTING_ROWS {
+                            self.previews.clear();
+                        }
+                        let clean = messages
+                            .into_iter()
+                            .map(|message| TranscriptMessage {
+                                text: ui::preview_text(&message.text),
+                                ..message
+                            })
+                            .collect();
+                        self.previews.insert(id, clean);
                         Vec::new()
                     }
                     Err(error) => self.toast(&error),
@@ -1113,6 +1157,84 @@ mod tests {
             "toggling back is served from the cache: {effects:?}"
         );
         assert_eq!(app.listing().map(<[SessionRow]>::len), Some(2));
+    }
+
+    #[test]
+    fn a_refresh_joins_requests_already_in_flight() {
+        let mut app = app(100, 12);
+        let first = app.start();
+        assert_eq!(fetches(&first), [&Call::Listing(app.scope()), &Call::Live]);
+        app.now += TimeDelta::seconds(5);
+        let again = app.on_event(&key(KeyCode::Char('r')));
+        assert!(fetches(&again).is_empty(), "{again:?}");
+    }
+
+    #[test]
+    fn toggling_back_leaves_the_slow_listing_running_into_the_cache() {
+        let api = MockApi::golden();
+        let mut app = opened(&api, 100, 12);
+        let all_time = app.on_event(&key(KeyCode::Char('t')));
+        let listing = all_time
+            .into_iter()
+            .find(|effect| {
+                matches!(
+                    effect,
+                    Effect::Fetch {
+                        call: Call::Listing(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let back = app.on_event(&key(KeyCode::Char('t')));
+        assert!(
+            !back.contains(&Effect::Cancel(Lane::Listing)),
+            "toggling back cancelled the listing: {back:?}"
+        );
+        assert!(!app.all_time);
+        settle(&mut app, &api, vec![listing]);
+        assert!(!app.all_time, "the late listing moved the view");
+        let cached = app.on_event(&key(KeyCode::Char('t')));
+        assert!(
+            !fetches(&cached)
+                .iter()
+                .any(|call| matches!(call, Call::Listing(_))),
+            "the landed listing was not cached: {cached:?}"
+        );
+        assert_eq!(app.listing().map(<[SessionRow]>::len), Some(2));
+    }
+
+    #[test]
+    fn previews_are_cached_clipped_and_clean() {
+        let api = MockApi {
+            transcript: vec![message(
+                "m1",
+                now(),
+                &format!("\u{1b}[31m{}", "x".repeat(ui::PREVIEW_CHARS * 3)),
+            )],
+            ..MockApi::golden()
+        };
+        let mut app = opened(&api, 100, 20);
+        press(&mut app, &api, KeyCode::Char(' '));
+        let text = &app.previews["s-live"][0].text;
+        assert!(text.chars().count() <= ui::PREVIEW_CHARS);
+        assert!(!text.contains('\u{1b}') && !text.contains("[31m"));
+    }
+
+    #[test]
+    fn the_spinner_ticks_only_where_it_shows() {
+        let mut app = opened(&MockApi::golden(), 100, 12);
+        assert!(!app.spinner_visible());
+        let refresh = app.on_event(&key(KeyCode::Char('r')));
+        assert!(!refresh.is_empty());
+        assert!(
+            app.spinner_visible(),
+            "the desk footer shows the listing load"
+        );
+        app.pager = Some(Pager::new("s-old".to_owned(), "t".to_owned(), 80));
+        assert!(!app.spinner_visible(), "the pager shows only its own load");
+        app.load_more();
+        assert!(app.spinner_visible());
     }
 
     #[test]
@@ -1462,14 +1584,20 @@ mod tests {
         app.pager.as_mut().unwrap().offset = target;
         let wide = app.pager.as_ref().unwrap().lines.len();
 
+        app.on_event(&Event::Resize(50, 8));
         app.on_event(&Event::Resize(30, 6));
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines.len(),
+            wide,
+            "a resize waits for the next draw to re-wrap"
+        );
+        let screen_text = screen(&mut app);
         let pager = app.pager.as_ref().unwrap();
         assert!(pager.lines.len() > wide, "re-wrapped narrower");
         assert_eq!(
             pager.offset, pager.starts[10],
             "the same message stays on top"
         );
-        let screen_text = screen(&mut app);
         assert!(screen_text.contains("message 10"), "{screen_text}");
     }
 

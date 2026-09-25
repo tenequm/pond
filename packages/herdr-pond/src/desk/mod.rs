@@ -90,7 +90,7 @@ where
                 Some(Err(_)) | None => return Ok(DeskExit::Quit),
             },
             Some(msg) = rx.recv() => app.apply(msg),
-            _ = spinner.tick(), if app.is_loading() => {
+            _ = spinner.tick(), if app.spinner_visible() => {
                 app.tick();
                 Vec::new()
             }
