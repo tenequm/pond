@@ -31,6 +31,12 @@ const USAGE_ERROR_EXIT: i32 = 2;
 /// Bind env `pond serve` reads for `--host`/`--port`: clap counts an env value
 /// as given, so an inherited one would conflict with `--socket`.
 const BIND_ENV: [&str; 2] = ["POND_HOST", "POND_PORT"];
+/// `sockaddr_un.sun_path`, NUL included: a longer path cannot be bound, so a
+/// serve spawned on one would open the store only to fail at bind.
+#[cfg(target_os = "linux")]
+const SUN_PATH_BYTES: usize = 108;
+#[cfg(not(target_os = "linux"))]
+const SUN_PATH_BYTES: usize = 104;
 
 /// `STATE_DIR/serve/<sockhash>/`: herdr keys plugin state by plugin id only,
 /// so two herdr servers on one machine share the state dir - everything a
@@ -153,6 +159,18 @@ impl ServeChild {
         log: PathBuf,
         grace: Duration,
     ) -> std::io::Result<Self> {
+        let length = socket.as_os_str().len();
+        if length >= SUN_PATH_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "socket path {} is {length} bytes, past the {}-byte Unix socket limit - \
+                     herdr's plugin state dir (HERDR_PLUGIN_STATE_DIR) is nested too deep",
+                    socket.display(),
+                    SUN_PATH_BYTES - 1
+                ),
+            ));
+        }
         let _ = fs::remove_file(&socket);
         let mut command = serve_command(pond, &socket);
         log_stdio(&mut command, &log)?;
@@ -492,6 +510,22 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(removed, BIND_ENV);
+    }
+
+    #[test]
+    fn a_socket_path_past_the_limit_is_refused_before_spawning() {
+        let sandbox = Sandbox::new();
+        let pond = sandbox.fake_serve(None, "exec sleep 30");
+        let socket = sandbox.path(&format!("{}/owner.sock", "x".repeat(SUN_PATH_BYTES)));
+        let Err(error) = ServeChild::spawn(&pond, socket, sandbox.path("log"), FALLBACK_GRACE)
+        else {
+            panic!("spawned on an unbindable path");
+        };
+        assert!(
+            error.to_string().contains("HERDR_PLUGIN_STATE_DIR"),
+            "{error}"
+        );
+        assert!(!sandbox.path("calls").exists(), "pond was started");
     }
 
     #[tokio::test]

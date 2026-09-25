@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -125,18 +125,17 @@ fn decode<T: DeserializeOwned>(path: &str, status: u16, body: &str) -> Result<T,
     }
 }
 
+/// How long a failed resolution answers for later callers instead of a new
+/// attempt, so callers queued behind it do not each spawn another serve.
+const RESOLVE_RETRY_AFTER: Duration = Duration::from_secs(1);
+
 /// The resolved serve. `serve` stays unset until the first call, so the
 /// desk's loading state covers a cold fallback spawn.
 #[derive(Default)]
 struct Link {
     serve: Option<Socket>,
     fallback: Option<Fallback>,
-}
-
-/// A socket that just refused a connection, and why.
-struct Stale {
-    socket: PathBuf,
-    reason: String,
+    failed: Option<(Instant, ApiError)>,
 }
 
 /// Owned by the api and by each resolution task, so resolution survives the
@@ -151,29 +150,38 @@ struct Resolver {
 
 impl Resolver {
     /// Runs with `link` locked, so concurrent callers queue behind one
-    /// resolution and then reuse its result.
-    async fn resolve(&self, stale: Option<Stale>) -> Result<Socket, ApiError> {
+    /// resolution and then reuse its result. `stale` is a socket that just
+    /// refused; the same path is used again only once `connect` probed it
+    /// live, since a successor owner reuses its path.
+    async fn resolve(&self, stale: Option<PathBuf>) -> Result<Socket, ApiError> {
         let mut link = self.link.lock().await;
         if let Some(current) = &link.serve
-            && stale
-                .as_ref()
-                .is_none_or(|stale| current.path != stale.socket)
+            && stale.as_ref().is_none_or(|stale| current.path != *stale)
         {
             return Ok(current.clone());
+        }
+        if let Some((at, error)) = &link.failed
+            && at.elapsed() < RESOLVE_RETRY_AFTER
+        {
+            return Err(error.clone());
         }
         let origin = self
             .origin
             .as_ref()
             .map_err(|error| ApiError::Unreachable(error.clone()))?;
-        let connection = serve::connect(origin, link.fallback.take()).await?;
-        link.fallback = connection.fallback;
-        link.serve = Some(connection.socket.clone());
-        if let Some(stale) = stale
-            && connection.socket.path == stale.socket
-        {
-            return Err(ApiError::Unreachable(stale.reason));
+        match serve::connect(origin, link.fallback.take()).await {
+            Ok(connection) => {
+                link.fallback = connection.fallback;
+                link.serve = Some(connection.socket.clone());
+                link.failed = None;
+                Ok(connection.socket)
+            }
+            Err(error) => {
+                link.serve = None;
+                link.failed = Some((Instant::now(), error.clone()));
+                Err(error)
+            }
         }
-        Ok(connection.socket)
     }
 }
 
@@ -194,7 +202,7 @@ impl HttpApi {
     }
 
     /// The current serve, else a resolution run in its own task.
-    async fn resolve(&self, stale: Option<Stale>) -> Result<Socket, ApiError> {
+    async fn resolve(&self, stale: Option<PathBuf>) -> Result<Socket, ApiError> {
         if stale.is_none() {
             let current = self.resolver.link.lock().await.serve.clone();
             if let Some(socket) = current {
@@ -218,12 +226,8 @@ impl HttpApi {
     {
         let socket = self.resolve(None).await?;
         match socket.post(route, body, deadline).await {
-            Err(ApiError::Unreachable(reason)) => {
-                let stale = Stale {
-                    socket: socket.path,
-                    reason,
-                };
-                self.resolve(Some(stale))
+            Err(ApiError::Unreachable(_)) => {
+                self.resolve(Some(socket.path))
                     .await?
                     .post(route, body, deadline)
                     .await
@@ -344,7 +348,7 @@ mod tests {
                 origin: Ok(sandbox.origin()),
                 link: Mutex::new(Link {
                     serve,
-                    fallback: None,
+                    ..Link::default()
                 }),
             }),
             herdr: Herdr::new(sandbox.path("bin/herdr")),
@@ -692,6 +696,52 @@ exec sleep 30"#,
             1,
             "the abort killed the spawn"
         );
+    }
+
+    #[tokio::test]
+    async fn callers_queued_behind_a_failed_resolution_share_its_error() {
+        let sandbox = Sandbox::new();
+        let script = write_script(
+            &sandbox.path("bin/pond"),
+            &format!(
+                "echo spawned >> '{}'; sleep 0.2; exit 1",
+                sandbox.path("calls").display()
+            ),
+        );
+        sandbox.write_config(&format!("pond_bin = \"{}\"\n", script.display()));
+        let api = api(&sandbox, None);
+        let (preview, titles) = tokio::join!(
+            api.preview("s1".to_owned()),
+            api.titles(vec!["s1".to_owned()])
+        );
+        let Err(error @ ApiError::Unreachable(_)) = preview else {
+            panic!("expected Unreachable, got {preview:?}");
+        };
+        assert_eq!(titles, Err(error));
+        assert_eq!(sandbox.lines("calls").len(), 1, "one spawn for both");
+
+        tokio::time::sleep(RESOLVE_RETRY_AFTER).await;
+        assert!(api.preview("s1".to_owned()).await.is_err());
+        assert_eq!(
+            sandbox.lines("calls").len(),
+            2,
+            "a later call resolves again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successor_live_at_the_refused_path_is_used() {
+        let sandbox = Sandbox::new();
+        let owner = sandbox.origin().dir.socket("owner");
+        let api = api_at(stale_socket(&owner), &sandbox);
+        let successor = preview_pond().await;
+        std::fs::remove_file(&owner).unwrap();
+        std::os::unix::fs::symlink(&successor.socket, &owner).unwrap();
+        write_endpoint(&sandbox.origin().dir.endpoint(), &endpoint(&owner, "t")).unwrap();
+
+        let socket = api.resolve(Some(owner.clone())).await.unwrap();
+        assert_eq!(socket.path, owner);
+        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
