@@ -3,12 +3,18 @@ name: CI
 on:
   push:
     branches: [main]
+  # `labeled` is how a PR opts into build-and-test-windows: adding the `windows`
+  # label starts a new run, so on an already-green PR wait for that run's ci-ok
+  # before merging. Every label re-runs the whole graph on purpose: release-plz
+  # labels each release PR (`pr_labels`), and a run skipped at the roots would
+  # post an all-skipped green ci-ok over a red one.
   pull_request:
-  # Manual trigger, added for the Windows jobs: windows-dist is release-gated,
-  # so dispatch is the only way to exercise the shipped-artifact path before it
-  # reaches main. Side effect accepted: build-and-test and flake-check carry no
-  # event condition, so they run on dispatch too. release-prep and everything
-  # downstream stay push-gated.
+    types: [opened, synchronize, reopened, labeled]
+  # Manual trigger, added for the Windows jobs: dist-build-windows is
+  # release-gated, so dispatch is the only way to exercise the shipped-artifact
+  # path before it reaches main. Side effect accepted: the roots run on dispatch
+  # too, and a dispatch on main redeploys the docs. release-prep and everything
+  # downstream except dist-build-windows stay push-gated.
   workflow_dispatch:
     inputs:
       force_build:
@@ -35,6 +41,10 @@ permissions:
 # also kills an in-flight release mid-publish (after release-plz cuts the tag, the
 # is_release gate is false forever, so an interrupted publish can't auto-recover).
 # So builds stay cancellable while publish-release is made non-cancellable below.
+#
+# ci-ok at the bottom needs every job and is the single required check. Event
+# conditions sit on the roots only (release-prep and dist-build-windows are the
+# two documented exceptions), so a job's position in the graph says when it runs.
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,16 +55,16 @@ env:
   BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
 
 jobs:
-  build-and-test:
+  build-and-test-linux:
     # In-cluster ARC ephemeral runner (scale set `pond-ci`). The toolchain comes
     # from the flake devShell, realized in the node's /nix store volume; the
     # cargo registry, target/ and proto's tool tree stay on the /ci-cache PVC.
     # Both persist across the ephemeral pods.
     # Fork PRs run hosted instead: those volumes are writable and shared with
     # the release jobs, so untrusted code must never touch them. Same test as
-    # windows-verify, inverted; a PR whose head repo is gone also lands hosted.
-    # A hosted run is always cold (windows-verify measured 76 min cold), hence
-    # its longer timeout.
+    # build-and-test-windows, inverted; a PR whose head repo is gone also lands
+    # hosted. A hosted run is always cold (the Windows leg measured 76 min
+    # cold), hence its longer timeout.
     runs-on: >-
       ${{ github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name != github.repository &&
@@ -110,9 +120,9 @@ jobs:
       # widen it. Requires the fetch-depth: 0 checkout above; moon resolves the
       # merge base from full history and mis-detects on a shallow clone.
       #
-      # dist-build and windows-dist deliberately stay on `moon run`: under
-      # affected-only filtering a release commit that touches no declared input
-      # would build nothing and publish nothing.
+      # dist-build-unix and dist-build-windows deliberately stay on `moon run`:
+      # under affected-only filtering a release commit that touches no declared
+      # input would build nothing and publish nothing.
       #
       # Base revision is moon's own detection (the ci_env crate): the PR base
       # ref for a pull_request, HEAD~1 for a push to main. Accepted as-is -
@@ -220,49 +230,57 @@ jobs:
           jq -S . ops/toolchain-id.json > "$out/toolchain-committed.json"
           diff -u "$out/toolchain-evaluated.json" "$out/toolchain-committed.json"
 
-  # Windows runs as TWO jobs, deliberately. One serial job cost 46 min warm
-  # (20.7 test + 23.8 dist). Split, they start together on separate hosted
-  # runners - separate machines, separate disks, nothing shared - so Windows
-  # contributes the longer of the two to a release, not the sum.
+  # Windows runs as TWO jobs, deliberately: the test leg gates every main push
+  # (and labelled PRs), the dist leg runs only for a release or a dispatch, and
+  # each keeps its own kache store. dist-build-windows needs
+  # build-and-test-windows, so a shipped zip never comes from a commit its own
+  # test leg did not pass. The test leg starts at t=0, so the dist leg waits only
+  # for whichever of it and release-prep finishes last: about +6 min on the
+  # v0.19.1 release (run 35924997199), not the two legs' sum.
   #
-  # windows-verify runs moon's `pond:test-msvc`, never `pond:test`: the task
-  # fingerprint carries command/args/deps/env/inputs/outputs but no OS or
+  # build-and-test-windows runs moon's `pond:test-msvc`, never `pond:test`: the
+  # task fingerprint carries command/args/deps/env/inputs/outputs but no OS or
   # architecture of its own (crates/task-hasher/src/task_fingerprint.rs), so
   # sharing one task would hit the hash the Linux runner already stored and go
   # green without compiling a line here. `rust: {}` in .moon/toolchains.yml now
   # folds the host triple in as well, but the differing command is what has kept
   # them apart and still does, and the remote cache is what lets a prose-only
   # commit skip the leg entirely.
-  # windows-dist runs `repo:build-dist-msvc` for the same two reasons: its own
-  # task so the OS-less fingerprint cannot collide with `repo:build-dist`, and a
-  # moon task so it is cacheable at all.
+  # dist-build-windows runs `repo:build-dist-msvc` for the same two reasons: its
+  # own task so the OS-less fingerprint cannot collide with `repo:build-dist`,
+  # and a moon task so it is cacheable at all.
   #
-  # The two carry DIFFERENT kache manifest-keys. Sharing one would make each
-  # overwrite the other's warm-prefetch manifest, silently dropping both to a
-  # near-cold fetch.
+  # The two carry DIFFERENT kache manifest-keys, and those keys and their S3
+  # prefixes still read windows-verify / windows-dist: they are cache
+  # identities, not job names, and renaming one forces a cold run. Sharing one
+  # would make each overwrite the other's warm-prefetch manifest, silently
+  # dropping both to a near-cold fetch.
 
-  # The gate: the full suite, natively. Runs on ordinary PRs too - at 20.7 min
-  # warm there is no reason to defer a Windows regression to release time (the
-  # plan deferred it only because a run was estimated at 50-75 min, before kache).
-  # Skipped for fork PRs: they get no secrets, so kache has no S3 credentials.
-  windows-verify:
+  # The gate: the full suite, natively. Every main push runs it before anything
+  # ships (dist-build-windows, and through it publish-release, needs it); a PR
+  # runs it only when labelled `windows`, since most diffs carry no
+  # Windows-specific risk and the leg costs ~20 min of a hosted runner. Never on
+  # fork PRs: they get no secrets, so kache has no S3 credentials.
+  build-and-test-windows:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'windows'))
     runs-on: windows-2025
-    # No `needs:` - starts at t=0 alongside the Linux jobs and windows-dist.
+    # No `needs:` - a root, starting at t=0 alongside the Linux jobs.
     # 180 is measured headroom: this leg was 76 min on a fully cold cache.
     timeout-minutes: 180
-    # Cancellable, like build-and-test: a newer push supersedes it. That makes
-    # this the one `needs:` of publish-release that can be cancelled - the
-    # sibling windows-dist is explicitly not, being an artifact producer. It is
-    # safe because release-plz cuts the tag INSIDE publish-release, so a
-    # cancelled run leaves is_release still true and the superseding push simply
-    # re-runs the whole release path. The same exposure build-and-test already
-    # carries. Do not "fix" this to false without that reasoning changing.
-    concurrency: { group: "ci-windows-verify-${{ github.ref }}", cancel-in-progress: true }
+    # Cancellable, like build-and-test-linux: a newer push supersedes it. That
+    # makes this the one ancestor of publish-release on the Windows side that
+    # can be cancelled - dist-build-windows is explicitly not, being an artifact
+    # producer. It is safe because release-plz cuts the tag INSIDE
+    # publish-release, so a cancelled run leaves is_release still true and the
+    # superseding push simply re-runs the whole release path. The same exposure
+    # build-and-test-linux already carries. Do not "fix" this to false without
+    # that reasoning changing.
+    concurrency: { group: "ci-build-and-test-windows-${{ github.ref }}", cancel-in-progress: true }
     # Only a main push may write moon's remote cache. A hash stored by a PR or
     # dispatch run is one main would replay without compiling - but kache may
     # only write its remote from a protected-branch push, so that replay leaves
@@ -294,7 +312,7 @@ jobs:
       - name: Allow long paths in git
         shell: pwsh
         run: git config --system core.longpaths true
-      # Full history for the same reason build-and-test needs it: moon's vcs
+      # Full history for the same reason build-and-test-linux needs it: moon's vcs
       # layer resolves vcs.defaultBranch, which a shallow PR checkout lacks.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -305,9 +323,10 @@ jobs:
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
           s3-prefix: kache/pond/windows-verify/k33
-          # verify only, never windows-dist: a restored harness has unresolved
-          # .pdb paths, so a failing test gets a weaker backtrace. Worth ~3 min
-          # of link time here; not worth it on the leg whose output ships.
+          # Test leg only, never dist-build-windows: a restored harness has
+          # unresolved .pdb paths, so a failing test gets a weaker backtrace.
+          # Worth ~3 min of link time here; not worth it on the leg whose
+          # output ships.
           cache-executables: 'true'
 
       # The round-one `kache pull dry run` step is gone, deliberately: it
@@ -381,29 +400,30 @@ jobs:
   # pipeline that ever executes a Windows binary.
   # `!cancelled()` is load-bearing: release-prep only runs on a main push, and a
   # skipped `needs` skips its dependents, so a bare `needs:` would stop the
-  # workflow_dispatch escape hatch ever running.
+  # workflow_dispatch escape hatch ever running. It also drops the implicit
+  # success() check, so build-and-test-windows's result is asserted explicitly.
   # Deliberately NOT pre-flighted on the release PR: a failure here cuts no tag,
   # so is_release stays true and `gh run rerun --failed` recovers it.
-  windows-dist:
-    needs: [release-prep]
+  dist-build-windows:
+    needs: [build-and-test-windows, release-prep]
     if: >-
-      !cancelled() && (
+      !cancelled() && needs.build-and-test-windows.result == 'success' && (
         github.event_name == 'workflow_dispatch' ||
         needs.release-prep.outputs.is_release == 'true'
       )
     runs-on: windows-2025
     timeout-minutes: 180
-    # Not cancellable, same rule as dist-build: this produces a release artifact
-    # publish-release needs. Cancelling it mid-release cancels the publish with
+    # Not cancellable, same rule as dist-build-unix: this produces a release
+    # artifact publish-release needs. Cancelling it mid-release cancels the publish with
     # it, and after release-plz cuts the tag the is_release gate is false
     # forever - an interrupted publish cannot auto-recover.
-    concurrency: { group: "ci-windows-dist-${{ github.ref }}", cancel-in-progress: false }
-    # Same cache-warming rule as windows-verify: only a main push may write
-    # moon's remote cache, so a release push compiles for real inside kache's
-    # write window instead of replaying a dispatch-stored hash.
+    concurrency: { group: "ci-dist-build-windows-${{ github.ref }}", cancel-in-progress: false }
+    # Same cache-warming rule as build-and-test-windows: only a main push may
+    # write moon's remote cache, so a release push compiles for real inside
+    # kache's write window instead of replaying a dispatch-stored hash.
     env:
       MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
-      # Same '[force-build]' warmer as windows-verify.
+      # Same '[force-build]' warmer as build-and-test-windows.
       MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     steps:
       - name: Allow long paths in git
@@ -463,9 +483,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # Same permanent diagnostics as windows-verify, and for the same reason:
-      # this leg runs rarely enough that a silent cache regression would first
-      # be noticed as a slow release. See the sibling job for why the daemon log
+      # Same permanent diagnostics as build-and-test-windows, and for the same
+      # reason: this leg runs rarely enough that a silent cache regression would
+      # first be noticed as a slow release. See that job for why the daemon log
       # is read as a file and why continue-on-error is load-bearing under pwsh.
       - name: kache diagnostics
         if: always()
@@ -494,9 +514,12 @@ jobs:
     # A skipped `needs` job skips its dependents, so flake-check must stay
     # unconditional: give it a `paths:` filter or an `if:` and releases silently
     # stop happening.
-    needs: [build-and-test, flake-check]
+    needs: [build-and-test-linux, flake-check]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Normally under a minute. The headroom is for release-plz's source-build
+    # fallback (below), which compiles it when binstall cannot find the asset.
+    timeout-minutes: 20
     concurrency: { group: "release-plz-${{ github.ref }}", cancel-in-progress: false }
     outputs:
       is_release: ${{ steps.detect.outputs.is_release }}
@@ -515,7 +538,7 @@ jobs:
         with: { command: release-pr, config: .github/release-plz.toml }   # keep the release PR current; never publishes
         env:
           RUSTUP_TOOLCHAIN: stable
-          # PAT (not GITHUB_TOKEN) so the opened release PR triggers build-and-test.
+          # PAT (not GITHUB_TOKEN) so the opened release PR triggers CI.
           GITHUB_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       - id: detect
@@ -530,7 +553,7 @@ jobs:
 
   # Build + Developer ID sign. Split from publish-release so notarization and
   # the macOS checks can gate the publish without re-running the 3-target build.
-  dist-build:
+  dist-build-unix:
     needs: [release-prep]
     if: needs.release-prep.outputs.is_release == 'true'
     # ARC runner pod: rust + its three cross targets, zig/zigbuild/SDK/rcodesign
@@ -603,7 +626,8 @@ jobs:
 
       # Two artifacts, not one: the macOS jobs only need the 38MB darwin
       # tarball, while publish needs all three cross-compiled tarballs plus
-      # checksums (the Windows zip reaches it separately, from windows-dist).
+      # checksums (the Windows zip reaches it separately, from
+      # dist-build-windows).
       # Seven-day retention: "Re-run failed jobs" on publish-release is the
       # recovery path, and it needs these artifacts to still exist.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -621,13 +645,13 @@ jobs:
 
   # Notarization does NOT alter the artifact: a bare Mach-O has nowhere to hold
   # a ticket, so Apple serves it online and every sha256 computed from the
-  # signed binary in dist-build stays valid.
+  # signed binary in dist-build-unix stays valid.
   #
   # One macOS job does launch smoke, signature assertions, and notarization:
   # macos-15 ships `xcrun notarytool`, so the Mac notarizes itself rather than
   # bouncing the artifact through a second Linux job.
-  macos-verify:
-    needs: [dist-build]
+  dist-verify-macos:
+    needs: [dist-build-unix]
     runs-on: macos-15
     timeout-minutes: 45
     # Same rule as flake-check: this job runs a binary built elsewhere.
@@ -653,7 +677,7 @@ jobs:
           grep -q '_pond' completions.zsh
 
       - name: Verify code signature
-        if: needs.dist-build.outputs.signed == 'true'
+        if: needs.dist-build-unix.outputs.signed == 'true'
         run: |
           set -euo pipefail
           codesign --verify --strict --verbose=2 ./pond
@@ -666,7 +690,7 @@ jobs:
           grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)' sig.txt
 
       - name: Notarize with Apple
-        if: needs.dist-build.outputs.signed == 'true'
+        if: needs.dist-build-unix.outputs.signed == 'true'
         env:
           APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
           APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
@@ -690,10 +714,11 @@ jobs:
           test "$(jq -r .status result.json)" = "Accepted"
 
   # Publish everywhere. release-plz publishes crates.io + cuts the tag/release
-  # HERE (after build AND macos-verify), so crates.io can't ship without
+  # HERE (after build AND dist-verify-macos), so crates.io can't ship without
   # binaries, and no channel can ship a binary macOS refuses to run.
   publish-release:
-    needs: [dist-build, macos-verify, windows-verify, windows-dist]
+    # build-and-test-windows is implied: dist-build-windows needs it.
+    needs: [dist-build-unix, dist-verify-macos, dist-build-windows]
     # GitHub-hosted, no devshell: release-plz only packages and uploads
     # (publish_no_verify in release-plz.toml, so nothing compiles), and gh - which
     # the devShell deliberately ships no copy of - plus jq and sha256sum all come
@@ -719,17 +744,15 @@ jobs:
     # whose auth header is empty. The task itself is `cache: false`, so there is
     # nothing to cache here anyway.
     env:
-      V: ${{ needs.dist-build.outputs.v }}
+      V: ${{ needs.dist-build-unix.outputs.v }}
       BAZEL_REMOTE_AUTH: ""
       MOON_REMOTE_HOST: ""
-    outputs:
-      released: ${{ steps.gate.outputs.released }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-all, path: dist }
-      # The msvc zip is built natively by windows-dist, not by the moon dist
+      # The msvc zip is built natively by dist-build-windows, not by the moon dist
       # task, so it arrives as its own artifact.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: dist-windows, path: dist }
@@ -768,15 +791,16 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       # A re-run finds the tag already cut, so release-plz reports no release;
-      # the release existing is what lets the tail (and npm/winget) resume.
-      - id: gate
+      # the release existing is what lets the tail (and the jobs after this one)
+      # resume. The step passes only when the release exists, so everything
+      # downstream can rely on this job's success alone.
+      - name: The GitHub release exists
         env:
           GH_TOKEN: ${{ github.token }}
           CREATED: ${{ steps.release-plz.outputs.releases_created }}
         run: |
           set -euo pipefail
           if [ "$CREATED" = true ]; then
-            echo "released=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # publish-release only runs while the tag is missing, and release-plz
@@ -786,15 +810,14 @@ jobs:
           code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/tenequm/pond/releases/tags/v$V")
           case "$code" in
-            200) echo "released=true" >> "$GITHUB_OUTPUT" ;;
+            200) ;;
             404) echo "::error::release-plz created no release and v$V has none: the crate or tag was published without the GitHub release. Create the v$V release by hand, then re-run this job." >&2; exit 1 ;;
             *) echo "::error::release lookup for v$V returned HTTP $code" >&2; exit 1 ;;
           esac
 
       # Checksums merge, binary upload, repo flake commit, Homebrew formula.
       # Idempotent, so "Re-run failed jobs" is safe.
-      - if: steps.gate.outputs.released == 'true'
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
         run: moon run repo:publish-release
@@ -808,16 +831,15 @@ jobs:
   # this repo + ci.yml as the trusted publisher. Idempotent via the
   # registry-version check in the script: a release without a plugin version
   # bump publishes nothing, and "Re-run failed jobs" retries safely.
-  npm-publish:
+  publish-npm:
     needs: [publish-release]
-    if: ${{ needs.publish-release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       id-token: write   # OIDC token for npm trusted publishing
       contents: read
-    # Same rule as flake-check/macos-verify: the workflow-level env hands the
-    # remote-cache secret to every job; nothing here needs it.
+    # Same rule as flake-check/dist-verify-macos: the workflow-level env hands
+    # the remote-cache secret to every job; nothing here needs it.
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
@@ -829,54 +851,130 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - run: ops/scripts/publish-npm.sh packages/openclaw-pond packages/pi-pond
 
-  # Not `on: release`: release-plz publishes the release, and publish-release
-  # uploads the binaries to it several steps later, so a release-triggered run
-  # would hand winget-releaser an empty installer list. Its own job rather than
-  # a step in publish-release so an upstream hiccup cannot red-flag a release
-  # that already published; "Re-run failed jobs" retries just this.
-  winget-publish:
-    needs: [dist-build, publish-release]
-    # Disabled until the winget token gets CreateRef on the winget-pkgs fork
-    # (komac: "tenequm does not have the correct permissions to execute CreateRef").
-    if: false
+  # publish-winget is OFF until the winget token gets CreateRef on the
+  # winget-pkgs fork (komac: "tenequm does not have the correct permissions to
+  # execute CreateRef"). Commented out rather than `if: false` so ci-ok's needs
+  # list only live jobs; to re-enable, uncomment it and add it there.
+  #
+  # # Not `on: release`: release-plz publishes the release, and publish-release
+  # # uploads the binaries to it several steps later, so a release-triggered run
+  # # would hand winget-releaser an empty installer list. Its own job rather than
+  # # a step in publish-release so an upstream hiccup cannot red-flag a release
+  # # that already published; "Re-run failed jobs" retries just this.
+  # publish-winget:
+  #   needs: [dist-build-unix, publish-release]
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 15
+  #   # Same rule as flake-check/dist-verify-macos: the workflow-level env hands
+  #   # this secret to every job, and the action below binstalls and runs komac.
+  #   env:
+  #     BAZEL_REMOTE_AUTH: ""
+  #   steps:
+  #     # The bucket's scheduled Excavator picks releases up within 4h on its own;
+  #     # this dispatch just cuts the lag to minutes, so a failure only warns.
+  #     - name: Trigger Scoop bucket excavator
+  #       env:
+  #         GH_TOKEN: ${{ secrets.WINGET_PAT }}
+  #       run: gh workflow run excavator.yml -R tenequm/scoop-bucket || echo "::warning::excavator dispatch failed; the scoop-bucket schedule will pick up the release within 4h"
+  #     # winget-releaser hard-fails until the package exists upstream; self-clears once microsoft/winget-pkgs#419055 merges.
+  #     - id: winget
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #       shell: bash
+  #       run: |
+  #         if gh api repos/microsoft/winget-pkgs/contents/manifests/t/tenequm/pond >/dev/null 2>&1; then
+  #           echo "present=true" >> "$GITHUB_OUTPUT"
+  #         else
+  #           echo "::notice::winget package tenequm.pond is not yet in microsoft/winget-pkgs (microsoft/winget-pkgs#419055 still open); skipping winget-releaser"
+  #           echo "present=false" >> "$GITHUB_OUTPUT"
+  #         fi
+  #     - if: steps.winget.outputs.present == 'true'
+  #       uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+  #       with:
+  #         identifier: tenequm.pond
+  #         version: ${{ needs.dist-build-unix.outputs.v }}
+  #         # Unlimited (the default) would accumulate every pond patch release in
+  #         # winget-pkgs. Trades away `winget install --version` for versions
+  #         # older than the last 5.
+  #         max-versions-to-keep: 5
+  #         # Defaults to github.ref_name, which is `main` here.
+  #         release-tag: v${{ needs.dist-build-unix.outputs.v }}
+  #         # The default regex matches exe/msi/msix/appx only; pond ships a
+  #         # portable zip, so without this the manifest gets no installer URL.
+  #         installers-regex: '\.zip$'
+  #         # Classic PAT: winget-releaser rejects fine-grained tokens.
+  #         token: ${{ secrets.WINGET_PAT }}
+
+  # The docs site (docs/site) on Cloudflare, redeployed on every main push
+  # rather than only on docs changes: both deploy jobs share one cancellable
+  # group, and each builds the whole site from main's head and fetches releases
+  # at build time, so a newer deploy supersedes whatever it cancels.
+  deploy-docs:
+    # Main only: a dispatch on another branch must not ship that branch's docs.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # Same rule as flake-check/macos-verify: the workflow-level env hands this
-    # secret to every job, and the action below binstalls and runs komac.
+    timeout-minutes: 10
+    concurrency: { group: deploy-docs, cancel-in-progress: true }
+    # pnpm install runs third-party lifecycle scripts; nothing here needs the
+    # remote-cache secret the workflow-level env hands every job.
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
-      # The bucket's scheduled Excavator picks releases up within 4h on its own;
-      # this dispatch just cuts the lag to minutes, so a failure only warns.
-      - name: Trigger Scoop bucket excavator
-        env:
-          GH_TOKEN: ${{ secrets.WINGET_PAT }}
-        run: gh workflow run excavator.yml -R tenequm/scoop-bucket || echo "::warning::excavator dispatch failed; the scoop-bucket schedule will pick up the release within 4h"
-      # winget-releaser hard-fails until the package exists upstream; self-clears once microsoft/winget-pkgs#419055 merges.
-      - id: winget
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          if gh api repos/microsoft/winget-pkgs/contents/manifests/t/tenequm/pond >/dev/null 2>&1; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::winget package tenequm.pond is not yet in microsoft/winget-pkgs (microsoft/winget-pkgs#419055 still open); skipping winget-releaser"
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.winget.outputs.present == 'true'
-        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/docs-deploy
         with:
-          identifier: tenequm.pond
-          version: ${{ needs.dist-build.outputs.v }}
-          # Unlimited (the default) would accumulate every pond patch release in
-          # winget-pkgs. Trades away `winget install --version` for versions
-          # older than the last 5.
-          max-versions-to-keep: 5
-          # Defaults to github.ref_name, which is `main` here.
-          release-tag: v${{ needs.dist-build.outputs.v }}
-          # The default regex matches exe/msi/msix/appx only; pond ships a
-          # portable zip, so without this the manifest gets no installer URL.
-          installers-regex: '\.zip$'
-          # Classic PAT: winget-releaser rejects fine-grained tokens.
-          token: ${{ secrets.WINGET_PAT }}
+          cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # The changelog page fetches GitHub releases at build time, so a release is
+  # a docs change even when no file under docs/ moved.
+  deploy-docs-changelog:
+    needs: [publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency: { group: deploy-docs, cancel-in-progress: true }
+    env:
+      BAZEL_REMOTE_AUTH: ""
+    steps:
+      # main, not the release commit: the shared group must only ever deploy
+      # main's head, never roll the site back to an older commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: main }
+      - uses: ./.github/actions/docs-deploy
+        with:
+          cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # The single required check. It needs EVERY job, not just the leaves: a
+  # failed root skips its descendants, so a sink watching only leaves would see
+  # "skipped" and pass. Skipped is fine here (event-gated jobs); failure and
+  # cancelled are not.
+  ci-ok:
+    needs:
+      - build-and-test-linux
+      - flake-check
+      - build-and-test-windows
+      - deploy-docs
+      - release-prep
+      - dist-build-unix
+      - dist-verify-macos
+      - dist-build-windows
+      - publish-release
+      - publish-npm
+      - deploy-docs-changelog
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(printf '%s' "$NEEDS" | jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | "\(.key) (\(.value.result))"')
+          if [ -n "$bad" ]; then
+            printf '%s\n' "$bad" | while IFS= read -r job; do echo "::error::not ok: $job"; done
+            exit 1
+          fi
