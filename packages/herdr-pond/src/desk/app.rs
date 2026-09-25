@@ -262,7 +262,8 @@ pub(super) struct App {
     pub(super) fatal: Option<String>,
     pub(super) spinner: usize,
     pub(super) dirty: bool,
-    /// Set by a resize, so a burst of them re-wraps the pager once, at draw.
+    /// Set by a resize, so a burst of them re-wraps the pager once, before
+    /// the next frame.
     resized: bool,
 }
 
@@ -482,21 +483,21 @@ impl App {
         self.size = Size::new(width, height);
         self.dirty = true;
         self.resized = true;
-        let mut effects: Vec<Effect> = self.hydrate_visible().into_iter().collect();
-        effects.extend(self.load_more());
-        effects
+        self.hydrate_visible().into_iter().collect()
     }
 
-    /// Re-wraps the pager for the latest size, once per drawn frame.
-    pub(super) fn relayout(&mut self) {
+    /// Re-wraps the pager for the latest size, then fetches more if the new
+    /// wrap left the viewport near the end. Runs before every frame.
+    pub(super) fn relayout(&mut self) -> Vec<Effect> {
         if !std::mem::take(&mut self.resized) {
-            return;
+            return Vec::new();
         }
         let viewport = self.pager_viewport();
         if let Some(pager) = &mut self.pager {
             pager.rewrap(usize::from(viewport.width));
             pager.scroll(0, usize::from(viewport.height));
         }
+        self.load_more()
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Effect> {
@@ -1599,6 +1600,26 @@ mod tests {
             "the same message stays on top"
         );
         assert!(screen_text.contains("message 10"), "{screen_text}");
+    }
+
+    #[test]
+    fn widening_fetches_more_once_the_rewrap_runs_short() {
+        let mut app = opened(&MockApi::golden(), 30, 10);
+        let width = usize::from(app.pager_viewport().width);
+        app.pager = Some(Pager::new("s-old".to_owned(), "t".to_owned(), width));
+        let request = app.load_more().remove(0);
+        let messages: Vec<_> = (0..3)
+            .map(|i| message(&format!("m{i}"), now(), &"word ".repeat(60)))
+            .collect();
+        assert!(app.apply(page_reply(request, messages, true)).is_empty());
+
+        let resized = app.on_event(&Event::Resize(200, 10));
+        assert!(fetches(&resized).is_empty(), "{resized:?}");
+        let relaid = app.relayout();
+        assert!(
+            matches!(fetches(&relaid)[..], [Call::Page { after: Some(_), .. }]),
+            "{relaid:?}"
+        );
     }
 
     #[test]

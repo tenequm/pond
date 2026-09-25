@@ -72,6 +72,7 @@ where
     tokio::pin!(shutdown);
     let mut effects = app.start();
     loop {
+        effects.extend(app.relayout());
         for effect in effects.drain(..) {
             if let Some(exit) = runner.perform(effect) {
                 return Ok(exit);
@@ -370,6 +371,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::desk) fn screen(app: &mut App) -> String {
+        app.relayout();
         let mut terminal =
             Terminal::new(TestBackend::new(app.size.width, app.size.height)).unwrap();
         terminal.draw(|frame| ui::render(frame, app)).unwrap();

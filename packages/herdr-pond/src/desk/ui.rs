@@ -94,7 +94,6 @@ pub(super) fn pager_areas(area: Rect) -> PagerAreas {
 }
 
 pub(super) fn render(frame: &mut Frame, app: &mut App) {
-    app.relayout();
     if let Some(message) = &app.fatal {
         render_fatal(frame, message);
     } else if app.pager.is_some() {
