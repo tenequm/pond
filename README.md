@@ -49,7 +49,12 @@ pond init   # guided setup: storage, adapters, MCP + agent skill, optional sched
 pond sync   # ingest and index - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for Claude Code and installs the bundled pond skill; for Codex it prints the command to run instead - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for Claude Code and installs the bundled pond skill; for Codex it prints the command to run instead - restart the client afterwards so the tools load. It asks how clients should reach pond:
+
+- **one resident `pond serve` over HTTP** (recommended): init registers `pond serve --transport http --with-sync` with your OS service manager and points the client at `http://127.0.0.1:9797/mcp`. One warm process per host, so the prewarm, the rowmap build, and the search indexes load once instead of once per client process - the first query after a client starts takes seconds, not minutes.
+- **one-shot stdio** (`pond mcp`): no background process, but every client start pays the full cold start again.
+
+By hand: `pond service start` then `claude mcp add -s user --transport http pond http://127.0.0.1:9797/mcp` (`codex mcp add pond --url http://127.0.0.1:9797/mcp`), or stdio-only with `claude mcp add -s user pond -- pond mcp` / `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -176,6 +181,17 @@ pond serve                         # HTTP on 127.0.0.1:9797
 pond serve --transport stdio       # MCP over stdio
 pond mcp                           # alias for stdio MCP
 ```
+
+Keep one resident so MCP clients never cold-start (launchd on macOS, a systemd user service on Linux, Task Scheduler on Windows):
+
+```sh
+pond service start                 # pond serve --transport http --with-sync, supervised
+pond service status                # backend and the /mcp URL
+pond service logs
+pond service stop
+```
+
+Switching an existing stdio registration is a re-run of the wizard: `pond init --mcp-transport http` registers the resident server, replaces the stdio entry with the HTTP one, and names the switch (`--mcp-transport stdio` goes back). On Linux the service is a systemd **user** unit, so it stops at logout unless the host has lingering enabled (`loginctl enable-linger $USER`).
 
 ### Fetch and copy
 

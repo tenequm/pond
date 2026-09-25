@@ -1,5 +1,5 @@
 ---
-source: src/main.rs
+source: packages/pond/src/main.rs
 expression: sub.render_long_help().to_string()
 ---
 Set up pond (idempotent: safe to re-run).
@@ -19,6 +19,15 @@ Options:
 
       --skip-mcp
           Skip MCP registration and the skill install
+
+      --mcp-transport <TRANSPORT>
+          How MCP clients reach pond: `http` (one resident `pond serve`, warm) or `stdio` (a `pond mcp` process per client, cold on every start).
+          
+          `http` also registers that resident server with the OS service manager (`pond service`). Interactively the choice is a prompt, defaulting to `http`; non-interactively this flag is the only way to change an existing host's topology.
+
+          Possible values:
+          - http:  Streamable HTTP against a resident `pond serve --with-sync`
+          - stdio: A `pond mcp` child per client process
 
   -y, --yes
           Accept defaults for everything not covered by a flag (non-interactive)
