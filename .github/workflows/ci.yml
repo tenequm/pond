@@ -4,13 +4,16 @@ on:
   push:
     branches: [main]
   # `labeled` is how a PR opts into build-and-test-windows: adding the `windows`
-  # label starts a run. Any other label re-runs the graph too; accepted.
+  # label starts a new run, so on an already-green PR wait for that run's ci-ok
+  # before merging. Every label re-runs the whole graph on purpose: release-plz
+  # labels each release PR (`pr_labels`), and a run skipped at the roots would
+  # post an all-skipped green ci-ok over a red one.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   # Manual trigger, added for the Windows jobs: dist-build-windows is
   # release-gated, so dispatch is the only way to exercise the shipped-artifact
   # path before it reaches main. Side effect accepted: the roots run on dispatch
-  # too, and deploy-docs deploys unconditionally. release-prep and everything
+  # too, and a dispatch on main redeploys the docs. release-prep and everything
   # downstream except dist-build-windows stay push-gated.
   workflow_dispatch:
     inputs:
@@ -39,10 +42,9 @@ permissions:
 # is_release gate is false forever, so an interrupted publish can't auto-recover).
 # So builds stay cancellable while publish-release is made non-cancellable below.
 #
-# One graph, one verdict: every job is a root or a descendant of one, and ci-ok
-# at the bottom is the single required check. Event conditions sit on the roots
-# only (release-prep and dist-build-windows are the two documented exceptions),
-# so a job's position in the graph says when it runs.
+# ci-ok at the bottom needs every job and is the single required check. Event
+# conditions sit on the roots only (release-prep and dist-build-windows are the
+# two documented exceptions), so a job's position in the graph says when it runs.
 
 env:
   CARGO_TERM_COLOR: always
@@ -230,9 +232,11 @@ jobs:
 
   # Windows runs as TWO jobs, deliberately: the test leg gates every main push
   # (and labelled PRs), the dist leg runs only for a release or a dispatch, and
-  # each keeps its own kache store. dist-build-windows needs build-and-test-windows,
-  # so a release pays the sum (~46 min warm: 20.7 test + 23.8 dist), accepted
-  # so a shipped zip never comes from a commit its own test leg did not pass.
+  # each keeps its own kache store. dist-build-windows needs
+  # build-and-test-windows, so a shipped zip never comes from a commit its own
+  # test leg did not pass. The test leg starts at t=0, so the dist leg waits only
+  # for whichever of it and release-prep finishes last: about +6 min on the
+  # v0.19.1 release (run 35924997199), not the two legs' sum.
   #
   # build-and-test-windows runs moon's `pond:test-msvc`, never `pond:test`: the
   # task fingerprint carries command/args/deps/env/inputs/outputs but no OS or
@@ -513,6 +517,9 @@ jobs:
     needs: [build-and-test-linux, flake-check]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Normally under a minute. The headroom is for release-plz's source-build
+    # fallback (below), which compiles it when binstall cannot find the asset.
+    timeout-minutes: 20
     concurrency: { group: "release-plz-${{ github.ref }}", cancel-in-progress: false }
     outputs:
       is_release: ${{ steps.detect.outputs.is_release }}
@@ -740,8 +747,6 @@ jobs:
       V: ${{ needs.dist-build-unix.outputs.v }}
       BAZEL_REMOTE_AUTH: ""
       MOON_REMOTE_HOST: ""
-    outputs:
-      released: ${{ steps.gate.outputs.released }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
@@ -786,15 +791,16 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       # A re-run finds the tag already cut, so release-plz reports no release;
-      # the release existing is what lets the tail (and npm/winget) resume.
-      - id: gate
+      # the release existing is what lets the tail (and the jobs after this one)
+      # resume. The step passes only when the release exists, so everything
+      # downstream can rely on this job's success alone.
+      - name: The GitHub release exists
         env:
           GH_TOKEN: ${{ github.token }}
           CREATED: ${{ steps.release-plz.outputs.releases_created }}
         run: |
           set -euo pipefail
           if [ "$CREATED" = true ]; then
-            echo "released=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # publish-release only runs while the tag is missing, and release-plz
@@ -804,15 +810,14 @@ jobs:
           code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/tenequm/pond/releases/tags/v$V")
           case "$code" in
-            200) echo "released=true" >> "$GITHUB_OUTPUT" ;;
+            200) ;;
             404) echo "::error::release-plz created no release and v$V has none: the crate or tag was published without the GitHub release. Create the v$V release by hand, then re-run this job." >&2; exit 1 ;;
             *) echo "::error::release lookup for v$V returned HTTP $code" >&2; exit 1 ;;
           esac
 
       # Checksums merge, binary upload, repo flake commit, Homebrew formula.
       # Idempotent, so "Re-run failed jobs" is safe.
-      - if: steps.gate.outputs.released == 'true'
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
           GH_RELEASE_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
         run: moon run repo:publish-release
@@ -828,7 +833,6 @@ jobs:
   # bump publishes nothing, and "Re-run failed jobs" retries safely.
   publish-npm:
     needs: [publish-release]
-    if: ${{ needs.publish-release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -901,13 +905,15 @@ jobs:
   #         # Classic PAT: winget-releaser rejects fine-grained tokens.
   #         token: ${{ secrets.WINGET_PAT }}
 
-  # The docs site (docs/site) on Cloudflare. One cancellable group for both
-  # deploy jobs: each deploys the whole site from its own checkout, so a newer
-  # deploy supersedes an older one outright.
+  # The docs site (docs/site) on Cloudflare, redeployed on every main push
+  # rather than only on docs changes: both deploy jobs share one cancellable
+  # group, and each builds the whole site from main's head and fetches releases
+  # at build time, so a newer deploy supersedes whatever it cancels.
   deploy-docs:
+    # Main only: a dispatch on another branch must not ship that branch's docs.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency: { group: deploy-docs, cancel-in-progress: true }
@@ -917,33 +923,8 @@ jobs:
       BAZEL_REMOTE_AUTH: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # A job-level `paths:` filter does not exist, and a workflow-level one
-      # would gate the whole graph, so the push's own diff decides. Diffing two
-      # commits needs only their trees, hence the depth-1 fetch of `before`. A
-      # new branch (all-zeros `before`) or an unreachable one (a force-push)
-      # deploys rather than guesses.
-      - id: changed
-        env:
-          EVENT: ${{ github.event_name }}
-          BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          deploy() { echo "deploy=true" >> "$GITHUB_OUTPUT"; exit 0; }
-          [ "$EVENT" = push ] || deploy
-          case "$BEFORE" in ''|0000000000000000000000000000000000000000) deploy ;; esac
-          git fetch --no-tags --depth=1 origin "$BEFORE" || deploy
-          # To a file, not a pipe: `grep -q` exiting at its first match hands
-          # git a SIGPIPE, which pipefail would turn into "no match".
-          git diff --name-only "$BEFORE" HEAD > "$RUNNER_TEMP/changed.txt"
-          if grep -qE '^(docs/|\.github/workflows/ci\.yml$|\.github/actions/docs-deploy/)' "$RUNNER_TEMP/changed.txt"; then
-            deploy
-          fi
-          echo "deploy=false" >> "$GITHUB_OUTPUT"
-          echo "No docs change in this push; nothing to deploy."
-      - if: steps.changed.outputs.deploy == 'true'
-        uses: ./.github/actions/docs-deploy
+      - uses: ./.github/actions/docs-deploy
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
@@ -951,17 +932,18 @@ jobs:
   # a docs change even when no file under docs/ moved.
   deploy-docs-changelog:
     needs: [publish-release]
-    if: ${{ needs.publish-release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency: { group: deploy-docs, cancel-in-progress: true }
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
+      # main, not the release commit: the shared group must only ever deploy
+      # main's head, never roll the site back to an older commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { ref: main }
       - uses: ./.github/actions/docs-deploy
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 

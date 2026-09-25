@@ -24,4 +24,4 @@ pond's changelog is generated from squash-commit messages, so what you write on 
 
 ## Everything else
 
-Run the same three commands before pushing. CI re-runs them on Linux, and natively on Windows for same-repo branches (a fork PR gets the Windows leg when a maintainer pushes the branch, or on merge).
+Run the same three commands before pushing. CI re-runs them on Linux, and natively on Windows on every main push, on a manual dispatch, and on same-repo PRs labelled `windows` (a fork PR gets the Windows leg when a maintainer pushes the branch, or on merge).
