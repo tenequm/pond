@@ -5,8 +5,7 @@
 #
 # Separate from ci.yml because of the `edited` trigger: the input here is the PR
 # *description*, and editing one fires only `edited`. Adding that to ci.yml would
-# start the full test matrix - windows-verify included - on every keystroke saved
-# in the description box.
+# start the whole build graph on every keystroke saved in the description box.
 #
 # The changelog is generated from squash-commit messages at release time (see
 # .github/release-plz.toml), so this is the last moment feedback can still change
