@@ -1,7 +1,6 @@
 //! What the desk knows about sessions, and the bounded file that carries it
-//! between opens (`desk-cache.json` in the plugin state dir). The desk paints
-//! from it before the first listing lands and hydrates only what it lacks. A
-//! missing or unreadable file is an empty cache, never an error.
+//! between opens (`desk-cache.json` in the plugin state dir). A missing or
+//! unreadable file is an empty cache, never an error.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -11,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{log_line, write_atomic};
-use crate::types::SessionRow;
+use crate::types::{SessionRow, SessionStats};
 
 const CACHE_FILE: &str = "desk-cache.json";
 const LOG_FILE: &str = "desk.log";
@@ -19,24 +18,26 @@ const LOG_FILE: &str = "desk.log";
 const VERSION: u32 = 1;
 const MAX_SESSIONS: usize = 2000;
 const MAX_LISTINGS: usize = 8;
+/// Owner-only: it holds prompt titles, project paths and host names.
+const CACHE_MODE: u32 = 0o600;
 
 /// Titles and hosts never change once read; counts and a missing title hold
 /// only for the `last_ts` they were read at.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(super) struct Known {
-    /// The newest `last_ts` a listing reported.
+    /// The newest `last_ts` a listing or stats read reported.
     #[serde(default)]
     last_ts: Option<DateTime<Utc>>,
     /// The session's first message: its host is the origin host, and a
     /// listing window starting at or before it holds the whole session.
     #[serde(default)]
-    pub(super) first_ts: Option<DateTime<Utc>>,
+    first_ts: Option<DateTime<Utc>>,
     #[serde(default)]
     count: Option<Counted>,
     #[serde(default)]
     title: Option<Title>,
     #[serde(default)]
-    pub(super) host: Option<Host>,
+    host: Option<Host>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -86,11 +87,31 @@ impl Known {
         ));
     }
 
-    pub(super) fn set_stats(&mut self, messages: u64, first_ts: DateTime<Utc>) {
-        self.first_ts = Some(first_ts);
+    pub(super) fn first_ts(&self) -> Option<DateTime<Utc>> {
+        self.first_ts
+    }
+
+    pub(super) fn host(&self) -> Option<&Host> {
+        self.host.as_ref()
+    }
+
+    /// `None` is a first message with no host stamp.
+    pub(super) fn set_host(&mut self, host: Option<String>) {
+        self.host = Some(host.map_or(Host::Unstamped, Host::Stamped));
+    }
+
+    /// The count holds for the activity the stats read saw, which a listing
+    /// that landed meanwhile may already have moved past; the newer count wins.
+    pub(super) fn set_stats(&mut self, stats: &SessionStats) {
+        self.first_ts = Some(stats.first_ts);
+        let seen = Some(stats.last_ts);
+        if self.count.is_some_and(|counted| counted.last_ts > seen) {
+            return;
+        }
+        self.last_ts = self.last_ts.max(seen);
         self.count = Some(Counted {
-            last_ts: self.last_ts,
-            messages,
+            last_ts: seen,
+            messages: stats.message_count,
         });
     }
 
@@ -124,6 +145,9 @@ pub(super) struct SavedListing {
     pub(super) all_time: bool,
     pub(super) saved_at: DateTime<Utc>,
     pub(super) rows: Vec<SessionRow>,
+    /// Landed during this desk run, as opposed to restored from the file.
+    #[serde(skip)]
+    pub(super) fresh: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -169,12 +193,23 @@ pub(super) fn load(state_dir: &Path) -> Snapshot {
         Err(error) if error.kind() == ErrorKind::NotFound => return Snapshot::default(),
         Err(error) => Err(error.to_string()),
     };
+    let log = state_dir.join(LOG_FILE);
     match loaded {
         Ok(snapshot) if snapshot.version == VERSION => snapshot,
-        Ok(_) => Snapshot::default(),
+        Ok(snapshot) => {
+            log_line(
+                &log,
+                &format!(
+                    "ignoring {}: version {}, expected {VERSION}",
+                    path.display(),
+                    snapshot.version
+                ),
+            );
+            Snapshot::default()
+        }
         Err(error) => {
             log_line(
-                &state_dir.join(LOG_FILE),
+                &log,
                 &format!("ignoring unreadable {}: {error}", path.display()),
             );
             Snapshot::default()
@@ -187,7 +222,7 @@ pub(super) fn save(state_dir: &Path, mut snapshot: Snapshot) {
     let path = state_dir.join(CACHE_FILE);
     let written = serde_json::to_vec(&snapshot)
         .map_err(std::io::Error::other)
-        .and_then(|json| write_atomic(&path, &json));
+        .and_then(|json| write_atomic(&path, &json, CACHE_MODE));
     if let Err(error) = written {
         log_line(
             &state_dir.join(LOG_FILE),
@@ -199,6 +234,8 @@ pub(super) fn save(state_dir: &Path, mut snapshot: Snapshot) {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::os::unix::fs::PermissionsExt;
 
     use chrono::TimeDelta;
 
@@ -305,11 +342,18 @@ mod tests {
                 all_time: false,
                 saved_at: base + TimeDelta::hours(i64::try_from(i).unwrap()),
                 rows: Vec::new(),
+                fresh: true,
             })
             .collect();
         save(&dir, Snapshot::new(sessions, listings));
+        let mode = std::fs::metadata(dir.join(CACHE_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, CACHE_MODE);
 
         let loaded = load(&dir);
+        assert!(loaded.listings.iter().all(|listing| !listing.fresh));
         assert_eq!(loaded.sessions.len(), MAX_SESSIONS);
         assert!(!loaded.sessions.contains_key("s0"), "the oldest is dropped");
         assert_eq!(
@@ -342,5 +386,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load(&dir), Snapshot::default());
+        let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert!(
+            log.contains(&format!("version 99, expected {VERSION}")),
+            "{log}"
+        );
+    }
+
+    fn stats(last: &str, messages: u64) -> SessionStats {
+        SessionStats {
+            session_id: "s".to_owned(),
+            message_count: messages,
+            first_ts: ts("2026-09-01T00:00:00Z"),
+            last_ts: ts(last),
+        }
+    }
+
+    #[test]
+    fn a_stats_count_holds_for_the_activity_it_saw() {
+        let mut known = Known::default();
+        known.observe(
+            &row("2026-09-12T00:00:00Z", "2026-09-20T00:00:00Z", 5),
+            Some(ts("2026-09-15T00:00:00Z")),
+        );
+        known.set_stats(&stats("2026-09-19T00:00:00Z", 4));
+        assert_eq!(
+            known.count(),
+            None,
+            "a read from before the listing's activity undercounts"
+        );
+
+        known.set_stats(&stats("2026-09-20T00:00:00Z", 9));
+        assert_eq!(known.count(), Some(9));
+        known.set_stats(&stats("2026-09-19T00:00:00Z", 4));
+        assert_eq!(known.count(), Some(9), "an older read is ignored");
+
+        known.set_stats(&stats("2026-09-21T00:00:00Z", 12));
+        assert_eq!(known.count(), Some(12), "a newer read moves the session on");
     }
 }

@@ -23,9 +23,9 @@ pub(crate) type ApiFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiErro
 /// open; the desk shows its loading state for the whole wait.
 pub(crate) trait Api: Send + Sync {
     fn list_sessions(&self, scope: ListingScope) -> ApiFuture<'_, Vec<SessionRow>>;
-    /// The page-scoped hydration queries: at most one row per id, order
-    /// unspecified, and empty input returns empty without a request. A
-    /// session with no user message has no title row.
+    // The page-scoped hydration queries: at most one row per id, order
+    // unspecified, and empty input returns empty without a request.
+    /// A session with no user message has no row.
     fn titles(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionTitle>>;
     fn stats(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionStats>>;
     /// Each session's origin host, read from its first message only.
@@ -80,12 +80,13 @@ pub(crate) struct SessionTitle {
     pub title: Option<String>,
 }
 
-/// Whole-session, whatever the listing window.
+/// Whole-session, whatever the listing window, as of `last_ts`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct SessionStats {
     pub session_id: String,
     pub message_count: u64,
     pub first_ts: DateTime<Utc>,
+    pub last_ts: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +183,8 @@ pub(crate) enum ApiError {
     Rejected { status: u16, body: String },
     /// The installed pond predates `/v1/x/sql` or `pond serve --socket`.
     PondTooOld,
-    /// Connection refused (the serve is gone), or no serve could be started.
+    /// Connection refused or no socket (the serve is gone), or no serve could
+    /// be started.
     Unreachable(String),
     /// Timed out or cut off mid-response; the serve may still be alive.
     Request(String),
@@ -386,11 +388,13 @@ pub(crate) fn titles_sql(session_ids: &[String]) -> String {
     )
 }
 
-/// Narrow columns only: the whole-session count and start.
+/// Narrow columns only: the whole-session count and start, and the newest
+/// activity the count covers.
 pub(crate) fn stats_sql(session_ids: &[String]) -> String {
     format!(
-        "SELECT session_id, COUNT(*) AS message_count, MIN(timestamp) AS first_ts \
-         FROM messages WHERE session_id IN ({}) GROUP BY session_id LIMIT {}",
+        "SELECT session_id, COUNT(*) AS message_count, MIN(timestamp) AS first_ts, \
+         MAX(timestamp) AS last_ts FROM messages WHERE session_id IN ({}) \
+         GROUP BY session_id LIMIT {}",
         id_list(session_ids.iter()),
         session_ids.len()
     )
@@ -503,7 +507,9 @@ mod tests {
         assert!(titles.ends_with("GROUP BY session_id LIMIT 2"));
 
         let stats = stats_sql(&ids);
-        assert!(stats.contains("COUNT(*) AS message_count, MIN(timestamp) AS first_ts"));
+        assert!(stats.contains(
+            "COUNT(*) AS message_count, MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts"
+        ));
         assert!(stats.ends_with("LIMIT 2"));
         assert!(!stats.contains("search_text") && !stats.contains("options"));
 
@@ -604,6 +610,7 @@ mod tests {
         assert_eq!(titles.len(), 1);
         let stats: Vec<SessionStats> = decode(golden::SQL_STATS).into_rows().unwrap();
         assert_eq!(stats[0].message_count, 94);
+        assert_eq!(stats[1].last_ts, ts("2026-09-23T19:29:20.1Z"));
 
         let messages: Vec<TranscriptMessage> = decode(golden::SQL_PAGE).into_rows().unwrap();
         assert_eq!(messages[0].timestamp, messages[1].timestamp);

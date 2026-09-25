@@ -104,7 +104,7 @@ pub(crate) fn read_endpoint(path: &Path) -> Option<Endpoint> {
 
 pub(crate) fn write_endpoint(path: &Path, endpoint: &Endpoint) -> std::io::Result<()> {
     let json = serde_json::to_vec(endpoint).map_err(std::io::Error::other)?;
-    write_atomic(path, &json)
+    write_atomic(path, &json, 0o666)
 }
 
 pub(crate) fn remove_endpoint_if_owned(path: &Path, token: &str) -> bool {

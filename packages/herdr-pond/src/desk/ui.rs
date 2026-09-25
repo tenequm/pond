@@ -13,16 +13,18 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, Lane};
-use super::cache::Host;
+use super::cache::{Host, Known};
 use crate::types::{LISTING_WINDOW_DAYS, SearchSession, SessionRow, TranscriptMessage};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TAB_STOP: usize = 4;
-/// The machine column fits the widest name in view, between these bounds;
-/// below [`SIDE_BY_SIDE_MIN_WIDTH`] it keeps to the narrow cap.
+/// The machine column fits the widest name in the listing, between these
+/// bounds; a list narrower than [`MACHINE_WIDE_LIST_MIN`] keeps to the
+/// narrow cap.
 const MACHINE_MIN: usize = 7;
 const MACHINE_NARROW: usize = 10;
 const MACHINE_WIDE: usize = 16;
+const MACHINE_WIDE_LIST_MIN: u16 = 100;
 const THIS_MACHINE: &str = "this";
 const UNSTAMPED: &str = "local?";
 const ADAPTER: usize = 12;
@@ -143,7 +145,7 @@ fn render_desk(frame: &mut Frame, app: &mut App) {
 }
 
 fn window_label(app: &App) -> String {
-    if app.all_time {
+    if !app.listing_filter.recent {
         "all time".to_owned()
     } else {
         format!("last {LISTING_WINDOW_DAYS} days")
@@ -152,7 +154,7 @@ fn window_label(app: &App) -> String {
 
 /// The typed-search scope in words: the whole corpus unless `p` or `t`
 /// narrowed it.
-pub(super) fn search_label(app: &App) -> String {
+fn search_label(app: &App) -> String {
     let scope = app.search_scope();
     let window = scope.since.map_or_else(String::new, |_| {
         format!(", last {LISTING_WINDOW_DAYS} days")
@@ -267,7 +269,7 @@ fn row_items(app: &App, machine: usize) -> Result<Vec<ListItem<'static>>, String
         };
     }
     match app.listing() {
-        None if app.lane_loading(Lane::Listing) && app.all_time => {
+        None if app.lane_loading(Lane::Listing) && !app.listing_filter.recent => {
             Err("loading the all-time listing - this can take a while".to_owned())
         }
         None if app.lane_loading(Lane::Listing) => Err("loading sessions...".to_owned()),
@@ -295,11 +297,7 @@ fn machine_label<'a>(app: &'a App, session_id: &str) -> Span<'a> {
             .as_deref()
             .is_some_and(|local| short_host(local).eq_ignore_ascii_case(short_host(name)))
     };
-    match app
-        .known
-        .get(session_id)
-        .and_then(|known| known.host.as_ref())
-    {
+    match app.known.get(session_id).and_then(Known::host) {
         Some(Host::Stamped(name)) if this(name) => THIS_MACHINE.fg(Color::Cyan),
         Some(Host::Stamped(name)) => Span::raw(short_host(name)),
         Some(Host::Unstamped) => UNSTAMPED.dim(),
@@ -307,18 +305,28 @@ fn machine_label<'a>(app: &'a App, session_id: &str) -> Span<'a> {
     }
 }
 
-pub(super) fn machine_width(app: &App, list_width: u16) -> usize {
-    let cap = if list_width >= SIDE_BY_SIDE_MIN_WIDTH {
+fn machine_width(app: &App, list_width: u16) -> usize {
+    let cap = if list_width >= MACHINE_WIDE_LIST_MIN {
         MACHINE_WIDE
     } else {
         MACHINE_NARROW
     };
-    (0..app.rows_len())
-        .filter_map(|index| app.id_at(index))
-        .map(|id| machine_label(app, id).width())
-        .max()
-        .unwrap_or(0)
-        .clamp(MACHINE_MIN, cap)
+    let width = |id: &str| machine_label(app, id).width();
+    let widest = match &app.search {
+        Some(search) => search
+            .response
+            .iter()
+            .flat_map(|response| &response.sessions)
+            .map(|session| width(&session.session_id))
+            .max(),
+        None => app
+            .listing()
+            .unwrap_or_default()
+            .iter()
+            .map(|row| width(&row.session_id))
+            .max(),
+    };
+    widest.unwrap_or(0).clamp(MACHINE_MIN, cap)
 }
 
 fn machine(app: &App, session_id: &str, width: usize) -> Span<'static> {
@@ -412,11 +420,14 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
 
 fn footer(app: &App) -> Line<'static> {
     let help = if app.typing {
-        "enter done  esc clear  up/down select"
+        "enter done  esc clear  up/down select".to_owned()
     } else if app.search.is_some() {
-        "/ edit  esc back  enter open  space preview  p project/everything  t 14 days/any  q quit"
+        format!(
+            "/ edit  esc back  enter open  space preview  p project/everything  \
+             t {LISTING_WINDOW_DAYS} days/any  q quit"
+        )
     } else {
-        "/ search  enter open  space preview  p projects  t time  r refresh  q quit"
+        "/ search  enter open  space preview  p projects  t time  r refresh  q quit".to_owned()
     };
     let mut spans = Vec::new();
     if app.spinner_visible() {
@@ -435,9 +446,14 @@ fn render_pager(frame: &mut Frame, app: &App) {
         return;
     };
     let areas = pager_areas(frame.area());
+    let title = match app.known.get(&pager.session_id).and_then(Known::title) {
+        Some(Some(title)) => Span::raw(one_line(title)).bold(),
+        Some(None) => NO_TITLE.dim(),
+        None => "...".dim(),
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::raw(pager.title.clone()).bold(),
+            title,
             Span::raw(format!(" | {}", pager.session_id)).dim(),
         ])),
         areas.header,

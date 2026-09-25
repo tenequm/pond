@@ -48,9 +48,9 @@ pub(crate) mod golden {
         {"session_id":"s-live","title":"fix the timer re-arm"}
     ],"row_count":1,"truncated":false,"elapsed_ms":910}"#;
 
-    pub(crate) const SQL_STATS: &str = r#"{"columns":["session_id","message_count","first_ts"],"rows":[
-        {"session_id":"s-live","message_count":94,"first_ts":"2026-09-24T21:10:00.000000Z"},
-        {"session_id":"s-old","message_count":3,"first_ts":"2026-09-23T19:20:00.000000Z"}
+    pub(crate) const SQL_STATS: &str = r#"{"columns":["session_id","message_count","first_ts","last_ts"],"rows":[
+        {"session_id":"s-live","message_count":94,"first_ts":"2026-09-24T21:10:00.000000Z","last_ts":"2026-09-25T04:00:02.384123Z"},
+        {"session_id":"s-old","message_count":3,"first_ts":"2026-09-23T19:20:00.000000Z","last_ts":"2026-09-23T19:29:20.100000Z"}
     ],"row_count":2,"truncated":false,"elapsed_ms":380}"#;
 
     /// Nulls are omitted: `s-old`'s first message carries no host stamp.

@@ -4,7 +4,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -156,13 +156,21 @@ pub(crate) fn try_lock(path: &Path) -> io::Result<Option<Flock<File>>> {
     }
 }
 
-/// Temp file + rename, so a reader never sees a half-written file.
-pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+/// Temp file + rename, so a reader never sees a half-written file. `mode`
+/// is filtered by the umask, as `fs::write`'s 0o666 is; the temp file is
+/// created fresh so a leftover one cannot carry a wider mode over.
+pub(crate) fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     ensure_parent(path)?;
     let mut temp = path.as_os_str().to_owned();
     temp.push(format!(".tmp.{}", std::process::id()));
     let temp = PathBuf::from(temp);
-    fs::write(&temp, contents)?;
+    let _ = fs::remove_file(&temp);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temp)?
+        .write_all(contents)?;
     fs::rename(&temp, path).inspect_err(|_| {
         let _ = fs::remove_file(&temp);
     })
@@ -285,9 +293,13 @@ mod tests {
     fn atomic_write_replaces_whole_file() {
         let sandbox = Sandbox::new();
         let path = sandbox.path("state/endpoint");
-        write_atomic(&path, b"one").unwrap();
-        write_atomic(&path, b"two").unwrap();
+        write_atomic(&path, b"one", 0o666).unwrap();
+        write_atomic(&path, b"two", 0o600).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(fs::read_dir(sandbox.path("state")).unwrap().count(), 1);
     }
 }

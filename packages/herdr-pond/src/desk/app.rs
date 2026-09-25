@@ -12,7 +12,7 @@ use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use unicode_width::UnicodeWidthStr;
 
-use super::cache::{Host, Known, SavedListing, Snapshot};
+use super::cache::{Known, SavedListing, Snapshot};
 use super::ui;
 use crate::types::{
     ApiError, Cursor, DeskContext, DeskExit, LISTING_ROWS, ListingScope, LiveAgent, PAGE_ROWS,
@@ -83,6 +83,18 @@ impl Call {
             _ => self == other,
         }
     }
+
+    /// The sessions a hydration call asks about; none for other calls.
+    fn ids(&self) -> Vec<&str> {
+        match self {
+            Self::Titles(ids) | Self::Stats(ids) => ids.iter().map(String::as_str).collect(),
+            Self::Hosts(starts) => starts
+                .iter()
+                .map(|start| start.session_id.as_str())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -124,6 +136,27 @@ pub(super) enum Effect {
 struct LaneState {
     generation: u64,
     in_flight: Option<Call>,
+    /// Hydration ids asked since the last listing landed, so an id the
+    /// server has no row for is not asked again until the next refresh.
+    asked: HashSet<String>,
+}
+
+/// What `p` and `t` narrow a view to: the desk's project, and the listing
+/// window.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Narrowing {
+    pub(super) project: bool,
+    pub(super) recent: bool,
+}
+
+impl Narrowing {
+    fn toggle(&mut self, projects: bool) {
+        if projects {
+            self.project = !self.project;
+        } else {
+            self.recent = !self.recent;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -184,7 +217,6 @@ pub(super) struct Search {
 #[derive(Debug)]
 pub(super) struct Pager {
     pub(super) session_id: String,
-    pub(super) title: String,
     messages: Vec<TranscriptMessage>,
     starts: Vec<usize>,
     pub(super) lines: Vec<Line<'static>>,
@@ -194,10 +226,9 @@ pub(super) struct Pager {
 }
 
 impl Pager {
-    fn new(session_id: String, title: String, width: usize) -> Self {
+    fn new(session_id: String, width: usize) -> Self {
         Self {
             session_id,
-            title,
             messages: Vec::new(),
             starts: Vec::new(),
             lines: Vec::new(),
@@ -252,19 +283,14 @@ pub(super) struct App {
     pub(super) size: Size,
     epoch: u64,
     lanes: [LaneState; Lane::COUNT],
-    pub(super) all_projects: bool,
-    pub(super) all_time: bool,
-    /// Typed search covers everything unless narrowed to the project or the
-    /// listing window.
-    pub(super) search_project: bool,
-    pub(super) search_recent: bool,
+    /// The listing opens narrowed to the project and the listing window;
+    /// typed search opens on everything.
+    pub(super) listing_filter: Narrowing,
+    pub(super) search_filter: Narrowing,
     /// One per scope, this desk's and other projects' alike, so saving the
     /// cache keeps what other desks stored.
     listings: Vec<SavedListing>,
     pub(super) known: HashMap<String, Known>,
-    /// Asked per hydration lane since the last listing landed, so an id the
-    /// server has no row for is not asked again until the next refresh.
-    requested: HashMap<Lane, HashSet<String>>,
     pub(super) live: Vec<LiveAgent>,
     pub(super) listing_state: ListState,
     pub(super) search_state: ListState,
@@ -291,13 +317,16 @@ impl App {
             size,
             epoch: 0,
             lanes: Default::default(),
-            all_projects: false,
-            all_time: false,
-            search_project: false,
-            search_recent: false,
+            listing_filter: Narrowing {
+                project: true,
+                recent: true,
+            },
+            search_filter: Narrowing {
+                project: false,
+                recent: false,
+            },
             listings: Vec::new(),
             known: HashMap::new(),
-            requested: HashMap::new(),
             live: Vec::new(),
             listing_state: ListState::default(),
             search_state: ListState::default(),
@@ -354,35 +383,45 @@ impl App {
         self.dirty = true;
     }
 
-    pub(super) fn scope(&self) -> ListingScope {
-        let project = (!self.all_projects)
+    fn scope_for(&self, filter: Narrowing) -> ListingScope {
+        let project = filter
+            .project
             .then(|| self.context.project.clone())
             .flatten();
         let mut scope = ListingScope::recent(project, self.now);
-        if self.all_time {
+        if !filter.recent {
             scope.since = None;
         }
         scope
+    }
+
+    pub(super) fn scope(&self) -> ListingScope {
+        self.scope_for(self.listing_filter)
     }
 
     pub(super) fn search_scope(&self) -> ListingScope {
-        let project = self
-            .search_project
-            .then(|| self.context.project.clone())
+        self.scope_for(self.search_filter)
+    }
+
+    /// [`Self::scope`]'s key, without building the scope.
+    fn listing_key(&self) -> ScopeKey<'_> {
+        let filter = self.listing_filter;
+        let project = filter
+            .project
+            .then_some(self.context.project.as_deref())
             .flatten();
-        let mut scope = ListingScope::recent(project, self.now);
-        if !self.search_recent {
-            scope.since = None;
-        }
-        scope
+        (project, !filter.recent)
+    }
+
+    fn saved_listing(&self) -> Option<&SavedListing> {
+        let key = self.listing_key();
+        self.listings
+            .iter()
+            .find(|listing| saved_key(listing) == key)
     }
 
     pub(super) fn listing(&self) -> Option<&[SessionRow]> {
-        let key = scope_key(&self.scope());
-        self.listings
-            .iter()
-            .find(|listing| (&listing.project, listing.all_time) == (&key.0, key.1))
-            .map(|listing| listing.rows.as_slice())
+        self.saved_listing().map(|listing| listing.rows.as_slice())
     }
 
     pub(super) fn rows_len(&self) -> usize {
@@ -699,30 +738,37 @@ impl App {
 
     /// Hydrates the rows around the selection - never the whole listing -
     /// with one request per lane, concurrently, each asking only for what is
-    /// not known yet. A host is read at the session's first message, so it
-    /// waits for the stats that find that start when the listing cannot.
+    /// not known yet. The window snaps to page-sized blocks so a held key
+    /// asks nothing new within one, titles are asked only where they show
+    /// (the listing and the pager header), and a host waits for the stats
+    /// that find the session's first message when the listing cannot.
     fn hydrate_visible(&mut self) -> Vec<Effect> {
         let len = self.rows_len();
-        let selected = self.selected_index().unwrap_or(0);
         let height = usize::from(ui::desk_areas(self.area(), self.preview_open).list.height).max(1);
-        let window: Vec<String> = (selected.saturating_sub(height)
-            ..(selected + height + 1).min(len))
+        let base = self.selected_index().unwrap_or(0) / height * height;
+        let window: Vec<String> = (base.saturating_sub(height)..(base + 2 * height).min(len))
             .filter_map(|index| self.id_at(index))
             .map(str::to_owned)
             .collect();
         let listing = self.search.is_none();
-        let titles = self.unknown(Lane::Titles, &window, |known| known.title().is_none());
+        let mut titled = if listing { window.clone() } else { Vec::new() };
+        if let Some(pager) = &self.pager
+            && !titled.contains(&pager.session_id)
+        {
+            titled.push(pager.session_id.clone());
+        }
+        let titles = self.unknown(Lane::Titles, &titled, |known| known.title().is_none());
         let stats = self.unknown(Lane::Stats, &window, |known| {
             (listing && known.count().is_none())
-                || (known.host.is_none() && known.first_ts.is_none())
+                || (known.host().is_none() && known.first_ts().is_none())
         });
         let hosts: Vec<SessionStart> = self
             .unknown(Lane::Hosts, &window, |known| {
-                known.host.is_none() && known.first_ts.is_some()
+                known.host().is_none() && known.first_ts().is_some()
             })
             .into_iter()
             .filter_map(|id| {
-                let first_ts = self.known.get(&id)?.first_ts?;
+                let first_ts = self.known.get(&id)?.first_ts()?;
                 Some(SessionStart {
                     session_id: id,
                     first_ts,
@@ -730,13 +776,9 @@ impl App {
             })
             .collect();
         [
-            self.request(Lane::Titles, titles.clone(), Call::Titles(titles)),
-            self.request(Lane::Stats, stats.clone(), Call::Stats(stats)),
-            self.request(
-                Lane::Hosts,
-                hosts.iter().map(|start| start.session_id.clone()).collect(),
-                Call::Hosts(hosts),
-            ),
+            self.request(Call::Titles(titles)),
+            self.request(Call::Stats(stats)),
+            self.request(Call::Hosts(hosts)),
         ]
         .into_iter()
         .flatten()
@@ -749,20 +791,27 @@ impl App {
         if self.lane_loading(lane) {
             return Vec::new();
         }
-        let asked = self.requested.get(&lane);
+        let asked = &self.lanes[lane as usize].asked;
         ids.iter()
-            .filter(|id| asked.is_none_or(|asked| !asked.contains(*id)))
+            .filter(|id| !asked.contains(*id))
             .filter(|id| self.known.get(*id).is_none_or(&need))
             .cloned()
             .collect()
     }
 
-    fn request(&mut self, lane: Lane, ids: Vec<String>, call: Call) -> Option<Effect> {
+    fn request(&mut self, call: Call) -> Option<Effect> {
+        let ids: Vec<String> = call.ids().into_iter().map(str::to_owned).collect();
         if ids.is_empty() {
             return None;
         }
-        self.requested.entry(lane).or_default().extend(ids);
+        self.lanes[call.lane() as usize].asked.extend(ids);
         self.fetch(call, Duration::ZERO)
+    }
+
+    fn forget_asked(&mut self) {
+        for lane in &mut self.lanes {
+            lane.asked.clear();
+        }
     }
 
     fn preview_selected(&mut self, delay: Duration) -> Option<Effect> {
@@ -814,7 +863,9 @@ impl App {
 
     /// `p` means "this project only / everything" and `t` "the listing
     /// window / all time", for whichever view is up: the listing and typed
-    /// search keep their own scopes.
+    /// search keep their own filters. A listing already fetched this run
+    /// shows at once; one restored from the file shows at once too, but may
+    /// be days old, so it is refetched behind.
     fn toggle_scope(&mut self, projects: bool) -> Vec<Effect> {
         if projects && self.context.project.is_none() {
             self.toast = Some(
@@ -825,25 +876,19 @@ impl App {
         if let Some(search) = &mut self.search {
             search.response = None;
             let query = search.query.clone();
-            if projects {
-                self.search_project = !self.search_project;
-            } else {
-                self.search_recent = !self.search_recent;
-            }
+            self.search_filter.toggle(projects);
             let mut effects = self.transition();
             effects.extend(self.fetch_search(query, Duration::ZERO));
             return effects;
         }
         let selected = self.selected_listing_id();
-        if projects {
-            self.all_projects = !self.all_projects;
-        } else {
-            self.all_time = !self.all_time;
-        }
+        self.listing_filter.toggle(projects);
         let mut effects = self.transition();
-        if self.listing().is_some() {
+        let fresh = self.saved_listing().map(|listing| listing.fresh);
+        if fresh.is_some() {
             self.restore_listing_selection(selected.as_deref());
-        } else {
+        }
+        if fresh != Some(true) {
             effects.extend(self.fetch(Call::Listing(self.scope()), Duration::ZERO));
         }
         effects.extend(self.selection_changed());
@@ -875,14 +920,11 @@ impl App {
                 pane_id: agent.pane_id.clone(),
             })];
         }
-        let title = self
-            .known
-            .get(&id)
-            .and_then(|known| known.title().flatten())
-            .map_or_else(|| ui::NO_TITLE.to_owned(), ui::one_line);
         let width = usize::from(self.pager_viewport().width);
-        self.pager = Some(Pager::new(id, title, width));
-        self.load_more()
+        self.pager = Some(Pager::new(id, width));
+        let mut effects = self.hydrate_visible();
+        effects.extend(self.load_more());
+        effects
     }
 
     fn close_pager(&mut self) -> Vec<Effect> {
@@ -931,38 +973,9 @@ impl App {
         self.dirty = true;
         match (msg.call, msg.reply) {
             (Call::Listing(scope), Reply::Listing(result)) => self.on_listing(&scope, result),
-            (Call::Titles(ids), Reply::Titles(result)) => match result {
-                Ok(rows) => {
-                    let mut titles: HashMap<String, Option<String>> =
-                        ids.into_iter().map(|id| (id, None)).collect();
-                    titles.extend(rows.into_iter().map(|row| (row.session_id, row.title)));
-                    for (id, title) in titles {
-                        self.known.entry(id).or_default().set_title(title);
-                    }
-                    self.hydrate_visible()
-                }
-                Err(error) => self.toast(&error),
-            },
-            (Call::Stats(_), Reply::Stats(result)) => match result {
-                Ok(rows) => {
-                    for row in rows {
-                        let known = self.known.entry(row.session_id).or_default();
-                        known.set_stats(row.message_count, row.first_ts);
-                    }
-                    self.hydrate_visible()
-                }
-                Err(error) => self.toast(&error),
-            },
-            (Call::Hosts(_), Reply::Hosts(result)) => match result {
-                Ok(rows) => {
-                    for row in rows {
-                        self.known.entry(row.session_id).or_default().host =
-                            Some(row.host.map_or(Host::Unstamped, Host::Stamped));
-                    }
-                    self.hydrate_visible()
-                }
-                Err(error) => self.toast(&error),
-            },
+            (call @ (Call::Titles(_) | Call::Stats(_) | Call::Hosts(_)), reply) => {
+                self.on_hydration(&call, reply)
+            }
             (Call::Live, Reply::Live(result)) => match result {
                 Ok(agents) => {
                     self.live = agents;
@@ -1019,33 +1032,79 @@ impl App {
                     known.observe(row, scope.since);
                 }
                 let key = scope_key(scope);
-                let current = key == scope_key(&self.scope());
+                let current = key == self.listing_key();
                 let selected = self.selected_listing_id();
-                self.listings
-                    .retain(|listing| (&listing.project, listing.all_time) != (&key.0, key.1));
+                self.listings.retain(|listing| saved_key(listing) != key);
                 self.listings.push(SavedListing {
-                    project: key.0,
-                    all_time: key.1,
+                    project: scope.project.clone(),
+                    all_time: scope.since.is_none(),
                     saved_at: self.now,
                     rows,
+                    fresh: true,
                 });
                 if !current {
                     return Vec::new();
                 }
                 self.fatal = None;
-                self.requested.clear();
+                self.forget_asked();
                 self.restore_listing_selection(selected.as_deref());
                 self.hydrate_visible()
             }
             Err(error) => {
-                if self.listings.is_empty()
-                    && matches!(error, ApiError::PondTooOld | ApiError::Unreachable(_))
+                let nothing_shown =
+                    scope_key(scope) == self.listing_key() && self.listing().is_none();
+                if nothing_shown && matches!(error, ApiError::PondTooOld | ApiError::Unreachable(_))
                 {
                     self.fatal = Some(error.to_string());
                     Vec::new()
                 } else {
                     self.toast(&error)
                 }
+            }
+        }
+    }
+
+    /// Learns what a hydration reply proves. A failed one un-asks its ids,
+    /// so their rows are asked again instead of waiting for the next listing.
+    fn on_hydration(&mut self, call: &Call, reply: Reply) -> Vec<Effect> {
+        let learned = match reply {
+            Reply::Titles(result) => result.map(|rows| {
+                let mut titles: HashMap<String, Option<String>> = rows
+                    .into_iter()
+                    .map(|row| (row.session_id, row.title))
+                    .collect();
+                for id in call.ids() {
+                    let title = titles.remove(id).flatten();
+                    self.known
+                        .entry(id.to_owned())
+                        .or_default()
+                        .set_title(title);
+                }
+            }),
+            Reply::Stats(result) => result.map(|rows| {
+                for row in rows {
+                    let known = self.known.entry(row.session_id.clone()).or_default();
+                    known.set_stats(&row);
+                }
+            }),
+            Reply::Hosts(result) => result.map(|rows| {
+                for row in rows {
+                    self.known
+                        .entry(row.session_id)
+                        .or_default()
+                        .set_host(row.host);
+                }
+            }),
+            _ => return Vec::new(),
+        };
+        match learned {
+            Ok(()) => self.hydrate_visible(),
+            Err(error) => {
+                let asked = &mut self.lanes[call.lane() as usize].asked;
+                for id in call.ids() {
+                    asked.remove(id);
+                }
+                self.toast(&error)
             }
         }
     }
@@ -1097,10 +1156,17 @@ impl App {
     }
 }
 
-/// Listings are cached per project and window kind, not per timestamp, so
-/// toggling back is instant even though `since` moves with the clock.
-fn scope_key(scope: &ListingScope) -> (Option<String>, bool) {
-    (scope.project.clone(), scope.since.is_none())
+/// Listings are cached per project and window kind (all time or not), not
+/// per timestamp, so toggling back is instant even though `since` moves
+/// with the clock.
+type ScopeKey<'a> = (Option<&'a str>, bool);
+
+fn scope_key(scope: &ListingScope) -> ScopeKey<'_> {
+    (scope.project.as_deref(), scope.since.is_none())
+}
+
+fn saved_key(listing: &SavedListing) -> ScopeKey<'_> {
+    (listing.project.as_deref(), listing.all_time)
 }
 
 #[cfg(test)]
@@ -1231,6 +1297,56 @@ mod tests {
     }
 
     #[test]
+    fn moving_within_a_page_block_asks_nothing_new() {
+        let api = MockApi {
+            sessions: (0..60).map(|i| row(&format!("s{i:02}"))).collect(),
+            ..MockApi::default()
+        };
+        let mut app = opened(&api, 100, 10);
+        let height = usize::from(ui::desk_areas(app.area(), false).list.height);
+        let opening = hydrations(&api).len();
+        for _ in 1..height {
+            press(&mut app, &api, KeyCode::Down);
+        }
+        assert_eq!(hydrations(&api).len(), opening, "held j inside one block");
+        press(&mut app, &api, KeyCode::Down);
+        assert!(hydrations(&api).len() > opening, "the next block is asked");
+    }
+
+    #[test]
+    fn a_failed_hydration_is_asked_again() {
+        let mut app = opened(&MockApi::golden(), 110, 10);
+        app.known.clear();
+        app.forget_asked();
+        let Some(Effect::Fetch {
+            generation,
+            epoch,
+            call,
+            ..
+        }) = app.hydrate_visible().into_iter().find(|effect| {
+            matches!(
+                effect,
+                Effect::Fetch {
+                    call: Call::Titles(_),
+                    ..
+                }
+            )
+        })
+        else {
+            panic!("no titles asked");
+        };
+        let error = ApiError::Request("timed out".to_owned());
+        app.apply(Msg {
+            generation,
+            epoch,
+            call: call.clone(),
+            reply: Reply::Titles(Err(error.clone())),
+        });
+        assert_eq!(app.toast, Some(error.to_string()));
+        assert!(fetches(&app.hydrate_visible()).contains(&&call));
+    }
+
+    #[test]
     fn a_windowed_count_waits_for_the_session_start_and_all_time_needs_none() {
         let api = MockApi {
             titles_delay: Duration::from_secs(1),
@@ -1304,12 +1420,17 @@ mod tests {
         let api = MockApi::golden();
         let mut app = opened(&api, 110, 10);
         app.known.clear();
-        app.requested.clear();
+        app.forget_asked();
         for id in ["s-live", "s-old"] {
             app.known
                 .entry(id.to_owned())
                 .or_default()
-                .set_stats(5, now() - TimeDelta::days(1));
+                .set_stats(&SessionStats {
+                    session_id: id.to_owned(),
+                    message_count: 5,
+                    first_ts: now() - TimeDelta::days(1),
+                    last_ts: now(),
+                });
         }
         let effects = app.hydrate_visible();
         let lanes: Vec<Lane> = effects
@@ -1447,6 +1568,63 @@ mod tests {
         assert_eq!(app.listing().map(<[SessionRow]>::len), Some(2));
     }
 
+    /// `snapshot` as `load` reads it back from the file.
+    fn reloaded(snapshot: &Snapshot) -> Snapshot {
+        serde_json::from_slice(&serde_json::to_vec(snapshot).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_failed_listing_is_fatal_while_its_own_scope_shows_nothing() {
+        let api = MockApi::golden();
+        let mut warm = opened(&api, 100, 12);
+        press(&mut warm, &api, KeyCode::Char('t'));
+        let mut saved = reloaded(&warm.snapshot());
+        saved.listings.retain(|listing| listing.all_time);
+
+        let failing = MockApi {
+            listing_error: Some(ApiError::PondTooOld),
+            ..MockApi::golden()
+        };
+        let mut app = app(100, 12);
+        app.restore(saved);
+        let effects = app.start();
+        settle(&mut app, &failing, effects);
+        assert_eq!(app.fatal, Some(ApiError::PondTooOld.to_string()));
+    }
+
+    #[test]
+    fn a_restored_listing_for_another_scope_shows_at_once_and_refreshes() {
+        let api = MockApi::golden();
+        let mut warm = opened(&api, 100, 12);
+        press(&mut warm, &api, KeyCode::Char('t'));
+        let mut app = app(100, 12);
+        app.restore(reloaded(&warm.snapshot()));
+        let effects = app.start();
+        settle(&mut app, &api, effects);
+
+        let toggled = app.on_event(&key(KeyCode::Char('t')));
+        assert_eq!(
+            app.listing().map(<[SessionRow]>::len),
+            Some(2),
+            "shown at once"
+        );
+        assert!(
+            fetches(&toggled)
+                .iter()
+                .any(|call| matches!(call, Call::Listing(scope) if scope.since.is_none())),
+            "a restored listing is refetched: {toggled:?}"
+        );
+        settle(&mut app, &api, toggled);
+        press(&mut app, &api, KeyCode::Char('t'));
+        let again = app.on_event(&key(KeyCode::Char('t')));
+        assert!(
+            !fetches(&again)
+                .iter()
+                .any(|call| matches!(call, Call::Listing(_))),
+            "fetched this run: {again:?}"
+        );
+    }
+
     #[test]
     fn later_errors_are_verbatim_toasts() {
         let mut app = opened(&MockApi::golden(), 100, 12);
@@ -1550,9 +1728,9 @@ mod tests {
             !back.contains(&Effect::Cancel(Lane::Listing)),
             "toggling back cancelled the listing: {back:?}"
         );
-        assert!(!app.all_time);
+        assert!(app.listing_filter.recent);
         settle(&mut app, &api, vec![listing]);
-        assert!(!app.all_time, "the late listing moved the view");
+        assert!(app.listing_filter.recent, "the late listing moved the view");
         let cached = app.on_event(&key(KeyCode::Char('t')));
         assert!(
             !fetches(&cached)
@@ -1590,7 +1768,7 @@ mod tests {
             app.spinner_visible(),
             "the desk footer shows the listing load"
         );
-        app.pager = Some(Pager::new("s-old".to_owned(), "t".to_owned(), 80));
+        app.pager = Some(Pager::new("s-old".to_owned(), 80));
         assert!(!app.spinner_visible(), "the pager shows only its own load");
         app.load_more();
         assert!(app.spinner_visible());
@@ -1644,7 +1822,7 @@ mod tests {
 
         press(&mut app, &api, KeyCode::Esc);
         assert!(
-            !app.all_projects && !app.all_time,
+            app.listing_filter.project && app.listing_filter.recent,
             "the listing kept its default"
         );
         press(&mut app, &api, KeyCode::Char('p'));
@@ -1724,6 +1902,34 @@ mod tests {
         press(&mut app, &api, KeyCode::Esc);
         assert!(app.search.is_none());
         assert!(screen(&mut app).contains("2 sessions"));
+    }
+
+    #[test]
+    fn search_asks_no_titles_and_the_pager_asks_for_its_own() {
+        let api = MockApi {
+            search: Some(search_response(golden::SEARCH)),
+            live: Vec::new(),
+            ..MockApi::golden()
+        };
+        let mut app = opened(&api, 120, 12);
+        type_query(&mut app, &api, "timer");
+        press(&mut app, &api, KeyCode::Enter);
+        app.known.clear();
+        app.forget_asked();
+        let searching = app.hydrate_visible();
+        assert!(
+            fetches(&searching)
+                .iter()
+                .all(|call| !matches!(call, Call::Titles(_))),
+            "search rows show snippets, not titles: {searching:?}"
+        );
+        settle(&mut app, &api, searching);
+
+        let opening = app.on_event(&key(KeyCode::Enter));
+        assert!(fetches(&opening).contains(&&Call::Titles(ids(&["s-live"]))));
+        assert!(!screen(&mut app).contains(ui::NO_TITLE));
+        settle(&mut app, &api, opening);
+        assert!(screen(&mut app).starts_with("fix the timer re-arm | s-live"));
     }
 
     #[test]
@@ -1873,7 +2079,7 @@ mod tests {
     }
 
     fn open_pager(app: &mut App) -> Effect {
-        app.pager = Some(Pager::new("s-old".to_owned(), "t".to_owned(), 80));
+        app.pager = Some(Pager::new("s-old".to_owned(), 80));
         let mut effects = app.load_more();
         assert_eq!(effects.len(), 1);
         effects.remove(0)
@@ -2016,7 +2222,7 @@ mod tests {
     fn widening_fetches_more_once_the_rewrap_runs_short() {
         let mut app = opened(&MockApi::golden(), 30, 10);
         let width = usize::from(app.pager_viewport().width);
-        app.pager = Some(Pager::new("s-old".to_owned(), "t".to_owned(), width));
+        app.pager = Some(Pager::new("s-old".to_owned(), width));
         let request = app.load_more().remove(0);
         let messages: Vec<_> = (0..3)
             .map(|i| message(&format!("m{i}"), now(), &"word ".repeat(60)))
@@ -2035,7 +2241,11 @@ mod tests {
     #[test]
     fn the_pager_frame_is_the_viewport_slice() {
         let mut app = app(40, 6);
-        let mut pager = Pager::new("s-old".to_owned(), "fix it".to_owned(), 39);
+        app.known
+            .entry("s-old".to_owned())
+            .or_default()
+            .set_title(Some("fix it".to_owned()));
+        let mut pager = Pager::new("s-old".to_owned(), 39);
         pager.append(vec![
             message("m1", now(), "one\ntwo"),
             TranscriptMessage {
