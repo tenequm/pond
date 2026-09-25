@@ -225,13 +225,6 @@ impl ServeChild {
         let started = Instant::now();
         let mut last_probe = String::new();
         loop {
-            if self.socket.exists() {
-                match probe(&socket).await {
-                    Ok(()) => return Ok(socket),
-                    Err(ApiError::PondTooOld) => return Err(ApiError::PondTooOld),
-                    Err(error) => last_probe = format!(" (last probe: {error})"),
-                }
-            }
             if let Ok(Some(status)) = self.child.try_wait() {
                 if status.code() == Some(USAGE_ERROR_EXIT) && self.rejected_socket_flag() {
                     return Err(ApiError::PondTooOld);
@@ -240,6 +233,16 @@ impl ServeChild {
                     "pond serve exited ({status}) before listening - see {}",
                     self.log.display()
                 )));
+            }
+            if self.socket.exists() {
+                match probe(&socket).await {
+                    // An answer while the child is gone came from another
+                    // process; the next pass reports the exit.
+                    Ok(()) if matches!(self.child.try_wait(), Ok(None)) => return Ok(socket),
+                    Ok(()) => {}
+                    Err(ApiError::PondTooOld) => return Err(ApiError::PondTooOld),
+                    Err(error) => last_probe = format!(" (last probe: {error})"),
+                }
             }
             if started.elapsed() > deadline {
                 return Err(ApiError::Unreachable(format!(
