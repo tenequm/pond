@@ -1356,14 +1356,6 @@ fn io_trace_report(label: &str) {
 }
 
 async fn run() -> anyhow::Result<()> {
-    #[cfg(unix)]
-    #[allow(unsafe_code)]
-    unsafe {
-        // Rust ignores SIGPIPE at startup; restore the Unix default so a closed
-        // pipe exits quietly instead of panicking inside clap_complete's unwrap.
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
     human_panic::setup_panic!();
 
     let cli = Cli::parse();
@@ -1942,12 +1934,13 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::Schedule { command } => schedule::run(command, config)?,
         Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
+            // Buffered because clap_complete unwraps its writes, so a closed
+            // pipe would panic inside it instead of exiting quietly.
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "pond", &mut script);
+            pond::output::raw(&script)?;
         }
-        Command::Skill => {
-            use std::io::Write;
-            io::stdout().write_all(include_str!("../SKILL.md").as_bytes())?;
-        }
+        Command::Skill => pond::output::raw(include_str!("../SKILL.md").as_bytes())?,
         Command::Storage { command } => run_storage_command(command, storage_path, config).await?,
         Command::Creds { command } => {
             let config_file = config_path(config);
@@ -2030,10 +2023,7 @@ async fn run() -> anyhow::Result<()> {
                             path.display()
                         ))?;
                     }
-                    None => {
-                        use std::io::Write;
-                        io::stdout().write_all(&bytes)?;
-                    }
+                    None => pond::output::raw(&bytes)?,
                 },
                 Err(pond::sql::SqlError::Query(message)) => {
                     output_err(&format!(
@@ -2974,10 +2964,13 @@ async fn copy_store_to_jsonl(
             writer.flush().await.context("copy: flush")?;
             summary
         }
-        None => {
-            let mut stdout = tokio::io::stdout();
-            handlers::pond_export(&store, None, &mut stdout).await?
-        }
+        None => handlers::pond_export(&store, None, &mut tokio::io::stdout())
+            .await
+            .inspect_err(|error| {
+                if let Some(error) = error.downcast_ref::<io::Error>() {
+                    pond::output::exit_if_broken_pipe(error);
+                }
+            })?,
     };
     let line = format!(
         "{} jsonl sessions={} messages={} parts={}",

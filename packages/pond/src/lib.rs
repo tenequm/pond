@@ -113,12 +113,28 @@ pub mod output {
     #[allow(clippy::print_stdout)]
     pub fn line(message: &str) -> anyhow::Result<()> {
         let mut stdout = io::stdout().lock();
-        match writeln!(stdout, "{message}") {
-            // Downstream (`pond ... | head`) closed the pipe after reading
-            // what it wanted; the CLI convention is to stop quietly, not
-            // surface "Broken pipe" as an error.
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
-            result => result.context("failed to write command output"),
+        writeln!(stdout, "{message}")
+            .inspect_err(exit_if_broken_pipe)
+            .context("failed to write command output")
+    }
+
+    /// [`line`] for output that is already bytes, flushed so a closed pipe
+    /// surfaces here rather than being dropped at exit.
+    pub fn raw(bytes: &[u8]) -> anyhow::Result<()> {
+        let mut stdout = io::stdout().lock();
+        stdout
+            .write_all(bytes)
+            .and_then(|()| stdout.flush())
+            .inspect_err(exit_if_broken_pipe)
+            .context("failed to write command output")
+    }
+
+    /// Downstream (`pond ... | head`) closed the pipe, so stop quietly the way
+    /// `cat` does. This replaces the Unix SIGPIPE default, which would also kill
+    /// `pond serve` or a sync whenever a socket peer hangs up mid-write.
+    pub fn exit_if_broken_pipe(error: &io::Error) {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
         }
     }
 
@@ -128,10 +144,9 @@ pub mod output {
     /// file or another command yields the machine-readable view alone.
     pub fn line_err(message: &str) -> anyhow::Result<()> {
         let mut stderr = io::stderr().lock();
-        match writeln!(stderr, "{message}") {
-            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
-            result => result.context("failed to write command meta"),
-        }
+        writeln!(stderr, "{message}")
+            .inspect_err(exit_if_broken_pipe)
+            .context("failed to write command meta")
     }
 }
 
