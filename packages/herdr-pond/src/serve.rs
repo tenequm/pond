@@ -251,6 +251,9 @@ impl Drop for ServeChild {
 fn serve_command(pond: &Path, socket: &Path) -> Command {
     let mut command = Command::new(pond);
     command.args(["serve", "--socket"]).arg(socket);
+    // pond ignores these beside `--socket`, but clap still parses them: a
+    // malformed ambient POND_PORT would fail serve before it binds.
+    command.env_remove("POND_HOST").env_remove("POND_PORT");
     command
 }
 
@@ -494,10 +497,16 @@ mod tests {
     }
 
     #[test]
-    fn serve_gets_only_the_socket() {
+    fn serve_gets_only_the_socket_and_never_the_bind_env() {
         let command = serve_command(Path::new("/bin/pond"), Path::new("/s/owner.sock"));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["serve", "--socket", "/s/owner.sock"]);
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(removed, ["POND_HOST", "POND_PORT"]);
     }
 
     #[test]
