@@ -2121,19 +2121,22 @@ fn reject_tcp_bind_beside_socket(matches: &clap::ArgMatches) -> Result<(), clap:
     }
     for flag in ["host", "port"] {
         if serve.value_source(flag) == Some(ValueSource::CommandLine) {
-            return Err(Cli::command().error(
-                clap::error::ErrorKind::ArgumentConflict,
-                format!(
-                    "--socket replaces the TCP bind; drop --{flag} to serve on the socket, \
-                     or drop --socket to serve on --host:--port"
-                ),
-            ));
+            let kind = clap::error::ErrorKind::ArgumentConflict;
+            let message = format!(
+                "--socket replaces the TCP bind; drop --{flag} to serve on the socket, \
+                 or drop --socket to serve on --host:--port"
+            );
+            let mut cli = Cli::command();
+            cli.build();
+            return Err(match cli.find_subcommand_mut("serve") {
+                Some(serve) => serve.error(kind, message),
+                None => cli.error(kind, message),
+            });
         }
     }
     Ok(())
 }
 
-/// Runs before the store opens, so a bad `--socket` fails before any slow work.
 #[cfg(unix)]
 fn prepare_serve_socket(transport: ServeTransport, path: &Path) -> anyhow::Result<()> {
     if transport == ServeTransport::Stdio {
@@ -8032,10 +8035,9 @@ mod tests {
             let error = reject_tcp_bind_beside_socket(&matches)
                 .expect_err("--socket replaces the TCP bind");
             assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-            assert!(
-                error.to_string().contains(&format!("drop {}", tcp[0])),
-                "{error}"
-            );
+            let rendered = error.to_string();
+            assert!(rendered.contains(&format!("drop {}", tcp[0])), "{rendered}");
+            assert!(rendered.contains("Usage: pond serve"), "{rendered}");
         }
         for args in [
             &["pond", "serve", "--socket", "/tmp/pond.sock"][..],
