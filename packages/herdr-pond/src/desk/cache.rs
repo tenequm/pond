@@ -21,11 +21,11 @@ const MAX_LISTINGS: usize = 8;
 /// Owner-only: it holds prompt titles, project paths and host names.
 const CACHE_MODE: u32 = 0o600;
 
-/// Titles and hosts never change once read; counts and a missing title hold
-/// only for the `last_ts` they were read at.
+/// Titles and hosts never change once read; a missing title holds only for
+/// the `last_ts` it was read at, a count until activity past its own.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(super) struct Known {
-    /// The newest `last_ts` a listing or stats read reported.
+    /// The newest `last_ts` a listing reported.
     #[serde(default)]
     last_ts: Option<DateTime<Utc>>,
     /// The session's first message: its host is the origin host, and a
@@ -65,7 +65,7 @@ impl Known {
     /// The whole-session count, if one is known for the current `last_ts`.
     pub(super) fn count(&self) -> Option<u64> {
         self.count
-            .filter(|counted| counted.last_ts == self.last_ts)
+            .filter(|counted| counted.last_ts >= self.last_ts)
             .map(|counted| counted.messages)
     }
 
@@ -101,18 +101,17 @@ impl Known {
     }
 
     /// The count holds for the activity the stats read saw, which a listing
-    /// that landed meanwhile may already have moved past; the newer count wins.
+    /// that landed meanwhile may already have moved past.
     pub(super) fn set_stats(&mut self, stats: &SessionStats) {
         self.first_ts = Some(stats.first_ts);
-        let seen = Some(stats.last_ts);
-        if self.count.is_some_and(|counted| counted.last_ts > seen) {
-            return;
+        self.count_as_of(Some(stats.last_ts), stats.message_count);
+    }
+
+    /// Keeps whichever count saw the newer activity.
+    fn count_as_of(&mut self, last_ts: Option<DateTime<Utc>>, messages: u64) {
+        if self.count.is_none_or(|counted| counted.last_ts <= last_ts) {
+            self.count = Some(Counted { last_ts, messages });
         }
-        self.last_ts = self.last_ts.max(seen);
-        self.count = Some(Counted {
-            last_ts: seen,
-            messages: stats.message_count,
-        });
     }
 
     /// Takes what a listing row proves. The row counts only its window, so
@@ -131,10 +130,7 @@ impl Known {
             .first_ts
             .is_some_and(|first| since.is_none_or(|since| first >= since));
         if whole {
-            self.count = Some(Counted {
-                last_ts: self.last_ts,
-                messages: row.message_count,
-            });
+            self.count_as_of(self.last_ts, row.message_count);
         }
     }
 }
@@ -422,6 +418,24 @@ mod tests {
         assert_eq!(known.count(), Some(9), "an older read is ignored");
 
         known.set_stats(&stats("2026-09-21T00:00:00Z", 12));
-        assert_eq!(known.count(), Some(12), "a newer read moves the session on");
+        assert_eq!(known.count(), Some(12), "a read past the listing counts");
+        known.observe(
+            &row("2026-09-12T00:00:00Z", "2026-09-20T00:00:00Z", 9),
+            None,
+        );
+        assert_eq!(known.count(), Some(12), "an older listing row is ignored");
+    }
+
+    #[test]
+    fn a_stats_read_leaves_a_missing_title_standing() {
+        let mut known = Known::default();
+        known.observe(
+            &row("2026-09-12T00:00:00Z", "2026-09-20T00:00:00Z", 5),
+            Some(ts("2026-09-15T00:00:00Z")),
+        );
+        known.set_title(None);
+        known.set_stats(&stats("2026-09-21T00:00:00Z", 6));
+        assert_eq!(known.title(), Some(None));
+        assert_eq!(known.count(), Some(6));
     }
 }
