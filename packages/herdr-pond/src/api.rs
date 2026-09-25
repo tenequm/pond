@@ -1,7 +1,8 @@
-//! The HTTP [`Api`] implementation over `pond serve`
+//! The HTTP [`Api`] implementation over `pond serve`'s Unix socket
 //! (`/v1/x/sql`, `/v1/search`), plus herdr's pane list for live agents.
 //! Tested against [`crate::fake_pond`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +22,8 @@ use crate::types::{
 pub(crate) const SQL_PATH: &str = "/v1/x/sql";
 pub(crate) const SEARCH_PATH: &str = "/v1/search";
 
+/// The host names only the `Host` header: `/v1/x/sql` answers a loopback one.
+const BASE_URL: &str = "http://localhost";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Server-side execution budgets, sent as `timeout_seconds`. The client waits
 /// [`CLIENT_SLACK`] longer so pond's enriched timeout error arrives instead of
@@ -30,57 +33,72 @@ const ALL_TIME_TIMEOUT_SECS: u64 = 60;
 const CLIENT_SLACK: Duration = Duration::from_secs(5);
 pub(crate) const SEARCH_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Loopback only: an inherited `HTTP_PROXY` must never see desk traffic.
-pub(crate) fn client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()?)
-}
-
 pub(crate) fn sql_deadline(timeout_seconds: u64) -> Duration {
     Duration::from_secs(timeout_seconds) + CLIENT_SLACK
 }
 
-/// One request against a known base URL.
-pub(crate) async fn post<B, T>(
-    client: &reqwest::Client,
-    base_url: &str,
-    path: &str,
-    body: &B,
-    deadline: Duration,
-) -> Result<T, ApiError>
-where
-    B: Serialize + ?Sized,
-    T: DeserializeOwned,
-{
-    let response = client
-        .post(format!("{base_url}{path}"))
-        .json(body)
-        .timeout(deadline)
-        .send()
-        .await
-        .map_err(transport)?;
-    let status = response.status().as_u16();
-    let body = response.text().await.map_err(transport)?;
-    decode(path, status, &body)
+/// One `pond serve --socket` path and a client bound to it.
+#[derive(Debug, Clone)]
+pub(crate) struct Socket {
+    pub path: PathBuf,
+    client: reqwest::Client,
 }
 
-/// Only a failed connect proves the serve gone; a timeout or a dropped
-/// response may come from a live serve that is merely slow. reqwest's own
-/// message is only "error sending request", so the cause chain is appended.
-fn transport(error: reqwest::Error) -> ApiError {
-    let mut message = error.to_string();
-    let mut source = std::error::Error::source(&error);
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
+impl Socket {
+    pub(crate) fn new(path: PathBuf) -> Result<Self, ApiError> {
+        let client = reqwest::Client::builder()
+            .unix_socket(path.as_path())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .map_err(|error| {
+                ApiError::Request(format!("no HTTP client for {}: {error}", path.display()))
+            })?;
+        Ok(Self { path, client })
     }
-    if error.is_connect() {
-        ApiError::Unreachable(message)
-    } else {
-        ApiError::Request(message)
+
+    pub(crate) async fn post<B, T>(
+        &self,
+        route: &str,
+        body: &B,
+        deadline: Duration,
+    ) -> Result<T, ApiError>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned,
+    {
+        let response = self
+            .client
+            .post(format!("{BASE_URL}{route}"))
+            .json(body)
+            .timeout(deadline)
+            .send()
+            .await
+            .map_err(|error| self.transport(&error))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.transport(&error))?;
+        decode(route, status, &body)
+    }
+
+    /// Only a failed connect (a missing or refusing socket) proves the serve
+    /// gone; a timeout or a dropped response may come from a live serve that
+    /// is merely slow. reqwest's own message is only "error sending request"
+    /// and names no socket, so both are added.
+    fn transport(&self, error: &reqwest::Error) -> ApiError {
+        let mut message = format!("{}: {error}", self.path.display());
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        if error.is_connect() {
+            ApiError::Unreachable(message)
+        } else {
+            ApiError::Request(message)
+        }
     }
 }
 
@@ -107,17 +125,17 @@ fn decode<T: DeserializeOwned>(path: &str, status: u16, body: &str) -> Result<T,
     }
 }
 
-/// The resolved serve. `base_url` stays unset until the first call, so the
+/// The resolved serve. `serve` stays unset until the first call, so the
 /// desk's loading state covers a cold fallback spawn.
 #[derive(Default)]
 struct Link {
-    base_url: Option<String>,
+    serve: Option<Socket>,
     fallback: Option<Fallback>,
 }
 
-/// A URL that just refused a connection, and why.
+/// A socket that just refused a connection, and why.
 struct Stale {
-    url: String,
+    socket: PathBuf,
     reason: String,
 }
 
@@ -125,7 +143,6 @@ struct Stale {
 /// request that started it: the desk aborts a lane on every new fetch, and a
 /// cancelled resolution would kill a half-open fallback serve mid store-open.
 struct Resolver {
-    client: reqwest::Client,
     /// Why no serve can be found at all (not running under herdr), reported
     /// on first use rather than before the desk can draw.
     origin: Result<Origin, String>,
@@ -135,10 +152,12 @@ struct Resolver {
 impl Resolver {
     /// Runs with `link` locked, so concurrent callers queue behind one
     /// resolution and then reuse its result.
-    async fn resolve(&self, stale: Option<Stale>) -> Result<String, ApiError> {
+    async fn resolve(&self, stale: Option<Stale>) -> Result<Socket, ApiError> {
         let mut link = self.link.lock().await;
-        if let Some(current) = &link.base_url
-            && stale.as_ref().is_none_or(|stale| *current != stale.url)
+        if let Some(current) = &link.serve
+            && stale
+                .as_ref()
+                .is_none_or(|stale| current.path != stale.socket)
         {
             return Ok(current.clone());
         }
@@ -146,15 +165,15 @@ impl Resolver {
             .origin
             .as_ref()
             .map_err(|error| ApiError::Unreachable(error.clone()))?;
-        let connection = serve::connect(&self.client, origin, link.fallback.take()).await?;
+        let connection = serve::connect(origin, link.fallback.take()).await?;
         link.fallback = connection.fallback;
-        link.base_url = Some(connection.base_url.clone());
+        link.serve = Some(connection.socket.clone());
         if let Some(stale) = stale
-            && connection.base_url == stale.url
+            && connection.socket.path == stale.socket
         {
             return Err(ApiError::Unreachable(stale.reason));
         }
-        Ok(connection.base_url)
+        Ok(connection.socket)
     }
 }
 
@@ -164,23 +183,22 @@ pub(crate) struct HttpApi {
 }
 
 impl HttpApi {
-    pub(crate) fn from_env() -> anyhow::Result<Self> {
-        Ok(Self {
+    pub(crate) fn from_env() -> Self {
+        Self {
             resolver: Arc::new(Resolver {
-                client: client()?,
                 origin: Origin::from_env().map_err(|error| format!("{error:#}")),
                 link: Mutex::default(),
             }),
             herdr: Herdr::from_env(),
-        })
+        }
     }
 
     /// The current serve, else a resolution run in its own task.
-    async fn resolve(&self, stale: Option<Stale>) -> Result<String, ApiError> {
+    async fn resolve(&self, stale: Option<Stale>) -> Result<Socket, ApiError> {
         if stale.is_none() {
-            let current = self.resolver.link.lock().await.base_url.clone();
-            if let Some(url) = current {
-                return Ok(url);
+            let current = self.resolver.link.lock().await.serve.clone();
+            if let Some(socket) = current {
+                return Ok(socket);
             }
         }
         let resolver = Arc::clone(&self.resolver);
@@ -193,17 +211,22 @@ impl HttpApi {
     /// the endpoint is resolved again (daemon record, else a fallback child)
     /// and the request retried there once; a refusal on the retry stands as
     /// this call's error, and the next call may fail over again.
-    async fn post<B, T>(&self, path: &str, body: &B, deadline: Duration) -> Result<T, ApiError>
+    async fn post<B, T>(&self, route: &str, body: &B, deadline: Duration) -> Result<T, ApiError>
     where
         B: Serialize + ?Sized + Sync,
         T: DeserializeOwned,
     {
-        let client = &self.resolver.client;
-        let url = self.resolve(None).await?;
-        match post(client, &url, path, body, deadline).await {
+        let socket = self.resolve(None).await?;
+        match socket.post(route, body, deadline).await {
             Err(ApiError::Unreachable(reason)) => {
-                let retry = self.resolve(Some(Stale { url, reason })).await?;
-                post(client, &retry, path, body, deadline).await
+                let stale = Stale {
+                    socket: socket.path,
+                    reason,
+                };
+                self.resolve(Some(stale))
+                    .await?
+                    .post(route, body, deadline)
+                    .await
             }
             other => other,
         }
@@ -289,18 +312,18 @@ mod tests {
 
     use super::*;
     use crate::fake_pond::{
-        FakePond, Reply, Sandbox, dead_url, endpoint, golden, ts, write_script,
+        FakePond, Reply, Sandbox, endpoint, golden, missing_socket, stale_socket, ts, write_script,
     };
     use crate::serve::write_endpoint;
+    use crate::types::READY_SQL;
 
-    /// An api resolving through `sandbox`'s state, pinned to `base_url` if given.
-    fn api(sandbox: &Sandbox, base_url: Option<&str>) -> HttpApi {
+    /// An api resolving through `sandbox`'s state, pinned to `serve` if given.
+    fn api(sandbox: &Sandbox, serve: Option<Socket>) -> HttpApi {
         HttpApi {
             resolver: Arc::new(Resolver {
-                client: client().unwrap(),
                 origin: Ok(sandbox.origin()),
                 link: Mutex::new(Link {
-                    base_url: base_url.map(str::to_owned),
+                    serve,
                     fallback: None,
                 }),
             }),
@@ -308,14 +331,14 @@ mod tests {
         }
     }
 
-    /// Pinned to `base_url`, with a `pond_bin` that points nowhere, so no
+    /// Pinned to `serve`, with a `pond_bin` that points nowhere, so no
     /// re-resolution can reach a real pond.
-    fn api_at(base_url: &str, sandbox: &Sandbox) -> HttpApi {
+    fn api_at(serve: Socket, sandbox: &Sandbox) -> HttpApi {
         sandbox.write_config(&format!(
             "pond_bin = \"{}\"\n",
             sandbox.path("bin/no-pond").display()
         ));
-        api(sandbox, Some(base_url))
+        api(sandbox, Some(serve))
     }
 
     /// Answers the probe and the preview query.
@@ -345,7 +368,7 @@ mod tests {
             Reply::json(golden::SEARCH),
         )
         .await;
-        let api = api_at(&pond.base_url, &sandbox);
+        let api = api_at(pond.connect(), &sandbox);
         let scope = ListingScope {
             project: Some("/home/me/pj/pond".to_owned()),
             since: Some(ts("2026-09-11T00:00:00Z")),
@@ -363,6 +386,7 @@ mod tests {
 
         let recorded = pond.recorded();
         assert!(recorded.iter().all(|request| request.path == SQL_PATH));
+        assert!(recorded.iter().all(|request| request.host == "localhost"));
         let bodies = sent(&pond);
         assert_eq!(bodies[0]["query"], listing_sql(&scope));
         assert_eq!(bodies[0]["limit"], 200);
@@ -380,7 +404,7 @@ mod tests {
             Reply::json(golden::SEARCH),
         )
         .await;
-        let api = api_at(&pond.base_url, &sandbox);
+        let api = api_at(pond.connect(), &sandbox);
         assert!(api.hydrate(Vec::new()).await.unwrap().is_empty());
         assert!(pond.recorded().is_empty(), "empty hydrate sent a request");
 
@@ -413,7 +437,7 @@ mod tests {
             Reply::json(golden::SEARCH),
         )
         .await;
-        let api = api_at(&pond.base_url, &sandbox);
+        let api = api_at(pond.connect(), &sandbox);
         assert!(api.preview("s1".to_owned()).await.unwrap().is_empty());
 
         let first = api.page("s1".to_owned(), None).await.unwrap();
@@ -439,7 +463,7 @@ mod tests {
     async fn search_posts_the_wire_request() {
         let sandbox = Sandbox::new();
         let pond = FakePond::with_sql(Vec::new(), Reply::json(golden::SEARCH_OUT_OF_SCOPE)).await;
-        let api = api_at(&pond.base_url, &sandbox);
+        let api = api_at(pond.connect(), &sandbox);
         let scope = ListingScope {
             project: Some("/pj/pond".to_owned()),
             since: None,
@@ -472,7 +496,7 @@ mod tests {
             _ => Reply::plain(404, ""),
         })
         .await;
-        let api = api_at(&pond.base_url, &sandbox);
+        let api = api_at(pond.connect(), &sandbox);
 
         let Err(ApiError::Pond { code, message }) = api.preview("preview_error".to_owned()).await
         else {
@@ -509,10 +533,10 @@ mod tests {
         let ready = preview_pond().await;
         write_endpoint(
             &sandbox.origin().dir.endpoint(),
-            &endpoint(ready.port(), "t"),
+            &endpoint(&ready.socket, "t"),
         )
         .unwrap();
-        let api = api_at(&stalled.base_url, &sandbox);
+        let api = api_at(stalled.connect(), &sandbox);
         let request = SqlRequest::new(preview_sql("s"), PREVIEW_ROWS, 1);
         let result: Result<SqlResponse, _> = api
             .post(SQL_PATH, &request, Duration::from_millis(200))
@@ -525,6 +549,35 @@ mod tests {
             ready.recorded().is_empty(),
             "a timeout re-resolved the serve"
         );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_refusing_socket_is_unreachable() {
+        let sandbox = Sandbox::new();
+        let request = SqlRequest::new(READY_SQL.to_owned(), 1, 1);
+        for socket in [missing_socket(), stale_socket(&sandbox.path("stale.sock"))] {
+            let result: Result<SqlResponse, _> = socket
+                .post(SQL_PATH, &request, Duration::from_secs(5))
+                .await;
+            let Err(ApiError::Unreachable(reason)) = result else {
+                panic!("expected Unreachable, got {result:?}");
+            };
+            assert!(reason.contains(&*socket.path.to_string_lossy()), "{reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_socket_fails_over_to_the_endpoint() {
+        let sandbox = Sandbox::new();
+        let ready = preview_pond().await;
+        write_endpoint(
+            &sandbox.origin().dir.endpoint(),
+            &endpoint(&ready.socket, "t"),
+        )
+        .unwrap();
+        let api = api_at(stale_socket(&sandbox.path("stale.sock")), &sandbox);
+        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
+        assert_eq!(ready.recorded().len(), 2, "probe, then the retried preview");
     }
 
     #[tokio::test]
@@ -542,8 +595,8 @@ mod tests {
             Reply::json(golden::SEARCH),
         )
         .await;
-        write_endpoint(&endpoint_path, &endpoint(stalling.port(), "t")).unwrap();
-        let api = api_at(&dead_url(), &sandbox);
+        write_endpoint(&endpoint_path, &endpoint(&stalling.socket, "t")).unwrap();
+        let api = api_at(missing_socket(), &sandbox);
         let request = SqlRequest::new(preview_sql("s1"), PREVIEW_ROWS, 1);
         let result: Result<SqlResponse, _> = api
             .post(SQL_PATH, &request, Duration::from_millis(300))
@@ -553,7 +606,7 @@ mod tests {
         drop(stalling);
         tokio::time::sleep(Duration::from_millis(50)).await;
         let ready = preview_pond().await;
-        write_endpoint(&endpoint_path, &endpoint(ready.port(), "t")).unwrap();
+        write_endpoint(&endpoint_path, &endpoint(&ready.socket, "t")).unwrap();
         assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
         assert_eq!(ready.recorded().len(), 2, "probe, then the retried preview");
     }
@@ -567,11 +620,11 @@ mod tests {
             &format!(
                 r#"printf '%s\n' "$*" >> '{calls}'
 sleep 0.3
-eval "port_file=\${{$#}}"
-printf '%s' '{addr}' > "$port_file.tmp" && mv "$port_file.tmp" "$port_file"
+eval "socket=\${{$#}}"
+ln -s '{target}' "$socket"
 exec sleep 30"#,
                 calls = sandbox.path("calls").display(),
-                addr = pond.addr(),
+                target = pond.socket.display(),
             ),
         );
         sandbox.write_config(&format!("pond_bin = \"{}\"\n", script.display()));
@@ -604,7 +657,7 @@ exec sleep 30"#,
             &sandbox.path("bin/herdr"),
             r#"echo '{"result":{"panes":[{"pane_id":"p1","agent":"codex","agent_session":{"kind":"path","value":"/s/rollout-abc.jsonl"}},{"pane_id":"p2"}]}}'"#,
         );
-        let api = api_at(&dead_url(), &sandbox);
+        let api = api_at(missing_socket(), &sandbox);
         let live = api.live_agents().await.unwrap();
         assert_eq!(live.len(), 1);
         assert!(live[0].matches("abc"));

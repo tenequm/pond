@@ -149,7 +149,7 @@ pub(crate) enum ApiError {
     Pond { code: String, message: String },
     /// A non-envelope rejection (axum's plain-text JSON/route errors).
     Rejected { status: u16, body: String },
-    /// The installed pond predates `/v1/x/sql` or `pond serve --port-file`.
+    /// The installed pond predates `/v1/x/sql` or `pond serve --socket`.
     PondTooOld,
     /// Connection refused (the serve is gone), or no serve could be started.
     Unreachable(String),
@@ -167,7 +167,7 @@ impl fmt::Display for ApiError {
             Self::Pond { code, message } => write!(f, "pond {code}: {message}"),
             Self::Rejected { status, body } => write!(f, "HTTP {status}: {body}"),
             Self::PondTooOld => f.write_str(
-                "this pond is too old for the desk (needs /v1/x/sql and `pond serve --port-file`) - upgrade pond (`brew upgrade pond` / `cargo install pond-db`)",
+                "this pond is too old for the desk (needs /v1/x/sql and `pond serve --socket`) - upgrade pond (`brew upgrade pond` / `cargo install pond-db`)",
             ),
             Self::Unreachable(reason) => write!(f, "pond serve unreachable: {reason}"),
             Self::Request(reason) => write!(f, "request to pond serve failed: {reason}"),

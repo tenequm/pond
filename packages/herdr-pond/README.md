@@ -8,7 +8,7 @@ A [herdr](https://herdr.dev) plugin for pond:
 ## Prerequisites
 
 - `pond` installed and initialized: run `pond init` once, with the adapters you use enabled (`pond adapters enable <adapter>`). Sync-on-idle only syncs adapters that are already enabled; it never enables one.
-- A pond release that includes `POST /v1/x/sql` and `pond serve --port-file` ([tenequm/pond#311](https://github.com/tenequm/pond/pull/311)). With an older pond the desk and `daemon.log` say it is too old and name the upgrade command.
+- A pond release that includes `POST /v1/x/sql` and `pond serve --socket` ([tenequm/pond#311](https://github.com/tenequm/pond/pull/311)). With an older pond the desk and `daemon.log` say it is too old and name the upgrade command.
 - For live rows (the running-agent marker and jump): the official herdr integration for each agent, e.g. `herdr integration install claude`. Without it herdr knows the agent but not its session id.
 
 ## Build and link
@@ -48,8 +48,8 @@ herdr's PATH is fixed when the herdr server starts. If `pond` is not on it, set 
 
 ## How it runs
 
-- Each herdr server starts one `pond serve` in the background at startup, bound to `127.0.0.1` on a free port, and stops it when that server exits. It is a personal localhost server; the plugin sends it only reads. It never runs sync (`--with-sync` is not passed), and `pond schedule` stays the owner of scheduled sync.
-- If that serve is missing or dead, the desk starts its own for as long as it is open. If the desk is killed with SIGKILL, that serve is orphaned (visible in `ps`) until you stop it.
+- Each herdr server starts one `pond serve` in the background at startup, listening on a Unix socket in the plugin state dir (`serve/<hash>/owner.sock`, owner-only), and stops it when that server exits. It is a personal server only your user can reach, not a TCP port; the plugin sends it only reads. It never runs sync (`--with-sync` is not passed), and `pond schedule` stays the owner of scheduled sync.
+- If that serve is missing or dead, the desk starts its own, on its own socket, for as long as it is open. If the desk is killed with SIGKILL, that serve is orphaned (visible in `ps`) until you stop it.
 - Idle syncs wait for any sync already holding the store lock, then run. Bursts of idle events coalesce; the last one always produces a sync.
 - Sessions ingested before pond stamped the ingest host have no recorded machine. The desk shows them as `local?` - unknown provenance, not a claim that they came from this machine.
 - The transcript view is conversation only: user and assistant text. Tool calls and results stay reachable through `pond_sql` and `pond_get_session`.

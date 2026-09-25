@@ -1,7 +1,8 @@
-//! A canned-response stand-in for `pond serve`, so the HTTP client is tested
-//! against real bytes on a real socket - trait mocks alone would let the
-//! client's serialization drift while every test stays green. Also the
-//! sandbox dirs and fake `pond`/`herdr` scripts the shell-level tests run.
+//! A canned-response stand-in for `pond serve --socket`, so the HTTP client
+//! is tested against real bytes on a real Unix socket - trait mocks alone
+//! would let the client's serialization drift while every test stays green.
+//! Also the sandbox dirs and fake `pond`/`herdr` scripts the shell-level
+//! tests run.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -15,11 +16,23 @@ use chrono::{DateTime, Utc};
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{UnixListener, UnixStream};
 
-use crate::api::{SEARCH_PATH, SQL_PATH};
+use crate::api::{SEARCH_PATH, SQL_PATH, Socket};
 use crate::config::CONFIG_FILE;
 use crate::serve::{Endpoint, Origin, ServeDir};
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// A fresh path under the temp dir: short, since a socket path is capped
+/// near 100 bytes.
+fn temp_path(kind: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "herdr-pond-{kind}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 /// Golden bodies: the frozen `/v1/x/sql` and `/v1/search` contract.
 pub(crate) mod golden {
@@ -97,15 +110,17 @@ impl Reply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Recorded {
     pub path: String,
+    pub host: String,
     pub body: String,
 }
 
 type Router = dyn Fn(&str, &str) -> Reply + Send + Sync;
 
-/// A loopback HTTP/1.1 server answering each request through `router(path,
-/// body)`. Every request is recorded, so tests can assert on the SQL sent.
+/// An HTTP/1.1 server on a Unix socket answering each request through
+/// `router(path, body)`. Every request is recorded, so tests can assert on
+/// the SQL sent.
 pub(crate) struct FakePond {
-    pub base_url: String,
+    pub socket: PathBuf,
     requests: Arc<Mutex<Vec<Recorded>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -114,8 +129,8 @@ impl FakePond {
     pub(crate) async fn start(
         router: impl Fn(&str, &str) -> Reply + Send + Sync + 'static,
     ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let socket = temp_path("fake");
+        let listener = UnixListener::bind(&socket).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let router: Arc<Router> = Arc::new(router);
         let recorded = Arc::clone(&requests);
@@ -129,7 +144,7 @@ impl FakePond {
             }
         });
         Self {
-            base_url,
+            socket,
             requests,
             task,
         }
@@ -156,24 +171,20 @@ impl FakePond {
         self.requests.lock().unwrap().clone()
     }
 
-    pub(crate) fn port(&self) -> u16 {
-        self.base_url.rsplit(':').next().unwrap().parse().unwrap()
-    }
-
-    /// The `host:port` a fake serve publishes through `--port-file`.
-    pub(crate) fn addr(&self) -> &str {
-        self.base_url.trim_start_matches("http://")
+    pub(crate) fn connect(&self) -> Socket {
+        Socket::new(self.socket.clone()).unwrap()
     }
 }
 
 impl Drop for FakePond {
     fn drop(&mut self) {
         self.task.abort();
+        let _ = std::fs::remove_file(&self.socket);
     }
 }
 
 async fn serve_one(
-    mut stream: tokio::net::TcpStream,
+    mut stream: UnixStream,
     router: Arc<Router>,
     recorded: Arc<Mutex<Vec<Recorded>>>,
 ) {
@@ -209,9 +220,19 @@ async fn serve_one(
         .nth(1)
         .unwrap_or_default()
         .to_owned();
+    let host = head
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("host:")
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
     let body = String::from_utf8_lossy(&buffer[head_end..head_end + content_length]).into_owned();
     let reply = router(&path, &body);
-    recorded.lock().unwrap().push(Recorded { path, body });
+    recorded.lock().unwrap().push(Recorded { path, host, body });
     tokio::time::sleep(reply.delay).await;
     let response = format!(
         "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -232,12 +253,7 @@ pub(crate) struct Sandbox {
 
 impl Sandbox {
     pub(crate) fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "herdr-pond-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = temp_path("test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Self { root }
@@ -277,13 +293,12 @@ impl Sandbox {
     }
 
     /// A fake `pond serve` at `bin/pond`, set as `pond_bin`: records its argv
-    /// in `calls` and its pid in `pid`, prints to both streams, publishes
-    /// `addr` through `--port-file` when given, then runs `after`.
-    pub(crate) fn fake_serve(&self, addr: Option<&str>, after: &str) -> PathBuf {
-        let publish = addr.map_or_else(String::new, |addr| {
-            format!(
-                r#"printf '%s' '{addr}' > "$port_file.tmp" && mv "$port_file.tmp" "$port_file""#
-            )
+    /// in `calls` and its pid in `pid`, prints to both streams, and when
+    /// given a `target` socket answers at its `--socket` path through a
+    /// symlink to it (connect follows symlinks), then runs `after`.
+    pub(crate) fn fake_serve(&self, target: Option<&Path>, after: &str) -> PathBuf {
+        let publish = target.map_or_else(String::new, |target| {
+            format!(r#"ln -s '{}' "$socket""#, target.display())
         });
         let pond = write_script(
             &self.path("bin/pond"),
@@ -291,7 +306,7 @@ impl Sandbox {
                 r#"printf '%s\n' "$*" >> '{calls}'
 echo $$ > '{pid}'
 echo "serve stdout"; echo "serve stderr" >&2
-eval "port_file=\${{$#}}"
+eval "socket=\${{$#}}"
 {publish}
 {after}"#,
                 calls = self.path("calls").display(),
@@ -322,22 +337,22 @@ pub(crate) fn alive(pid: u32) -> bool {
     kill(Pid::from_raw(i32::try_from(pid).unwrap()), None).is_ok()
 }
 
-/// A port nothing listens on: bound, then released.
-pub(crate) fn dead_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A socket path with nothing at it (connect fails with ENOENT).
+pub(crate) fn missing_socket() -> Socket {
+    Socket::new(temp_path("missing")).unwrap()
 }
 
-pub(crate) fn dead_url() -> String {
-    format!("http://127.0.0.1:{}", dead_port())
+/// A socket file left by a listener that is gone (connect fails with
+/// ECONNREFUSED), as a SIGKILLed serve leaves it.
+pub(crate) fn stale_socket(path: &Path) -> Socket {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    Socket::new(path.to_path_buf()).unwrap()
 }
 
-pub(crate) fn endpoint(port: u16, token: &str) -> Endpoint {
+pub(crate) fn endpoint(socket: &Path, token: &str) -> Endpoint {
     Endpoint {
-        port,
+        socket: socket.to_path_buf(),
         token: token.to_owned(),
     }
 }

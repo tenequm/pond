@@ -17,15 +17,14 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use chrono::Utc;
 
-use crate::api::{QUERY_TIMEOUT_SECS, SEARCH_PATH, SQL_PATH, client, post, sql_deadline};
+use crate::api::{QUERY_TIMEOUT_SECS, SEARCH_PATH, SQL_PATH, Socket, sql_deadline};
 use crate::config::{cap_log, log_line, try_lock};
 use crate::serve::{
-    Endpoint, PORT_DEADLINE, ServeChild, ServeDir, live_endpoint, probe, remove_endpoint_if_owned,
+    Endpoint, READY_DEADLINE, ServeChild, ServeDir, live_endpoint, remove_endpoint_if_owned,
     retire, write_endpoint,
 };
 use crate::types::{
-    ApiError, LISTING_ROWS, ListingScope, SearchRequest, SearchResponse, SqlRequest, SqlResponse,
-    listing_sql,
+    LISTING_ROWS, ListingScope, SearchRequest, SearchResponse, SqlRequest, SqlResponse, listing_sql,
 };
 use crate::{herdr, runtime, shutdown_signal};
 
@@ -36,11 +35,7 @@ struct Timing {
     /// for the old one to close before binding: only misses spanning longer
     /// than this mean herdr is gone.
     handoff_window: Duration,
-    port_deadline: Duration,
-    /// A serve that has just bound may still be settling, so a failed
-    /// capability probe is retried for this long.
-    probe_window: Duration,
-    probe_retry: Duration,
+    ready_deadline: Duration,
     /// The historical 47-300s cold FTS load is paid here, not by the desk.
     warmup_deadline: Duration,
     grace: Duration,
@@ -50,9 +45,7 @@ const TIMING: Timing = Timing {
     tick: Duration::from_millis(500),
     liveness_every: Duration::from_secs(20),
     handoff_window: Duration::from_secs(10),
-    port_deadline: PORT_DEADLINE,
-    probe_window: Duration::from_secs(30),
-    probe_retry: Duration::from_secs(5),
+    ready_deadline: READY_DEADLINE,
     warmup_deadline: Duration::from_secs(300),
     grace: Duration::from_secs(10),
 };
@@ -130,27 +123,27 @@ async fn own(
     let Some(_lock) = try_lock(&dir.lock())? else {
         return Ok(());
     };
-    let client = client()?;
-    if let Some(base_url) = live_endpoint(&client, dir).await {
+    if let Some(orphan) = live_endpoint(dir).await {
         log_line(
             &log,
             &format!(
-                "owner: {base_url} answers but no owner supervises it (a dead owner's orphan, \
-                 or another process on that port) - starting a fresh serve"
+                "owner: {} answers but no owner supervises it (a dead owner's orphan) - \
+                 starting a fresh serve",
+                orphan.path.display()
             ),
         );
     }
     let Some(pond) = resolve_pond() else {
         return Ok(());
     };
-    let mut serve = ServeChild::spawn(&pond, dir.port_file("owner"), log.clone(), timing.grace)?;
+    let mut serve = ServeChild::spawn(&pond, dir.socket("owner"), log.clone(), timing.grace)?;
     log_line(
         &log,
         &format!("owner: started {} (pid {})", pond.display(), serve.id()),
     );
     let mut token = None;
     let reason = tokio::select! {
-        reason = supervise(&mut serve, &client, dir, timing, &mut token) => reason,
+        reason = supervise(&mut serve, dir, timing, &mut token) => reason,
         reason = herdr_gone(socket, &log, timing) => reason,
         signal = shutdown => format!("received {signal}"),
     };
@@ -172,63 +165,36 @@ fn random_token() -> String {
     )
 }
 
-/// Publishes the endpoint once serve listens and passes the probe, warms it
+/// Publishes the endpoint once serve answers the capability probe, warms it
 /// up, and returns why the owner must stop. `token` is set on publish.
 async fn supervise(
     serve: &mut ServeChild,
-    client: &reqwest::Client,
     dir: &ServeDir,
     timing: &Timing,
     token: &mut Option<String>,
 ) -> String {
-    let addr = match serve.listening(timing.port_deadline).await {
-        Ok(addr) => addr,
+    let socket = match serve.ready(timing.ready_deadline).await {
+        Ok(socket) => socket,
         Err(error) => return error.to_string(),
     };
-    let base_url = format!("http://{addr}");
-    if let Err(reason) = probe_until_ready(serve, client, &base_url, timing).await {
-        return reason;
-    }
     let endpoint = Endpoint {
-        port: addr.port(),
+        socket: socket.path.clone(),
         token: random_token(),
     };
     if let Err(error) = write_endpoint(&dir.endpoint(), &endpoint) {
         return format!("cannot publish the endpoint: {error}");
     }
     let log = dir.daemon_log();
-    log_line(&log, &format!("owner: published {base_url}"));
+    log_line(
+        &log,
+        &format!("owner: published {}", endpoint.socket.display()),
+    );
     *token = Some(endpoint.token);
     let ((), reason) = tokio::join!(
-        warm_up(client, &base_url, &log, timing.warmup_deadline),
+        warm_up(&socket, &log, timing.warmup_deadline),
         exited(serve, timing.tick)
     );
     reason
-}
-
-/// Retries within `probe_window`, except for a pond too old for the desk,
-/// which no retry fixes.
-async fn probe_until_ready(
-    serve: &mut ServeChild,
-    client: &reqwest::Client,
-    base_url: &str,
-    timing: &Timing,
-) -> Result<(), String> {
-    let started = Instant::now();
-    loop {
-        match probe(client, base_url).await {
-            Ok(()) => return Ok(()),
-            Err(error @ ApiError::PondTooOld) => return Err(error.to_string()),
-            Err(error) if started.elapsed() >= timing.probe_window => {
-                return Err(format!("capability probe failed: {error}"));
-            }
-            Err(_) => {}
-        }
-        if let Some(reason) = serve.exited() {
-            return Err(reason);
-        }
-        tokio::time::sleep(timing.probe_retry).await;
-    }
 }
 
 async fn exited(serve: &mut ServeChild, tick: Duration) -> String {
@@ -267,7 +233,7 @@ async fn herdr_gone(socket: &Path, log: &Path, timing: &Timing) -> String {
 /// The desk's opening listing and a first FTS search, once, so their cold
 /// cost lands here instead of on the first desk open. The search gets what
 /// is left of `budget`. Failure is not fatal.
-async fn warm_up(client: &reqwest::Client, base_url: &str, log: &Path, budget: Duration) {
+async fn warm_up(socket: &Socket, log: &Path, budget: Duration) {
     let started = Instant::now();
     let listing = SqlRequest::new(
         listing_sql(&ListingScope::recent(None, Utc::now())),
@@ -277,9 +243,13 @@ async fn warm_up(client: &reqwest::Client, base_url: &str, log: &Path, budget: D
     let search = SearchRequest::new(WARMUP_QUERY.to_owned(), 1);
     let listing_deadline = sql_deadline(QUERY_TIMEOUT_SECS);
     let result = async {
-        post::<_, SqlResponse>(client, base_url, SQL_PATH, &listing, listing_deadline).await?;
+        socket
+            .post::<_, SqlResponse>(SQL_PATH, &listing, listing_deadline)
+            .await?;
         let search_deadline = budget.saturating_sub(started.elapsed());
-        post::<_, SearchResponse>(client, base_url, SEARCH_PATH, &search, search_deadline).await
+        socket
+            .post::<_, SearchResponse>(SEARCH_PATH, &search, search_deadline)
+            .await
     }
     .await;
     let outcome = match result {
@@ -305,16 +275,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::fake_pond::{FakePond, Reply, Sandbox, alive, endpoint, golden};
+    use crate::fake_pond::{FakePond, Reply, Sandbox, alive, endpoint, golden, stale_socket};
     use crate::serve::read_endpoint;
 
     const FAST: Timing = Timing {
         tick: Duration::from_millis(20),
         liveness_every: Duration::from_millis(100),
         handoff_window: Duration::from_millis(300),
-        port_deadline: Duration::from_millis(500),
-        probe_window: Duration::from_millis(300),
-        probe_retry: Duration::from_millis(20),
+        ready_deadline: Duration::from_secs(1),
         warmup_deadline: Duration::from_secs(5),
         grace: Duration::from_secs(2),
     };
@@ -352,11 +320,11 @@ mod tests {
             }
         }
 
-        /// A fake `pond serve` that publishes the fake server's address when
+        /// A fake `pond serve` that answers through the fake server when
         /// `publish`, then runs `after`.
         fn fake_pond(&self, publish: bool, after: &str) -> PathBuf {
-            let addr = publish.then(|| self.pond.addr());
-            self.sandbox.fake_serve(addr, after)
+            let target = publish.then_some(self.pond.socket.as_path());
+            self.sandbox.fake_serve(target, after)
         }
 
         async fn own(&self, pond: &Path) -> anyhow::Result<()> {
@@ -376,8 +344,14 @@ mod tests {
             self.sandbox
                 .lines("calls")
                 .iter()
-                .filter(|line| line.starts_with("serve --host 127.0.0.1 --port 0 --port-file "))
+                .filter(|line| {
+                    **line == format!("serve --socket {}", self.owner_socket().display())
+                })
                 .count()
+        }
+
+        fn owner_socket(&self) -> PathBuf {
+            self.dir.socket("owner")
         }
 
         fn log(&self) -> String {
@@ -424,6 +398,10 @@ mod tests {
 
         assert_eq!(setup.serve_calls(), 1, "{}", setup.log());
         assert!(setup.endpoint().is_none(), "endpoint outlived its serve");
+        assert!(
+            fs::symlink_metadata(setup.owner_socket()).is_err(),
+            "socket outlived its serve"
+        );
         assert!(
             !alive(setup.sandbox.serve_pid()),
             "pond serve outlived herdr"
@@ -495,6 +473,8 @@ mod tests {
         assert_eq!(setup.endpoint().unwrap().token, "successor");
     }
 
+    /// The orphan still answers at `owner.sock`, so the fresh serve's
+    /// readiness must come from the fresh serve, not from the orphan.
     #[tokio::test]
     async fn an_unsupervised_live_endpoint_is_replaced() {
         let setup = Setup::new().await;
@@ -503,7 +483,10 @@ mod tests {
             Reply::json(golden::SEARCH),
         )
         .await;
-        write_endpoint(&setup.dir.endpoint(), &endpoint(orphan.port(), "orphan")).unwrap();
+        let owner_socket = setup.owner_socket();
+        fs::create_dir_all(owner_socket.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&orphan.socket, &owner_socket).unwrap();
+        write_endpoint(&setup.dir.endpoint(), &endpoint(&owner_socket, "orphan")).unwrap();
         let pond = setup.fake_pond(true, "exec sleep 30");
         let listener = UnixListener::bind(&setup.socket).unwrap();
         let herdr_stops = async {
@@ -511,12 +494,14 @@ mod tests {
                 setup.endpoint().is_some_and(|e| e.token != "orphan")
             })
             .await;
-            assert_eq!(setup.endpoint().unwrap().port, setup.pond.port());
+            assert_eq!(setup.endpoint().unwrap().socket, owner_socket);
             drop(listener);
         };
         let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
         owner.unwrap();
         assert_eq!(setup.serve_calls(), 1);
+        assert_eq!(orphan.recorded().len(), 1, "only the liveness probe");
+        assert!(!setup.pond.recorded().is_empty());
         assert!(
             setup.log().contains("no owner supervises"),
             "{}",
@@ -558,10 +543,10 @@ mod tests {
         let pond = setup.fake_pond(true, "exec sleep 30");
         let _listener = UnixListener::bind(&setup.socket).unwrap();
         setup.own(&pond).await.unwrap();
+        let log = setup.log();
         assert!(
-            setup.log().contains("capability probe failed"),
-            "{}",
-            setup.log()
+            log.contains("did not answer") && log.contains("HTTP 503: starting"),
+            "{log}"
         );
         assert!(setup.pond.recorded().len() > 1, "never retried");
         assert!(!alive(setup.sandbox.serve_pid()));
@@ -585,17 +570,34 @@ mod tests {
         let pond = setup.fake_pond(false, "exec sleep 30");
         let _listener = UnixListener::bind(&setup.socket).unwrap();
         setup.own(&pond).await.unwrap();
-        assert!(setup.log().contains("did not listen"), "{}", setup.log());
+        assert!(setup.log().contains("did not answer"), "{}", setup.log());
         assert!(!alive(setup.sandbox.serve_pid()));
         assert!(setup.endpoint().is_none());
     }
 
+    /// A socket left by a SIGKILLed serve exists but refuses: never ready.
     #[tokio::test]
-    async fn a_pond_without_port_file_is_named_too_old() {
+    async fn a_stale_socket_is_not_ready() {
+        let setup = Setup::new().await;
+        let stale = setup.sandbox.path("stale.sock");
+        stale_socket(&stale);
+        let pond = setup.sandbox.fake_serve(Some(&stale), "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        let log = setup.log();
+        assert!(
+            log.contains("did not answer") && log.contains("Connection refused"),
+            "{log}"
+        );
+        assert!(setup.endpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pond_without_socket_is_named_too_old() {
         let setup = Setup::new().await;
         let pond = setup.fake_pond(
             false,
-            "echo \"error: unexpected argument '--port-file' found\" >&2; exit 2",
+            "echo \"error: unexpected argument '--socket' found\" >&2; exit 2",
         );
         let _listener = UnixListener::bind(&setup.socket).unwrap();
         setup.own(&pond).await.unwrap();

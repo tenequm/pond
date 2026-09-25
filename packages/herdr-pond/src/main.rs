@@ -78,7 +78,7 @@ fn desk_main() -> anyhow::Result<()> {
     let context = DeskContext {
         project: herdr::context_project(),
     };
-    let api = Arc::new(api::HttpApi::from_env()?);
+    let api = Arc::new(api::HttpApi::from_env());
     match desk::run(api, context)? {
         DeskExit::Quit => Ok(()),
         DeskExit::Jump { pane_id } => herdr::Herdr::from_env().agent_focus(&pane_id),
