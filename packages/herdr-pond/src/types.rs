@@ -2,8 +2,10 @@
 //! [`Api`] trait, the rows it returns, the pond wire mirrors, and every SQL
 //! query the desk runs. No SQL may live anywhere else in the crate.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
@@ -21,9 +23,13 @@ pub(crate) type ApiFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiErro
 /// open; the desk shows its loading state for the whole wait.
 pub(crate) trait Api: Send + Sync {
     fn list_sessions(&self, scope: ListingScope) -> ApiFuture<'_, Vec<SessionRow>>;
-    /// One row per id that exists; order is unspecified. Empty input returns
-    /// empty without a request.
-    fn hydrate(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionDetail>>;
+    /// The page-scoped hydration queries: at most one row per id, order
+    /// unspecified, and empty input returns empty without a request. A
+    /// session with no user message has no title row.
+    fn titles(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionTitle>>;
+    fn stats(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionStats>>;
+    /// Each session's origin host, read from its first message only.
+    fn hosts(&self, starts: Vec<SessionStart>) -> ApiFuture<'_, Vec<SessionHost>>;
     fn search(&self, request: SearchRequest) -> ApiFuture<'_, SearchResponse>;
     /// Newest first, at most [`PREVIEW_ROWS`].
     fn preview(&self, session_id: String) -> ApiFuture<'_, Vec<TranscriptMessage>>;
@@ -54,22 +60,43 @@ impl ListingScope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// `first_ts` and `message_count` cover only the listing's window: they are
+/// the whole session's only when nothing precedes the window start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SessionRow {
     pub session_id: String,
     pub last_ts: DateTime<Utc>,
+    pub first_ts: DateTime<Utc>,
+    pub message_count: u64,
     pub source_agent: String,
     pub project: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub(crate) struct SessionDetail {
+pub(crate) struct SessionTitle {
     pub session_id: String,
-    /// Whole-session count, not limited to the listing window.
-    pub message_count: u64,
     /// First non-empty user message, clipped server-side.
     #[serde(default)]
     pub title: Option<String>,
+}
+
+/// Whole-session, whatever the listing window.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct SessionStats {
+    pub session_id: String,
+    pub message_count: u64,
+    pub first_ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionStart {
+    pub session_id: String,
+    pub first_ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct SessionHost {
+    pub session_id: String,
     /// `None` means unknown provenance (pre-stamp rows), never "this machine".
     #[serde(default)]
     pub host: Option<String>,
@@ -133,6 +160,10 @@ impl LiveAgent {
 pub(crate) struct DeskContext {
     /// The underlying pane's cwd (`focused_pane_cwd`, else `workspace_cwd`).
     pub project: Option<String>,
+    /// This machine's hostname, to tell its sessions from other machines'.
+    pub hostname: Option<String>,
+    /// Where the desk keeps its cache between opens; `None` keeps nothing.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// How the desk leaves: the caller runs the jump only after the terminal has
@@ -250,7 +281,7 @@ impl SearchRequest {
         }
     }
 
-    /// The listing's scope as search filters; `from_date` is a calendar day.
+    /// A scope as search filters; `from_date` is a calendar day.
     pub(crate) fn within(mut self, scope: &ListingScope) -> Self {
         self.filters = SearchFilters {
             project: scope.project.clone().map(ProjectFilter::Contains),
@@ -333,7 +364,8 @@ pub(crate) fn listing_sql(scope: &ListingScope) -> String {
         ));
     }
     format!(
-        "SELECT session_id, MAX(timestamp) AS last_ts, MIN(source_agent) AS source_agent, \
+        "SELECT session_id, MAX(timestamp) AS last_ts, MIN(timestamp) AS first_ts, \
+         COUNT(*) AS message_count, MIN(source_agent) AS source_agent, \
          MIN(project) AS project FROM messages WHERE {} GROUP BY session_id \
          ORDER BY last_ts DESC, session_id LIMIT {}",
         filters.join(" AND "),
@@ -341,20 +373,51 @@ pub(crate) fn listing_sql(scope: &ListingScope) -> String {
     )
 }
 
-pub(crate) fn hydrate_sql(session_ids: &[String]) -> String {
-    let ids = session_ids
+/// `search_text` stays out of the WHERE clause: there it would be read for
+/// every candidate row, while the aggregate FILTER reads it only for the user
+/// rows that pass.
+pub(crate) fn titles_sql(session_ids: &[String]) -> String {
+    format!(
+        "SELECT session_id, substr(first_value(search_text ORDER BY timestamp, message_id) \
+         FILTER (WHERE search_text <> ''), 1, {TITLE_CHARS}) AS title FROM messages \
+         WHERE session_id IN ({}) AND role = 'user' GROUP BY session_id LIMIT {}",
+        id_list(session_ids.iter()),
+        session_ids.len()
+    )
+}
+
+/// Narrow columns only: the whole-session count and start.
+pub(crate) fn stats_sql(session_ids: &[String]) -> String {
+    format!(
+        "SELECT session_id, COUNT(*) AS message_count, MIN(timestamp) AS first_ts \
+         FROM messages WHERE session_id IN ({}) GROUP BY session_id LIMIT {}",
+        id_list(session_ids.iter()),
+        session_ids.len()
+    )
+}
+
+/// The wide `options` column is read only for rows at a session's first
+/// timestamp. One session's row can share another's start, so the ordering
+/// by timestamp keeps each session's own first row.
+pub(crate) fn hosts_sql(starts: &[SessionStart]) -> String {
+    let timestamps = starts
         .iter()
-        .map(|id| quote(id))
+        .map(|start| format!("TIMESTAMP {}", timestamp_literal(start.first_ts)))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "SELECT session_id, COUNT(*) AS message_count, \
-         substr(first_value(search_text ORDER BY timestamp, message_id) \
-         FILTER (WHERE role = 'user' AND search_text <> ''), 1, {TITLE_CHARS}) AS title, \
-         MAX(json_get_string(options, 'pond', 'ingest', 'host', 'hostname')) AS host \
-         FROM messages WHERE session_id IN ({ids}) GROUP BY session_id LIMIT {}",
-        session_ids.len()
+        "SELECT session_id, first_value(json_get_string(options, 'pond', 'ingest', 'host', \
+         'hostname') ORDER BY timestamp, message_id) AS host FROM messages \
+         WHERE session_id IN ({}) AND timestamp IN ({timestamps}) GROUP BY session_id LIMIT {}",
+        id_list(starts.iter().map(|start| &start.session_id)),
+        starts.len()
     )
+}
+
+fn id_list<'a>(ids: impl Iterator<Item = &'a String>) -> String {
+    ids.map(|id| quote(id)).collect::<Vec<_>>().join(", ")
 }
 
 pub(crate) fn preview_sql(session_id: &str) -> String {
@@ -416,7 +479,60 @@ mod tests {
         assert!(sql.contains("timestamp >= TIMESTAMP '2026-09-11T00:00:00.000000Z'"));
         assert!(sql.contains("project = '/home/me/pj/pond'"));
         assert!(sql.contains("starts_with(project, '/home/me/pj/pond/')"));
+        assert!(sql.contains("MIN(timestamp) AS first_ts, COUNT(*) AS message_count"));
         assert!(sql.ends_with("LIMIT 200"));
+    }
+
+    #[test]
+    fn hydration_queries_are_page_scoped_and_bounded() {
+        let ids = ["a".to_owned(), "b'c".to_owned()];
+        let titles = titles_sql(&ids);
+        assert!(titles.contains("WHERE session_id IN ('a', 'b''c') AND role = 'user'"));
+        assert!(
+            titles.contains("FILTER (WHERE search_text <> '')"),
+            "{titles}"
+        );
+        assert!(
+            !titles
+                .split(" WHERE session_id")
+                .nth(1)
+                .unwrap()
+                .contains("search_text"),
+            "search_text in WHERE is read for every candidate row: {titles}"
+        );
+        assert!(titles.ends_with("GROUP BY session_id LIMIT 2"));
+
+        let stats = stats_sql(&ids);
+        assert!(stats.contains("COUNT(*) AS message_count, MIN(timestamp) AS first_ts"));
+        assert!(stats.ends_with("LIMIT 2"));
+        assert!(!stats.contains("search_text") && !stats.contains("options"));
+
+        let tied = ts("2026-09-20T10:00:00Z");
+        let starts: Vec<SessionStart> = [
+            ("a", tied),
+            ("b", tied),
+            ("c", ts("2026-09-21T10:00:00.5Z")),
+        ]
+        .into_iter()
+        .map(|(id, first_ts)| SessionStart {
+            session_id: id.to_owned(),
+            first_ts,
+        })
+        .collect();
+        let hosts = hosts_sql(&starts);
+        assert!(
+            hosts.contains("WHERE session_id IN ('a', 'b', 'c')"),
+            "{hosts}"
+        );
+        assert!(
+            hosts.contains(
+                "timestamp IN (TIMESTAMP '2026-09-20T10:00:00.000000Z', \
+                 TIMESTAMP '2026-09-21T10:00:00.500000Z')"
+            ),
+            "one literal per distinct start: {hosts}"
+        );
+        assert!(hosts.contains("ORDER BY timestamp, message_id) AS host"));
+        assert!(hosts.ends_with("GROUP BY session_id LIMIT 3"));
     }
 
     #[test]
@@ -452,13 +568,23 @@ mod tests {
             since: None,
             limit: 5,
         };
+        let ids = ["a".to_owned()];
+        let starts = [SessionStart {
+            session_id: "a".to_owned(),
+            first_ts: ts("2026-09-20T10:00:00Z"),
+        }];
         for sql in [
             listing_sql(&scope),
-            hydrate_sql(&["a".to_owned()]),
+            titles_sql(&ids),
+            stats_sql(&ids),
+            hosts_sql(&starts),
             preview_sql("a"),
             page_sql("a", None),
         ] {
             assert!(sql.contains(" LIMIT "), "{sql}");
+        }
+        for unscoped in [listing_sql(&scope), stats_sql(&ids)] {
+            assert!(!unscoped.contains("json_get"), "{unscoped}");
         }
     }
 
@@ -469,9 +595,15 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].last_ts, ts("2026-09-25T04:00:02.384123Z"));
 
-        let details: Vec<SessionDetail> = decode(golden::SQL_HYDRATE).into_rows().unwrap();
-        assert_eq!(details[1].host, None);
-        assert_eq!(details[1].title, None);
+        assert_eq!(rows[1].first_ts, ts("2026-09-23T19:20:00Z"));
+        assert_eq!(rows[1].message_count, 3);
+
+        let hosts: Vec<SessionHost> = decode(golden::SQL_HOSTS).into_rows().unwrap();
+        assert_eq!(hosts[1].host, None);
+        let titles: Vec<SessionTitle> = decode(golden::SQL_TITLES).into_rows().unwrap();
+        assert_eq!(titles.len(), 1);
+        let stats: Vec<SessionStats> = decode(golden::SQL_STATS).into_rows().unwrap();
+        assert_eq!(stats[0].message_count, 94);
 
         let messages: Vec<TranscriptMessage> = decode(golden::SQL_PAGE).into_rows().unwrap();
         assert_eq!(messages[0].timestamp, messages[1].timestamp);

@@ -14,9 +14,9 @@ use crate::herdr::{self, Herdr};
 use crate::serve::{self, Fallback, Origin};
 use crate::types::{
     Api, ApiError, ApiFuture, Cursor, ErrorEnvelope, ListingScope, LiveAgent, PAGE_ROWS,
-    PREVIEW_ROWS, SearchRequest, SearchResponse, SessionDetail, SessionRow, SqlRequest,
-    SqlResponse, TranscriptMessage, TranscriptPage, hydrate_sql, listing_sql, page_sql,
-    preview_sql,
+    PREVIEW_ROWS, SearchRequest, SearchResponse, SessionHost, SessionRow, SessionStart,
+    SessionStats, SessionTitle, SqlRequest, SqlResponse, TranscriptMessage, TranscriptPage,
+    hosts_sql, listing_sql, page_sql, preview_sql, stats_sql, titles_sql,
 };
 
 pub(crate) const SQL_PATH: &str = "/v1/x/sql";
@@ -242,6 +242,20 @@ impl HttpApi {
         self.post(SQL_PATH, &request, sql_deadline(timeout_seconds))
             .await
     }
+
+    /// A page-scoped query answering at most one row per session.
+    async fn per_session<T: DeserializeOwned>(
+        &self,
+        sessions: usize,
+        query: impl FnOnce() -> String,
+    ) -> Result<Vec<T>, ApiError> {
+        if sessions == 0 {
+            return Ok(Vec::new());
+        }
+        self.sql(query(), sessions, QUERY_TIMEOUT_SECS)
+            .await?
+            .into_rows()
+    }
 }
 
 impl Api for HttpApi {
@@ -258,16 +272,22 @@ impl Api for HttpApi {
         })
     }
 
-    fn hydrate(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionDetail>> {
+    fn titles(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionTitle>> {
         Box::pin(async move {
-            if session_ids.is_empty() {
-                return Ok(Vec::new());
-            }
-            let query = hydrate_sql(&session_ids);
-            self.sql(query, session_ids.len(), QUERY_TIMEOUT_SECS)
-                .await?
-                .into_rows()
+            self.per_session(session_ids.len(), || titles_sql(&session_ids))
+                .await
         })
+    }
+
+    fn stats(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionStats>> {
+        Box::pin(async move {
+            self.per_session(session_ids.len(), || stats_sql(&session_ids))
+                .await
+        })
+    }
+
+    fn hosts(&self, starts: Vec<SessionStart>) -> ApiFuture<'_, Vec<SessionHost>> {
+        Box::pin(async move { self.per_session(starts.len(), || hosts_sql(&starts)).await })
     }
 
     fn search(&self, request: SearchRequest) -> ApiFuture<'_, SearchResponse> {
@@ -397,28 +417,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_reads_omitted_nulls_as_none() {
+    async fn hydration_sends_three_bounded_queries_and_reads_omitted_nulls_as_none() {
         let sandbox = Sandbox::new();
         let pond = FakePond::with_sql(
-            vec![("COUNT(*)", Reply::json(golden::SQL_HYDRATE))],
+            vec![
+                ("AS title", Reply::json(golden::SQL_TITLES)),
+                ("AS first_ts", Reply::json(golden::SQL_STATS)),
+                ("AS host", Reply::json(golden::SQL_HOSTS)),
+            ],
             Reply::json(golden::SEARCH),
         )
         .await;
         let api = api_at(pond.connect(), &sandbox);
-        assert!(api.hydrate(Vec::new()).await.unwrap().is_empty());
-        assert!(pond.recorded().is_empty(), "empty hydrate sent a request");
+        assert!(api.titles(Vec::new()).await.unwrap().is_empty());
+        assert!(api.stats(Vec::new()).await.unwrap().is_empty());
+        assert!(api.hosts(Vec::new()).await.unwrap().is_empty());
+        assert!(pond.recorded().is_empty(), "empty hydration sent a request");
 
         let ids = vec!["s-live".to_owned(), "s-old".to_owned()];
-        let details = api.hydrate(ids.clone()).await.unwrap();
-        assert_eq!(details[0].host.as_deref(), Some("ws-pond-01"));
-        assert_eq!(
-            (details[1].title.clone(), details[1].host.clone()),
-            (None, None)
+        let starts = vec![SessionStart {
+            session_id: "s-live".to_owned(),
+            first_ts: ts("2026-09-24T21:10:00Z"),
+        }];
+        let (titles, stats, hosts) = tokio::join!(
+            api.titles(ids.clone()),
+            api.stats(ids.clone()),
+            api.hosts(starts.clone())
         );
-        assert_eq!(details[1].message_count, 3);
-        let body = &sent(&pond)[0];
-        assert_eq!(body["query"], hydrate_sql(&ids));
-        assert_eq!(body["limit"], 2);
+        assert_eq!(
+            titles.unwrap()[0].title.as_deref(),
+            Some("fix the timer re-arm")
+        );
+        assert_eq!(stats.unwrap()[1].message_count, 3);
+        assert_eq!(hosts.unwrap()[1].host, None);
+
+        let mut bodies = sent(&pond);
+        bodies.sort_by_key(|body| body["query"].as_str().unwrap().to_owned());
+        let mut expected = [
+            (titles_sql(&ids), 2),
+            (stats_sql(&ids), 2),
+            (hosts_sql(&starts), 1),
+        ];
+        expected.sort();
+        for (body, (query, limit)) in bodies.iter().zip(expected) {
+            assert_eq!(body["query"], query);
+            assert_eq!(body["limit"], limit);
+        }
     }
 
     #[tokio::test]

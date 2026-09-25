@@ -12,20 +12,24 @@ use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use unicode_width::UnicodeWidthStr;
 
+use super::cache::{Host, Known, SavedListing, Snapshot};
 use super::ui;
 use crate::types::{
     ApiError, Cursor, DeskContext, DeskExit, LISTING_ROWS, ListingScope, LiveAgent, PAGE_ROWS,
-    SearchRequest, SearchResponse, SessionDetail, SessionRow, TranscriptMessage, TranscriptPage,
+    SearchRequest, SearchResponse, SessionHost, SessionRow, SessionStart, SessionStats,
+    SessionTitle, TranscriptMessage, TranscriptPage,
 };
 
 pub(super) const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 pub(super) const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 const SEARCH_LIMIT: usize = 50;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Lane {
     Listing,
-    Hydrate,
+    Titles,
+    Stats,
+    Hosts,
     Live,
     Search,
     Preview,
@@ -46,7 +50,9 @@ impl Lane {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Call {
     Listing(ListingScope),
-    Hydrate(Vec<String>),
+    Titles(Vec<String>),
+    Stats(Vec<String>),
+    Hosts(Vec<SessionStart>),
     Live,
     Search(SearchRequest),
     Preview(String),
@@ -60,7 +66,9 @@ impl Call {
     pub(super) fn lane(&self) -> Lane {
         match self {
             Self::Listing(_) => Lane::Listing,
-            Self::Hydrate(_) => Lane::Hydrate,
+            Self::Titles(_) => Lane::Titles,
+            Self::Stats(_) => Lane::Stats,
+            Self::Hosts(_) => Lane::Hosts,
             Self::Live => Lane::Live,
             Self::Search(_) => Lane::Search,
             Self::Preview(_) => Lane::Preview,
@@ -80,7 +88,9 @@ impl Call {
 #[derive(Debug)]
 pub(super) enum Reply {
     Listing(Result<Vec<SessionRow>, ApiError>),
-    Hydrate(Result<Vec<SessionDetail>, ApiError>),
+    Titles(Result<Vec<SessionTitle>, ApiError>),
+    Stats(Result<Vec<SessionStats>, ApiError>),
+    Hosts(Result<Vec<SessionHost>, ApiError>),
     Live(Result<Vec<LiveAgent>, ApiError>),
     Search(Result<SearchResponse, ApiError>),
     Preview(Result<Vec<TranscriptMessage>, ApiError>),
@@ -244,11 +254,17 @@ pub(super) struct App {
     lanes: [LaneState; Lane::COUNT],
     pub(super) all_projects: bool,
     pub(super) all_time: bool,
-    listings: HashMap<(bool, bool), Vec<SessionRow>>,
-    pub(super) details: HashMap<String, SessionDetail>,
-    /// Requested since the last listing fetch, so a refresh re-hydrates counts
-    /// while the old details stay on screen.
-    hydrated: HashSet<String>,
+    /// Typed search covers everything unless narrowed to the project or the
+    /// listing window.
+    pub(super) search_project: bool,
+    pub(super) search_recent: bool,
+    /// One per scope, this desk's and other projects' alike, so saving the
+    /// cache keeps what other desks stored.
+    listings: Vec<SavedListing>,
+    pub(super) known: HashMap<String, Known>,
+    /// Asked per hydration lane since the last listing landed, so an id the
+    /// server has no row for is not asked again until the next refresh.
+    requested: HashMap<Lane, HashSet<String>>,
     pub(super) live: Vec<LiveAgent>,
     pub(super) listing_state: ListState,
     pub(super) search_state: ListState,
@@ -277,9 +293,11 @@ impl App {
             lanes: Default::default(),
             all_projects: false,
             all_time: false,
-            listings: HashMap::new(),
-            details: HashMap::new(),
-            hydrated: HashSet::new(),
+            search_project: false,
+            search_recent: false,
+            listings: Vec::new(),
+            known: HashMap::new(),
+            requested: HashMap::new(),
             live: Vec::new(),
             listing_state: ListState::default(),
             search_state: ListState::default(),
@@ -297,8 +315,22 @@ impl App {
         }
     }
 
+    /// Paints the cached listing and facts at once; `start` then refreshes
+    /// behind them.
+    pub(super) fn restore(&mut self, snapshot: Snapshot) {
+        self.known = snapshot.sessions;
+        self.listings = snapshot.listings;
+        self.restore_listing_selection(None);
+    }
+
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot::new(self.known.clone(), self.listings.clone())
+    }
+
     pub(super) fn start(&mut self) -> Vec<Effect> {
-        self.refresh()
+        let mut effects = self.refresh();
+        effects.extend(self.hydrate_visible());
+        effects
     }
 
     pub(super) fn lane_loading(&self, lane: Lane) -> bool {
@@ -333,10 +365,24 @@ impl App {
         scope
     }
 
+    pub(super) fn search_scope(&self) -> ListingScope {
+        let project = self
+            .search_project
+            .then(|| self.context.project.clone())
+            .flatten();
+        let mut scope = ListingScope::recent(project, self.now);
+        if !self.search_recent {
+            scope.since = None;
+        }
+        scope
+    }
+
     pub(super) fn listing(&self) -> Option<&[SessionRow]> {
+        let key = scope_key(&self.scope());
         self.listings
-            .get(&scope_key(&self.scope()))
-            .map(Vec::as_slice)
+            .iter()
+            .find(|listing| (&listing.project, listing.all_time) == (&key.0, key.1))
+            .map(|listing| listing.rows.as_slice())
     }
 
     pub(super) fn rows_len(&self) -> usize {
@@ -346,7 +392,7 @@ impl App {
         }
     }
 
-    fn id_at(&self, index: usize) -> Option<&str> {
+    pub(super) fn id_at(&self, index: usize) -> Option<&str> {
         match &self.search {
             Some(search) => search
                 .response
@@ -467,7 +513,7 @@ impl App {
     }
 
     fn fetch_search(&mut self, query: String, delay: Duration) -> Option<Effect> {
-        let request = SearchRequest::new(query, SEARCH_LIMIT).within(&self.scope());
+        let request = SearchRequest::new(query, SEARCH_LIMIT).within(&self.search_scope());
         self.fetch(Call::Search(request), delay)
     }
 
@@ -483,7 +529,7 @@ impl App {
         self.size = Size::new(width, height);
         self.dirty = true;
         self.resized = true;
-        self.hydrate_visible().into_iter().collect()
+        self.hydrate_visible()
     }
 
     /// Re-wraps the pager for the latest size, then fetches more if the new
@@ -646,31 +692,77 @@ impl App {
     }
 
     fn selection_changed(&mut self) -> Vec<Effect> {
-        let mut effects: Vec<Effect> = self.hydrate_visible().into_iter().collect();
+        let mut effects = self.hydrate_visible();
         effects.extend(self.preview_selected(PREVIEW_DEBOUNCE));
         effects
     }
 
-    /// One hydrate per visible page: the rows around the selection that this
-    /// listing has not asked about yet, never the whole listing.
-    fn hydrate_visible(&mut self) -> Option<Effect> {
-        if self.lane_loading(Lane::Hydrate) {
-            return None;
-        }
+    /// Hydrates the rows around the selection - never the whole listing -
+    /// with one request per lane, concurrently, each asking only for what is
+    /// not known yet. A host is read at the session's first message, so it
+    /// waits for the stats that find that start when the listing cannot.
+    fn hydrate_visible(&mut self) -> Vec<Effect> {
         let len = self.rows_len();
         let selected = self.selected_index().unwrap_or(0);
         let height = usize::from(ui::desk_areas(self.area(), self.preview_open).list.height).max(1);
-        let window = selected.saturating_sub(height)..(selected + height + 1).min(len);
-        let missing: Vec<String> = window
+        let window: Vec<String> = (selected.saturating_sub(height)
+            ..(selected + height + 1).min(len))
             .filter_map(|index| self.id_at(index))
-            .filter(|id| !self.hydrated.contains(*id))
             .map(str::to_owned)
             .collect();
-        if missing.is_empty() {
+        let listing = self.search.is_none();
+        let titles = self.unknown(Lane::Titles, &window, |known| known.title().is_none());
+        let stats = self.unknown(Lane::Stats, &window, |known| {
+            (listing && known.count().is_none())
+                || (known.host.is_none() && known.first_ts.is_none())
+        });
+        let hosts: Vec<SessionStart> = self
+            .unknown(Lane::Hosts, &window, |known| {
+                known.host.is_none() && known.first_ts.is_some()
+            })
+            .into_iter()
+            .filter_map(|id| {
+                let first_ts = self.known.get(&id)?.first_ts?;
+                Some(SessionStart {
+                    session_id: id,
+                    first_ts,
+                })
+            })
+            .collect();
+        [
+            self.request(Lane::Titles, titles.clone(), Call::Titles(titles)),
+            self.request(Lane::Stats, stats.clone(), Call::Stats(stats)),
+            self.request(
+                Lane::Hosts,
+                hosts.iter().map(|start| start.session_id.clone()).collect(),
+                Call::Hosts(hosts),
+            ),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The ids `lane` has not been asked about that still `need` it; none
+    /// while the lane is busy, since a new fetch would abort its request.
+    fn unknown(&self, lane: Lane, ids: &[String], need: impl Fn(&Known) -> bool) -> Vec<String> {
+        if self.lane_loading(lane) {
+            return Vec::new();
+        }
+        let asked = self.requested.get(&lane);
+        ids.iter()
+            .filter(|id| asked.is_none_or(|asked| !asked.contains(*id)))
+            .filter(|id| self.known.get(*id).is_none_or(&need))
+            .cloned()
+            .collect()
+    }
+
+    fn request(&mut self, lane: Lane, ids: Vec<String>, call: Call) -> Option<Effect> {
+        if ids.is_empty() {
             return None;
         }
-        self.hydrated.extend(missing.iter().cloned());
-        self.fetch(Call::Hydrate(missing), Duration::ZERO)
+        self.requested.entry(lane).or_default().extend(ids);
+        self.fetch(call, Duration::ZERO)
     }
 
     fn preview_selected(&mut self, delay: Duration) -> Option<Effect> {
@@ -720,16 +812,30 @@ impl App {
         effects
     }
 
+    /// `p` means "this project only / everything" and `t` "the listing
+    /// window / all time", for whichever view is up: the listing and typed
+    /// search keep their own scopes.
     fn toggle_scope(&mut self, projects: bool) -> Vec<Effect> {
+        if projects && self.context.project.is_none() {
+            self.toast = Some(
+                "the desk was opened without a project: already covering all projects".to_owned(),
+            );
+            return Vec::new();
+        }
+        if let Some(search) = &mut self.search {
+            search.response = None;
+            let query = search.query.clone();
+            if projects {
+                self.search_project = !self.search_project;
+            } else {
+                self.search_recent = !self.search_recent;
+            }
+            let mut effects = self.transition();
+            effects.extend(self.fetch_search(query, Duration::ZERO));
+            return effects;
+        }
         let selected = self.selected_listing_id();
         if projects {
-            if self.context.project.is_none() {
-                self.toast = Some(
-                    "the desk was opened without a project: already showing all projects"
-                        .to_owned(),
-                );
-                return Vec::new();
-            }
             self.all_projects = !self.all_projects;
         } else {
             self.all_time = !self.all_time;
@@ -739,11 +845,6 @@ impl App {
             self.restore_listing_selection(selected.as_deref());
         } else {
             effects.extend(self.fetch(Call::Listing(self.scope()), Duration::ZERO));
-        }
-        if let Some(search) = &mut self.search {
-            search.response = None;
-            let query = search.query.clone();
-            effects.extend(self.fetch_search(query, Duration::ZERO));
         }
         effects.extend(self.selection_changed());
         effects
@@ -775,9 +876,9 @@ impl App {
             })];
         }
         let title = self
-            .details
+            .known
             .get(&id)
-            .and_then(|detail| detail.title.as_deref())
+            .and_then(|known| known.title().flatten())
             .map_or_else(|| ui::NO_TITLE.to_owned(), ui::one_line);
         let width = usize::from(self.pager_viewport().width);
         self.pager = Some(Pager::new(id, title, width));
@@ -830,11 +931,35 @@ impl App {
         self.dirty = true;
         match (msg.call, msg.reply) {
             (Call::Listing(scope), Reply::Listing(result)) => self.on_listing(&scope, result),
-            (Call::Hydrate(_), Reply::Hydrate(result)) => match result {
-                Ok(details) => {
-                    self.details
-                        .extend(details.into_iter().map(|d| (d.session_id.clone(), d)));
-                    self.hydrate_visible().into_iter().collect()
+            (Call::Titles(ids), Reply::Titles(result)) => match result {
+                Ok(rows) => {
+                    let mut titles: HashMap<String, Option<String>> =
+                        ids.into_iter().map(|id| (id, None)).collect();
+                    titles.extend(rows.into_iter().map(|row| (row.session_id, row.title)));
+                    for (id, title) in titles {
+                        self.known.entry(id).or_default().set_title(title);
+                    }
+                    self.hydrate_visible()
+                }
+                Err(error) => self.toast(&error),
+            },
+            (Call::Stats(_), Reply::Stats(result)) => match result {
+                Ok(rows) => {
+                    for row in rows {
+                        let known = self.known.entry(row.session_id).or_default();
+                        known.set_stats(row.message_count, row.first_ts);
+                    }
+                    self.hydrate_visible()
+                }
+                Err(error) => self.toast(&error),
+            },
+            (Call::Hosts(_), Reply::Hosts(result)) => match result {
+                Ok(rows) => {
+                    for row in rows {
+                        self.known.entry(row.session_id).or_default().host =
+                            Some(row.host.map_or(Host::Unstamped, Host::Stamped));
+                    }
+                    self.hydrate_visible()
                 }
                 Err(error) => self.toast(&error),
             },
@@ -889,16 +1014,28 @@ impl App {
     ) -> Vec<Effect> {
         match result {
             Ok(rows) => {
-                let current = scope_key(scope) == scope_key(&self.scope());
+                for row in &rows {
+                    let known = self.known.entry(row.session_id.clone()).or_default();
+                    known.observe(row, scope.since);
+                }
+                let key = scope_key(scope);
+                let current = key == scope_key(&self.scope());
                 let selected = self.selected_listing_id();
-                self.listings.insert(scope_key(scope), rows);
+                self.listings
+                    .retain(|listing| (&listing.project, listing.all_time) != (&key.0, key.1));
+                self.listings.push(SavedListing {
+                    project: key.0,
+                    all_time: key.1,
+                    saved_at: self.now,
+                    rows,
+                });
                 if !current {
                     return Vec::new();
                 }
                 self.fatal = None;
-                self.hydrated.clear();
+                self.requested.clear();
                 self.restore_listing_selection(selected.as_deref());
-                self.hydrate_visible().into_iter().collect()
+                self.hydrate_visible()
             }
             Err(error) => {
                 if self.listings.is_empty()
@@ -960,10 +1097,10 @@ impl App {
     }
 }
 
-/// Listings are cached per toggle state, not per timestamp, so toggling back
-/// is instant even though `since` moves with the clock.
-fn scope_key(scope: &ListingScope) -> (bool, bool) {
-    (scope.project.is_none(), scope.since.is_none())
+/// Listings are cached per project and window kind, not per timestamp, so
+/// toggling back is instant even though `since` moves with the clock.
+fn scope_key(scope: &ListingScope) -> (Option<String>, bool) {
+    (scope.project.clone(), scope.since.is_none())
 }
 
 #[cfg(test)]
@@ -979,7 +1116,9 @@ mod tests {
     use chrono::TimeDelta;
 
     use super::*;
-    use crate::desk::tests::{MockApi, app, key, message, now, press, screen, settle, sql_rows};
+    use crate::desk::tests::{
+        MockApi, app, context, key, message, now, press, screen, settle, sql_rows,
+    };
     use crate::fake_pond::golden;
     use crate::types::{LISTING_ROWS, ProjectFilter};
 
@@ -994,9 +1133,22 @@ mod tests {
         SessionRow {
             session_id: id.to_owned(),
             last_ts: now() - TimeDelta::hours(1),
+            first_ts: now() - TimeDelta::hours(3),
+            message_count: 7,
             source_agent: "codex-cli".to_owned(),
             project: "/home/me/pj/pond".to_owned(),
         }
+    }
+
+    fn hydrations(api: &MockApi) -> Vec<Call> {
+        api.calls()
+            .into_iter()
+            .filter(|call| matches!(call.lane(), Lane::Titles | Lane::Stats | Lane::Hosts))
+            .collect()
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
     fn search_response(body: &str) -> SearchResponse {
@@ -1026,11 +1178,24 @@ mod tests {
         let calls = api.calls();
         assert!(matches!(&calls[0], Call::Listing(scope) if scope.limit == LISTING_ROWS));
         assert_eq!(calls[1], Call::Live);
+        let page = ids(&["s-live", "s-old"]);
         assert_eq!(
-            calls[2],
-            Call::Hydrate(vec!["s-live".to_owned(), "s-old".to_owned()])
+            hydrations(&api),
+            [
+                Call::Titles(page.clone()),
+                Call::Stats(page),
+                Call::Hosts(
+                    sql_rows::<SessionStats>(golden::SQL_STATS)
+                        .into_iter()
+                        .map(|stats| SessionStart {
+                            session_id: stats.session_id,
+                            first_ts: stats.first_ts,
+                        })
+                        .collect()
+                ),
+            ],
+            "one request per lane for the page; hosts wait for the starts"
         );
-        assert_eq!(calls.len(), 3, "exactly one hydrate for the page");
         let screen = screen(&mut app);
         assert!(screen.contains("msgs = whole-session counts"), "{screen}");
         assert!(screen.contains("● ws-pond-01 claude-code"), "{screen}");
@@ -1048,16 +1213,209 @@ mod tests {
         };
         let mut app = opened(&api, 100, 10);
         let first = api.calls().into_iter().find_map(|call| match call {
-            Call::Hydrate(ids) => Some(ids),
+            Call::Titles(ids) => Some(ids),
             _ => None,
         });
         assert!(first.unwrap().len() < 20, "never the whole listing");
         press(&mut app, &api, KeyCode::End);
-        let Some(Call::Hydrate(ids)) = api.calls().pop() else {
+        let Some(Call::Titles(ids)) = api
+            .calls()
+            .into_iter()
+            .rev()
+            .find(|call| matches!(call, Call::Titles(_)))
+        else {
             panic!("jumping to the end hydrates the new page");
         };
         assert!(ids.contains(&"s59".to_owned()));
         assert!(!ids.contains(&"s00".to_owned()));
+    }
+
+    #[test]
+    fn a_windowed_count_waits_for_the_session_start_and_all_time_needs_none() {
+        let api = MockApi {
+            titles_delay: Duration::from_secs(1),
+            ..MockApi::golden()
+        };
+        let mut app = app(110, 10);
+        let effects = app.start();
+        let listing: Vec<Effect> = effects
+            .into_iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    Effect::Fetch {
+                        call: Call::Listing(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let hydration = settle_listing(&mut app, &api, listing);
+        assert!(
+            !screen(&mut app).contains("    94 "),
+            "an in-window count is not the whole session's until the start is known"
+        );
+        assert!(
+            hydration.contains(&Call::Stats(ids(&["s-live", "s-old"]))),
+            "{hydration:?}"
+        );
+
+        let all_time = MockApi::golden();
+        let mut app = opened(&all_time, 110, 10);
+        press(&mut app, &all_time, KeyCode::Char('t'));
+        let after_toggle: Vec<Call> = hydrations(&all_time).into_iter().skip(3).collect();
+        assert!(
+            after_toggle.is_empty(),
+            "known starts and counts need no new hydration: {after_toggle:?}"
+        );
+        assert!(screen(&mut app).contains("    94 "));
+    }
+
+    /// Applies just the listing reply and returns the hydration it asks for.
+    fn settle_listing(app: &mut App, api: &MockApi, listing: Vec<Effect>) -> Vec<Call> {
+        let [
+            Effect::Fetch {
+                generation,
+                epoch,
+                call,
+                ..
+            },
+        ] = &listing[..]
+        else {
+            panic!("{listing:?}");
+        };
+        let reply = Reply::Listing(Ok(api.sessions.clone()));
+        app.apply(Msg {
+            generation: *generation,
+            epoch: *epoch,
+            call: call.clone(),
+            reply,
+        })
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::Fetch { call, .. } => Some(call),
+            _ => None,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn hosts_render_before_titles_land() {
+        let api = MockApi::golden();
+        let mut app = opened(&api, 110, 10);
+        app.known.clear();
+        app.requested.clear();
+        for id in ["s-live", "s-old"] {
+            app.known
+                .entry(id.to_owned())
+                .or_default()
+                .set_stats(5, now() - TimeDelta::days(1));
+        }
+        let effects = app.hydrate_visible();
+        let lanes: Vec<Lane> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Fetch { call, .. } => Some(call.lane()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lanes,
+            [Lane::Titles, Lane::Hosts],
+            "concurrent, not chained"
+        );
+
+        let hosts = effects.into_iter().filter(|effect| {
+            matches!(
+                effect,
+                Effect::Fetch {
+                    call: Call::Hosts(_),
+                    ..
+                }
+            )
+        });
+        settle(&mut app, &api, hosts.collect());
+        let partial = screen(&mut app);
+        assert!(partial.contains("ws-pond-01"), "{partial}");
+        assert!(!partial.contains("fix the timer re-arm"), "{partial}");
+        assert!(app.lane_loading(Lane::Titles));
+    }
+
+    #[test]
+    fn a_restored_cache_paints_at_once_and_hydrates_only_what_it_lacks() {
+        let warm = MockApi::golden();
+        let saved = opened(&warm, 110, 10).snapshot();
+
+        let mut fresh_rows = warm.sessions.clone();
+        let mut new_session = row("s-new");
+        new_session.last_ts = now() - TimeDelta::minutes(1);
+        fresh_rows.insert(0, new_session);
+        let api = MockApi {
+            sessions: fresh_rows,
+            ..MockApi::golden()
+        };
+        let mut app = app(110, 10);
+        app.restore(saved);
+        let painted = screen(&mut app);
+        assert!(painted.contains("fix the timer re-arm"), "{painted}");
+        assert!(painted.contains("ws-pond-01"), "{painted}");
+        assert!(painted.contains("    94 "), "{painted}");
+
+        let effects = app.start();
+        assert!(
+            fetches(&effects)
+                .iter()
+                .all(|call| !matches!(call.lane(), Lane::Titles | Lane::Stats | Lane::Hosts)),
+            "every cached row is complete: {effects:?}"
+        );
+        assert!(app.spinner_visible(), "the refresh runs behind the cache");
+        assert!(screen(&mut app).contains("2 sessions"));
+        settle(&mut app, &api, effects);
+        assert!(screen(&mut app).contains("3 sessions"));
+        for call in hydrations(&api) {
+            let asked = match call {
+                Call::Titles(ids) | Call::Stats(ids) => ids,
+                Call::Hosts(starts) => starts.into_iter().map(|s| s.session_id).collect(),
+                _ => unreachable!(),
+            };
+            assert_eq!(asked, ["s-new"], "only the new session is hydrated");
+        }
+    }
+
+    #[test]
+    fn hosts_show_short_names_and_this_machine() {
+        let api = MockApi {
+            hosts: vec![
+                SessionHost {
+                    session_id: "s-live".to_owned(),
+                    host: Some("beelink-eq14.tail1234.ts.net".to_owned()),
+                },
+                SessionHost {
+                    session_id: "s-old".to_owned(),
+                    host: Some("DEVBOX.lan".to_owned()),
+                },
+            ],
+            ..MockApi::golden()
+        };
+        let mut app = opened(&api, 110, 10);
+        let screen_text = screen(&mut app);
+        assert!(
+            screen_text.contains("● beelink-eq14 claude-code"),
+            "short name, uncut: {screen_text}"
+        );
+        assert!(
+            screen_text.contains("  this         codex-cli"),
+            "{screen_text}"
+        );
+        assert!(!screen_text.contains("tail1234"), "{screen_text}");
+        assert!(
+            screen_text.contains("    machine      adapter"),
+            "{screen_text}"
+        );
+
+        let mut narrow = opened(&api, 60, 10);
+        let narrow_text = screen(&mut narrow);
+        assert!(narrow_text.contains("● beelink-e… claude"), "{narrow_text}");
     }
 
     #[test]
@@ -1238,33 +1596,85 @@ mod tests {
         assert!(app.spinner_visible());
     }
 
+    fn last_search(api: &MockApi) -> SearchRequest {
+        api.calls()
+            .into_iter()
+            .rev()
+            .find_map(|call| match call {
+                Call::Search(request) => Some(request),
+                _ => None,
+            })
+            .expect("a search was sent")
+    }
+
     #[test]
-    fn project_toggle_widens_listing_and_search() {
+    fn search_covers_everything_until_p_or_t_narrow_it() {
         let api = MockApi::golden();
-        let mut app = opened(&api, 100, 12);
+        let mut app = opened(&api, 140, 12);
         type_query(&mut app, &api, "timer");
-        let Some(Call::Search(scoped)) = api.calls().pop() else {
-            panic!("typing searches");
-        };
-        assert_eq!(
-            scoped.filters.project,
-            Some(ProjectFilter::Contains("/home/me/pj/pond".to_owned()))
-        );
-        assert_eq!(scoped.filters.from_date.as_deref(), Some("2026-09-11"));
+        let wide = last_search(&api);
+        assert_eq!(wide.filters.project, None);
+        assert_eq!(wide.filters.from_date, None);
+        assert!(screen(&mut app).contains("| searching everything |"));
 
         press(&mut app, &api, KeyCode::Enter);
         press(&mut app, &api, KeyCode::Char('p'));
-        let calls = api.calls();
-        assert!(
-            calls
-                .iter()
-                .any(|call| matches!(call, Call::Listing(s) if s.project.is_none()))
+        let project = last_search(&api);
+        assert_eq!(
+            project.filters.project,
+            Some(ProjectFilter::Contains("/home/me/pj/pond".to_owned()))
         );
-        let Some(Call::Search(wide)) = calls.iter().rev().find(|c| matches!(c, Call::Search(_)))
-        else {
-            panic!("the search follows the scope");
-        };
-        assert_eq!(wide.filters.project, None);
+        assert_eq!(project.filters.from_date, None);
+        assert!(screen(&mut app).contains("| searching this project |"));
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|call| matches!(call, Call::Listing(s) if s.project.is_none())),
+            "p in search leaves the listing scope alone"
+        );
+
+        press(&mut app, &api, KeyCode::Char('t'));
+        assert_eq!(
+            last_search(&api).filters.from_date.as_deref(),
+            Some("2026-09-11")
+        );
+        assert!(screen(&mut app).contains("| searching this project, last 14 days |"));
+        press(&mut app, &api, KeyCode::Char('p'));
+        assert!(screen(&mut app).contains("| searching all projects, last 14 days |"));
+
+        press(&mut app, &api, KeyCode::Esc);
+        assert!(
+            !app.all_projects && !app.all_time,
+            "the listing kept its default"
+        );
+        press(&mut app, &api, KeyCode::Char('p'));
+        assert!(
+            api.calls()
+                .iter()
+                .any(|call| matches!(call, Call::Listing(s) if s.project.is_none())),
+            "p in the listing widens the listing"
+        );
+    }
+
+    #[test]
+    fn p_without_a_project_explains_itself() {
+        let api = MockApi::golden();
+        let mut app = App::new(
+            DeskContext {
+                project: None,
+                ..context()
+            },
+            now(),
+            Size::new(100, 12),
+        );
+        let effects = app.start();
+        settle(&mut app, &api, effects);
+        type_query(&mut app, &api, "timer");
+        press(&mut app, &api, KeyCode::Enter);
+        let before = api.calls().len();
+        press(&mut app, &api, KeyCode::Char('p'));
+        assert_eq!(api.calls().len(), before);
+        assert!(app.toast.as_ref().unwrap().contains("without a project"));
     }
 
     #[test]
@@ -1277,7 +1687,7 @@ mod tests {
         type_query(&mut app, &empty_scope, "timer");
         let screen_text = screen(&mut app);
         assert!(
-            screen_text.contains("nothing searchable in scope"),
+            screen_text.contains("nothing searchable in scope (searching everything)"),
             "{screen_text}"
         );
 

@@ -1,7 +1,9 @@
 //! The session desk TUI: a runtime that owns the terminal and performs the
-//! effects of the pure reducers in `app`, and `ui` to draw their state.
+//! effects of the pure reducers in `app`, `ui` to draw their state, and
+//! `cache` to carry what the desk learned into the next open.
 
 mod app;
+mod cache;
 mod ui;
 
 use std::future::Future;
@@ -51,11 +53,36 @@ pub(crate) fn run(api: Arc<dyn Api>, context: DeskContext) -> anyhow::Result<Des
 }
 
 /// Ends on quit, jump, `shutdown`, or the event stream ending - a closed or
-/// failing stream means the pane is gone.
+/// failing stream means the pane is gone. The cache is read before the first
+/// frame and written on every one of those exits.
 async fn event_loop<B, S>(
     terminal: &mut Terminal<B>,
     api: Arc<dyn Api>,
     context: DeskContext,
+    events: S,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<DeskExit>
+where
+    B: Backend,
+    B::Error: Send + Sync + 'static,
+    S: Stream<Item = io::Result<Event>> + Unpin,
+{
+    let state_dir = context.state_dir.clone();
+    let mut app = App::new(context, Utc::now(), terminal.size()?);
+    if let Some(dir) = &state_dir {
+        app.restore(cache::load(dir));
+    }
+    let exit = drive(terminal, api, &mut app, events, shutdown).await;
+    if let Some(dir) = &state_dir {
+        cache::save(dir, app.snapshot());
+    }
+    exit
+}
+
+async fn drive<B, S>(
+    terminal: &mut Terminal<B>,
+    api: Arc<dyn Api>,
+    app: &mut App,
     mut events: S,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<DeskExit>
@@ -66,7 +93,6 @@ where
 {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut runner = Runner::new(api, tx);
-    let mut app = App::new(context, Utc::now(), terminal.size()?);
     let mut spinner = tokio::time::interval(SPINNER_TICK);
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
@@ -79,7 +105,7 @@ where
             }
         }
         if app.dirty {
-            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            terminal.draw(|frame| ui::render(frame, app))?;
             app.dirty = false;
         }
         effects = tokio::select! {
@@ -157,7 +183,9 @@ impl Runner {
 async fn call_api(api: &dyn Api, call: &Call) -> Reply {
     match call.clone() {
         Call::Listing(scope) => Reply::Listing(api.list_sessions(scope).await),
-        Call::Hydrate(ids) => Reply::Hydrate(api.hydrate(ids).await),
+        Call::Titles(ids) => Reply::Titles(api.titles(ids).await),
+        Call::Stats(ids) => Reply::Stats(api.stats(ids).await),
+        Call::Hosts(starts) => Reply::Hosts(api.hosts(starts).await),
         Call::Live => Reply::Live(api.live_agents().await),
         Call::Search(request) => Reply::Search(api.search(request).await),
         Call::Preview(id) => Reply::Preview(api.preview(id).await),
@@ -182,11 +210,11 @@ pub(super) mod tests {
     use serde::de::DeserializeOwned;
 
     use super::*;
-    use crate::fake_pond::golden;
+    use crate::fake_pond::{Sandbox, golden};
     use crate::types::{
         ApiError, ApiFuture, Cursor, ListingScope, LiveAgent, PAGE_ROWS, PREVIEW_ROWS,
-        SearchRequest, SearchResponse, SessionDetail, SessionRow, SqlResponse, TranscriptMessage,
-        TranscriptPage,
+        SearchRequest, SearchResponse, SessionHost, SessionRow, SessionStart, SessionStats,
+        SessionTitle, SqlResponse, TranscriptMessage, TranscriptPage,
     };
 
     pub(in crate::desk) fn now() -> DateTime<Utc> {
@@ -214,7 +242,10 @@ pub(super) mod tests {
     #[derive(Default)]
     pub(in crate::desk) struct MockApi {
         pub(in crate::desk) sessions: Vec<SessionRow>,
-        pub(in crate::desk) details: Vec<SessionDetail>,
+        pub(in crate::desk) titles: Vec<SessionTitle>,
+        pub(in crate::desk) stats: Vec<SessionStats>,
+        pub(in crate::desk) hosts: Vec<SessionHost>,
+        pub(in crate::desk) titles_delay: Duration,
         pub(in crate::desk) transcript: Vec<TranscriptMessage>,
         pub(in crate::desk) live: Vec<LiveAgent>,
         pub(in crate::desk) listing_error: Option<ApiError>,
@@ -228,7 +259,9 @@ pub(super) mod tests {
         pub(in crate::desk) fn golden() -> Self {
             Self {
                 sessions: sql_rows(golden::SQL_LISTING),
-                details: sql_rows(golden::SQL_HYDRATE),
+                titles: sql_rows(golden::SQL_TITLES),
+                stats: sql_rows(golden::SQL_STATS),
+                hosts: sql_rows(golden::SQL_HOSTS),
                 transcript: sql_rows(golden::SQL_PAGE),
                 live: vec![LiveAgent {
                     pane_id: "p7".to_owned(),
@@ -267,14 +300,38 @@ pub(super) mod tests {
             self.reply(Call::Listing(scope), Duration::ZERO, result)
         }
 
-        fn hydrate(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionDetail>> {
-            let details = self
-                .details
+        fn titles(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionTitle>> {
+            let rows = self
+                .titles
                 .iter()
-                .filter(|d| session_ids.contains(&d.session_id))
+                .filter(|row| session_ids.contains(&row.session_id))
                 .cloned()
                 .collect();
-            self.reply(Call::Hydrate(session_ids), Duration::ZERO, Ok(details))
+            self.reply(Call::Titles(session_ids), self.titles_delay, Ok(rows))
+        }
+
+        fn stats(&self, session_ids: Vec<String>) -> ApiFuture<'_, Vec<SessionStats>> {
+            let rows = self
+                .stats
+                .iter()
+                .filter(|row| session_ids.contains(&row.session_id))
+                .cloned()
+                .collect();
+            self.reply(Call::Stats(session_ids), Duration::ZERO, Ok(rows))
+        }
+
+        fn hosts(&self, starts: Vec<SessionStart>) -> ApiFuture<'_, Vec<SessionHost>> {
+            let rows = self
+                .hosts
+                .iter()
+                .filter(|row| {
+                    starts
+                        .iter()
+                        .any(|start| start.session_id == row.session_id)
+                })
+                .cloned()
+                .collect();
+            self.reply(Call::Hosts(starts), Duration::ZERO, Ok(rows))
         }
 
         fn search(&self, request: SearchRequest) -> ApiFuture<'_, SearchResponse> {
@@ -323,11 +380,16 @@ pub(super) mod tests {
         }
     }
 
-    pub(in crate::desk) fn app(width: u16, height: u16) -> App {
-        let context = DeskContext {
+    pub(in crate::desk) fn context() -> DeskContext {
+        DeskContext {
             project: Some("/home/me/pj/pond".to_owned()),
-        };
-        App::new(context, now(), Size::new(width, height))
+            hostname: Some("devbox".to_owned()),
+            state_dir: None,
+        }
+    }
+
+    pub(in crate::desk) fn app(width: u16, height: u16) -> App {
+        App::new(context(), now(), Size::new(width, height))
     }
 
     /// Performs effects synchronously against an undelayed mock, feeding
@@ -490,17 +552,50 @@ pub(super) mod tests {
         events: impl Stream<Item = io::Result<Event>> + Send + 'static,
         shutdown: impl Future<Output = ()>,
     ) -> (anyhow::Result<DeskExit>, String) {
+        run_loop_in(DeskContext::default(), api, events, shutdown).await
+    }
+
+    async fn run_loop_in(
+        context: DeskContext,
+        api: MockApi,
+        events: impl Stream<Item = io::Result<Event>> + Send + 'static,
+        shutdown: impl Future<Output = ()>,
+    ) -> (anyhow::Result<DeskExit>, String) {
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         let events: Pin<Box<dyn Stream<Item = io::Result<Event>> + Send>> = Box::pin(events);
-        let exit = event_loop(
-            &mut terminal,
-            Arc::new(api),
-            DeskContext::default(),
-            events,
-            shutdown,
+        let exit = event_loop(&mut terminal, Arc::new(api), context, events, shutdown).await;
+        (exit, buffer_text(terminal.backend()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_paints_the_next_open_before_pond_answers() {
+        let sandbox = Sandbox::new();
+        let context = DeskContext {
+            state_dir: Some(sandbox.state_dir()),
+            ..context()
+        };
+        let quit_later = stream::once(async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok(key(KeyCode::Char('q')))
+        });
+        let (exit, _) = run_loop_in(
+            context.clone(),
+            MockApi::golden(),
+            quit_later.chain(stream::pending()),
+            std::future::pending(),
         )
         .await;
-        (exit, buffer_text(terminal.backend()))
+        assert_eq!(exit.unwrap(), DeskExit::Quit);
+
+        let offline = MockApi {
+            listing_error: Some(ApiError::Request("timed out".to_owned())),
+            ..MockApi::default()
+        };
+        let (_, screen) =
+            run_loop_in(context, offline, stream::empty(), std::future::pending()).await;
+        assert!(screen.contains("fix the timer re-arm"), "{screen}");
+        assert!(screen.contains("ws-pond-01"), "{screen}");
+        assert!(screen.contains("    94 "), "{screen}");
     }
 
     #[tokio::test]

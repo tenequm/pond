@@ -13,11 +13,18 @@ use ratatui::widgets::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{App, Lane};
+use super::cache::Host;
 use crate::types::{LISTING_WINDOW_DAYS, SearchSession, SessionRow, TranscriptMessage};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TAB_STOP: usize = 4;
-const MACHINE: usize = 10;
+/// The machine column fits the widest name in view, between these bounds;
+/// below [`SIDE_BY_SIDE_MIN_WIDTH`] it keeps to the narrow cap.
+const MACHINE_MIN: usize = 7;
+const MACHINE_NARROW: usize = 10;
+const MACHINE_WIDE: usize = 16;
+const THIS_MACHINE: &str = "this";
+const UNSTAMPED: &str = "local?";
 const ADAPTER: usize = 12;
 const AGE: usize = 4;
 const COUNT: usize = 7;
@@ -126,8 +133,9 @@ fn render_desk(frame: &mut Frame, app: &mut App) {
     let areas = desk_areas(frame.area(), app.preview_open);
     frame.render_widget(Paragraph::new(header(app)), areas.header);
     render_input(frame, app, areas.input);
-    frame.render_widget(Paragraph::new(column_header()).dim(), areas.columns);
-    render_rows(frame, app, areas.list);
+    let machine = machine_width(app, areas.list.width);
+    frame.render_widget(Paragraph::new(column_header(machine)).dim(), areas.columns);
+    render_rows(frame, app, areas.list, machine);
     if let Some(preview) = areas.preview {
         render_preview(frame, app, preview);
     }
@@ -142,26 +150,41 @@ fn window_label(app: &App) -> String {
     }
 }
 
+/// The typed-search scope in words: the whole corpus unless `p` or `t`
+/// narrowed it.
+pub(super) fn search_label(app: &App) -> String {
+    let scope = app.search_scope();
+    let window = scope.since.map_or_else(String::new, |_| {
+        format!(", last {LISTING_WINDOW_DAYS} days")
+    });
+    match (scope.project.is_some(), scope.since.is_some()) {
+        (false, false) => "searching everything".to_owned(),
+        (true, _) => format!("searching this project{window}"),
+        (false, true) => format!("searching all projects{window}"),
+    }
+}
+
 fn header(app: &App) -> Line<'static> {
-    let scope = app.scope();
-    let count = match &app.search {
-        Some(search) => search.response.as_ref().map_or_else(
-            || "searching".to_owned(),
-            |r| format!("{} sessions match", r.sessions.len()),
+    let text = match &app.search {
+        Some(search) => format!(
+            " | {} | {} | msgs = matched/whole-session",
+            search.response.as_ref().map_or_else(
+                || "searching".to_owned(),
+                |r| format!("{} sessions match", r.sessions.len()),
+            ),
+            search_label(app)
         ),
-        None => app.listing().map_or_else(
-            || "loading".to_owned(),
-            |rows| format!("{} sessions", rows.len()),
+        None => format!(
+            " | {} | {} | {} | msgs = whole-session counts",
+            app.listing().map_or_else(
+                || "loading".to_owned(),
+                |rows| format!("{} sessions", rows.len()),
+            ),
+            app.scope().project.as_deref().unwrap_or("all projects"),
+            window_label(app)
         ),
     };
-    Line::from(vec![
-        "pond desk".bold(),
-        Span::raw(format!(
-            " | {count} | {} | {} | msgs = whole-session counts",
-            scope.project.as_deref().unwrap_or("all projects"),
-            window_label(app)
-        )),
-    ])
+    Line::from(vec!["pond desk".bold(), Span::raw(text)])
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -190,18 +213,18 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn column_header() -> String {
+fn column_header(machine: usize) -> String {
     format!(
         "    {} {} {:>AGE$} {:>COUNT$} title",
-        fit("machine", MACHINE),
+        fit("machine", machine),
         fit("adapter", ADAPTER),
         "age",
         "msgs"
     )
 }
 
-fn render_rows(frame: &mut Frame, app: &mut App, area: Rect) {
-    let items = match row_items(app) {
+fn render_rows(frame: &mut Frame, app: &mut App, area: Rect, machine: usize) {
+    let items = match row_items(app, machine) {
         Ok(items) => items,
         Err(placeholder) => {
             frame.render_widget(
@@ -220,7 +243,7 @@ fn render_rows(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// The rows of the current view, or the sentence that stands in for them.
-fn row_items(app: &App) -> Result<Vec<ListItem<'static>>, String> {
+fn row_items(app: &App, machine: usize) -> Result<Vec<ListItem<'static>>, String> {
     let project = app
         .scope()
         .project
@@ -229,8 +252,8 @@ fn row_items(app: &App) -> Result<Vec<ListItem<'static>>, String> {
         return match &search.response {
             None => Err("searching...".to_owned()),
             Some(response) if response.searchable_in_scope == 0 => Err(format!(
-                "nothing searchable in scope: the filters ({project}, {}) excluded every message before search ran - p all projects, t all time",
-                window_label(app)
+                "nothing searchable in scope ({}): the filters excluded every message before search ran - p this project/everything, t last {LISTING_WINDOW_DAYS} days/any time",
+                search_label(app)
             )),
             Some(response) if response.sessions.is_empty() => Err(format!(
                 "no matches for \"{}\" among {} searchable messages",
@@ -239,7 +262,7 @@ fn row_items(app: &App) -> Result<Vec<ListItem<'static>>, String> {
             Some(response) => Ok(response
                 .sessions
                 .iter()
-                .map(|session| search_item(app, session))
+                .map(|session| search_item(app, session, machine))
                 .collect()),
         };
     }
@@ -253,18 +276,54 @@ fn row_items(app: &App) -> Result<Vec<ListItem<'static>>, String> {
             "no sessions in {} for {project} - p all projects, t all time",
             window_label(app)
         )),
-        Some(rows) => Ok(rows.iter().map(|row| listing_item(app, row)).collect()),
+        Some(rows) => Ok(rows
+            .iter()
+            .map(|row| listing_item(app, row, machine))
+            .collect()),
     }
 }
 
-fn machine(app: &App, session_id: &str) -> Span<'static> {
-    match app.details.get(session_id) {
-        Some(detail) => match &detail.host {
-            Some(host) => Span::raw(fit(host, MACHINE)),
-            None => Span::raw(fit("local?", MACHINE)).dim(),
-        },
-        None => Span::raw(fit("", MACHINE)),
+/// The host name without its domain: `beelink-eq14.lan` is `beelink-eq14`.
+fn short_host(host: &str) -> &str {
+    host.split('.').next().unwrap_or(host)
+}
+
+fn machine_label<'a>(app: &'a App, session_id: &str) -> Span<'a> {
+    let this = |name: &str| {
+        app.context
+            .hostname
+            .as_deref()
+            .is_some_and(|local| short_host(local).eq_ignore_ascii_case(short_host(name)))
+    };
+    match app
+        .known
+        .get(session_id)
+        .and_then(|known| known.host.as_ref())
+    {
+        Some(Host::Stamped(name)) if this(name) => THIS_MACHINE.fg(Color::Cyan),
+        Some(Host::Stamped(name)) => Span::raw(short_host(name)),
+        Some(Host::Unstamped) => UNSTAMPED.dim(),
+        None => Span::raw(""),
     }
+}
+
+pub(super) fn machine_width(app: &App, list_width: u16) -> usize {
+    let cap = if list_width >= SIDE_BY_SIDE_MIN_WIDTH {
+        MACHINE_WIDE
+    } else {
+        MACHINE_NARROW
+    };
+    (0..app.rows_len())
+        .filter_map(|index| app.id_at(index))
+        .map(|id| machine_label(app, id).width())
+        .max()
+        .unwrap_or(0)
+        .clamp(MACHINE_MIN, cap)
+}
+
+fn machine(app: &App, session_id: &str, width: usize) -> Span<'static> {
+    let label = machine_label(app, session_id);
+    Span::styled(fit(&label.content, width), label.style)
 }
 
 fn glyph(app: &App, session_id: &str) -> Span<'static> {
@@ -275,19 +334,19 @@ fn glyph(app: &App, session_id: &str) -> Span<'static> {
     }
 }
 
-fn listing_item(app: &App, row: &SessionRow) -> ListItem<'static> {
-    let detail = app.details.get(&row.session_id);
-    let count = detail.map_or_else(String::new, |d| d.message_count.to_string());
-    let title = match detail {
-        Some(detail) => detail
-            .title
-            .as_deref()
-            .map_or_else(|| NO_TITLE.dim(), |t| Span::raw(one_line(t))),
+fn listing_item(app: &App, row: &SessionRow, machine_width: usize) -> ListItem<'static> {
+    let known = app.known.get(&row.session_id);
+    let count = known
+        .and_then(|known| known.count())
+        .map_or_else(String::new, |count| count.to_string());
+    let title = match known.and_then(|known| known.title()) {
+        Some(Some(title)) => Span::raw(one_line(title)),
+        Some(None) => NO_TITLE.dim(),
         None => "...".dim(),
     };
     ListItem::new(Line::from(vec![
         glyph(app, &row.session_id),
-        machine(app, &row.session_id),
+        machine(app, &row.session_id, machine_width),
         Span::raw(format!(
             " {} {:>AGE$} {:>COUNT$} ",
             fit(&row.source_agent, ADAPTER),
@@ -298,7 +357,7 @@ fn listing_item(app: &App, row: &SessionRow) -> ListItem<'static> {
     ]))
 }
 
-fn search_item(app: &App, session: &SearchSession) -> ListItem<'static> {
+fn search_item(app: &App, session: &SearchSession, machine_width: usize) -> ListItem<'static> {
     let newest = session.matches.iter().map(|m| m.timestamp).max();
     let snippet = session
         .matches
@@ -310,7 +369,7 @@ fn search_item(app: &App, session: &SearchSession) -> ListItem<'static> {
     );
     ListItem::new(Line::from(vec![
         glyph(app, &session.session_id),
-        machine(app, &session.session_id),
+        machine(app, &session.session_id, machine_width),
         Span::raw(format!(
             " {} {:>AGE$} {:>COUNT$} {snippet}",
             fit(&session.source_agent, ADAPTER),
@@ -354,6 +413,8 @@ fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
 fn footer(app: &App) -> Line<'static> {
     let help = if app.typing {
         "enter done  esc clear  up/down select"
+    } else if app.search.is_some() {
+        "/ edit  esc back  enter open  space preview  p project/everything  t 14 days/any  q quit"
     } else {
         "/ search  enter open  space preview  p projects  t time  r refresh  q quit"
     };

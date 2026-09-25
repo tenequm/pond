@@ -38,16 +38,26 @@ fn temp_path(kind: &str) -> PathBuf {
 pub(crate) mod golden {
     pub(crate) const SQL_READY: &str = r#"{"columns":["ready"],"rows":[{"ready":1}],"row_count":1,"truncated":false,"elapsed_ms":1}"#;
 
-    pub(crate) const SQL_LISTING: &str = r#"{"columns":["session_id","last_ts","source_agent","project"],"rows":[
-        {"session_id":"s-live","last_ts":"2026-09-25T04:00:02.384123Z","source_agent":"claude-code","project":"/home/me/pj/pond"},
-        {"session_id":"s-old","last_ts":"2026-09-23T19:29:20.100000Z","source_agent":"codex-cli","project":"/home/me/pj/pond/packages/pond"}
+    pub(crate) const SQL_LISTING: &str = r#"{"columns":["session_id","last_ts","first_ts","message_count","source_agent","project"],"rows":[
+        {"session_id":"s-live","last_ts":"2026-09-25T04:00:02.384123Z","first_ts":"2026-09-24T21:10:00.000000Z","message_count":94,"source_agent":"claude-code","project":"/home/me/pj/pond"},
+        {"session_id":"s-old","last_ts":"2026-09-23T19:29:20.100000Z","first_ts":"2026-09-23T19:20:00.000000Z","message_count":3,"source_agent":"codex-cli","project":"/home/me/pj/pond/packages/pond"}
     ],"row_count":2,"truncated":false,"elapsed_ms":1712}"#;
 
-    /// Nulls are omitted: `s-old` has no user message and no host stamp.
-    pub(crate) const SQL_HYDRATE: &str = r#"{"columns":["session_id","message_count","title","host"],"rows":[
-        {"session_id":"s-live","message_count":94,"title":"fix the timer re-arm","host":"ws-pond-01"},
-        {"session_id":"s-old","message_count":3}
+    /// `s-old` has no user message, so it has no row.
+    pub(crate) const SQL_TITLES: &str = r#"{"columns":["session_id","title"],"rows":[
+        {"session_id":"s-live","title":"fix the timer re-arm"}
+    ],"row_count":1,"truncated":false,"elapsed_ms":910}"#;
+
+    pub(crate) const SQL_STATS: &str = r#"{"columns":["session_id","message_count","first_ts"],"rows":[
+        {"session_id":"s-live","message_count":94,"first_ts":"2026-09-24T21:10:00.000000Z"},
+        {"session_id":"s-old","message_count":3,"first_ts":"2026-09-23T19:20:00.000000Z"}
     ],"row_count":2,"truncated":false,"elapsed_ms":380}"#;
+
+    /// Nulls are omitted: `s-old`'s first message carries no host stamp.
+    pub(crate) const SQL_HOSTS: &str = r#"{"columns":["session_id","host"],"rows":[
+        {"session_id":"s-live","host":"ws-pond-01.lan"},
+        {"session_id":"s-old"}
+    ],"row_count":2,"truncated":false,"elapsed_ms":760}"#;
 
     /// Two rows share a timestamp: the pager must order and seek on the pair.
     pub(crate) const SQL_PAGE: &str = r#"{"columns":["message_id","timestamp","role","search_text"],"rows":[
