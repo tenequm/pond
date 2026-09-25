@@ -144,6 +144,8 @@ pub(crate) enum ApiError {
     Unreachable(String),
     /// The response did not match the contract.
     Decode(String),
+    /// A herdr CLI call failed.
+    Herdr(String),
 }
 
 impl fmt::Display for ApiError {
@@ -156,6 +158,7 @@ impl fmt::Display for ApiError {
             ),
             Self::Unreachable(reason) => write!(f, "pond serve unreachable: {reason}"),
             Self::Decode(reason) => write!(f, "unexpected response from pond: {reason}"),
+            Self::Herdr(reason) => write!(f, "herdr: {reason}"),
         }
     }
 }

@@ -260,8 +260,8 @@ impl Api for HttpApi {
         Box::pin(async move {
             let panes = tokio::task::spawn_blocking(move || herdr.pane_list(None))
                 .await
-                .map_err(|error| ApiError::Unreachable(format!("herdr pane list: {error}")))?
-                .map_err(|error| ApiError::Unreachable(format!("{error:#}")))?;
+                .map_err(|error| ApiError::Herdr(format!("pane list: {error}")))?
+                .map_err(|error| ApiError::Herdr(format!("{error:#}")))?;
             Ok(herdr::live_agents(panes))
         })
     }
@@ -576,7 +576,7 @@ mod tests {
         assert!(live[0].matches("abc"));
 
         write_script(&sandbox.path("bin/herdr"), "echo boom >&2; exit 1");
-        let Err(ApiError::Unreachable(reason)) = api.live_agents().await else {
+        let Err(ApiError::Herdr(reason)) = api.live_agents().await else {
             panic!("expected an error");
         };
         assert!(reason.contains("boom"), "{reason}");
