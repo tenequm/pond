@@ -303,7 +303,8 @@ impl Sandbox {
     }
 
     /// A fake `pond serve` at `bin/pond`, set as `pond_bin`: records its argv
-    /// in `calls` and its pid in `pid`, prints to both streams, and when
+    /// in `calls` and its pid in `pid`, prints to both streams, creates the
+    /// `<socket>.lock` pond keeps beside its socket, and when
     /// given a `target` socket answers at its `--socket` path through a
     /// symlink to it (connect follows symlinks), then runs `after`.
     pub(crate) fn fake_serve(&self, target: Option<&Path>, after: &str) -> PathBuf {
@@ -317,6 +318,7 @@ impl Sandbox {
 echo $$ > '{pid}'
 echo "serve stdout"; echo "serve stderr" >&2
 eval "socket=\${{$#}}"
+: > "$socket.lock"
 {publish}
 {after}"#,
                 calls = self.path("calls").display(),

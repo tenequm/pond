@@ -75,6 +75,14 @@ impl ServeDir {
     }
 }
 
+/// Mirrors `pond serve --socket`'s lifetime lock, `<socket>.lock`, which pond
+/// never removes.
+pub(crate) fn socket_lock(socket: &Path) -> PathBuf {
+    let mut lock = socket.as_os_str().to_owned();
+    lock.push(".lock");
+    PathBuf::from(lock)
+}
+
 /// FNV-1a over the canonical socket path: stable across builds and processes,
 /// unlike std's hasher.
 fn sockhash(socket: &Path) -> String {
@@ -143,13 +151,16 @@ pub(crate) struct ServeChild {
     /// Where this child's output starts in the shared `log`.
     log_start: u64,
     grace: Duration,
+    /// Set for a socket path no later serve reuses, whose lock file would
+    /// otherwise pile up; a reused path keeps its lock for the next serve.
+    unique_path: bool,
 }
 
 impl ServeChild {
     /// `pond serve --socket <socket>`; stdio goes to `log` because serve's
     /// output would corrupt the TUI or pin a herdr slot. A leftover socket at
-    /// the path - a dead serve's, or an unsupervised orphan's - is removed
-    /// first, so only this child can answer there.
+    /// the path is removed first: pond clears a dead serve's itself, but an
+    /// unsupervised orphan's still answers and would pass [`Self::ready`].
     pub(crate) fn spawn(
         pond: &Path,
         socket: PathBuf,
@@ -179,7 +190,15 @@ impl ServeChild {
             log,
             log_start,
             grace,
+            unique_path: false,
         })
+    }
+
+    /// Removes pond's lock file along with the socket on drop, once the
+    /// child has exited and no server can hold it.
+    pub(crate) fn unique_path(mut self) -> Self {
+        self.unique_path = true;
+        self
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -245,6 +264,9 @@ impl Drop for ServeChild {
     fn drop(&mut self) {
         terminate(&mut self.child, self.grace);
         let _ = fs::remove_file(&self.socket);
+        if self.unique_path {
+            let _ = fs::remove_file(socket_lock(&self.socket));
+        }
     }
 }
 
@@ -354,9 +376,11 @@ async fn spawn_fallback(origin: &Origin) -> Result<Fallback, ApiError> {
         SPAWNED.fetch_add(1, Ordering::Relaxed)
     ));
     log_line(&log, &format!("desk: starting fallback {}", pond.display()));
-    let mut serve = ServeChild::spawn(&pond, socket, log, FALLBACK_GRACE).map_err(|error| {
-        ApiError::Unreachable(format!("cannot start {}: {error}", pond.display()))
-    })?;
+    let mut serve = ServeChild::spawn(&pond, socket, log, FALLBACK_GRACE)
+        .map_err(|error| {
+            ApiError::Unreachable(format!("cannot start {}: {error}", pond.display()))
+        })?
+        .unique_path();
     match serve.ready(READY_DEADLINE).await {
         Ok(socket) => Ok(Fallback { serve, socket }),
         Err(error) => {
@@ -494,6 +518,7 @@ mod tests {
         drop(fallback);
         assert!(!alive(pid), "fallback serve survived the desk");
         assert!(fs::symlink_metadata(&socket).is_err(), "socket left behind");
+        assert!(!socket_lock(&socket).exists(), "lock file left behind");
     }
 
     #[test]
@@ -523,6 +548,34 @@ mod tests {
             "{error}"
         );
         assert!(!sandbox.path("calls").exists(), "pond was started");
+    }
+
+    #[test]
+    fn only_a_unique_path_serve_takes_its_lock_file_along() {
+        let sandbox = Sandbox::new();
+        let pond = sandbox.fake_serve(None, "exec sleep 30");
+        let spawn = |name: &str| {
+            ServeChild::spawn(
+                &pond,
+                sandbox.path(name),
+                sandbox.path("log"),
+                FALLBACK_GRACE,
+            )
+            .unwrap()
+        };
+        let (fallback, owner) = (spawn("desk.1.0.sock").unique_path(), spawn("owner.sock"));
+        let locks = [
+            socket_lock(&sandbox.path("desk.1.0.sock")),
+            socket_lock(&sandbox.path("owner.sock")),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !locks.iter().all(|lock| lock.exists()) {
+            assert!(Instant::now() < deadline, "the fake serve made no locks");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop((fallback, owner));
+        assert!(!locks[0].exists(), "the fallback's lock outlived it");
+        assert!(locks[1].exists(), "the owner's lock is its successor's");
     }
 
     #[tokio::test]

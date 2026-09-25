@@ -280,7 +280,7 @@ mod tests {
 
     use super::*;
     use crate::fake_pond::{FakePond, Reply, Sandbox, alive, endpoint, golden, stale_socket};
-    use crate::serve::read_endpoint;
+    use crate::serve::{read_endpoint, socket_lock};
 
     const FAST: Timing = Timing {
         tick: Duration::from_millis(20),
@@ -405,6 +405,10 @@ mod tests {
         assert!(
             fs::symlink_metadata(setup.owner_socket()).is_err(),
             "socket outlived its serve"
+        );
+        assert!(
+            socket_lock(&setup.owner_socket()).exists(),
+            "the owner's lock is its successor's"
         );
         assert!(
             !alive(setup.sandbox.serve_pid()),
