@@ -3,7 +3,6 @@
 //! Tested against [`crate::fake_pond`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -131,9 +130,6 @@ struct Resolver {
     /// on first use rather than before the desk can draw.
     origin: Result<Origin, String>,
     link: Mutex<Link>,
-    /// Set by a failover, cleared by the next successful request: while set,
-    /// a refused connection is an error instead of another failover.
-    failed_over: AtomicBool,
 }
 
 impl Resolver {
@@ -141,15 +137,10 @@ impl Resolver {
     /// resolution and then reuse its result.
     async fn resolve(&self, stale: Option<Stale>) -> Result<String, ApiError> {
         let mut link = self.link.lock().await;
-        if let Some(current) = &link.base_url {
-            match &stale {
-                None => return Ok(current.clone()),
-                Some(stale) if *current != stale.url => return Ok(current.clone()),
-                Some(stale) if self.failed_over.load(Ordering::Relaxed) => {
-                    return Err(ApiError::Unreachable(stale.reason.clone()));
-                }
-                Some(_) => {}
-            }
+        if let Some(current) = &link.base_url
+            && stale.as_ref().is_none_or(|stale| *current != stale.url)
+        {
+            return Ok(current.clone());
         }
         let origin = self
             .origin
@@ -158,11 +149,10 @@ impl Resolver {
         let connection = serve::connect(&self.client, origin, link.fallback.take()).await?;
         link.fallback = connection.fallback;
         link.base_url = Some(connection.base_url.clone());
-        if let Some(stale) = stale {
-            if connection.base_url == stale.url {
-                return Err(ApiError::Unreachable(stale.reason));
-            }
-            self.failed_over.store(true, Ordering::Relaxed);
+        if let Some(stale) = stale
+            && connection.base_url == stale.url
+        {
+            return Err(ApiError::Unreachable(stale.reason));
         }
         Ok(connection.base_url)
     }
@@ -180,7 +170,6 @@ impl HttpApi {
                 client: client()?,
                 origin: Origin::from_env().map_err(|error| format!("{error:#}")),
                 link: Mutex::default(),
-                failed_over: AtomicBool::new(false),
             }),
             herdr: Herdr::from_env(),
         })
@@ -202,8 +191,8 @@ impl HttpApi {
 
     /// Sends to the resolved serve. When the serve refuses the connection,
     /// the endpoint is resolved again (daemon record, else a fallback child)
-    /// and the request retried there once; a second refusal in a row, with
-    /// no success in between, stands as an error.
+    /// and the request retried there once; a refusal on the retry stands as
+    /// this call's error, and the next call may fail over again.
     async fn post<B, T>(&self, path: &str, body: &B, deadline: Duration) -> Result<T, ApiError>
     where
         B: Serialize + ?Sized + Sync,
@@ -211,17 +200,13 @@ impl HttpApi {
     {
         let client = &self.resolver.client;
         let url = self.resolve(None).await?;
-        let result = match post(client, &url, path, body, deadline).await {
+        match post(client, &url, path, body, deadline).await {
             Err(ApiError::Unreachable(reason)) => {
                 let retry = self.resolve(Some(Stale { url, reason })).await?;
                 post(client, &retry, path, body, deadline).await
             }
             other => other,
-        };
-        if result.is_ok() {
-            self.resolver.failed_over.store(false, Ordering::Relaxed);
         }
-        result
     }
 
     async fn sql(
@@ -318,7 +303,6 @@ mod tests {
                     base_url: base_url.map(str::to_owned),
                     fallback: None,
                 }),
-                failed_over: AtomicBool::new(false),
             }),
             herdr: Herdr::new(sandbox.path("bin/herdr")),
         }
@@ -544,42 +528,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_success_rearms_failover() {
+    async fn a_failed_retry_does_not_wedge_failover() {
         let sandbox = Sandbox::new();
         let endpoint_path = sandbox.origin().dir.endpoint();
-        let first = preview_pond().await;
-        write_endpoint(&endpoint_path, &endpoint(first.port(), "t")).unwrap();
-        let api = api_at(&dead_url(), &sandbox);
-        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
-
-        drop(first);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let second = preview_pond().await;
-        write_endpoint(&endpoint_path, &endpoint(second.port(), "t")).unwrap();
-        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
-        assert_eq!(
-            second.recorded().len(),
-            2,
-            "probe, then the retried preview"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_refusal_right_after_a_failover_stands() {
-        let sandbox = Sandbox::new();
-        let ready = preview_pond().await;
-        write_endpoint(
-            &sandbox.origin().dir.endpoint(),
-            &endpoint(ready.port(), "t"),
+        let stalling = FakePond::with_sql(
+            vec![
+                ("SELECT 1", Reply::json(golden::SQL_READY)),
+                (
+                    "DESC LIMIT",
+                    Reply::json(golden::SQL_PAGE).delayed(Duration::from_secs(5)),
+                ),
+            ],
+            Reply::json(golden::SEARCH),
         )
-        .unwrap();
+        .await;
+        write_endpoint(&endpoint_path, &endpoint(stalling.port(), "t")).unwrap();
         let api = api_at(&dead_url(), &sandbox);
-        api.resolver.failed_over.store(true, Ordering::Relaxed);
-        assert!(matches!(
-            api.preview("s1".to_owned()).await,
-            Err(ApiError::Unreachable(_))
-        ));
-        assert!(ready.recorded().is_empty(), "failed over twice in a row");
+        let request = SqlRequest::new(preview_sql("s1"), PREVIEW_ROWS, 1);
+        let result: Result<SqlResponse, _> = api
+            .post(SQL_PATH, &request, Duration::from_millis(300))
+            .await;
+        assert!(matches!(result, Err(ApiError::Request(_))), "{result:?}");
+
+        drop(stalling);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ready = preview_pond().await;
+        write_endpoint(&endpoint_path, &endpoint(ready.port(), "t")).unwrap();
+        assert_eq!(api.preview("s1".to_owned()).await.unwrap().len(), 2);
+        assert_eq!(ready.recorded().len(), 2, "probe, then the retried preview");
     }
 
     #[tokio::test]
