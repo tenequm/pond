@@ -247,9 +247,9 @@ pub mod http {
     }
 
     /// Serve the same router on a Unix socket at `path` until `stop`, then
-    /// remove the socket file. Access control is the file's owner-only mode,
-    /// and readiness is a connect that succeeds - there is nothing to publish.
-    /// Run [`clear_stale_socket`] first, before the slow store open.
+    /// remove the socket file if it is still the one this run bound. Access
+    /// control is the file's owner-only mode, and readiness is a connect that
+    /// succeeds - there is nothing to publish. Run [`clear_stale_socket`] first.
     #[cfg(unix)]
     pub async fn serve_unix(
         state: AppState,
@@ -257,23 +257,19 @@ pub mod http {
         allowed_hosts: &[String],
         stop: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        let listener = bind_owner_only(path)?;
+        let (listener, bound) = bind_owner_only(path)?;
         let served = async {
             crate::output::line(&format!("serve: http listening on unix:{}", path.display()))?;
             tracing::info!(path = %path.display(), "pond serve listening (HTTP /v1/*, MCP /mcp)");
             serve_with_shutdown(listener, state, allowed_hosts, stop).await
         }
         .await;
-        if let Err(error) = std::fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(%error, path = %path.display(), "failed to remove the socket file");
-        }
+        remove_own_socket(path, bound);
         served
     }
 
     /// Checks `--socket` before the store opens, so a bad path fails before any
-    /// slow work. A socket nothing answers on is a previous run's leftover and is
+    /// slow work. A socket that refuses connects is a previous run's leftover and is
     /// removed; a live socket or any other file is refused, never deleted.
     #[cfg(unix)]
     pub fn clear_stale_socket(path: &Path) -> anyhow::Result<()> {
@@ -329,26 +325,74 @@ pub mod http {
             .unwrap_or(Path::new("."))
     }
 
-    /// Binds inside a fresh 0700 staging dir, narrows the socket to 0600, then
-    /// hard-links it into place: it is never connectable by another user, the
-    /// process-wide umask is left alone, and unlike a rename the link refuses
-    /// to replace a socket another process bound at `path` meanwhile.
+    /// Binds at `path`, narrows the file to 0600, and only then listens: every
+    /// connect is refused until `listen`, so no other user ever reaches the
+    /// socket and the process-wide umask is left alone. Returns the file's
+    /// identity, so shutdown never removes a socket another server put there.
     #[cfg(unix)]
-    fn bind_owner_only(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
-        use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+    fn bind_owner_only(path: &Path) -> anyhow::Result<(tokio::net::UnixListener, SocketIdentity)> {
+        use std::{
+            fs::Permissions,
+            os::{fd::OwnedFd, unix::fs::PermissionsExt},
+        };
 
-        let staging = tempfile::Builder::new()
-            .permissions(Permissions::from_mode(0o700))
-            .tempdir_in(socket_dir(path))
-            .with_context(|| format!("failed to stage --socket {}", path.display()))?;
-        let staged = staging.path().join("s");
-        let listener = tokio::net::UnixListener::bind(&staged)
-            .with_context(|| format!("failed to bind --socket {}", path.display()))?;
-        std::fs::set_permissions(&staged, Permissions::from_mode(0o600))
+        use socket2::{Domain, SockAddr, Socket, Type};
+
+        let raced = || {
+            anyhow::anyhow!(
+                "another server bound --socket {} meanwhile; stop it or pick another path",
+                path.display()
+            )
+        };
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
+            .context("failed to create a Unix socket")?;
+        let address =
+            SockAddr::unix(path).with_context(|| format!("invalid --socket {}", path.display()))?;
+        if let Err(error) = socket.bind(&address) {
+            if error.kind() == std::io::ErrorKind::AddrInUse {
+                return Err(raced());
+            }
+            return Err(error)
+                .with_context(|| format!("failed to bind --socket {}", path.display()));
+        }
+        let bound = socket_identity(path)
+            .with_context(|| format!("failed to inspect --socket {}", path.display()))?;
+        std::fs::set_permissions(path, Permissions::from_mode(0o600))
             .with_context(|| format!("failed to restrict --socket {}", path.display()))?;
-        std::fs::hard_link(&staged, path)
-            .with_context(|| format!("failed to install --socket {}", path.display()))?;
-        Ok(listener)
+        socket
+            .listen(1024)
+            .with_context(|| format!("failed to listen on --socket {}", path.display()))?;
+        // A concurrent start's stale check reads the not-yet-listening socket
+        // as dead and may have replaced it; serving an unlinked socket is silent.
+        if socket_identity(path).ok() != Some(bound) {
+            return Err(raced());
+        }
+        socket.set_nonblocking(true)?;
+        let listener = std::os::unix::net::UnixListener::from(OwnedFd::from(socket));
+        Ok((tokio::net::UnixListener::from_std(listener)?, bound))
+    }
+
+    #[cfg(unix)]
+    type SocketIdentity = (u64, u64);
+
+    #[cfg(unix)]
+    fn socket_identity(path: &Path) -> std::io::Result<SocketIdentity> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    #[cfg(unix)]
+    fn remove_own_socket(path: &Path, bound: SocketIdentity) {
+        if socket_identity(path).ok() != Some(bound) {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, path = %path.display(), "failed to remove the socket file");
+        }
     }
 
     /// The serving half of [`serve`] and [`serve_unix`], with the stop trigger
@@ -590,23 +634,29 @@ pub mod http {
 
         #[cfg(unix)]
         #[tokio::test]
-        async fn bound_socket_is_owner_only_and_leaves_no_staging() {
+        async fn bound_socket_is_owner_only_and_only_its_own_is_removed() {
             use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
             let temp = tempfile::TempDir::new().unwrap();
             let path = temp.path().join("pond.sock");
-            let _listener = bind_owner_only(&path).unwrap();
+            let (_listener, bound) = bind_owner_only(&path).unwrap();
             let metadata = std::fs::symlink_metadata(&path).unwrap();
             assert!(metadata.file_type().is_socket());
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-            let entries: Vec<_> = std::fs::read_dir(temp.path())
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            assert_eq!(entries, ["pond.sock"]);
+            std::os::unix::net::UnixStream::connect(&path).expect("listening once bound");
 
             let error = bind_owner_only(&path).unwrap_err().to_string();
-            assert!(error.contains("failed to install"), "{error}");
+            assert!(error.contains("another server bound"), "{error}");
+
+            std::fs::remove_file(&path).unwrap();
+            let _successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            remove_own_socket(&path, bound);
+            assert!(path.exists(), "a socket another server bound is left alone");
+
+            std::fs::remove_file(&path).unwrap();
+            let (_listener, bound) = bind_owner_only(&path).unwrap();
+            remove_own_socket(&path, bound);
+            assert!(!path.exists(), "this run's own socket is removed");
         }
     }
 }

@@ -206,6 +206,9 @@ zstd = "0.13"
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
 libc = "0.2"
+# `--socket` binds, narrows the mode, then listens - std and tokio fuse
+# bind with listen. Already in the tree via tokio/hyper.
+socket2 = "0.6.3"
 
 # Vendor protoc via protobuf-src everywhere except Windows, where it does not
 # link (see the [dependencies] lance note). Cargo features cannot be
