@@ -51,7 +51,9 @@ herdr's PATH is fixed when the herdr server starts. If `pond` is not on it, set 
 - Each herdr server starts one `pond serve` in the background at startup, listening on a Unix socket in the plugin state dir (`serve/<hash>/owner.sock`, owner-only), and stops it when that server exits. It is a personal server only your user can reach, not a TCP port; the plugin sends it only reads. It never runs sync (`--with-sync` is not passed), and `pond schedule` stays the owner of scheduled sync.
 - If that serve is missing or dead, the desk starts its own, on its own socket, for as long as it is open. If the desk is killed with SIGKILL, that serve is orphaned (visible in `ps`) until you stop it.
 - Idle syncs wait for any sync already holding the store lock, then run. Bursts of idle events coalesce; the last one always produces a sync.
-- Sessions ingested before pond stamped the ingest host have no recorded machine. The desk shows them as `local?` - unknown provenance, not a claim that they came from this machine.
+- The machine column shows each session's origin host, read from its first message; sessions from the machine the desk runs on show as `this`. Sessions ingested before pond stamped the ingest host have no recorded machine. The desk shows them as `local?` - unknown provenance, not a claim that they came from this machine.
+- Typed search (`/`) covers the whole store - every project and all time - until `p` narrows it to this project or `t` to the last 14 days. In the listing, `p` and `t` widen instead: it opens on this project's last 14 days.
+- The desk keeps what it learned (listings, titles, counts, hosts) in `desk-cache.json` in the plugin state dir, readable only by you, and paints from it at once on the next open while pond refreshes behind it. Deleting the file only costs that head start.
 - The transcript view is conversation only: user and assistant text. Tool calls and results stay reachable through `pond_sql` and `pond_get_session`.
 
 ## Logs
@@ -61,5 +63,6 @@ In the plugin state dir (herdr's state dir, `plugins/pond/`):
 - `sync.log` - one line per idle sync (adapter, exit status, duration) plus pond's own output.
 - `serve/<hash>/daemon.log` - the per-server serve's lifecycle and output.
 - `serve/<hash>/desk-serve.log` - a desk-started serve's output.
+- `desk.log` - the desk's own notes: a `desk-cache.json` it could not read or write.
 
 Each log starts over past 1 MiB. herdr's `plugin log list` only shows that a hook exited, not that a sync ran - `sync.log` is the record.
