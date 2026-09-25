@@ -3,7 +3,8 @@
 //! per-transport behavior divergence.
 //!
 //! HTTP exposes `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`,
-//! and `POST /v1/ingest`. MCP
+//! `POST /v1/ingest`, and the unstable `POST /v1/x/sql` (read-only SQL, JSON
+//! rows). MCP
 //! exposes `pond_search` / `pond_get_session` / `pond_get_message` plus
 //! `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
 
@@ -64,12 +65,13 @@ impl Drop for ActivityGuard {
 
 pub mod http {
     //! axum HTTP+JSON server: `POST /v1/search`, `POST /v1/get-session`,
-    //! `POST /v1/get-message`, and the `/mcp` route carrying rmcp's
+    //! `POST /v1/get-message`, `POST /v1/ingest`, `POST /v1/x/sql`, and the `/mcp` route carrying rmcp's
     //! streamable-HTTP MCP transport.
 
     use std::{
         future::Future,
         net::{IpAddr, SocketAddr},
+        path::{Path, PathBuf},
         time::Duration,
     };
 
@@ -89,10 +91,11 @@ pub mod http {
 
     use super::AppState;
     use crate::{
-        handlers::{pond_get_message, pond_get_session, pond_ingest, pond_search},
+        handlers::{pond_get_message, pond_get_session, pond_ingest, pond_search, pond_sql},
         wire::{
             ErrorCode, GetEnvelope, GetMessageRequest, GetSessionRequest, IngestEnvelope,
-            IngestRequest, SearchEnvelope, SearchRequest, default_namespace, new_request_id,
+            IngestRequest, SearchEnvelope, SearchRequest, SqlEnvelope, SqlRequest,
+            default_namespace, new_request_id,
         },
     };
 
@@ -156,6 +159,7 @@ pub mod http {
             .route("/v1/get-session", post(get_session))
             .route("/v1/get-message", post(get_message))
             .route("/v1/ingest", post(ingest))
+            .route("/v1/x/sql", post(sql))
             .layer(DefaultBodyLimit::max(HTTP_BODY_LIMIT_BYTES))
             .with_state(state)
             .nest_service("/mcp", mcp)
@@ -165,12 +169,14 @@ pub mod http {
     /// an unspecified host (`0.0.0.0` / `::`) logs a security notice because the
     /// personal pond is single-user and LAN exposure is opt-in (spec.md#scope).
     /// `allowed_hosts` names the public authorities the `/mcp` route accepts
-    /// (see [`mcp_allowed_hosts`]).
+    /// (see [`mcp_allowed_hosts`]). `port_file`, when set, receives the bound
+    /// address once the socket is live (see [`write_port_file`]).
     pub async fn serve(
         state: AppState,
         host: String,
         port: u16,
         allowed_hosts: Vec<String>,
+        port_file: Option<PathBuf>,
     ) -> anyhow::Result<()> {
         let ip: IpAddr = host
             .parse()
@@ -188,8 +194,25 @@ pub mod http {
         let local = listener
             .local_addr()
             .context("failed to read bound address")?;
+        if let Some(path) = &port_file {
+            write_port_file(path, local)?;
+        }
         tracing::info!(%local, "pond serve listening (HTTP /v1/*, MCP /mcp)");
         serve_with_shutdown(listener, state, &allowed_hosts, shutdown_signal()).await
+    }
+
+    /// Publish the bound `host:port` (no trailing newline) for a supervisor: it
+    /// is the readiness signal, since the store opens before the bind, and
+    /// with `--port 0` the only way to learn the port. Temp file + rename in
+    /// the same directory, so a poller never reads a partial address.
+    fn write_port_file(path: &Path, local: SocketAddr) -> anyhow::Result<()> {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, local.to_string())
+            .with_context(|| format!("failed to write --port-file {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("failed to install --port-file {}", path.display()))
     }
 
     /// The serving half of [`serve`], with the stop trigger injected. Public so
@@ -323,6 +346,17 @@ pub mod http {
         with_request_id((status, Json(envelope)).into_response())
     }
 
+    async fn sql(State(state): State<AppState>, Json(mut request): Json<SqlRequest>) -> Response {
+        let _activity = state.track_activity();
+        request.namespace.get_or_insert_with(default_namespace);
+        let envelope = pond_sql(&state.store, request).await;
+        let status = match &envelope {
+            SqlEnvelope::Success(_) => StatusCode::OK,
+            SqlEnvelope::Error(error) => status_for(&error.error.code),
+        };
+        with_request_id((status, Json(envelope)).into_response())
+    }
+
     fn with_request_id(mut response: Response) -> Response {
         if let Ok(value) = HeaderValue::from_str(&new_request_id()) {
             response.headers_mut().insert("x-pond-request-id", value);
@@ -414,7 +448,6 @@ pub mod mcp {
             pond_search as run_search,
         },
         sql,
-        substrate::Table,
         wire::{
             ErrorCode as WireErrorCode, ErrorEnvelope, GetEnvelope, GetMessageRequest,
             GetSessionRequest, ProjectFilter, SearchEnvelope, SearchFilters, SearchModeWire,
@@ -715,8 +748,10 @@ local/stdio install the response also names the on-disk path so you can open it 
 directly with duckdb/polars.
 
 Pagination - keyset (preferred):
-Use ORDER BY on indexed columns plus a composite seek key for stable tie-breaking. \
-The agent owns the cursor (the last sort value it saw); no server-side state.
+Use ORDER BY on indexed columns plus a composite seek key for stable tie-breaking, \
+spelled out as an OR - DataFusion rejects row-value comparisons like \
+`(timestamp, message_id) < (...)`. The agent owns the cursor (the last sort value \
+it saw); no server-side state.
 
   -- page 1: most recent 100 messages in pond
   SELECT message_id, timestamp, role, project
@@ -729,7 +764,8 @@ The agent owns the cursor (the last sort value it saw); no server-side state.
   SELECT message_id, timestamp, role, project
   FROM messages
   WHERE project LIKE '%pond%'
-    AND (timestamp, message_id) < (TIMESTAMP '2026-06-05T08:14:22.123456Z', 'last-id')
+    AND (timestamp < TIMESTAMP '2026-06-05T08:14:22.123456Z'
+      OR (timestamp = TIMESTAMP '2026-06-05T08:14:22.123456Z' AND message_id < 'last-id'))
   ORDER BY timestamp DESC, message_id DESC
   LIMIT 100;
 
@@ -1166,43 +1202,12 @@ Examples (4 patterns the agent should recognize):
             };
             let inline_rows = sql::DEFAULT_INLINE_ROWS;
 
-            // Open only the tables the query names (spec.md#search): the slow
-            // `parts.lance` open is pure waste for the common messages-only
-            // query. The referenced tables are independent (per-table
-            // caches/mutexes), so overlap their freshness/manifest fetches.
             let store = &self.state.store;
-            let query = params.query.as_str();
-            let tables = match tokio::try_join!(
-                async {
-                    anyhow::Ok(match sql::mentions_table(query, "sessions") {
-                        true => Some(store.dataset(Table::Sessions).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match sql::mentions_table(query, "messages") {
-                        true => Some(store.dataset(Table::Messages).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match sql::mentions_table(query, "parts") {
-                        true => Some(store.dataset(Table::Parts).await?),
-                        false => None,
-                    })
-                },
-            ) {
-                Ok((sessions, messages, parts)) => sql::Tables {
-                    sessions,
-                    messages,
-                    parts,
-                },
-                Err(_) => {
-                    return Err(ErrorData::internal_error(
-                        "sql datasets unavailable".to_owned(),
-                        None,
-                    ));
-                }
+            let Ok(tables) = sql::open_tables(store, &params.query).await else {
+                return Err(ErrorData::internal_error(
+                    "sql datasets unavailable".to_owned(),
+                    None,
+                ));
             };
 
             match sql::run(
@@ -1237,6 +1242,10 @@ Examples (4 patterns the agent should recognize):
                         )),
                     }
                 }
+                Ok(sql::Outcome::Json { .. }) => Err(ErrorData::internal_error(
+                    "pond_sql never requests JSON rows".to_owned(),
+                    None,
+                )),
                 Err(sql::SqlError::Query(message)) => {
                     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
                 }

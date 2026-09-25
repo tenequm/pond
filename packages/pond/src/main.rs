@@ -754,7 +754,8 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
   pond serve                       HTTP on 127.0.0.1:9797
   pond serve --port 8080
   pond serve --transport stdio     same as `pond mcp`
-  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name")]
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name
+  pond serve --port 0 --port-file /tmp/pond.addr   OS-picked port, published once bound")]
     #[command(display_order = 16)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
@@ -807,6 +808,12 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         /// nothing, serve still starts and logs the `pond init` fix.
         #[arg(long, value_name = "ADAPTER")]
         bootstrap: Option<String>,
+        /// Once the HTTP socket is bound, write its `host:port` here
+        /// (atomically, no trailing newline). The readiness signal for a
+        /// supervisor - the store opens before the bind - and, with `--port 0`,
+        /// how it learns the OS-assigned port.
+        #[arg(long, value_name = "PATH")]
+        port_file: Option<PathBuf>,
     },
     /// Serve the MCP tools over stdio (for agent clients).
     ///
@@ -1749,7 +1756,11 @@ async fn run() -> anyhow::Result<()> {
             with_sync,
             sync_every,
             bootstrap,
+            port_file,
         } => {
+            if port_file.is_some() && matches!(transport, ServeTransport::Stdio) {
+                bail!("--port-file applies to the HTTP transport; drop it or use --transport http");
+            }
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1792,7 +1803,7 @@ async fn run() -> anyhow::Result<()> {
             match transport {
                 ServeTransport::Http => {
                     output(&format!("serve: http listening on http://{host}:{port}"))?;
-                    transport::http::serve(state, host, port, allowed_host).await?;
+                    transport::http::serve(state, host, port, allowed_host, port_file).await?;
                 }
                 ServeTransport::Stdio => {
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
@@ -1981,34 +1992,7 @@ async fn run() -> anyhow::Result<()> {
                 CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
             let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
-            // Open only the tables the query names (spec.md#search); the slow
-            // `parts.lance` open is waste for the common messages-only query.
-            use pond::substrate::Table;
-            let (sessions, messages, parts) = tokio::try_join!(
-                async {
-                    anyhow::Ok(match pond::sql::mentions_table(&sql, "sessions") {
-                        true => Some(store.dataset(Table::Sessions).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match pond::sql::mentions_table(&sql, "messages") {
-                        true => Some(store.dataset(Table::Messages).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match pond::sql::mentions_table(&sql, "parts") {
-                        true => Some(store.dataset(Table::Parts).await?),
-                        false => None,
-                    })
-                },
-            )?;
-            let tables = pond::sql::Tables {
-                sessions,
-                messages,
-                parts,
-            };
+            let tables = pond::sql::open_tables(&store, &sql).await?;
             match pond::sql::run(&tables, &sql, mode, inline_rows, Some(timeout)).await {
                 Ok(pond::sql::Outcome::Inline(text)) => {
                     output(&text)?;
@@ -2035,6 +2019,9 @@ async fn run() -> anyhow::Result<()> {
                         io::stdout().write_all(&bytes)?;
                     }
                 },
+                Ok(pond::sql::Outcome::Json { .. }) => {
+                    bail!("internal: `pond sql` never requests JSON rows");
+                }
                 Err(pond::sql::SqlError::Query(message)) => {
                     output_err(&format!(
                         "{} {}",

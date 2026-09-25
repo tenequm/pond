@@ -5,8 +5,9 @@
 //! single-`SELECT` pre-parse and `sql_with_options` with DDL/DML/statements all
 //! disabled - so no statement that mutates the corpus or touches the filesystem
 //! (INSERT/UPDATE/DELETE/CREATE/DROP/COPY/CREATE EXTERNAL TABLE/SET) can run.
-//! Results render inline (row-capped) or export to a parquet/ndjson file the
-//! caller fetches via the `pond-sql-export://` resource (`src/transport.rs`).
+//! Results render inline (row-capped), as JSON rows (the HTTP `/v1/x/sql`
+//! route), or export to a parquet/ndjson file the caller fetches via the
+//! `pond-sql-export://` resource (`src/transport.rs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,11 +20,16 @@ use lance::datafusion::LanceTableProvider;
 use lance::deps::arrow_array::builder::{
     BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
 };
+use lance::deps::arrow_array::cast::AsArray;
+use lance::deps::arrow_array::types::{
+    ArrowTimestampType, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType,
+};
 use lance::deps::arrow_array::{
     Array, ArrayRef, GenericStringArray, LargeBinaryArray, OffsetSizeTrait, RecordBatch,
     StringArray, StringViewArray,
 };
-use lance::deps::arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use lance::deps::arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use lance::deps::datafusion::arrow::util::pretty::pretty_format_batches;
 use lance::deps::datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use lance::deps::datafusion::common::ScalarValue;
@@ -46,6 +52,9 @@ use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::parser::from_json;
 use parquet::arrow::ArrowWriter;
 
+use crate::sessions::Store;
+use crate::substrate::Table;
+
 /// Per-query memory ceiling for the DataFusion runtime. Not enforced on every
 /// operator (datafusion caveat), so the timeout below is the hard backstop.
 const MEM_LIMIT_BYTES: usize = 512 * 1024 * 1024;
@@ -66,6 +75,10 @@ fn effective_timeout(timeout_secs: Option<u64>) -> Duration {
 }
 /// Byte budget for the inline (rendered table) result; rows are dropped to fit.
 const INLINE_BUDGET_BYTES: usize = 80_000;
+/// Byte budget for [`Mode::Json`] rows, measured as serialized JSON. Sized for
+/// an HTTP client paging transcripts rather than an LLM context, so it is far
+/// above the inline budget and cells are never clipped.
+const JSON_BUDGET_BYTES: usize = 2 * 1024 * 1024;
 /// Hard ceiling on an export artifact: base64'd over `resources/read` it costs
 /// ~1.33x this in the response, so keep it well under any process envelope.
 const MAX_EXPORT_BYTES: usize = 100 * 1024 * 1024;
@@ -105,6 +118,8 @@ pub enum Mode {
     Inline,
     /// Write the full result to a file and return a `pond-sql-export://` link.
     Export(Format),
+    /// Row-capped JSON objects, one per row (the HTTP `/v1/x/sql` route).
+    Json,
 }
 
 /// The Lance datasets a query references, fetched fresh per call so each query
@@ -130,6 +145,33 @@ pub fn mentions_table(sql: &str, table: &str) -> bool {
         .any(|token| token == table)
 }
 
+/// Open only the datasets `sql` names (see [`mentions_table`]): the slow
+/// `parts.lance` open is pure waste for the common messages-only query. The
+/// ranked `fts('<table>', ...)` provider names its table literally, so the same
+/// scan hands it the dataset it searches. The tables have independent
+/// caches/mutexes, so their freshness/manifest fetches overlap.
+pub async fn open_tables(store: &Store, sql: &str) -> anyhow::Result<Tables> {
+    let open = |table: Table| {
+        let wanted = mentions_table(sql, table.as_str());
+        async move {
+            anyhow::Ok(match wanted {
+                true => Some(store.dataset(table).await?),
+                false => None,
+            })
+        }
+    };
+    let (sessions, messages, parts) = tokio::try_join!(
+        open(Table::Sessions),
+        open(Table::Messages),
+        open(Table::Parts),
+    )?;
+    Ok(Tables {
+        sessions,
+        messages,
+        parts,
+    })
+}
+
 /// Result of a successful `run`.
 pub enum Outcome {
     /// A rendered, row-capped table (already includes the metrics footer).
@@ -140,6 +182,16 @@ pub enum Outcome {
         format: Format,
         rows: usize,
         columns: Vec<String>,
+    },
+    /// One JSON object per returned row, keyed by column name; NULL fields are
+    /// omitted. `columns` lists every result column even when `rows` is empty.
+    /// `truncated` is true iff the row cap or [`JSON_BUDGET_BYTES`] cut rows.
+    Json {
+        columns: Vec<String>,
+        rows: Vec<serde_json::Value>,
+        row_count: usize,
+        truncated: bool,
+        elapsed_ms: u64,
     },
 }
 
@@ -168,8 +220,7 @@ pub async fn run(
     let parsed = parse_and_gate(sql)?;
     if matches!(parsed.kind, StatementKind::Explain) && matches!(mode, Mode::Export(_)) {
         return Err(SqlError::Query(
-            "EXPLAIN returns a plan, not a result set; use format=text (or json) to read it"
-                .to_owned(),
+            "EXPLAIN returns a plan, not a result set; read it with format=text instead".to_owned(),
         ));
     }
     if projection_mentions_vector(parsed.projection_query()) {
@@ -234,8 +285,8 @@ pub async fn run(
         .map_err(|_| {
             SqlError::Query(format!(
                 "query exceeded the {}s limit; add a narrower WHERE or a LIMIT, or raise \
-                 the per-query timeout (`timeout_seconds` on pond_sql, `--timeout` \
-                 on pond sql; max {MAX_QUERY_TIMEOUT_SECS}s) if it legitimately needs \
+                 the per-query timeout (`timeout_seconds` on pond_sql and POST /v1/x/sql, \
+                 `--timeout` on pond sql; max {MAX_QUERY_TIMEOUT_SECS}s) if it legitimately needs \
                  longer. On a remote object store, queries over parts cost seconds per \
                  round-trip - scope by session_id / tool_name, and to reconstruct one \
                  session use pond_get_session, not SQL. For tool analytics use the \
@@ -267,19 +318,10 @@ pub async fn run(
         Mode::Inline => Ok(Outcome::Inline(
             render_inline(&display, inline_rows, elapsed).map_err(infra)?,
         )),
+        Mode::Json => json_rows(&display, inline_rows, elapsed),
         Mode::Export(format) => {
             let rows = display.iter().map(RecordBatch::num_rows).sum();
-            let columns = display
-                .first()
-                .map(|batch| {
-                    batch
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|field| field.name().clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let columns = column_names(&display);
             let bytes = match format {
                 Format::Parquet => encode_parquet(&display)?,
                 Format::Ndjson => encode_ndjson(&display)?,
@@ -1230,14 +1272,121 @@ fn render_inline(
     let mut out = format!("{total} row(s) in {elapsed_ms} ms; showing {shown}.\n{table}");
     if shown < total {
         out.push_str(&format!(
-            "\n... {} row(s) omitted. To page: ORDER BY <indexed col> (e.g. timestamp, \
-             message_id), then in the next call add `WHERE (col, message_id) < \
-             (<last_col>, <last_message_id>)` - keyset pagination, see schema://pond-sql. \
-             For the full set: format=parquet or format=ndjson.",
+            "\n... {} row(s) omitted. To page: ORDER BY <indexed col> DESC, message_id DESC \
+             (e.g. timestamp), then in the next call add `WHERE (col < <last_col> OR \
+             (col = <last_col> AND message_id < '<last_message_id>'))` - keyset \
+             pagination, see schema://pond-sql. For the full set: format=parquet or \
+             format=ndjson.",
             total - shown
         ));
     }
     Ok(out)
+}
+
+fn column_names(display: &[RecordBatch]) -> Vec<String> {
+    display
+        .first()
+        .map(|batch| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`Mode::Json`]: cap at `max_rows`, then drop rows from the end until the
+/// serialized rows fit [`JSON_BUDGET_BYTES`] - but always keep the first row,
+/// so a pager is never stalled by one oversized message.
+fn json_rows(
+    display: &[RecordBatch],
+    max_rows: usize,
+    elapsed: Duration,
+) -> Result<Outcome, SqlError> {
+    let total: usize = display.iter().map(RecordBatch::num_rows).sum();
+    let limited = limit_batches(display, max_rows)
+        .iter()
+        .map(timestamps_as_rfc3339)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(infra)?;
+    let encoded = encode_ndjson(&limited)?;
+    let mut rows = Vec::new();
+    let mut used = 0;
+    for line in encoded.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if !rows.is_empty() && used + line.len() > JSON_BUDGET_BYTES {
+            break;
+        }
+        used += line.len();
+        rows.push(
+            serde_json::from_slice(line)
+                .map_err(|error| SqlError::Infra(anyhow!("json row decode failed: {error}")))?,
+        );
+    }
+    Ok(Outcome::Json {
+        columns: column_names(display),
+        row_count: rows.len(),
+        truncated: rows.len() < total,
+        rows,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    })
+}
+
+/// Render timestamp columns as RFC3339 UTC with exactly six fractional digits.
+/// arrow-json trims fractions (`.384Z`), and JSON clients use these values as
+/// keyset cursors, so the microsecond value must round-trip losslessly.
+fn timestamps_as_rfc3339(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+    fn render<T: ArrowTimestampType>(array: &ArrayRef, to_micros: fn(i64) -> i64) -> ArrayRef {
+        let text: StringArray = array
+            .as_primitive::<T>()
+            .iter()
+            .map(|value| {
+                value
+                    .and_then(|raw| chrono::DateTime::from_timestamp_micros(to_micros(raw)))
+                    .map(|at| at.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string())
+            })
+            .collect();
+        Arc::new(text)
+    }
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|field| matches!(field.data_type(), DataType::Timestamp(_, _)))
+    {
+        return Ok(batch.clone());
+    }
+    let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .map(|(field, array)| {
+            let rendered = match field.data_type() {
+                DataType::Timestamp(TimeUnit::Second, _) => {
+                    render::<TimestampSecondType>(array, |s| s.saturating_mul(1_000_000))
+                }
+                DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                    render::<TimestampMillisecondType>(array, |ms| ms.saturating_mul(1_000))
+                }
+                DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                    render::<TimestampMicrosecondType>(array, |us| us)
+                }
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    render::<TimestampNanosecondType>(array, |ns| ns.div_euclid(1_000))
+                }
+                _ => return (field.as_ref().clone(), array.clone()),
+            };
+            (
+                Field::new(field.name(), DataType::Utf8, field.is_nullable()),
+                rendered,
+            )
+        })
+        .unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
 fn limit_batches(batches: &[RecordBatch], max_rows: usize) -> Vec<RecordBatch> {
@@ -1606,6 +1755,208 @@ mod tests {
             .filter(|line| line.contains("line one"))
             .collect();
         assert_eq!(row_lines.len(), 1, "one physical line per row: {out}");
+    }
+
+    #[test]
+    fn rejects_explain_analyze_of_non_query() {
+        // ANALYZE executes the inner statement, so the gate must reject it on
+        // the inner shape exactly as it does a bare EXPLAIN.
+        assert!(rejected(
+            "EXPLAIN ANALYZE INSERT INTO messages VALUES ('x')"
+        ));
+        assert!(rejected("EXPLAIN ANALYZE DELETE FROM messages"));
+    }
+
+    fn no_tables() -> Tables {
+        Tables {
+            sessions: None,
+            messages: None,
+            parts: None,
+        }
+    }
+
+    struct JsonResult {
+        columns: Vec<String>,
+        rows: Vec<serde_json::Value>,
+        row_count: usize,
+        truncated: bool,
+    }
+
+    fn expect_json(outcome: Outcome) -> JsonResult {
+        match outcome {
+            Outcome::Json {
+                columns,
+                rows,
+                row_count,
+                truncated,
+                elapsed_ms: _,
+            } => JsonResult {
+                columns,
+                rows,
+                row_count,
+                truncated,
+            },
+            Outcome::Inline(_) | Outcome::Export { .. } => panic!("Mode::Json yields Json"),
+        }
+    }
+
+    async fn run_json(sql: &str, limit: usize) -> Result<JsonResult, SqlError> {
+        run(&no_tables(), sql, Mode::Json, limit, None)
+            .await
+            .map(expect_json)
+    }
+
+    #[tokio::test]
+    async fn json_rows_are_objects_with_typed_values_and_omitted_nulls() {
+        let result = run_json(
+            "SELECT 'abc' AS session_id, \
+                    TIMESTAMP '2026-09-25T04:00:02.384123Z' AS last_ts, \
+                    TIMESTAMP '2026-09-25T04:00:02.384Z' AS whole_ms, \
+                    3 AS n, true AS ok, CAST(NULL AS VARCHAR) AS gone",
+            DEFAULT_INLINE_ROWS,
+        )
+        .await
+        .expect("query runs");
+        assert_eq!(
+            result.columns,
+            ["session_id", "last_ts", "whole_ms", "n", "ok", "gone"],
+            "columns list every result column, the all-NULL one included"
+        );
+        assert_eq!(result.row_count, 1);
+        assert!(!result.truncated);
+        // Exactly six fractional digits: the microsecond cursor round-trips,
+        // and a whole-millisecond value is not trimmed to `.384Z`.
+        assert_eq!(
+            result.rows,
+            [serde_json::json!({
+                "session_id": "abc",
+                "last_ts": "2026-09-25T04:00:02.384123Z",
+                "whole_ms": "2026-09-25T04:00:02.384000Z",
+                "n": 3,
+                "ok": true,
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn json_empty_result_still_names_its_columns() {
+        let result = run_json("SELECT 1 AS n, 'x' AS s WHERE false", DEFAULT_INLINE_ROWS)
+            .await
+            .expect("query runs");
+        assert_eq!(result.columns, ["n", "s"]);
+        assert!(result.rows.is_empty());
+        assert_eq!(result.row_count, 0);
+        assert!(!result.truncated);
+    }
+
+    #[tokio::test]
+    async fn json_row_cap_truncates_and_reports_it() {
+        let sql = "SELECT value FROM generate_series(1, 150) ORDER BY value";
+        let capped = run_json(sql, DEFAULT_INLINE_ROWS)
+            .await
+            .expect("query runs");
+        assert_eq!(capped.row_count, DEFAULT_INLINE_ROWS);
+        assert_eq!(capped.rows.len(), DEFAULT_INLINE_ROWS);
+        assert!(capped.truncated, "the row cap cut the result");
+        assert_eq!(capped.rows[0], serde_json::json!({"value": 1}));
+
+        let whole = run_json(sql, 150).await.expect("query runs");
+        assert_eq!(whole.row_count, 150);
+        assert!(!whole.truncated, "a cap that fits cuts nothing");
+    }
+
+    #[tokio::test]
+    async fn json_mode_drops_binary_columns_like_export() {
+        let result = run_json("SELECT X'00ff' AS raw, 1 AS n", DEFAULT_INLINE_ROWS)
+            .await
+            .expect("query runs");
+        assert_eq!(result.columns, ["n"]);
+        assert_eq!(result.rows, [serde_json::json!({"n": 1})]);
+    }
+
+    #[tokio::test]
+    async fn json_mode_returns_explain_plan_rows_as_data() {
+        let result = run_json("EXPLAIN SELECT 1", DEFAULT_INLINE_ROWS)
+            .await
+            .expect("EXPLAIN of a SELECT is allowed");
+        assert_eq!(result.columns, ["plan_type", "plan"]);
+        assert!(result.row_count > 0);
+        assert!(
+            run_json("DELETE FROM messages", DEFAULT_INLINE_ROWS)
+                .await
+                .is_err(),
+            "the read-only gate holds in JSON mode"
+        );
+    }
+
+    #[test]
+    fn json_mode_renders_jsonb_as_text_and_drops_vectors() {
+        let options =
+            lance_arrow::json::JsonArray::try_from_iter([Some(r#"{"pond":{"host":"desk"}}"#)])
+                .expect("valid json")
+                .into_inner();
+        let vector = lance::deps::arrow_array::FixedSizeListArray::from_iter_primitive::<
+            lance::deps::arrow_array::types::Float32Type,
+            _,
+            _,
+        >([Some([Some(0.5_f32), Some(0.25)])], 2);
+        let schema = Arc::new(Schema::new(vec![
+            lance_arrow::json::json_field("options", true),
+            Field::new("vector", vector.data_type().clone(), true),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(options), Arc::new(vector)]).expect("batch");
+        let display = displayable(&batch).expect("displayable");
+        let result = expect_json(
+            json_rows(&[display], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows"),
+        );
+        assert_eq!(result.columns, ["options"], "the vector column is dropped");
+        let text = result.rows[0]["options"]
+            .as_str()
+            .expect("JSONB arrives as JSON text, not a nested object");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text).expect("valid JSON text"),
+            serde_json::json!({"pond": {"host": "desk"}})
+        );
+    }
+
+    fn text_rows(cells: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, true)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(
+                cells.iter().map(|cell| Some(*cell)).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("single-column batch")
+    }
+
+    #[test]
+    fn json_budget_drops_rows_from_the_end_without_clipping_cells() {
+        let fat = "x".repeat(800 * 1024);
+        let batch = text_rows(&[&fat, &fat, &fat]);
+        let result = expect_json(
+            json_rows(&[batch], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows"),
+        );
+        assert_eq!(result.row_count, 2, "a third 800 KiB row overflows 2 MiB");
+        assert!(result.truncated, "the byte budget cut the result");
+        assert_eq!(
+            result.rows[1]["t"].as_str().map(str::len),
+            Some(fat.len()),
+            "cells are never clipped in JSON mode"
+        );
+    }
+
+    #[test]
+    fn json_budget_always_returns_the_first_row() {
+        let huge = "y".repeat(3 * 1024 * 1024);
+        let batch = text_rows(&[&huge, "small"]);
+        let result = expect_json(
+            json_rows(&[batch], DEFAULT_INLINE_ROWS, Duration::ZERO).expect("json rows"),
+        );
+        assert_eq!(result.row_count, 1, "one oversized row still pages");
+        assert!(result.truncated);
+        assert_eq!(result.rows[0]["t"].as_str().map(str::len), Some(huge.len()));
     }
 
     #[test]
