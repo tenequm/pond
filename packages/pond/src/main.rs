@@ -790,9 +790,12 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         ///
         /// The socket is owner-only (0600), so no other local user can reach
         /// it, and a successful connect means the server is ready (the store
-        /// opens before the bind). A dead socket left at the path is replaced;
-        /// any other file there is refused. Removed on shutdown. Excludes
-        /// --host/--port; POND_HOST/POND_PORT in the environment are ignored.
+        /// opens before the bind). Put it in a directory only you can write:
+        /// the mode is set by path, so a shared one lets another user swap it.
+        /// A `<path>.lock` beside it keeps a second server off the path; a
+        /// dead socket left there is replaced, any other file is refused, and
+        /// a clean stop removes the socket. Excludes --host/--port;
+        /// POND_HOST/POND_PORT in the environment are ignored.
         #[cfg(unix)]
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
@@ -1779,9 +1782,9 @@ async fn run() -> anyhow::Result<()> {
             socket,
         } => {
             #[cfg(unix)]
-            if let Some(path) = &socket {
-                prepare_serve_socket(transport, path)?;
-            }
+            let socket = socket
+                .map(|path| prepare_serve_socket(transport, &path))
+                .transpose()?;
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1811,27 +1814,44 @@ async fn run() -> anyhow::Result<()> {
             // `--with-sync`: fold the periodic sync into this process, reusing
             // the store + embedder above (no separate child cold-loading a
             // second ~500 MB model). The loop logs to tracing only; stdout is
-            // the transport's.
-            if with_sync {
-                spawn_in_serve_sync(
-                    state.store.clone(),
-                    config.clone(),
-                    config_file,
-                    storage_path,
-                    Duration::from_secs(sync_every.max(1) * 60),
-                );
-            }
+            // the transport's. Started only once the listener is bound, so a
+            // server that loses its bind never writes.
+            let start_sync = {
+                let store = state.store.clone();
+                move || {
+                    if with_sync {
+                        spawn_in_serve_sync(
+                            store,
+                            config,
+                            config_file,
+                            storage_path,
+                            Duration::from_secs(sync_every.max(1) * 60),
+                        );
+                    }
+                }
+            };
             match transport {
                 ServeTransport::Http => {
                     #[cfg(unix)]
-                    if let Some(path) = socket {
+                    if let Some(claim) = socket {
+                        let listener = claim.bind()?;
+                        start_sync();
                         let stop = transport::http::shutdown_signal();
-                        return transport::http::serve_unix(state, &path, &allowed_host, stop)
-                            .await;
+                        return transport::http::serve_unix(
+                            listener,
+                            claim,
+                            state,
+                            &allowed_host,
+                            stop,
+                        )
+                        .await;
                     }
-                    transport::http::serve(state, host, port, allowed_host).await?;
+                    let listener = transport::http::bind(&host, port).await?;
+                    start_sync();
+                    transport::http::serve(listener, state, allowed_host).await?;
                 }
                 ServeTransport::Stdio => {
+                    start_sync();
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
                     transport::mcp::serve_stdio(state).await?;
                 }
@@ -2138,11 +2158,14 @@ fn reject_tcp_bind_beside_socket(matches: &clap::ArgMatches) -> Result<(), clap:
 }
 
 #[cfg(unix)]
-fn prepare_serve_socket(transport: ServeTransport, path: &Path) -> anyhow::Result<()> {
+fn prepare_serve_socket(
+    transport: ServeTransport,
+    path: &Path,
+) -> anyhow::Result<transport::http::SocketClaim> {
     if transport == ServeTransport::Stdio {
         bail!("--socket serves HTTP; drop --socket or drop --transport stdio");
     }
-    transport::http::clear_stale_socket(path)
+    transport::http::SocketClaim::acquire(path)
 }
 
 #[allow(clippy::print_stdout)]

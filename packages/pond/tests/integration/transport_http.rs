@@ -833,16 +833,14 @@ async fn unix_socket_serves_sql_and_is_removed_on_shutdown() -> anyhow::Result<(
     let state = empty_state(&temp).await?;
     let sockets = TempDir::new()?;
     let path = sockets.path().join("pond.sock");
-    http::clear_stale_socket(&path)?;
+    let claim = http::SocketClaim::acquire(&path)?;
+    let listener = claim.bind()?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn({
-        let path = path.clone();
-        async move {
-            http::serve_unix(state, &path, &[], async move {
-                let _ = stopped.await;
-            })
-            .await
-        }
+    let server = tokio::spawn(async move {
+        http::serve_unix(listener, claim, state, &[], async move {
+            let _ = stopped.await;
+        })
+        .await
     });
 
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -879,7 +877,8 @@ async fn unix_socket_serves_sql_and_is_removed_on_shutdown() -> anyhow::Result<(
 
 /// The binary end to end, as a supervisor runs it: `--socket` wins over an
 /// inherited POND_HOST/POND_PORT instead of failing the parse as a conflict,
-/// the first successful connect is answered, and SIGTERM removes the socket.
+/// the first successful connect is answered, a second server on the same path
+/// is refused, and SIGTERM removes the socket.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow::Result<()> {
@@ -887,21 +886,26 @@ async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow:
     let path = temp.path().join("pond.sock");
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home)?;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pond"))
-        .arg("serve")
-        .arg("--storage-path")
-        .arg(temp.path().join("store"))
-        .arg("--socket")
-        .arg(&path)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", temp.path().join("config"))
-        .env("XDG_DATA_HOME", temp.path().join("data"))
-        .env("XDG_CACHE_HOME", temp.path().join("cache"))
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .env("POND_HOST", "0.0.0.0")
-        .env("POND_PORT", "1")
-        .env_remove("POND_CONFIG_FILE")
-        .env("NO_COLOR", "1")
+    let serve = || {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pond"));
+        command
+            .arg("serve")
+            .arg("--storage-path")
+            .arg(temp.path().join("store"))
+            .arg("--socket")
+            .arg(&path)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("XDG_DATA_HOME", temp.path().join("data"))
+            .env("XDG_CACHE_HOME", temp.path().join("cache"))
+            .env("XDG_STATE_HOME", temp.path().join("state"))
+            .env("POND_HOST", "0.0.0.0")
+            .env("POND_PORT", "1")
+            .env_remove("POND_CONFIG_FILE")
+            .env("NO_COLOR", "1");
+        command
+    };
+    let mut child = serve()
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()?;
@@ -933,6 +937,15 @@ async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow:
     .await?;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     drop(stream);
+
+    let second = serve().output()?;
+    assert!(!second.status.success(), "{:?}", second.status);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("another pond serve owns"), "{stderr}");
+    assert!(
+        path.exists(),
+        "the refused server leaves the live socket alone"
+    );
 
     let signalled = std::process::Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
