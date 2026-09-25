@@ -1,0 +1,55 @@
+name: Build and deploy the docs site
+description: >
+  Builds docs/site and deploys it to Cloudflare. Shared by ci.yml's deploy-docs
+  (every main push, and a dispatch on main) and deploy-docs-changelog (after a
+  release, which the changelog page picks up at build time), so the two cannot
+  drift. Expects the repository already checked out: a local action only
+  resolves after checkout.
+inputs:
+  github-token:
+    description: >
+      Token for the changelog page's GitHub releases fetch at build time;
+      unauthenticated API calls from shared runners rate-limit.
+    default: ${{ github.token }}
+  cloudflare-api-token:
+    description: Cloudflare API token for the deploy.
+    required: true
+  cloudflare-account-id:
+    description: Cloudflare account id for the deploy.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install pnpm
+      uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      with:
+        # uses: steps run from the repo root, not docs/site, so point the
+        # action at the package.json that declares packageManager: pnpm@...
+        package_json_file: docs/site/package.json
+
+    - name: Set up node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24.21.0
+        cache: pnpm
+        cache-dependency-path: docs/site/pnpm-lock.yaml
+
+    - name: Install
+      shell: bash
+      working-directory: docs/site
+      run: pnpm install --frozen-lockfile
+
+    - name: Build
+      shell: bash
+      working-directory: docs/site
+      run: pnpm build
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+
+    - name: Deploy
+      uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
+      with:
+        apiToken: ${{ inputs.cloudflare-api-token }}
+        accountId: ${{ inputs.cloudflare-account-id }}
+        wranglerVersion: "4"
+        workingDirectory: docs/site
