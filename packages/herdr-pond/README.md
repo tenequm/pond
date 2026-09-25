@@ -50,7 +50,7 @@ herdr's PATH is fixed when the herdr server starts. If `pond` is not on it, set 
 
 - Each herdr server starts one `pond serve` in the background at startup, listening on a Unix socket in the plugin state dir (`serve/<hash>/owner.sock`, owner-only), and stops it when that server exits. It is a personal server only your user can reach, not a TCP port; the plugin sends it only reads. It never runs sync (`--with-sync` is not passed), and `pond schedule` stays the owner of scheduled sync.
 - If that serve is missing or dead, the desk starts its own, on its own socket, for as long as it is open. If the desk is killed with SIGKILL, that serve is orphaned (visible in `ps`) until you stop it.
-- If the per-server serve outlives its herdr server's watchdog (the watchdog was killed), the next watchdog for that server stops it and starts a fresh one.
+- If the per-server serve outlives its herdr server's watchdog (the watchdog was killed), the next watchdog for that server stops it when it answers on its socket or its command line names that socket, then starts a fresh one; a process matching neither is left alone.
 - Idle syncs wait for any sync already holding the store lock, then run. Bursts of idle events coalesce; the last one always produces a sync.
 - The machine column shows each session's origin host, read from its first message; sessions from the machine the desk runs on show as `this`. Sessions ingested before pond stamped the ingest host have no recorded machine. The desk shows them as `local?` - unknown provenance, not a claim that they came from this machine.
 - Typed search (`/`) covers the whole store - every project and all time - until `p` narrows it to this project or `t` to the last 14 days. In the listing, `p` and `t` widen instead: it opens on this project's last 14 days.
@@ -64,6 +64,6 @@ In the plugin state dir (herdr's state dir, `plugins/pond/`):
 - `sync.log` - one line per idle sync (adapter, exit status, duration) plus pond's own output.
 - `serve/<hash>/daemon.log` - the per-server serve's lifecycle and output.
 - `serve/<hash>/desk-serve.log` - a desk-started serve's output.
-- `desk.log` - what the desk did not show you: a `desk-cache.json` it could not read or write, and failed background lookups of titles, counts and hosts (the rows are retried as you move).
+- `desk.log` - what the desk did not show you: a `desk-cache.json` it could not read or write, failed background lookups of titles, counts and hosts (the rows are retried as you move), and the full text of every error it showed as a clipped toast.
 
 Each log starts over past 1 MiB. herdr's `plugin log list` only shows that a hook exited, not that a sync ran - `sync.log` is the record.
