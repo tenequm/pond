@@ -29,6 +29,7 @@ mod agy;
 mod claude_ai_export;
 mod claude_code;
 mod codex_cli;
+mod devin;
 mod grok_build;
 mod hermes;
 mod letta_code;

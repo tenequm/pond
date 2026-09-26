@@ -1,5 +1,5 @@
 //! Shared read-only SQLite plumbing for DB-backed adapters (opencode, openclaw,
-//! hermes, nanoclaw, agy, pi-coding-agent).
+//! hermes, nanoclaw, agy, devin, pi-coding-agent).
 //!
 //! Seam rule (CLAUDE.md "Seam boundaries"): this module carries only
 //! cross-implementation infrastructure with two real callers and no
@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use base64::Engine as _;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, types::ValueRef};
 use serde_json::{Value, json};
 
 use super::AdapterError;
@@ -148,6 +149,23 @@ pub(crate) fn row_to_json(
         }
     }
     Ok(Value::Object(map))
+}
+
+/// One cell as lossless JSON: a blob (or TEXT that is not UTF-8) is base64
+/// under a key naming the encoding, so it can never read back as text. Shared
+/// by the adapters that mirror whole rows (`SELECT *`), agy and devin.
+pub(crate) fn value_json(value: ValueRef<'_>) -> Value {
+    let base64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(value) => json!(value),
+        ValueRef::Real(value) => json!(value),
+        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(text) => json!(text),
+            Err(_) => json!({ "text_base64": base64(bytes) }),
+        },
+        ValueRef::Blob(bytes) => json!({ "base64": base64(bytes) }),
+    }
 }
 
 /// Send one yield through a blocking read channel, returning `false` from the

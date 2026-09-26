@@ -29,7 +29,6 @@
 use std::path::{Path, PathBuf};
 
 use async_stream::stream;
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, types::ValueRef};
 use serde_json::{Map, Value, json};
@@ -1544,18 +1543,15 @@ impl Cell {
         }
     }
 
-    /// Lossless JSON: blobs (and non-UTF-8 text) are base64 under a key that
-    /// names the encoding, so a blob can never read back as text.
     fn to_json(&self) -> Value {
-        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-        match self {
-            Self::Null => Value::Null,
-            Self::Int(value) => json!(value),
-            Self::Real(value) => json!(value),
-            Self::Text(value) => json!(value),
-            Self::TextBytes(bytes) => json!({ "text_base64": b64(bytes) }),
-            Self::Blob(bytes) => json!({ "base64": b64(bytes) }),
-        }
+        sqlite::value_json(match self {
+            Self::Null => ValueRef::Null,
+            Self::Int(value) => ValueRef::Integer(*value),
+            Self::Real(value) => ValueRef::Real(*value),
+            Self::Text(value) => ValueRef::Text(value.as_bytes()),
+            Self::TextBytes(bytes) => ValueRef::Text(bytes),
+            Self::Blob(bytes) => ValueRef::Blob(bytes),
+        })
     }
 }
 
@@ -1862,6 +1858,7 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use base64::Engine as _;
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 
