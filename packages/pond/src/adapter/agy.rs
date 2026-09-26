@@ -1859,7 +1859,6 @@ mod tests {
     use std::collections::HashMap;
 
     use base64::Engine as _;
-
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 

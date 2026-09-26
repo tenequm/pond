@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_stream::stream;
 use chrono::DateTime;
@@ -113,24 +113,20 @@ fn data_roots(home: &Path) -> [PathBuf; 3] {
 }
 
 /// Configured reader, rooted at the directory holding `sessions.db`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DevinAdapter {
     root: PathBuf,
-    /// Heads `discover` computed, taken by the `events_with` that follows it
-    /// in the same sync, so the node-graph pass runs once per sync.
-    heads: Arc<Mutex<Option<Heads>>>,
+    /// Heads `discover` computed, taken by the `events_with` that follows it:
+    /// one sync per instance, so the node-graph pass runs once per sync.
+    heads: Mutex<Option<Heads>>,
 }
 
 impl DevinAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            heads: Arc::default(),
+            heads: Mutex::default(),
         }
-    }
-
-    fn take_heads(&self) -> Option<Heads> {
-        self.heads.lock().ok().and_then(|mut heads| heads.take())
     }
 
     fn db_path(&self) -> PathBuf {
@@ -143,30 +139,28 @@ impl Adapter for DevinAdapter {
     /// matches what the read emits.
     fn discover(&self) -> DiscoverFuture<'_> {
         let db = self.db_path();
-        let cache = Arc::clone(&self.heads);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let heads = collect_heads(&db, true)?;
-                let count = heads.pond_sessions();
-                if let Ok(mut slot) = cache.lock() {
-                    *slot = Some(heads);
-                }
-                Ok(count)
-            })
-            .await
-            .map_err(join_error)?
+            let heads = tokio::task::spawn_blocking(move || collect_heads(&db))
+                .await
+                .map_err(join_error)??;
+            let count = heads.pond_sessions();
+            if let Ok(mut slot) = self.heads.lock() {
+                *slot = Some(heads);
+            }
+            Ok(count)
         })
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         let db = self.db_path();
         Box::pin(stream! {
-            let peek = !oracle.is_empty();
-            let heads = match self.take_heads() {
+            let cached = self.heads.lock().ok().and_then(|mut slot| slot.take());
+            let heads = match cached {
                 Some(heads) => heads,
                 None => {
                     let heads_db = db.clone();
-                    match tokio::task::spawn_blocking(move || collect_heads(&heads_db, peek)).await {
+                    let peek = tokio::task::spawn_blocking(move || collect_heads(&heads_db));
+                    match peek.await {
                         Ok(Ok(heads)) => heads,
                         Ok(Err(error)) => { yield Err(error); return; }
                         Err(join) => { yield Err(join_error(join)); return; }
@@ -174,18 +168,24 @@ impl Adapter for DevinAdapter {
                 }
             };
             if let Some(reason) = heads.unsupported {
-                yield Ok(AdapterYield::Skipped { session_id: None, project: None, reason: SkipReason::Unsupported(reason) });
+                let reason = SkipReason::Unsupported(reason);
+                yield Ok(AdapterYield::Skipped { session_id: None, project: None, reason });
                 return;
             }
 
+            // An empty oracle holds nothing to compare against: read it all.
+            let peek = !oracle.is_empty();
             let mut survivors = Vec::with_capacity(heads.sessions.len());
             let mut fresh = 0usize;
             for head in heads.sessions {
-                match &head.watermarks {
-                    Some(marks) if peek && marks.iter().all(|(id, mark)| source_in_sync(oracle, Some(id), *mark)) => {
-                        fresh += marks.len();
-                    }
-                    _ => survivors.push(head.id),
+                let in_sync = head
+                    .watermarks
+                    .iter()
+                    .all(|(id, mark)| source_in_sync(oracle, Some(id), *mark));
+                if peek && in_sync {
+                    fresh += head.watermarks.len();
+                } else {
+                    survivors.push(head.id);
                 }
             }
             if fresh > 0 {
@@ -206,12 +206,10 @@ impl Adapter for DevinAdapter {
         })
     }
 
-    /// Always partitions, even on a first sync, so the session count is the
-    /// same one `discover` and every later plan report.
     fn plan<'a>(&'a self, oracle: &'a dyn SkipOracle) -> PlanFuture<'a> {
         let db = self.db_path();
         Box::pin(async move {
-            let heads = tokio::task::spawn_blocking(move || collect_heads(&db, true))
+            let heads = tokio::task::spawn_blocking(move || collect_heads(&db))
                 .await
                 .map_err(join_error)??;
             if oracle.is_empty() {
@@ -222,14 +220,14 @@ impl Adapter for DevinAdapter {
                 heads
                     .sessions
                     .iter()
-                    .flat_map(|head| head.watermarks.iter().flatten())
+                    .flat_map(|head| &head.watermarks)
                     .map(|(id, mark)| (Some(id.as_str()), *mark)),
             )))
         })
     }
 }
 
-// -- Opening and heads ------------------------------------------------------
+// -- Opening and heads ---------------------------------------------------------
 
 enum Opened {
     Forest(Connection),
@@ -262,13 +260,13 @@ fn open_forest(db: &Path) -> Result<Opened, AdapterError> {
     Ok(Opened::Forest(conn))
 }
 
-/// One `sessions` row as the gate sees it: its id, and - when there is an
-/// oracle to compare against - the watermark of every pond session it yields
-/// (the root plus each subagent child). The group is read or skipped whole.
+/// One `sessions` row as the gate sees it: its id and the watermark of every
+/// pond session it yields (the root plus each subagent child). The group is
+/// read or skipped whole.
 #[derive(Debug)]
 struct SessionHead {
     id: String,
-    watermarks: Option<Vec<(String, SourceWatermark)>>,
+    watermarks: Vec<(String, SourceWatermark)>,
 }
 
 #[derive(Debug, Default)]
@@ -278,17 +276,12 @@ struct Heads {
 }
 
 impl Heads {
-    /// Pond sessions the heads stand for; a session the peek could not
-    /// partition counts once.
     fn pond_sessions(&self) -> usize {
-        self.sessions
-            .iter()
-            .map(|head| head.watermarks.as_ref().map_or(1, Vec::len))
-            .sum()
+        self.sessions.iter().map(|head| head.watermarks.len()).sum()
     }
 }
 
-fn collect_heads(db: &Path, peek: bool) -> Result<Heads, AdapterError> {
+fn collect_heads(db: &Path) -> Result<Heads, AdapterError> {
     let conn = match open_forest(db)? {
         Opened::Forest(conn) => conn,
         Opened::Missing => return Ok(Heads::default()),
@@ -299,21 +292,11 @@ fn collect_heads(db: &Path, peek: bool) -> Result<Heads, AdapterError> {
             });
         }
     };
-    let rows = session_rows(&conn, db)?;
-    let mut marks = if peek {
-        forest_watermarks(&conn, &rows)
-    } else {
-        None
-    };
-    let sessions = rows
+    let sessions = session_rows(&conn, db)?
         .into_iter()
-        .map(|(id, _)| {
-            let watermarks = peek.then(|| {
-                marks
-                    .as_mut()
-                    .and_then(|marks| marks.remove(&id))
-                    .unwrap_or_else(|| vec![(id.clone(), SourceWatermark::Opaque)])
-            });
+        .map(|(id, main_head)| {
+            let watermarks = session_watermarks(&conn, &id, main_head)
+                .unwrap_or_else(|| vec![(id.clone(), SourceWatermark::Opaque)]);
             SessionHead { id, watermarks }
         })
         .collect();
@@ -335,125 +318,80 @@ fn session_rows(conn: &Connection, db: &Path) -> Result<Vec<(String, Option<i64>
         .map_err(|error| db_error(db, "read session list", &error))
 }
 
-/// Every pond session's watermark, from one pass over the node graph that
-/// pulls only the fields the partition needs, never message bodies to Rust,
-/// building one session's forest at a time. A node whose `chat_message` is not
-/// JSON with a string id leaves only its own session opaque, so that session
-/// re-reads and the read reports the node; a failed pass leaves every session
-/// opaque.
-fn forest_watermarks(
-    conn: &Connection,
-    rows: &[(String, Option<i64>)],
-) -> Option<HashMap<String, Vec<(String, SourceWatermark)>>> {
-    let table_heads = subagent_heads(conn).ok()?;
-    let main_heads: HashMap<&str, Option<i64>> =
-        rows.iter().map(|(id, head)| (id.as_str(), *head)).collect();
-    let mut marks: HashMap<String, Vec<(String, SourceWatermark)>> = HashMap::new();
-    let mut finish = |session: String, nodes: &[NodeRef], poisoned: bool| {
-        let Some(main_head) = main_heads.get(session.as_str()) else {
-            return;
-        };
-        let group = if poisoned {
-            vec![(session.clone(), SourceWatermark::Opaque)]
-        } else {
-            let heads = table_heads.get(&session).map_or(&[][..], Vec::as_slice);
-            let forest = Forest::new(*main_head, nodes, heads);
-            let mut group = vec![(session.clone(), forest.watermark(0))];
-            for (index, agent) in forest.agents.iter().enumerate() {
-                group.push((
-                    child_id(&session, &agent.agent_id),
-                    forest.watermark(index + 1),
-                ));
-            }
-            group
-        };
-        marks.insert(session, group);
-    };
+/// The four `chat_message` fields the partition needs, pulled in SQL for the
+/// peek and the read alike, so the two cannot disagree. One multi-path
+/// extract shares a single JSON parse per row; malformed JSON yields NULL
+/// instead of failing the statement.
+const NODE_FIELDS: &str = "CASE WHEN json_valid(chat_message) THEN json_extract(chat_message, \
+     '$.message_id', '$.metadata.created_at', \
+     '$.metadata.extensions.\"subagent/agent_id\"', \
+     '$.metadata.extensions.\"subagent/chain_node_id\"') END";
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT session_id, row_id, node_id, parent_node_id, created_at,
-                    CASE WHEN json_valid(chat_message)
-                          AND json_type(chat_message, '$.message_id') = 'text' THEN
-                         json_extract(chat_message, '$.message_id') END,
-                    CASE WHEN json_valid(chat_message)
-                          AND json_type(chat_message, '$.metadata.created_at') = 'text' THEN
-                         json_extract(chat_message, '$.metadata.created_at') END,
-                    CASE WHEN json_valid(chat_message)
-                          AND json_type(chat_message, '$.metadata.extensions.\"subagent/agent_id\"') = 'text' THEN
-                         json_extract(chat_message, '$.metadata.extensions.\"subagent/agent_id\"') END,
-                    CASE WHEN json_valid(chat_message)
-                          AND json_type(chat_message, '$.metadata.extensions.\"subagent/chain_node_id\"') = 'integer' THEN
-                         json_extract(chat_message, '$.metadata.extensions.\"subagent/chain_node_id\"') END
-             FROM message_nodes ORDER BY session_id, row_id",
-        )
-        .ok()?;
-    let mut cursor = stmt.query([]).ok()?;
-    let mut current: Option<(String, Vec<NodeRef>, bool)> = None;
-    while let Some(row) = cursor.next().ok()? {
-        let session: String = row.get(0).ok()?;
-        if current.as_ref().is_some_and(|(id, _, _)| *id != session)
-            && let Some((id, nodes, poisoned)) = current.take()
-        {
-            finish(id, &nodes, poisoned);
-        }
-        let (_, nodes, poisoned) = current.get_or_insert_with(|| (session, Vec::new(), false));
-        let Some(message_id) = row.get::<_, Option<String>>(5).ok()? else {
-            *poisoned = true;
-            continue;
-        };
-        nodes.push(NodeRef {
-            row_id: row.get(1).ok()?,
-            node_id: row.get(2).ok()?,
-            parent: row.get(3).ok()?,
-            node_created: row.get(4).ok()?,
-            message_id,
-            created_at: row.get(6).ok()?,
-            agent_id: row.get(7).ok()?,
-            chain_node_id: row.get(8).ok()?,
-        });
+/// One session's watermarks - the root and each subagent child - from its node
+/// graph alone, never message bodies. `None` (so the session re-reads, and the
+/// read reports the node) when a node is not JSON with a string `message_id`.
+fn session_watermarks(
+    conn: &Connection,
+    id: &str,
+    main_head: Option<i64>,
+) -> Option<Vec<(String, SourceWatermark)>> {
+    let sql = format!(
+        "SELECT row_id, node_id, parent_node_id, created_at, {NODE_FIELDS}
+         FROM message_nodes WHERE session_id = ?1 ORDER BY row_id"
+    );
+    let mut stmt = conn.prepare_cached(&sql).ok()?;
+    let mut rows = stmt.query([id]).ok()?;
+    let mut nodes = Vec::new();
+    while let Some(row) = rows.next().ok()? {
+        nodes.push(NodeRef::new(
+            row.get(0).ok()?,
+            row.get(1).ok()?,
+            row.get(2).ok()?,
+            row.get(3).ok()?,
+            row.get(4).ok()?,
+        )?);
     }
-    if let Some((id, nodes, poisoned)) = current.take() {
-        finish(id, &nodes, poisoned);
-    }
-    // A sessions row with no nodes yet holds nothing to ingest.
-    for (id, head) in rows {
-        marks
-            .entry(id.clone())
-            .or_insert_with(|| vec![(id.clone(), Forest::new(*head, &[], &[]).watermark(0))]);
+    let agent_heads = agent_heads(conn, id).ok()?;
+    let forest = Forest::new(main_head, &nodes, &agent_heads);
+    let mut marks = vec![(id.to_owned(), forest.watermark(0))];
+    for (index, agent) in forest.agents.iter().enumerate() {
+        marks.push((child_id(id, &agent.agent_id), forest.watermark(index + 1)));
     }
     Some(marks)
 }
 
-/// `subagent_heads` rows as `(agent_id, chain_node_id)` per session; the table
-/// arrived in V17, so its absence is an empty map.
-fn subagent_heads(conn: &Connection) -> rusqlite::Result<HashMap<String, Vec<(String, i64)>>> {
-    let mut heads: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+/// A session's `subagent_heads` rows, every column kept; the table arrived in
+/// V17, so a database without it has none.
+fn agent_head_rows(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Value>> {
     if !sqlite::has_table(conn, "subagent_heads")? {
-        return Ok(heads);
+        return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
-        "SELECT session_id, agent_id, chain_node_id FROM subagent_heads ORDER BY session_id, agent_id",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (session, agent, chain) = row?;
-        heads.entry(session).or_default().push((agent, chain));
-    }
-    Ok(heads)
+    dynamic_rows(
+        conn,
+        "SELECT * FROM subagent_heads WHERE session_id = ?1 ORDER BY agent_id",
+        id,
+    )
 }
 
-// -- The forest -------------------------------------------------------------
+/// `(agent_id, chain_node_id)` of a session's `subagent_heads` rows.
+fn agent_heads(conn: &Connection, id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
+    Ok(head_pairs(&agent_head_rows(conn, id)?))
+}
 
-/// What the partition needs from one `message_nodes` row. Built from a parsed
-/// row on the read path and from SQL-extracted columns on the peek path; the
-/// `watermark_matches_the_read` test pins that the two agree.
+fn head_pairs(rows: &[Value]) -> Vec<(String, i64)> {
+    rows.iter()
+        .filter_map(|row| {
+            Some((
+                row.get("agent_id")?.as_str()?.to_owned(),
+                row.get("chain_node_id")?.as_i64()?,
+            ))
+        })
+        .collect()
+}
+
+// -- The forest ----------------------------------------------------------------
+
+/// What the partition needs from one `message_nodes` row.
 #[derive(Debug, Clone)]
 struct NodeRef {
     row_id: i64,
@@ -467,23 +405,26 @@ struct NodeRef {
 }
 
 impl NodeRef {
-    fn from_row(node: &NodeRow, message: &Value) -> Option<Self> {
-        let extensions = message.pointer("/metadata/extensions");
-        let extension = |key: &str| extensions.and_then(|ext| ext.get(key));
+    /// From a row's columns and its [`NODE_FIELDS`] array; `None` when the
+    /// node has no string `message_id` (or no JSON at all).
+    fn new(
+        row_id: i64,
+        node_id: i64,
+        parent: Option<i64>,
+        node_created: i64,
+        fields: Option<String>,
+    ) -> Option<Self> {
+        let fields: Value = serde_json::from_str(&fields?).ok()?;
+        let text = |index: usize| fields.get(index)?.as_str().map(ToOwned::to_owned);
         Some(Self {
-            row_id: node.row_id,
-            node_id: node.node_id,
-            parent: node.parent_node_id,
-            node_created: node.created_at,
-            message_id: message.get("message_id")?.as_str()?.to_owned(),
-            created_at: message
-                .pointer("/metadata/created_at")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            agent_id: extension("subagent/agent_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            chain_node_id: extension("subagent/chain_node_id").and_then(Value::as_i64),
+            row_id,
+            node_id,
+            parent,
+            node_created,
+            message_id: text(0)?,
+            created_at: text(1),
+            agent_id: text(2),
+            chain_node_id: fields.get(3).and_then(Value::as_i64),
         })
     }
 
@@ -504,8 +445,8 @@ impl NodeRef {
 struct AgentChain {
     agent_id: String,
     head: i64,
-    /// `message_id` of the first parent-side message naming the agent (the
-    /// `run_subagent` result), the child's `parent_message_id`.
+    /// `message_id` of the first message naming the agent (the `run_subagent`
+    /// result), the child's `parent_message_id`.
     link_message: Option<String>,
 }
 
@@ -514,8 +455,6 @@ struct AgentChain {
 struct Forest {
     owner: HashMap<String, usize>,
     agents: Vec<AgentChain>,
-    /// Agent ids that cannot name a child session; their messages stay with
-    /// the parent.
     rejected: Vec<String>,
     /// Newest timestamp per owner, `None` when the owner holds no message.
     newest: Vec<Option<i64>>,
@@ -525,25 +464,7 @@ impl Forest {
     fn new(main_head: Option<i64>, nodes: &[NodeRef], table_heads: &[(String, i64)]) -> Self {
         let by_node: HashMap<i64, &NodeRef> =
             nodes.iter().map(|node| (node.node_id, node)).collect();
-
-        // Agent heads: the writer's own `subagent_heads` record wins; otherwise
-        // the newest parent-side link row (a resumed subagent advances its head).
-        let mut heads: BTreeMap<String, i64> = BTreeMap::new();
-        let mut link_messages: HashMap<String, String> = HashMap::new();
-        for node in nodes {
-            let Some(agent) = &node.agent_id else {
-                continue;
-            };
-            link_messages
-                .entry(agent.clone())
-                .or_insert_with(|| node.message_id.clone());
-            if let Some(chain) = node.chain_node_id {
-                heads.insert(agent.clone(), chain);
-            }
-        }
-        for (agent, chain) in table_heads {
-            heads.insert(agent.clone(), *chain);
-        }
+        let (heads, link_messages) = resolve_heads(nodes, table_heads);
 
         let mut owner: HashMap<String, usize> = HashMap::new();
         for id in chain_messages(&by_node, main_head) {
@@ -554,7 +475,7 @@ impl Forest {
         for (agent_id, head) in heads {
             // The id becomes a child session id; one that cannot be leaves
             // its messages with the parent rather than minting a malformed id.
-            if validate_path_id(NAME, "subagent id", &agent_id, agent_id.clone()).is_err() {
+            if validate_path_id(NAME, "subagent id", &agent_id, agent_id.as_str()).is_err() {
                 rejected.push(agent_id);
                 continue;
             }
@@ -576,6 +497,7 @@ impl Forest {
                 });
             }
         }
+
         // A message's time is its first placement's, the one the read stamps;
         // a later copy's node second must not move the watermark past it.
         let mut newest = vec![None; agents.len() + 1];
@@ -608,6 +530,32 @@ impl Forest {
     }
 }
 
+/// Each agent's head node and its first link message. The writer's own
+/// `subagent_heads` record wins; otherwise the newest link row carrying a
+/// chain id (a resumed subagent advances its head).
+fn resolve_heads(
+    nodes: &[NodeRef],
+    table_heads: &[(String, i64)],
+) -> (BTreeMap<String, i64>, HashMap<String, String>) {
+    let mut heads = BTreeMap::new();
+    let mut link_messages = HashMap::new();
+    for node in nodes {
+        let Some(agent) = &node.agent_id else {
+            continue;
+        };
+        link_messages
+            .entry(agent.clone())
+            .or_insert_with(|| node.message_id.clone());
+        if let Some(chain) = node.chain_node_id {
+            heads.insert(agent.clone(), chain);
+        }
+    }
+    for (agent, chain) in table_heads {
+        heads.insert(agent.clone(), *chain);
+    }
+    (heads, link_messages)
+}
+
 /// `message_id`s on the chain ending at `head`, walking `parent_node_id` to
 /// the root. A dangling parent ends the walk; a revisited node (a cycle the
 /// writer never produces) ends it too, so a corrupt forest cannot hang a sync.
@@ -634,40 +582,26 @@ fn child_id(session_id: &str, agent_id: &str) -> String {
 
 // -- Reading -------------------------------------------------------------------
 
-/// One `message_nodes` row as read. `message_id` comes from SQLite, so a copy
-/// identical to one already parsed is never parsed again.
-struct NodeRow {
-    row_id: i64,
-    node_id: i64,
-    parent_node_id: Option<i64>,
-    created_at: i64,
-    metadata: Option<String>,
-    chat_message: String,
-    message_id: Option<String>,
-}
-
 /// One message: its newest `chat_message` (a later copy can only add fields -
 /// the ACP tool content lands after the fact), every older distinct variant,
 /// and every node placing it.
 struct Collected {
     newest: Value,
     newest_raw: String,
-    newest_ref: NodeRef,
     first: NodeRef,
     variants: Vec<Value>,
     nodes: Vec<Value>,
 }
 
-type Tx = mpsc::Sender<Result<AdapterYield, AdapterError>>;
-
-fn read_sessions(db: &Path, ids: &[String], tx: &Tx) {
+fn read_sessions(db: &Path, ids: &[String], tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>) {
     let conn = match open_forest(db) {
         Ok(Opened::Forest(conn)) => conn,
         Ok(Opened::Missing | Opened::Unsupported(_)) => {
             let error = AdapterError::schema(
                 NAME,
                 db.display().to_string(),
-                "the session database changed shape between listing and read; re-run `pond sync devin`",
+                "the session database changed shape between listing and read; \
+                 re-run `pond sync devin`",
             );
             let _ = tx.blocking_send(Err(error));
             return;
@@ -685,121 +619,110 @@ fn read_sessions(db: &Path, ids: &[String], tx: &Tx) {
         )
         .ok()
         .flatten();
-    let heads = match subagent_heads(&conn) {
-        Ok(heads) => heads,
-        Err(error) => {
-            let _ = tx.blocking_send(Err(db_error(db, "read subagent_heads", &error)));
-            return;
-        }
-    };
     for id in ids {
-        let heads = heads.get(id).map_or(&[][..], Vec::as_slice);
-        if !read_session(&conn, db, id, schema_version, heads, tx) {
+        if !read_session(&conn, db, id, schema_version, tx) {
             return;
         }
     }
 }
 
 /// One `sessions` row with everything it yields: the root session, its
-/// messages, then each subagent child and its messages.
+/// messages, then each subagent child and its messages. A failure before the
+/// root session is a skip naming this session, so the ingest never charges it
+/// to the session read before.
 fn read_session(
     conn: &Connection,
     db: &Path,
     id: &str,
     schema_version: Option<i64>,
-    heads: &[(String, i64)],
-    tx: &Tx,
+    tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
     let location = format!("{}#{id}", db.display());
+    let skip = |reason: SkipReason| {
+        let skipped = AdapterYield::Skipped {
+            session_id: Some(id.to_owned()),
+            project: None,
+            reason,
+        };
+        tx.blocking_send(Ok(skipped)).is_ok()
+    };
     // A root id that fails here would never reach a restore filename or the
     // default search: `/` is the subagent marker there, `:` an NTFS stream.
     if let Err(error) = validate_path_id(NAME, "session id", id, &location) {
-        return tx.blocking_send(Err(error)).is_ok();
+        return skip(SkipReason::Unsupported(error.to_string()));
     }
-    // One read transaction, so the session row, its nodes and its tool state
-    // come from the same snapshot while devin keeps writing.
-    let snapshot = match conn.unchecked_transaction() {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            return tx
-                .blocking_send(Err(db_error(db, "begin read", &error)))
-                .is_ok();
-        }
+    let mut read = match SessionRead::load(conn, db, id, &location) {
+        Ok(Some(read)) => read,
+        // `devin rm` between listing and read.
+        Ok(None) => return skip(SkipReason::Empty),
+        Err(error) => return skip(SkipReason::Unsupported(error.to_string())),
     };
-    let mut read = match SessionRead::load(&snapshot, db, id, &location) {
-        Ok(read) => read,
-        Err(error) => return tx.blocking_send(Err(error)).is_ok(),
-    };
-    drop(snapshot);
 
-    let root = read.root_session(id, schema_version, heads);
+    let root = read.root_session(id, schema_version);
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(root))));
     // Node and subagent-id errors wait for the root, so the ingest charges
-    // them to this session rather than to whichever one was read before it.
+    // them to this session.
     for error in std::mem::take(&mut read.errors) {
         emit!(tx, Err(error));
     }
-    let forest = Forest::new(read.main_head, &read.refs, heads);
+    let forest = Forest::new(read.main_head, &read.refs, &head_pairs(&read.agent_heads));
     for agent in &forest.rejected {
-        emit!(
-            tx,
-            Err(AdapterError::schema(
-                NAME,
-                location.clone(),
-                format!(
-                    "subagent id {agent:?} cannot name a child session; its messages stay with the parent"
-                ),
-            ))
+        let error = AdapterError::schema(
+            NAME,
+            location.clone(),
+            format!(
+                "subagent id {agent:?} cannot name a child session; \
+                 its messages stay with the parent"
+            ),
         );
+        emit!(tx, Err(error));
     }
     let tools = ToolIndex::new(&read.tool_states, read.collected.values());
-
-    let mut owned: Vec<Vec<&Collected>> = vec![Vec::new(); forest.agents.len() + 1];
-    for (message_id, entry) in &read.collected {
-        owned[forest.owner_of(message_id)].push(entry);
-    }
-    for list in &mut owned {
-        list.sort_by(|left, right| {
-            left.first
-                .micros()
-                .cmp(&right.first.micros())
-                .then_with(|| left.first.message_id.cmp(&right.first.message_id))
-        });
-    }
+    let owned = read.partition(&forest);
     for entry in &owned[0] {
         if !emit_message(tx, id, entry, &tools) {
             return false;
         }
     }
     for (index, agent) in forest.agents.iter().enumerate() {
-        let messages = &owned[index + 1];
-        let child = child_id(id, &agent.agent_id);
-        let Some(created_at) = messages
-            .iter()
-            .find_map(|entry| DateTime::from_timestamp_micros(entry.first.micros()))
-        else {
-            emit!(
-                tx,
-                Err(AdapterError::schema(
-                    NAME,
-                    child,
-                    "no message of the subagent carries a usable timestamp"
-                ))
-            );
-            continue;
-        };
-        let session = child_session(id, &child, agent, created_at, &read, &forest);
-        emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
-        for entry in messages {
-            if !emit_message(tx, &child, entry, &tools) {
-                return false;
-            }
+        if !emit_child(tx, id, agent, &owned[index + 1], &read, &forest, &tools) {
+            return false;
         }
     }
     true
 }
 
-/// Everything read for one `sessions` row inside its snapshot.
+fn emit_child(
+    tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
+    root: &str,
+    agent: &AgentChain,
+    messages: &[&Collected],
+    read: &SessionRead,
+    forest: &Forest,
+    tools: &ToolIndex,
+) -> bool {
+    let child = child_id(root, &agent.agent_id);
+    let Some(created_at) = messages
+        .iter()
+        .find_map(|entry| DateTime::from_timestamp_micros(entry.first.micros()))
+    else {
+        let reason = "no message of the subagent carries a usable timestamp";
+        emit!(tx, Err(AdapterError::schema(NAME, child, reason)));
+        return true;
+    };
+    let session = child_session(root, &child, agent, created_at, read, forest);
+    emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
+    for entry in messages {
+        if !emit_message(tx, &child, entry, tools) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Everything read for one `sessions` row inside one read transaction, so the
+/// row, its nodes, tool state and subagent heads come from the same snapshot
+/// while devin keeps writing.
 struct SessionRead {
     row: Value,
     created_at: DateTime<chrono::Utc>,
@@ -808,42 +731,43 @@ struct SessionRead {
     refs: Vec<NodeRef>,
     collected: BTreeMap<String, Collected>,
     tool_states: Vec<Value>,
+    agent_heads: Vec<Value>,
     errors: Vec<AdapterError>,
 }
 
 impl SessionRead {
-    fn load(conn: &Connection, db: &Path, id: &str, location: &str) -> Result<Self, AdapterError> {
-        let row = dynamic_rows(conn, "SELECT * FROM sessions WHERE id = ?1", id)
+    /// `Ok(None)` when the row vanished since the listing.
+    fn load(
+        conn: &Connection,
+        db: &Path,
+        id: &str,
+        location: &str,
+    ) -> Result<Option<Self>, AdapterError> {
+        let snapshot = conn
+            .unchecked_transaction()
+            .map_err(|error| db_error(db, "begin read", &error))?;
+        let Some(row) = dynamic_rows(&snapshot, "SELECT * FROM sessions WHERE id = ?1", id)
             .map_err(|error| db_error(db, "read session row", &error))?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                AdapterError::schema(
-                    NAME,
-                    location,
-                    "session row vanished between listing and read",
-                )
-            })?;
+        else {
+            return Ok(None);
+        };
+        let schema = |reason: &str| AdapterError::schema(NAME, location, reason);
         let created_at = row
             .get("created_at")
             .and_then(Value::as_i64)
             .and_then(|secs| DateTime::from_timestamp(secs, 0))
-            .ok_or_else(|| {
-                AdapterError::schema(NAME, location, "session has no integer created_at")
-            })?;
+            .ok_or_else(|| schema("session has no integer created_at"))?;
         let project = extract_str(&row, "working_directory")
             .filter(|dir| !dir.is_empty())
-            .ok_or_else(|| {
-                AdapterError::schema(NAME, location, "session has no working_directory")
-            })?;
-        let nodes =
-            node_rows(conn, id).map_err(|error| db_error(db, "read message_nodes", &error))?;
+            .ok_or_else(|| schema("session has no working_directory"))?;
         // `tool_call_state` arrived in V14; a forest database before it has none.
-        let tool_states = if sqlite::has_table(conn, "tool_call_state")
+        let tool_states = if sqlite::has_table(&snapshot, "tool_call_state")
             .map_err(|error| db_error(db, "probe tool_call_state", &error))?
         {
             dynamic_rows(
-                conn,
+                &snapshot,
                 "SELECT * FROM tool_call_state WHERE session_id = ?1 ORDER BY rowid",
                 id,
             )
@@ -851,104 +775,109 @@ impl SessionRead {
         } else {
             Vec::new()
         };
-        let main_head = row.get("main_chain_id").and_then(Value::as_i64);
+        let agent_heads = agent_head_rows(&snapshot, id)
+            .map_err(|error| db_error(db, "read subagent_heads", &error))?;
         let mut read = Self {
+            main_head: row.get("main_chain_id").and_then(Value::as_i64),
             row,
             created_at,
             project,
-            main_head,
-            refs: Vec::with_capacity(nodes.len()),
+            refs: Vec::new(),
             collected: BTreeMap::new(),
             tool_states,
+            agent_heads,
             errors: Vec::new(),
         };
-        for node in &nodes {
-            read.collect(node, location);
-        }
-        Ok(read)
+        read.collect_nodes(&snapshot, id, location)
+            .map_err(|error| db_error(db, "read message_nodes", &error))?;
+        Ok(Some(read))
     }
 
-    /// Fold one node in: an identical copy of the newest known form only adds
-    /// a placement; anything else is parsed and becomes the newest form.
-    fn collect(&mut self, node: &NodeRow, location: &str) {
-        let known = node
-            .message_id
-            .as_ref()
-            .and_then(|message_id| self.collected.get_mut(message_id))
-            .filter(|entry| entry.newest_raw == node.chat_message);
-        if let Some(entry) = known {
-            entry.nodes.push(placement(node));
-            self.refs.push(NodeRef {
-                row_id: node.row_id,
-                node_id: node.node_id,
-                parent: node.parent_node_id,
-                node_created: node.created_at,
-                ..entry.newest_ref.clone()
-            });
-            return;
-        }
-        let parsed = serde_json::from_str::<Value>(&node.chat_message)
-            .ok()
-            .and_then(|message| {
-                NodeRef::from_row(node, &message).map(|node_ref| (message, node_ref))
-            });
-        let Some((message, node_ref)) = parsed else {
-            self.errors.push(AdapterError::schema(
-                NAME,
-                format!("{location}/node {}", node.node_id),
-                "chat_message is not a JSON object with a string message_id",
-            ));
-            return;
-        };
-        match self.collected.get_mut(&node_ref.message_id) {
-            Some(entry) => {
-                let older = std::mem::replace(&mut entry.newest, message);
-                if !entry.variants.contains(&older) {
-                    entry.variants.push(older);
-                }
-                entry.newest_raw.clone_from(&node.chat_message);
-                entry.newest_ref = node_ref.clone();
-                entry.nodes.push(placement(node));
-            }
-            None => {
-                self.collected.insert(
-                    node_ref.message_id.clone(),
-                    Collected {
-                        newest: message,
-                        newest_raw: node.chat_message.clone(),
-                        newest_ref: node_ref.clone(),
-                        first: node_ref.clone(),
-                        variants: Vec::new(),
-                        nodes: vec![placement(node)],
-                    },
-                );
-            }
-        }
-        self.refs.push(node_ref);
-    }
-
-    fn root_session(
-        &self,
+    /// Fold every node in as it streams, so only distinct message bodies stay
+    /// resident: an identical copy of the newest known form only adds a
+    /// placement; anything else is parsed.
+    fn collect_nodes(
+        &mut self,
+        conn: &Connection,
         id: &str,
-        schema_version: Option<i64>,
-        heads: &[(String, i64)],
-    ) -> Session {
+        location: &str,
+    ) -> rusqlite::Result<()> {
+        let sql = format!(
+            "SELECT row_id, node_id, parent_node_id, created_at, metadata, chat_message, \
+             {NODE_FIELDS} FROM message_nodes WHERE session_id = ?1 ORDER BY row_id"
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query([id])?;
+        while let Some(row) = rows.next()? {
+            let node_id: i64 = row.get(1)?;
+            let metadata: Option<String> = row.get(4)?;
+            let chat_message: String = row.get(5)?;
+            let node = NodeRef::new(row.get(0)?, node_id, row.get(2)?, row.get(3)?, row.get(6)?);
+            let parsed = node.and_then(|node| {
+                let known = self
+                    .collected
+                    .get(&node.message_id)
+                    .is_some_and(|entry| entry.newest_raw == chat_message);
+                if known {
+                    return Some((node, None));
+                }
+                let message = serde_json::from_str::<Value>(&chat_message).ok()?;
+                Some((node, Some(message)))
+            });
+            let Some((node, message)) = parsed else {
+                self.errors.push(AdapterError::schema(
+                    NAME,
+                    format!("{location}/node {node_id}"),
+                    "chat_message is not a JSON object with a string message_id",
+                ));
+                continue;
+            };
+            let placement = placement(&node, metadata.as_deref());
+            match (self.collected.get_mut(&node.message_id), message) {
+                (Some(entry), None) => entry.nodes.push(placement),
+                (Some(entry), Some(message)) => {
+                    // A copy can differ only in key order and still be the
+                    // same value; only a real change is a variant.
+                    if entry.newest != message {
+                        let older = std::mem::replace(&mut entry.newest, message);
+                        if !entry.variants.contains(&older) {
+                            entry.variants.push(older);
+                        }
+                    }
+                    entry.newest_raw = chat_message;
+                    entry.nodes.push(placement);
+                }
+                (None, Some(message)) => {
+                    self.collected.insert(
+                        node.message_id.clone(),
+                        Collected {
+                            newest: message,
+                            newest_raw: chat_message,
+                            first: node.clone(),
+                            variants: Vec::new(),
+                            nodes: vec![placement],
+                        },
+                    );
+                }
+                (None, None) => unreachable!("an unknown message is always parsed"),
+            }
+            self.refs.push(node);
+        }
+        Ok(())
+    }
+
+    fn root_session(&self, id: &str, schema_version: Option<i64>) -> Session {
         let mut devin = Map::new();
         if let Some(version) = schema_version {
             devin.insert("schema_version".to_owned(), json!(version));
         }
         if !self.tool_states.is_empty() {
-            devin.insert(
-                "tool_call_state".to_owned(),
-                Value::Array(self.tool_states.clone()),
-            );
+            let states = Value::Array(self.tool_states.clone());
+            devin.insert("tool_call_state".to_owned(), states);
         }
-        if !heads.is_empty() {
-            let rows = heads
-                .iter()
-                .map(|(agent, chain)| json!({ "agent_id": agent, "chain_node_id": chain }))
-                .collect();
-            devin.insert("subagent_heads".to_owned(), Value::Array(rows));
+        if !self.agent_heads.is_empty() {
+            let heads = Value::Array(self.agent_heads.clone());
+            devin.insert("subagent_heads".to_owned(), heads);
         }
         let mut options = source_options(NAME, &self.row);
         options.insert(NAME.to_owned(), Value::Object(devin));
@@ -963,12 +892,25 @@ impl SessionRead {
             options,
         }
     }
+
+    /// Messages per owner (root first, then each child), each in
+    /// `(timestamp, message id)` order.
+    fn partition(&self, forest: &Forest) -> Vec<Vec<&Collected>> {
+        let mut owned: Vec<Vec<&Collected>> = vec![Vec::new(); forest.agents.len() + 1];
+        for (message_id, entry) in &self.collected {
+            owned[forest.owner_of(message_id)].push(entry);
+        }
+        for list in &mut owned {
+            list.sort_by_cached_key(|entry| (entry.first.micros(), entry.first.message_id.clone()));
+        }
+        owned
+    }
 }
 
 /// A subagent child. Its parent is the session that owns the message naming
 /// it - the root, or another subagent when one spawned it - and its raw record
-/// is that message's link extensions, or the `subagent_heads` row when no
-/// link message survives.
+/// is that message's link extensions, or its `subagent_heads` row when no link
+/// message survives.
 fn child_session(
     root: &str,
     child: &str,
@@ -986,9 +928,16 @@ fn child_session(
         Some(owner) if owner > 0 => child_id(root, &forest.agents[owner - 1].agent_id),
         _ => root.to_owned(),
     };
+    let head_row = || {
+        read.agent_heads
+            .iter()
+            .find(|row| row.get("agent_id").and_then(Value::as_str) == Some(&agent.agent_id))
+            .cloned()
+    };
     let raw = link
         .and_then(|(_, entry)| entry.newest.pointer("/metadata/extensions").cloned())
-        .unwrap_or_else(|| json!({ "session_id": root, "agent_id": agent.agent_id, "chain_node_id": agent.head }));
+        .or_else(head_row)
+        .unwrap_or(Value::Null);
     let mut options = source_options(NAME, &raw);
     options.insert(
         NAME.to_owned(),
@@ -1005,7 +954,12 @@ fn child_session(
     }
 }
 
-fn emit_message(tx: &Tx, session_id: &str, entry: &Collected, tools: &ToolIndex) -> bool {
+fn emit_message(
+    tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
+    session_id: &str,
+    entry: &Collected,
+    tools: &ToolIndex,
+) -> bool {
     match message_events(session_id, entry, tools) {
         Ok(events) => {
             for event in events {
@@ -1017,40 +971,18 @@ fn emit_message(tx: &Tx, session_id: &str, entry: &Collected, tools: &ToolIndex)
     true
 }
 
-fn node_rows(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<NodeRow>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT row_id, node_id, parent_node_id, created_at, metadata, chat_message,
-                CASE WHEN json_valid(chat_message)
-                      AND json_type(chat_message, '$.message_id') = 'text'
-                     THEN json_extract(chat_message, '$.message_id') END
-         FROM message_nodes WHERE session_id = ?1 ORDER BY row_id",
-    )?;
-    let rows = stmt.query_map([session_id], |row| {
-        Ok(NodeRow {
-            row_id: row.get(0)?,
-            node_id: row.get(1)?,
-            parent_node_id: row.get(2)?,
-            created_at: row.get(3)?,
-            metadata: row.get(4)?,
-            chat_message: row.get(5)?,
-            message_id: row.get(6)?,
-        })
-    })?;
-    rows.collect()
-}
-
 /// A node's own columns, `metadata` parsed when it is JSON: where the message
 /// sits in the forest and why (system prefix, compaction source).
-fn placement(node: &NodeRow) -> Value {
+fn placement(node: &NodeRef, metadata: Option<&str>) -> Value {
     let mut placement = json!({
         "row_id": node.row_id,
         "node_id": node.node_id,
-        "created_at": node.created_at,
+        "created_at": node.node_created,
     });
-    if let Some(parent) = node.parent_node_id {
+    if let Some(parent) = node.parent {
         placement["parent_node_id"] = json!(parent);
     }
-    if let Some(metadata) = &node.metadata {
+    if let Some(metadata) = metadata {
         placement["metadata"] = json_or_string(metadata);
     }
     placement
@@ -1557,17 +1489,30 @@ mod tests {
                 .as_array()
                 .is_some_and(|variants| !variants.is_empty())
         );
+
+        // Copies that differ only in key order are one value, never a variant.
+        for message in read.messages.values().flatten() {
+            let options = message.options();
+            let newest = &options["source"]["raw_record"];
+            let variants = options[NAME]["variants"]
+                .as_array()
+                .map_or(&[][..], Vec::as_slice);
+            assert!(!variants.contains(newest), "{}", message.id());
+        }
+    }
+
+    fn peeked(db: &Path) -> BTreeMap<String, SourceWatermark> {
+        collect_heads(db)
+            .unwrap()
+            .sessions
+            .into_iter()
+            .flat_map(|head| head.watermarks)
+            .collect()
     }
 
     fn assert_peek_matches_read(db: &Path) {
         let read = read(db);
-        let conn = sqlite::open_db(NAME, db).unwrap();
-        let rows = session_rows(&conn, db).unwrap();
-        let peeked: BTreeMap<String, SourceWatermark> = forest_watermarks(&conn, &rows)
-            .unwrap()
-            .into_values()
-            .flatten()
-            .collect();
+        let peeked: BTreeMap<String, SourceWatermark> = peeked(db).into_iter().collect();
         let emitted: BTreeMap<String, SourceWatermark> = read
             .messages
             .iter()
@@ -1604,7 +1549,8 @@ mod tests {
         std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
         let conn = Connection::open(&db).unwrap();
         conn.execute(
-            "UPDATE message_nodes SET chat_message = json_remove(chat_message, '$.metadata.created_at'),
+            "UPDATE message_nodes
+             SET chat_message = json_remove(chat_message, '$.metadata.created_at'),
                     created_at = created_at + row_id
              WHERE session_id = 'amplified-color'",
             [],
@@ -1664,7 +1610,7 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let heads = collect_heads(&db, false).unwrap();
+        let heads = collect_heads(&db).unwrap();
         assert!(heads.unsupported.unwrap().contains("copy the file aside"));
     }
 
@@ -1679,7 +1625,8 @@ mod tests {
         Connection::open(&db)
             .unwrap()
             .execute(
-                "UPDATE message_nodes SET chat_message = '{not json' WHERE session_id = 'level-waterlily' AND node_id = 1",
+                "UPDATE message_nodes SET chat_message = '{not json'
+                 WHERE session_id = 'level-waterlily' AND node_id = 1",
                 [],
             )
             .unwrap();
@@ -1688,8 +1635,9 @@ mod tests {
         assert!(read.errors[0].to_string().contains("node 1"));
         let position = |item: &str| read.order.iter().position(|entry| entry == item).unwrap();
         assert!(
-            position("level-waterlily") < position("error"),
-            "the node error follows its own session, so the ingest charges it there",
+            position("level-waterlily") < position("error")
+                && position("error") < position("power-almandine"),
+            "the node error sits between its own session and the next one",
         );
         assert_eq!(
             read.messages["level-waterlily"].len(),
@@ -1697,15 +1645,10 @@ mod tests {
             "the prompt survives through its copies"
         );
 
-        let conn = sqlite::open_db(NAME, &db).unwrap();
-        let rows = session_rows(&conn, &db).unwrap();
-        let marks = forest_watermarks(&conn, &rows).unwrap();
-        assert_eq!(
-            marks["level-waterlily"],
-            vec![("level-waterlily".to_owned(), SourceWatermark::Opaque)]
-        );
+        let marks = peeked(&db);
+        assert_eq!(marks["level-waterlily"], SourceWatermark::Opaque);
         assert!(
-            matches!(marks["branch-candy"][0].1, SourceWatermark::At(_)),
+            matches!(marks["branch-candy"], SourceWatermark::At(_)),
             "only the corrupt session re-reads"
         );
     }

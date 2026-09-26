@@ -1,5 +1,5 @@
 //! Shared read-only SQLite plumbing for DB-backed adapters (opencode, openclaw,
-//! hermes, nanoclaw, agy, pi-coding-agent).
+//! hermes, nanoclaw, agy, devin, pi-coding-agent).
 //!
 //! Seam rule (CLAUDE.md "Seam boundaries"): this module carries only
 //! cross-implementation infrastructure with two real callers and no
