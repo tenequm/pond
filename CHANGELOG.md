@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.19.2](https://github.com/tenequm/pond/compare/v0.19.1...v0.19.2) - 2026-09-25
+
+### <!-- 1 -->🎉 New Features
+- **serve:** add POST /v1/x/sql JSON endpoint and --socket ([#311](https://github.com/tenequm/pond/pull/311)) ([e21b3e6](https://github.com/tenequm/pond/commit/e21b3e6c0159d775dbf8ea10fc46feda7fbbddbf))
+  `pond serve` gains `POST /v1/x/sql` (read-only SQL returning JSON rows,
+  loopback Host only unless `--allowed-host`; `/v1/x/` routes are outside
+  the stable wire contract) and `--socket <path>` (unix), which serves on
+  an owner-only Unix socket instead of a TCP port.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **serve:** survive clients that disconnect mid-response (ignore SIGPIPE) ([#316](https://github.com/tenequm/pond/pull/316)) ([692774c](https://github.com/tenequm/pond/commit/692774c930a406fc392fbb7067be0f03e5db78f1))
+  `pond serve` no longer dies when an HTTP client disconnects
+  mid-response, and commands that talk to an S3 store (sync, copy,
+  optimize, mcp) are no longer killed when the store drops a connection
+  mid-write. `pond ... | head` still exits quietly. No action needed.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.1...v0.19.2
+
 ## [0.19.1](https://github.com/tenequm/pond/compare/v0.19.0...v0.19.1) - 2026-09-23
 
 ### <!-- 2 -->🐛 Bug Fixes
