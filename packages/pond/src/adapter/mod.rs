@@ -31,6 +31,7 @@ mod claude_ai_export;
 mod claude_code;
 mod claude_desktop_app;
 mod codex_cli;
+mod devin;
 mod discovery;
 pub mod extract;
 mod grok_build;
@@ -49,6 +50,7 @@ pub use claude_ai_export::{ClaudeAiExportAdapter, ClaudeAiExportFactory};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
+pub use devin::{DevinAdapter, DevinFactory};
 pub use discovery::{
     Candidate, apply_to_doc, discover, persist_accept, probe_pathless, probe_unconfigured,
     prompt_and_persist, set_adapter_enabled,
@@ -546,6 +548,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &LettaCodeFactory,
         &GrokBuildFactory,
         &AgyFactory,
+        &DevinFactory,
     ]
 }
 
