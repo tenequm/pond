@@ -9,17 +9,17 @@
 //! pond message is one `message_id`, and every node placing it rides along in
 //! `options.devin.nodes`.
 //!
-//! Subagents run inside the parent's forest. The parent-side record is the only
-//! link: the `run_subagent` result (and the completion notice) carry
-//! `subagent/agent_id` plus `subagent/chain_node_id`, the subagent's head node,
-//! mirrored by the `subagent_heads` table. Each head's ancestor chain claims the
-//! subagent's messages for a child session `<id>/agent-<agent_id>`; the main
-//! chain claims first, and everything unclaimed (pre-compaction history, the
-//! summarizer's chain) stays with the parent.
+//! Subagents run inside the parent's forest, in trees only a subagent roots.
+//! devin names them only when a subagent reports back (the `subagent/agent_id`
+//! and `subagent/chain_node_id` link on the parent's messages), so the
+//! partition ([`group_subagents`]) groups those trees by shape instead: each
+//! child, `<id>/agent-<task prompt message id>`, holds the messages placed in
+//! its trees, and the parent holds the rest - the link included.
 //!
 //! The writer deletes nodes on `/revert` and whole sessions on `devin rm`, and
-//! never updates a node in place, so pond keeps the superset it has seen.
-//! Restore is refused ([`RESTORE_UNSUPPORTED`]).
+//! re-saves nodes (same content, new `row_id`) rather than editing them, so
+//! pond keeps the superset it has seen. Restore is refused
+//! ([`RESTORE_UNSUPPORTED`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
@@ -294,8 +294,8 @@ fn collect_heads(db: &Path) -> Result<Heads, AdapterError> {
     };
     let sessions = session_rows(&conn, db)?
         .into_iter()
-        .map(|(id, main_head)| {
-            let watermarks = session_watermarks(&conn, &id, main_head)
+        .map(|id| {
+            let watermarks = session_watermarks(&conn, &id)
                 .unwrap_or_else(|| vec![(id.clone(), SourceWatermark::Opaque)]);
             SessionHead { id, watermarks }
         })
@@ -306,56 +306,60 @@ fn collect_heads(db: &Path) -> Result<Heads, AdapterError> {
     })
 }
 
-/// `(id, main_chain_id)` of every session, in id order.
-fn session_rows(conn: &Connection, db: &Path) -> Result<Vec<(String, Option<i64>)>, AdapterError> {
+/// Every session id, in order.
+fn session_rows(conn: &Connection, db: &Path) -> Result<Vec<String>, AdapterError> {
     let mut stmt = conn
-        .prepare("SELECT id, main_chain_id FROM sessions ORDER BY id")
+        .prepare("SELECT id FROM sessions ORDER BY id")
         .map_err(|error| db_error(db, "prepare session list", &error))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |row| row.get(0))
         .map_err(|error| db_error(db, "query session list", &error))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| db_error(db, "read session list", &error))
 }
 
-/// The four `chat_message` fields the partition needs, pulled in SQL for the
-/// peek and the read alike, so the two cannot disagree. One multi-path
-/// extract shares a single JSON parse per row; malformed JSON yields NULL
-/// instead of failing the statement.
-const NODE_FIELDS: &str = "CASE WHEN json_valid(chat_message) THEN json_extract(chat_message, \
-     '$.message_id', '$.metadata.created_at', \
-     '$.metadata.extensions.\"subagent/agent_id\"', \
-     '$.metadata.extensions.\"subagent/chain_node_id\"') END";
+/// One session's nodes in `row_id` order, as the columns [`NodeRef::from_row`]
+/// reads followed by `extra`. What the partition needs from `chat_message` is
+/// derived here in SQL (the string `message_id` and `metadata.created_at`, and
+/// the two flags `role` and the telemetry `operation` decide), so the peek
+/// reads no message body; the peek and the read both go through here, so the
+/// two cannot disagree. Malformed JSON yields NULLs, never a failed statement.
+fn node_query(extra: &str) -> String {
+    format!(
+        "SELECT row_id, node_id, parent_node_id, created_at,
+             iif(json_type(doc, '$.message_id') = 'text', doc ->> '$.message_id', NULL),
+             iif(json_type(doc, '$.metadata.created_at') = 'text',
+                 doc ->> '$.metadata.created_at', NULL),
+             ifnull(doc ->> '$.role' = 'system', 0),
+             parent_node_id IS NULL AND ifnull(doc ->> '$.role' = 'user'
+                 OR doc ->> '$.metadata.telemetry.operation' GLOB 'subagent_*', 0){extra}
+         FROM (SELECT row_id, node_id, parent_node_id, created_at, metadata, chat_message,
+                   iif(json_valid(chat_message), chat_message, NULL) AS doc
+               FROM message_nodes WHERE session_id = ?1)
+         ORDER BY row_id"
+    )
+}
 
-/// One session's watermarks - the root and each subagent child - from its node
-/// graph alone, never message bodies. `None` (so the session re-reads, and the
-/// read reports the node) when a node is not JSON with a string `message_id`.
-fn session_watermarks(
-    conn: &Connection,
-    id: &str,
-    main_head: Option<i64>,
-) -> Option<Vec<(String, SourceWatermark)>> {
-    let sql = format!(
-        "SELECT row_id, node_id, parent_node_id, created_at, {NODE_FIELDS}
-         FROM message_nodes WHERE session_id = ?1 ORDER BY row_id"
-    );
-    let mut stmt = conn.prepare_cached(&sql).ok()?;
+/// One session's nodes for the partition; `None` when a node is not JSON with
+/// a string `message_id` or a column fails to read.
+fn session_nodes(conn: &Connection, id: &str) -> Option<Vec<NodeRef>> {
+    let mut stmt = conn.prepare_cached(&node_query("")).ok()?;
     let mut rows = stmt.query([id]).ok()?;
     let mut nodes = Vec::new();
     while let Some(row) = rows.next().ok()? {
-        nodes.push(NodeRef::new(
-            row.get(0).ok()?,
-            row.get(1).ok()?,
-            row.get(2).ok()?,
-            row.get(3).ok()?,
-            row.get(4).ok()?,
-        )?);
+        nodes.push(NodeRef::from_row(row).ok()??);
     }
-    let agent_heads = agent_heads(conn, id).ok()?;
-    let forest = Forest::new(main_head, &nodes, &agent_heads);
+    Some(nodes)
+}
+
+/// One session's watermarks - the root and each subagent child - from its node
+/// graph alone, never message bodies. `None` (so the session re-reads, and the
+/// read reports the node) when a node is unreadable ([`session_nodes`]).
+fn session_watermarks(conn: &Connection, id: &str) -> Option<Vec<(String, SourceWatermark)>> {
+    let forest = Forest::new(&session_nodes(conn, id)?);
     let mut marks = vec![(id.to_owned(), forest.watermark(0))];
-    for (index, agent) in forest.agents.iter().enumerate() {
-        marks.push((child_id(id, &agent.agent_id), forest.watermark(index + 1)));
+    for (index, task_prompt) in forest.children.iter().enumerate() {
+        marks.push((child_id(id, task_prompt), forest.watermark(index + 1)));
     }
     Some(marks)
 }
@@ -373,22 +377,6 @@ fn agent_head_rows(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Value>> 
     )
 }
 
-/// `(agent_id, chain_node_id)` of a session's `subagent_heads` rows.
-fn agent_heads(conn: &Connection, id: &str) -> rusqlite::Result<Vec<(String, i64)>> {
-    Ok(head_pairs(&agent_head_rows(conn, id)?))
-}
-
-fn head_pairs(rows: &[Value]) -> Vec<(String, i64)> {
-    rows.iter()
-        .filter_map(|row| {
-            Some((
-                row.get("agent_id")?.as_str()?.to_owned(),
-                row.get("chain_node_id")?.as_i64()?,
-            ))
-        })
-        .collect()
-}
-
 // -- The forest ----------------------------------------------------------------
 
 /// What the partition needs from one `message_nodes` row.
@@ -400,32 +388,30 @@ struct NodeRef {
     node_created: i64,
     message_id: String,
     created_at: Option<String>,
-    agent_id: Option<String>,
-    chain_node_id: Option<i64>,
+    is_system: bool,
+    /// A root the harness writes only for a subagent: its system prefix
+    /// (telemetry operation `subagent_<profile>`), or the parentless copy of
+    /// its task prompt.
+    starts_subagent: bool,
 }
 
 impl NodeRef {
-    /// From a row's columns and its [`NODE_FIELDS`] array; `None` when the
-    /// node has no string `message_id` (or no JSON at all).
-    fn new(
-        row_id: i64,
-        node_id: i64,
-        parent: Option<i64>,
-        node_created: i64,
-        fields: Option<String>,
-    ) -> Option<Self> {
-        let fields: Value = serde_json::from_str(&fields?).ok()?;
-        let text = |index: usize| fields.get(index)?.as_str().map(ToOwned::to_owned);
-        Some(Self {
-            row_id,
-            node_id,
-            parent,
-            node_created,
-            message_id: text(0)?,
-            created_at: text(1),
-            agent_id: text(2),
-            chain_node_id: fields.get(3).and_then(Value::as_i64),
-        })
+    /// From the leading [`node_query`] columns; `Ok(None)` when the node has
+    /// no string `message_id` (or no JSON at all).
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Self>> {
+        let Some(message_id) = row.get(4)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            row_id: row.get(0)?,
+            node_id: row.get(1)?,
+            parent: row.get(2)?,
+            node_created: row.get(3)?,
+            message_id,
+            created_at: row.get(5)?,
+            is_system: row.get(6)?,
+            starts_subagent: row.get(7)?,
+        }))
     }
 
     /// The message's own `created_at`, else the node's insert second - the
@@ -440,86 +426,47 @@ impl NodeRef {
     }
 }
 
-/// One subagent the partition found messages for.
-#[derive(Debug, Clone)]
-struct AgentChain {
-    agent_id: String,
-    head: i64,
-    /// `message_id` of the first message naming the agent (the `run_subagent`
-    /// result), the child's `parent_message_id`.
-    link_message: Option<String>,
-}
-
-/// Which pond session owns each message: owner 0 is the root session, owner
-/// `i` is `agents[i - 1]`.
+/// Which pond sessions hold each message: owner 0 is the root session, owner
+/// `i` is the child named by `children[i - 1]`, the `message_id` of that
+/// subagent's task prompt. A message absent from `owners` belongs to the root
+/// alone; one listed with no owner waits for a sync that can name its
+/// subagent.
+#[derive(Default)]
 struct Forest {
-    owner: HashMap<String, usize>,
-    agents: Vec<AgentChain>,
+    owners: HashMap<String, Vec<usize>>,
+    children: Vec<String>,
     rejected: Vec<String>,
     /// Newest timestamp per owner, `None` when the owner holds no message.
     newest: Vec<Option<i64>>,
 }
 
 impl Forest {
-    fn new(main_head: Option<i64>, nodes: &[NodeRef], table_heads: &[(String, i64)]) -> Self {
-        let by_node: HashMap<i64, &NodeRef> =
-            nodes.iter().map(|node| (node.node_id, node)).collect();
-        let (heads, link_messages) = resolve_heads(nodes, table_heads);
-
-        let mut owner: HashMap<String, usize> = HashMap::new();
-        for id in chain_messages(&by_node, main_head) {
-            owner.entry(id).or_insert(0);
-        }
-        let mut agents = Vec::new();
-        let mut rejected = Vec::new();
-        for (agent_id, head) in heads {
-            // The id becomes a child session id; one that cannot be leaves
-            // its messages with the parent rather than minting a malformed id.
-            if validate_path_id(NAME, "subagent id", &agent_id, agent_id.as_str()).is_err() {
-                rejected.push(agent_id);
-                continue;
-            }
-            let index = agents.len() + 1;
-            let mut claimed = false;
-            for id in chain_messages(&by_node, Some(head)) {
-                if let Entry::Vacant(entry) = owner.entry(id) {
-                    entry.insert(index);
-                    claimed = true;
-                }
-            }
-            // A fork copies the parent's `run_subagent` result, link and all,
-            // but not the subagent's nodes: no messages, no child.
-            if claimed {
-                agents.push(AgentChain {
-                    link_message: link_messages.get(&agent_id).cloned(),
-                    agent_id,
-                    head,
-                });
-            }
-        }
-
+    fn new(nodes: &[NodeRef]) -> Self {
+        let mut forest = if nodes.iter().any(|node| node.starts_subagent) {
+            group_subagents(nodes)
+        } else {
+            Self::default()
+        };
+        let mut newest = vec![None; forest.children.len() + 1];
         // A message's time is its first placement's, the one the read stamps;
         // a later copy's node second must not move the watermark past it.
-        let mut newest = vec![None; agents.len() + 1];
         let mut seen = HashSet::new();
         for node in nodes {
             if !seen.insert(node.message_id.as_str()) {
                 continue;
             }
-            let slot = owner.get(&node.message_id).copied().unwrap_or(0);
             let micros = node.micros();
-            newest[slot] = Some(newest[slot].map_or(micros, |prev: i64| prev.max(micros)));
+            for &owner in forest.owners_of(&node.message_id) {
+                let slot: &mut Option<i64> = &mut newest[owner];
+                *slot = Some(slot.map_or(micros, |prev| prev.max(micros)));
+            }
         }
-        Self {
-            owner,
-            agents,
-            rejected,
-            newest,
-        }
+        forest.newest = newest;
+        forest
     }
 
-    fn owner_of(&self, message_id: &str) -> usize {
-        self.owner.get(message_id).copied().unwrap_or(0)
+    fn owners_of(&self, message_id: &str) -> &[usize] {
+        self.owners.get(message_id).map_or(&[0], Vec::as_slice)
     }
 
     fn watermark(&self, owner: usize) -> SourceWatermark {
@@ -530,54 +477,166 @@ impl Forest {
     }
 }
 
-/// Each agent's head node and its first link message. The writer's own
-/// `subagent_heads` record wins; otherwise the newest link row carrying a
-/// chain id (a resumed subagent advances its head).
-fn resolve_heads(
-    nodes: &[NodeRef],
-    table_heads: &[(String, i64)],
-) -> (BTreeMap<String, i64>, HashMap<String, String>) {
-    let mut heads = BTreeMap::new();
-    let mut link_messages = HashMap::new();
+/// The [`Forest`] (its `newest` left empty) the subagent trees partition
+/// into. Nothing here reads the main chain, the row order or the link devin
+/// writes when a subagent reports back - all of which change between syncs -
+/// so what a sync stores never depends on when it ran.
+fn group_subagents(nodes: &[NodeRef]) -> Forest {
+    let by_node: HashMap<i64, &NodeRef> = nodes.iter().map(|node| (node.node_id, node)).collect();
+    let tree_of = tree_roots(&by_node);
+    let seeded = |node: &NodeRef| by_node[&tree_of[&node.node_id]].starts_subagent;
+
+    // A main message two subagents both copied must not merge them.
+    let in_main: HashSet<&str> = nodes
+        .iter()
+        .filter(|node| !seeded(node))
+        .map(|node| node.message_id.as_str())
+        .collect();
+    let mut sets: HashMap<i64, i64> = HashMap::new();
+    let mut first_tree: HashMap<&str, i64> = HashMap::new();
+    for node in nodes.iter().filter(|node| {
+        seeded(node) && !node.is_system && !in_main.contains(node.message_id.as_str())
+    }) {
+        let tree = tree_of[&node.node_id];
+        match first_tree.entry(node.message_id.as_str()) {
+            Entry::Occupied(entry) => union(&mut sets, *entry.get(), tree),
+            Entry::Vacant(entry) => {
+                entry.insert(tree);
+            }
+        }
+    }
+
+    // Per message: whether a tree outside the subagents places it, and the
+    // subagent groups whose trees do.
+    let mut placed: HashMap<&str, (bool, Vec<i64>)> = HashMap::new();
+    // The task prompt: a non-system node that is parentless or sits directly
+    // under a subagent prefix root. It is the subagent's first message, so
+    // the earliest candidate wins and one arriving later cannot rename it.
+    let mut names: HashMap<i64, (i64, &str)> = HashMap::new();
     for node in nodes {
-        let Some(agent) = &node.agent_id else {
+        let (in_root, groups) = placed.entry(&node.message_id).or_default();
+        if !seeded(node) {
+            *in_root = true;
             continue;
-        };
-        link_messages
-            .entry(agent.clone())
-            .or_insert_with(|| node.message_id.clone());
-        if let Some(chain) = node.chain_node_id {
-            heads.insert(agent.clone(), chain);
+        }
+        let group = find(&sets, tree_of[&node.node_id]);
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+        let task_prompt = !node.is_system
+            && node.parent.is_none_or(|parent| {
+                by_node
+                    .get(&parent)
+                    .is_some_and(|up| up.is_system && up.starts_subagent)
+            });
+        if task_prompt {
+            let candidate = (node.micros(), node.message_id.as_str());
+            let name = names.entry(group).or_insert(candidate);
+            *name = (*name).min(candidate);
         }
     }
-    for (agent, chain) in table_heads {
-        heads.insert(agent.clone(), *chain);
-    }
-    (heads, link_messages)
-}
 
-/// `message_id`s on the chain ending at `head`, walking `parent_node_id` to
-/// the root. A dangling parent ends the walk; a revisited node (a cycle the
-/// writer never produces) ends it too, so a corrupt forest cannot hang a sync.
-fn chain_messages(by_node: &HashMap<i64, &NodeRef>, head: Option<i64>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    let mut cursor = head;
-    while let Some(node_id) = cursor {
-        let Some(node) = by_node.get(&node_id) else {
-            break;
-        };
-        if !seen.insert(node_id) {
-            break;
+    // The id becomes a child session id; one that cannot be leaves the
+    // subagent's messages with the parent rather than minting a malformed id.
+    let mut valid: Vec<(&str, i64)> = Vec::new();
+    let mut rejected = Vec::new();
+    for (&group, &(_, name)) in &names {
+        if validate_path_id(NAME, "subagent task prompt id", name, name).is_ok() {
+            valid.push((name, group));
+        } else {
+            rejected.push(name.to_owned());
         }
-        out.push(node.message_id.clone());
-        cursor = node.parent;
     }
-    out
+    valid.sort_unstable();
+    rejected.sort_unstable();
+    let index: HashMap<i64, usize> = valid
+        .iter()
+        .enumerate()
+        .map(|(position, (_, group))| (*group, position + 1))
+        .collect();
+
+    let mut owners = HashMap::new();
+    for (message, (in_root, groups)) in placed {
+        if groups.is_empty() {
+            continue;
+        }
+        let mut held: Vec<usize> = groups
+            .iter()
+            .filter_map(|group| match index.get(group) {
+                Some(&owner) => Some(owner),
+                // Rejected: back with the parent. Unnamed: nobody, yet.
+                None => names.contains_key(group).then_some(0),
+            })
+            .collect();
+        if in_root {
+            held.push(0);
+        }
+        held.sort_unstable();
+        held.dedup();
+        owners.insert(message.to_owned(), held);
+    }
+    let children = valid.into_iter().map(|(name, _)| name.to_owned()).collect();
+    Forest {
+        owners,
+        children,
+        rejected,
+        newest: Vec::new(),
+    }
 }
 
-fn child_id(session_id: &str, agent_id: &str) -> String {
-    format!("{session_id}/agent-{agent_id}")
+/// Each node's tree, named by its root's `node_id`. A dangling parent ends
+/// the walk, and so does a revisited node (a cycle the writer never
+/// produces), so a corrupt forest cannot hang a sync.
+fn tree_roots(by_node: &HashMap<i64, &NodeRef>) -> HashMap<i64, i64> {
+    // `None` marks a node on the walk in progress: one lookup per step both
+    // reuses a finished walk and detects a cycle.
+    let mut roots: HashMap<i64, Option<i64>> = HashMap::with_capacity(by_node.len());
+    let mut path = Vec::new();
+    for &start in by_node.keys() {
+        path.clear();
+        let mut cursor = start;
+        let root = loop {
+            match roots.entry(cursor) {
+                Entry::Occupied(entry) => break entry.get().unwrap_or(cursor),
+                Entry::Vacant(entry) => {
+                    entry.insert(None);
+                }
+            }
+            path.push(cursor);
+            match by_node[&cursor]
+                .parent
+                .filter(|parent| by_node.contains_key(parent))
+            {
+                Some(parent) => cursor = parent,
+                None => break cursor,
+            }
+        };
+        for &id in &path {
+            roots.insert(id, Some(root));
+        }
+    }
+    roots
+        .into_iter()
+        .map(|(node, root)| (node, root.unwrap_or(node)))
+        .collect()
+}
+
+fn find(sets: &HashMap<i64, i64>, mut tree: i64) -> i64 {
+    while let Some(&up) = sets.get(&tree) {
+        tree = up;
+    }
+    tree
+}
+
+fn union(sets: &mut HashMap<i64, i64>, a: i64, b: i64) {
+    let (a, b) = (find(sets, a), find(sets, b));
+    if a != b {
+        sets.insert(b, a);
+    }
+}
+
+fn child_id(session_id: &str, task_prompt: &str) -> String {
+    format!("{session_id}/agent-{task_prompt}")
 }
 
 // -- Reading -------------------------------------------------------------------
@@ -660,19 +719,19 @@ fn read_session(
 
     let root = read.root_session(id, schema_version);
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(root))));
-    // Node and subagent-id errors wait for the root, so the ingest charges
+    // Node and child-name errors wait for the root, so the ingest charges
     // them to this session.
     for error in std::mem::take(&mut read.errors) {
         emit!(tx, Err(error));
     }
-    let forest = Forest::new(read.main_head, &read.refs, &head_pairs(&read.agent_heads));
-    for agent in &forest.rejected {
+    let forest = Forest::new(&read.refs);
+    for message_id in &forest.rejected {
         let error = AdapterError::schema(
             NAME,
             location.clone(),
             format!(
-                "subagent id {agent:?} cannot name a child session; \
-                 its messages stay with the parent"
+                "subagent task prompt id {message_id:?} cannot name a child \
+                 session; its messages stay with the parent"
             ),
         );
         emit!(tx, Err(error));
@@ -684,36 +743,51 @@ fn read_session(
             return false;
         }
     }
-    for (index, agent) in forest.agents.iter().enumerate() {
-        if !emit_child(tx, id, agent, &owned[index + 1], &read, &forest, &tools) {
+    for (index, task_prompt) in forest.children.iter().enumerate() {
+        if !emit_child(tx, id, task_prompt, &owned[index + 1], &read, &tools) {
             return false;
         }
     }
     true
 }
 
+/// A subagent child, created at its task prompt's time. Apart from the
+/// project, which is latched at first ingest like the root's, its row holds
+/// only what devin writes with the subagent's first nodes, so a sync that
+/// lands while it runs stores the same row as one after it reports back. Its
+/// parent is the root even for a subagent another one spawned: that spawner
+/// is written only at report time, and the link messages naming it stay
+/// stored in the parent.
 fn emit_child(
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
     root: &str,
-    agent: &AgentChain,
+    task_prompt: &str,
     messages: &[&Collected],
     read: &SessionRead,
-    forest: &Forest,
     tools: &ToolIndex,
 ) -> bool {
-    let child = child_id(root, &agent.agent_id);
-    let Some(created_at) = messages
-        .iter()
-        .find_map(|entry| DateTime::from_timestamp_micros(entry.first.micros()))
+    let id = child_id(root, task_prompt);
+    let Some(created_at) = read
+        .collected
+        .get(task_prompt)
+        .and_then(|entry| DateTime::from_timestamp_micros(entry.first.micros()))
     else {
-        let reason = "no message of the subagent carries a usable timestamp";
-        emit!(tx, Err(AdapterError::schema(NAME, child, reason)));
+        let reason = "the subagent's task prompt carries no usable timestamp";
+        emit!(tx, Err(AdapterError::schema(NAME, id, reason)));
         return true;
     };
-    let session = child_session(root, &child, agent, created_at, read, forest);
+    let session = Session {
+        id: id.clone(),
+        parent_session_id: Some(root.to_owned()),
+        parent_message_id: None,
+        source_agent: SUBAGENT_AGENT.to_owned(),
+        created_at,
+        project: read.project.clone(),
+        options: ProviderOptions::new(),
+    };
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
     for entry in messages {
-        if !emit_message(tx, &child, entry, tools) {
+        if !emit_message(tx, &id, entry, tools) {
             return false;
         }
     }
@@ -727,7 +801,6 @@ struct SessionRead {
     row: Value,
     created_at: DateTime<chrono::Utc>,
     project: Extracted<String>,
-    main_head: Option<i64>,
     refs: Vec<NodeRef>,
     collected: BTreeMap<String, Collected>,
     tool_states: Vec<Value>,
@@ -778,7 +851,6 @@ impl SessionRead {
         let agent_heads = agent_head_rows(&snapshot, id)
             .map_err(|error| db_error(db, "read subagent_heads", &error))?;
         let mut read = Self {
-            main_head: row.get("main_chain_id").and_then(Value::as_i64),
             row,
             created_at,
             project,
@@ -802,17 +874,13 @@ impl SessionRead {
         id: &str,
         location: &str,
     ) -> rusqlite::Result<()> {
-        let sql = format!(
-            "SELECT row_id, node_id, parent_node_id, created_at, metadata, chat_message, \
-             {NODE_FIELDS} FROM message_nodes WHERE session_id = ?1 ORDER BY row_id"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut stmt = conn.prepare_cached(&node_query(", metadata, chat_message"))?;
         let mut rows = stmt.query([id])?;
         while let Some(row) = rows.next()? {
             let node_id: i64 = row.get(1)?;
-            let metadata: Option<String> = row.get(4)?;
-            let chat_message: String = row.get(5)?;
-            let node = NodeRef::new(row.get(0)?, node_id, row.get(2)?, row.get(3)?, row.get(6)?);
+            let metadata: Option<String> = row.get(8)?;
+            let chat_message: String = row.get(9)?;
+            let node = NodeRef::from_row(row)?;
             let parsed = node.and_then(|node| {
                 let known = self
                     .collected
@@ -896,61 +964,16 @@ impl SessionRead {
     /// Messages per owner (root first, then each child), each in
     /// `(timestamp, message id)` order.
     fn partition(&self, forest: &Forest) -> Vec<Vec<&Collected>> {
-        let mut owned: Vec<Vec<&Collected>> = vec![Vec::new(); forest.agents.len() + 1];
+        let mut owned: Vec<Vec<&Collected>> = vec![Vec::new(); forest.children.len() + 1];
         for (message_id, entry) in &self.collected {
-            owned[forest.owner_of(message_id)].push(entry);
+            for &owner in forest.owners_of(message_id) {
+                owned[owner].push(entry);
+            }
         }
         for list in &mut owned {
             list.sort_by_cached_key(|entry| (entry.first.micros(), entry.first.message_id.clone()));
         }
         owned
-    }
-}
-
-/// A subagent child. Its parent is the session that owns the message naming
-/// it - the root, or another subagent when one spawned it - and its raw record
-/// is that message's link extensions, or its `subagent_heads` row when no link
-/// message survives.
-fn child_session(
-    root: &str,
-    child: &str,
-    agent: &AgentChain,
-    created_at: DateTime<chrono::Utc>,
-    read: &SessionRead,
-    forest: &Forest,
-) -> Session {
-    let link = agent.link_message.as_deref().and_then(|message_id| {
-        read.collected
-            .get(message_id)
-            .map(|entry| (message_id, entry))
-    });
-    let parent = match link.map(|(message_id, _)| forest.owner_of(message_id)) {
-        Some(owner) if owner > 0 => child_id(root, &forest.agents[owner - 1].agent_id),
-        _ => root.to_owned(),
-    };
-    let head_row = || {
-        read.agent_heads
-            .iter()
-            .find(|row| row.get("agent_id").and_then(Value::as_str) == Some(&agent.agent_id))
-            .cloned()
-    };
-    let raw = link
-        .and_then(|(_, entry)| entry.newest.pointer("/metadata/extensions").cloned())
-        .or_else(head_row)
-        .unwrap_or(Value::Null);
-    let mut options = source_options(NAME, &raw);
-    options.insert(
-        NAME.to_owned(),
-        json!({ "agent_id": agent.agent_id, "chain_node_id": agent.head }),
-    );
-    Session {
-        id: child.to_owned(),
-        parent_message_id: link.map(|(message_id, _)| format!("{parent}:{message_id}")),
-        parent_session_id: Some(parent),
-        source_agent: SUBAGENT_AGENT.to_owned(),
-        created_at,
-        project: read.project.clone(),
-        options,
     }
 }
 
@@ -1243,6 +1266,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
     use crate::wire::Role;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     const MACOS: &str = concat!(
@@ -1294,11 +1318,7 @@ mod tests {
             Opened::Forest(conn) => conn,
             _ => panic!("fixture is not a forest database"),
         };
-        let ids: Vec<String> = session_rows(&conn, db)
-            .unwrap()
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let ids = session_rows(&conn, db).unwrap();
         drop(conn);
         let (tx, mut rx) = mpsc::channel(1024);
         let mut out = Read::default();
@@ -1377,18 +1397,25 @@ mod tests {
         );
     }
 
-    /// The main chain claims first, each subagent head chain claims its own,
-    /// and everything off-chain stays with the parent; a fork that copied a
+    /// Each subagent's trees yield a child holding its own messages - the
+    /// system prefix it shares with the other subagents of its profile
+    /// included - with a row naming only its parent; the link devin writes
+    /// at report time stays stored in the parent, whole. A fork that copied a
     /// subagent link without its nodes yields no child.
     #[test]
     fn subagents_split_into_children_and_forks_yield_none() {
         let read = macos();
         let count = |id: &str| read.messages[id].len();
         assert_eq!(count("amplified-color"), 39);
-        assert_eq!(count("amplified-color/agent-398e395d"), 10);
+        assert_eq!(
+            count("amplified-color/agent-51d1dc31-ee2a-44d7-b6f8-3be0f0cf5d6e"),
+            10
+        );
         assert_eq!(count("chalk-twig"), 27);
-        assert_eq!(count("chalk-twig/agent-029b10e6"), 7);
-        assert_eq!(count("chalk-twig/agent-1d6d342f"), 6);
+        let child = "chalk-twig/agent-9b8139a3-5985-4ab6-b952-405982c113bd";
+        assert_eq!(count(child), 7);
+        let resumed = "chalk-twig/agent-ef9333ef-da80-48fd-b99b-ad32bc2b3d04";
+        assert_eq!(count(resumed), 7);
         assert_eq!(count("power-almandine"), 15);
         assert_eq!(read.sessions.len(), 8);
         assert!(
@@ -1398,18 +1425,24 @@ mod tests {
                 .any(|id| id.starts_with("power-almandine/"))
         );
 
-        let child = &read.sessions["chalk-twig/agent-029b10e6"];
-        assert_eq!(child.source_agent, SUBAGENT_AGENT);
-        assert_eq!(child.parent_session_id.as_deref(), Some("chalk-twig"));
-        let link = child.parent_message_id.as_deref().unwrap();
-        let carrier = read.messages["chalk-twig"]
-            .iter()
-            .find(|message| message.id() == link)
-            .unwrap();
-        assert_eq!(
-            carrier.role(),
-            Role::Tool,
-            "the run_subagent result links the child"
+        let session = &read.sessions[child];
+        assert_eq!(session.source_agent, SUBAGENT_AGENT);
+        assert_eq!(session.parent_session_id.as_deref(), Some("chalk-twig"));
+        assert_eq!(session.parent_message_id, None);
+        assert!(session.options.is_empty());
+        // Created at its task prompt, not at the system prefix it shares with
+        // the older sibling.
+        let resumed = &read.sessions[resumed];
+        let task_prompt: DateTime<chrono::Utc> = "2026-09-26T01:57:15.866591Z".parse().unwrap();
+        assert_eq!(resumed.created_at, task_prompt);
+        assert!(resumed.created_at > session.created_at);
+        assert!(
+            read.messages["chalk-twig"].iter().any(|message| {
+                message.options()["source"]["raw_record"]
+                    .pointer("/metadata/extensions/subagent~1chain_node_id")
+                    == Some(&json!(43))
+            }),
+            "the report-time link is stored in the parent"
         );
         assert!(
             read.sessions["power-almandine"].parent_session_id.is_none(),
@@ -1501,6 +1534,49 @@ mod tests {
         }
     }
 
+    const MIDRUN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/devin/midrun"
+    );
+    const MIDRUN_CHILD: &str = "gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004";
+
+    fn midrun(stage: &str) -> Read {
+        let read = read(&Path::new(MIDRUN).join(stage).join("cli").join(DB_FILE));
+        assert!(read.errors.is_empty(), "{stage}: {:?}", read.errors);
+        read
+    }
+
+    /// A subagent still running when the sync reads - its link not written
+    /// yet - yields the same child row it yields once it reports back, and
+    /// every message the running snapshot places keeps its session through
+    /// two compactions and the re-save that renumbers every row: a sync in
+    /// between stores nothing a single later sync would not.
+    #[test]
+    fn a_running_subagent_reads_as_it_will_once_it_reports() {
+        let placed = |read: &Read| -> BTreeSet<String> {
+            read.messages
+                .values()
+                .flatten()
+                .map(|message| message.id().to_owned())
+                .collect()
+        };
+        let (before, after) = (midrun("before"), midrun("after"));
+        let later = placed(&after);
+        let moved: Vec<String> = placed(&before).difference(&later).cloned().collect();
+        assert!(moved.is_empty(), "{moved:?}");
+
+        let running = &before.sessions[MIDRUN_CHILD];
+        assert_eq!(running, &after.sessions[MIDRUN_CHILD]);
+        assert_eq!(running.parent_session_id.as_deref(), Some("gilded-orca"));
+        assert_eq!(running.parent_message_id, None);
+        assert!(before.messages[MIDRUN_CHILD].len() > 1);
+        assert_eq!(
+            after.sessions.len(),
+            2,
+            "the summarizer chains stay with the root"
+        );
+    }
+
     fn peeked(db: &Path) -> BTreeMap<String, SourceWatermark> {
         collect_heads(db)
             .unwrap()
@@ -1537,6 +1613,9 @@ mod tests {
         for root in [MACOS, WINDOWS] {
             assert_peek_matches_read(&Path::new(root).join(DB_FILE));
         }
+        for stage in ["before", "after"] {
+            assert_peek_matches_read(&Path::new(MIDRUN).join(stage).join("cli").join(DB_FILE));
+        }
     }
 
     /// Without `metadata.created_at` a message falls back to its first node's
@@ -1560,41 +1639,93 @@ mod tests {
         assert_peek_matches_read(&db);
     }
 
-    /// The writer's own `subagent_heads` record outranks the link rows, and a
-    /// chain walk stops at a cycle instead of hanging.
+    /// Subagent trees group by shape alone - the task prompt's parentless
+    /// copy and every tree a subagent prefix roots, joined through shared
+    /// non-system messages, a compaction continuation included - and are
+    /// named by that task prompt. A message is held by every session whose
+    /// trees place it: two subagents of one profile each keep the prefix they
+    /// share, and a main message copied into subagent trees stays with the
+    /// root too, without merging the two subagents that copied it. The
+    /// earliest task prompt names a child, so a later candidate with a smaller
+    /// id cannot rename it. A group nothing names yet holds its messages back,
+    /// and a cycle ends the walk instead of hanging. The nodes go through the
+    /// peek's own SQL, so each node's classification is exercised too.
     #[test]
-    fn subagent_heads_table_wins_and_cycles_end_the_walk() {
-        let node = |row_id: i64, node_id: i64, parent: Option<i64>, message: &str| NodeRef {
-            row_id,
-            node_id,
-            parent,
-            node_created: 1,
-            message_id: message.to_owned(),
-            created_at: None,
-            agent_id: None,
-            chain_node_id: None,
-        };
-        let mut link = node(3, 3, Some(1), "result");
-        link.agent_id = Some("a1".to_owned());
-        link.chain_node_id = Some(10);
-        let nodes = vec![
-            node(1, 1, None, "prompt"),
-            node(2, 10, None, "stale-sub"),
-            link,
-            node(4, 20, Some(21), "sub-new"),
-            node(5, 21, Some(20), "sub-root"),
+    fn subagent_trees_group_by_shape_alone() {
+        type Row = (i64, Option<i64>, &'static str, &'static str, &'static str);
+        let node =
+            |node_id, parent, role, message| -> Row { (node_id, parent, role, "normal", message) };
+        let prefix =
+            |node_id, operation, message| -> Row { (node_id, None, "system", operation, message) };
+        let nodes = [
+            prefix(1, "normal", "main-prefix"),
+            node(2, Some(1), "user", "prompt"),
+            node(3, Some(2), "assistant", "call"),
+            node(4, Some(3), "tool", "result"),
+            node(10, None, "user", "task"),
+            prefix(11, "subagent_general", "sub-prefix"),
+            node(12, Some(11), "user", "task"),
+            node(13, Some(12), "assistant", "sub-reply"),
+            prefix(14, "subagent_general", "sub-prefix"),
+            node(15, Some(14), "system", "summary"),
+            node(16, Some(15), "assistant", "sub-reply"),
+            node(17, Some(16), "tool", "sub-tool"),
+            node(18, Some(17), "user", "prompt"),
+            prefix(20, "subagent_general", "sub-prefix"),
+            node(21, Some(20), "user", "task-2"),
+            node(22, Some(21), "user", "prompt"),
+            prefix(30, "unknown", "summarizer-prefix"),
+            node(31, Some(30), "user", "summarize"),
+            prefix(40, "subagent_explore", "lone-prefix"),
+            node(41, Some(40), "system", "lone-summary"),
+            node(42, Some(41), "assistant", "lone-reply"),
+            node(50, Some(51), "user", "loop-a"),
+            node(51, Some(50), "user", "loop-b"),
+            prefix(60, "subagent_general", "sub-prefix"),
+            node(61, Some(60), "user", "a-later"),
+            node(62, Some(61), "assistant", "sub-reply"),
         ];
-        let forest = Forest::new(Some(3), &nodes, &[("a1".to_owned(), 20)]);
-        assert_eq!(forest.agents.len(), 1);
-        assert_eq!(forest.agents[0].head, 20);
-        assert_eq!(forest.owner_of("sub-new"), 1);
-        assert_eq!(forest.owner_of("sub-root"), 1);
-        assert_eq!(
-            forest.owner_of("stale-sub"),
-            0,
-            "unclaimed history stays with the parent"
-        );
-        assert_eq!(forest.agents[0].link_message.as_deref(), Some("result"));
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message_nodes (
+                 row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                 node_id INTEGER NOT NULL, parent_node_id INTEGER, chat_message TEXT NOT NULL,
+                 created_at INTEGER NOT NULL, metadata TEXT)",
+        )
+        .unwrap();
+        for (node_id, parent, role, operation, message) in nodes {
+            let chat_message = json!({
+                "message_id": message,
+                "role": role,
+                "metadata": { "telemetry": { "operation": operation } },
+            });
+            conn.execute(
+                "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message,
+                     created_at) VALUES ('s', ?1, ?2, ?3, ?1)",
+                rusqlite::params![node_id, parent, chat_message.to_string()],
+            )
+            .unwrap();
+        }
+        let forest = Forest::new(&session_nodes(&conn, "s").unwrap());
+        assert_eq!(forest.children, ["task", "task-2"]);
+        for (message, owners) in [
+            ("main-prefix", &[0][..]),
+            ("result", &[0]),
+            ("task", &[1]),
+            ("sub-reply", &[1]),
+            ("summary", &[1]),
+            ("sub-tool", &[1]),
+            ("a-later", &[1]),
+            ("sub-prefix", &[1, 2]),
+            ("task-2", &[2]),
+            ("prompt", &[0, 1, 2]),
+            ("summarize", &[0]),
+            ("lone-prefix", &[]),
+            ("lone-reply", &[]),
+            ("loop-a", &[0]),
+        ] {
+            assert_eq!(forest.owners_of(message), owners, "{message}");
+        }
     }
 
     /// A database that predates the forest is a visible, counted skip naming

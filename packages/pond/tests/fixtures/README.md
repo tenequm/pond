@@ -13,7 +13,7 @@ synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
 transcripts captured 2026-08-24 from letta-code 0.30.30; grok-build sessions
 captured 2026-08-24 from grok-build 1.0.5; agy conversations captured
 2026-09-10 from agy 1.2.0 and its ACP server; devin session stores
-captured 2026-09-26 from devin 3000.11.3).
+captured 2026-09-26 and 2026-09-28 from devin 3000.11.3).
 
 ## Why
 
@@ -52,7 +52,7 @@ adapter/
   claude_desktop_app/        Claude Desktop (macOS), Cowork / local-agent-mode
   claude_managed_agents/     Anthropic API Managed Agents (playground export)
   codex_cli/                 OpenAI Codex CLI
-  devin/                     Devin CLI (Cognition's `devin`), one `sessions.db` per platform
+  devin/                     Devin CLI (Cognition's `devin`), one `sessions.db` per platform plus a mid-run pair
   grok-build/                grok-build (xAI `grok` CLI) session directories
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
   letta-code/                letta-code (`letta` CLI) client-side transcripts
@@ -317,38 +317,43 @@ sample tree.
 ### devin (Cognition's local `devin` CLI)
 
 - Source path: `$XDG_DATA_HOME/devin/cli/sessions.db` (default `~/.local/share/devin/cli/`) on macOS and Linux, `%APPDATA%\devin\cli\sessions.db` (Roaming) on Windows. One SQLite database per install holds every session: `sessions`, the per-session message forest `message_nodes`, `tool_call_state`, `subagent_heads`, plus the non-captured `prompt_history`, `rendered_commits`, `app_state` and `refinery_schema_history` (version 17). The format, the forest model and the decision record are in `docs/adapters/devin.md`.
-- Layout: `macos/cli/sessions.db` and `windows/cli/sessions.db`. Each `cli/` directory is the adapter's configured root and mirrors `<data>/devin/cli/`; only the database was copied out (its sibling `transcripts/`, `summaries/`, `logs/`, `session_locks/`, `plugins/`, `app_state.json` and `installation_id` are non-capture, spec row 8). Both databases stay in WAL mode, the production shape, so a read-only open materializes gitignored `-wal`/`-shm` files.
-- Producer: devin 3000.11.3 (commit 9c803229faa4), model `swe-1-6-slow`, captured 2026-09-26 by sandbox self-capture.
+- Layout: `macos/cli/sessions.db`, `windows/cli/sessions.db`, and the mid-run pair `midrun/before/cli/sessions.db` and `midrun/after/cli/sessions.db`. Each `cli/` directory is the adapter's configured root and mirrors `<data>/devin/cli/`; only the database was copied out (its sibling `transcripts/`, `summaries/`, `logs/`, `session_locks/`, `plugins/`, `app_state.json` and `installation_id` are non-capture, spec row 8). All four databases stay in WAL mode, the production shape, so a read-only open materializes gitignored `-wal`/`-shm` files.
+- Producer: devin 3000.11.3 (commit 9c803229faa4), model `swe-1-6-slow`, captured by sandbox self-capture: `macos` and `windows` 2026-09-26, `midrun` 2026-09-28.
 - macOS capture: `HOME` and the `XDG_*` base directories under the neutral base path `/tmp/devin-fixture`, project cwd `/private/tmp/devin-fixture/work` (a git repo holding a `README.md`), every run with `--sandbox --permission-mode autonomous`. Headless `-p` (and `-p -r` to resume) for the simple sessions, the TUI under tmux for everything interactive (`/revert`, `/fork`, `/compact`, Esc Esc interrupts, subagents, `ask_user_question`).
 - Windows capture: Windows 11 native install, `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` under `C:\devin-fixture2`, project cwd `C:\devin-fixture2\work`, driven through `ssh -tt` from a macOS tmux pane. `--sandbox` refuses natively (WSL only), so the TUI session ran in the normal permission mode with each command approved in the TUI. `read_config_from` was set all false because devin's Claude-compat skill import resolves the real profile (`C:\Users\<real>\.claude\skills`) regardless of the sandboxed `USERPROFILE`. A fresh home first shows an interactive "connect your Git provider" prompt that blocks `--print` until answered once in the TUI.
+- Mid-run capture (macOS): the same sandbox shape under `/tmp/devin-midrun`, with `agent.compaction_threshold_tokens` set to 20000 in the sandbox's `config.json` so a subagent compacts within four small reads. One TUI turn started a background general subagent that ran `sleep 40`, read four ~22 KB generated word files (`notes1.txt`..`notes4.txt`), ran `sleep 60` and reported back. A poller took a SQLite online-backup snapshot (a single step, so one consistent read of the WAL) every time the node count, the highest `row_id` or `main_chain_id` changed. `before` is the last snapshot while the subagent ran; `after` is the final state, after the report, the subagent's two compactions and a whole-forest re-save (every row replaced with a new `row_id`, content byte-identical). The CLI's own `.backup` restarts whenever the live database is written, so it could not snapshot the busy windows.
 - Auth: the operator's `credentials.toml` was copied into each sandbox (`<data>/devin/credentials.toml`) purely to authenticate and deleted before anything was copied out.
 - Post-processing: each WAL was folded into its database with `PRAGMA wal_checkpoint(TRUNCATE)`, then `VACUUM` (after the one anonymization edit below, so no freed page keeps the original bytes).
 - Sessions (`macos/cli/sessions.db`):
   - `level-waterlily` - headless `-p`, one turn.
   - `branch-candy` - headless `-p` with tools (`exec ls`, `read README.md`, `exec cat missing.txt` exiting 1, `completed`), then a `-p -r` resume turn.
-  - `amplified-color` - TUI: a text turn; a foreground explore subagent (`398e395d`); a `write` of `hello.txt` plus a `read` validation failure (`chisel/tool_failure` `ValidationError`); `/revert 3` (deleted the write turn's nodes); a new turn; `/fork 2` (-> `power-almandine`); an interrupted `sleep 9` (Esc Esc; `Canceled due to user interrupt`); `/compact`; a post-compaction turn.
+  - `amplified-color` - TUI: a text turn; a foreground explore subagent (`398e395d`, child `agent-51d1dc31-ee2a-44d7-b6f8-3be0f0cf5d6e`); a `write` of `hello.txt` plus a `read` validation failure (`chisel/tool_failure` `ValidationError`); `/revert 3` (deleted the write turn's nodes); a new turn; `/fork 2` (-> `power-almandine`); an interrupted `sleep 9` (Esc Esc; `Canceled due to user interrupt`); `/compact`; a post-compaction turn.
   - `power-almandine` - the fork (title suffixed ` (fork)`) plus one `-p -r` turn. It carries the copied `run_subagent` link for `398e395d` but none of that subagent's nodes, so it yields no child.
-  - `chalk-twig` - TUI: a background general subagent (`029b10e6`) collected with `read_subagent`; `ask_user_question` answered "Spaces" (`chisel/user_question_answers`); a background subagent (`1d6d342f`) interrupted while the parent waited, then resumed to completion.
+  - `chalk-twig` - TUI: a background general subagent (`029b10e6`, child `agent-9b8139a3-5985-4ab6-b952-405982c113bd`) collected with `read_subagent`; `ask_user_question` answered "Spaces" (`chisel/user_question_answers`); a background subagent (`1d6d342f`, child `agent-ef9333ef-da80-48fd-b99b-ad32bc2b3d04`) interrupted while the parent waited, then resumed to completion.
 - Sessions (`windows/cli/sessions.db`):
-  - `viridian-bear` - TUI: `Get-ChildItem -Name`; a `read` of `crlf.txt` (a CRLF file; devin's line-numbered view is LF-normalized, while the shell outputs keep CRLF); `Get-Content missing.txt` (exit 1); a foreground explore subagent (`716d0f27`); an interrupted `Start-Sleep`; a follow-up turn.
+  - `viridian-bear` - TUI: `Get-ChildItem -Name`; a `read` of `crlf.txt` (a CRLF file; devin's line-numbered view is LF-normalized, while the shell outputs keep CRLF); `Get-Content missing.txt` (exit 1); a foreground explore subagent (`716d0f27`, child `agent-6d4f20d8-5ff2-433f-8f3f-96b071e6a2a1`); an interrupted `Start-Sleep`; a follow-up turn.
   - `spotless-lunaria` - headless `--print`, one turn.
-- Census. Nodes are `message_nodes` rows; messages are distinct `chat_message.message_id`s; the owner split is the adapter's partition (main chain, then each subagent head chain, off-chain history to the main session); roles count every owner.
+- Sessions (`midrun/{before,after}/cli/sessions.db`):
+  - `gilded-orca` - TUI: a background general subagent (`94c2de9d`) collected with `read_subagent`. `before` holds its task prompt, prefix copies, the `sleep 40` call and a partial assistant turn, with no link row; `after` adds its reads, both compactions (the summary attached under its own prefix root, each summarizer in a chain of its own) and the link.
+- Census. Nodes are `message_nodes` rows; messages are distinct `chat_message.message_id`s; the owner split is the adapter's partition (each subagent holds the messages placed in its own trees, the main session the rest; a message two sessions place counts in both); roles count every owner.
 
   | Store | Session | Nodes | Messages | Owner split | Roles sys/user/asst/tool | `tool_call_state` |
   |---|---|---|---|---|---|---|
   | macos | `level-waterlily` | 27 | 9 | main 9 | 7/1/1/0 | 0 |
   | macos | `branch-candy` | 37 | 16 | main 16 | 7/2/4/3 | 3 |
-  | macos | `amplified-color` | 125 | 49 | main 39 (30 off-chain), `398e395d` 10 | 16/9/15/9 | 6 |
+  | macos | `amplified-color` | 125 | 49 | main 39, `398e395d` 10 | 16/9/15/9 | 6 |
   | macos | `power-almandine` | 16 | 15 | main 15 | 7/3/4/1 | 1 |
-  | macos | `chalk-twig` | 82 | 40 | main 27, `029b10e6` 7, `1d6d342f` 6 | 10/6/15/9 | 5 |
+  | macos | `chalk-twig` | 82 | 40 | main 27, `029b10e6` 7, `1d6d342f` 7 (the shared prefix `0a1540d8` in both) | 10/6/15/9 | 5 |
   | windows | `viridian-bear` | 70 | 35 | main 27, `716d0f27` 8 | 8/7/13/7 | 5 |
   | windows | `spotless-lunaria` | 24 | 8 | main 8 | 6/1/1/0 | 0 |
   | | Total | 381 (287 macOS + 94 Windows) | 172 (129 + 43) | 7 main, 4 subagent | | 20 (15 + 5) |
+  | midrun/before | `gilded-orca` | 43 | 18 | main 13, `94c2de9d` 5 | 8/2/5/3 | 2 |
+  | midrun/after | `gilded-orca` | 132 | 69 | main 39, `94c2de9d` 30 | 18/14/22/15 | 3 |
 
-  7 root sessions + 4 subagent children = 11 pond sessions. `subagent_heads` rows: 0. `rendered_commits` rows: 0. Messages with a non-empty `images` list: 0. Every message carries `metadata.created_at`.
+  7 root sessions + 4 subagent children = 11 pond sessions in `macos` and `windows`; each `midrun` store yields 2 (the root and `gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004`), and every message `before` holds keeps its session in `after`. `subagent_heads` rows: 0. `rendered_commits` rows: 0. Messages with a non-empty `images` list: 0. Every message carries `metadata.created_at`.
 - Anonymization: one edit. An `ls -la` output in `amplified-color` listed the local username as the file owner; it was replaced with `user` (the "Local username" rule below), then the database was vacuumed. Nothing else needed anonymizing.
-- Sweeps: trufflehog 0 verified / 0 unverified over the tree; gitleaks 0 over a `.dump` of each database (gitleaks skips files it sniffs as SQLite); a regex sweep for the real username, email, org and home paths finds 0; both databases pass `PRAGMA integrity_check`.
-- Known gaps: no capture produced a `subagent_heads` or `rendered_commits` row (the binary's `INSERT OR REPLACE INTO subagent_heads` is the only evidence for the former; the adapter lets a row there override the link-row head); no image input; no ACP-lane session (Zed, JetBrains, Xcode, Devin Desktop) and no cloud session; no `hidden = 1` helper session (the `devin/helper` kind is unit-tested against a fixture row flipped to `hidden = 1`); no pre-V5 (linear `messages`) database. A fork's parent link is absent by design of the writer (no table or file records it), not by a capture gap.
+- Sweeps: trufflehog 0 verified / 0 unverified over the tree; gitleaks 0 over a `.dump` of each database (gitleaks skips files it sniffs as SQLite); a regex sweep for the real username, email, org and home paths finds 0; every database passes `PRAGMA integrity_check`. The `midrun` pair needed no anonymization edit.
+- Known gaps: no capture produced a `subagent_heads` or `rendered_commits` row (the binary's `INSERT OR REPLACE INTO subagent_heads` is the only evidence for the former; such a row would ride whole on the root Session's options, and the partition never reads it); no image input; no ACP-lane session (Zed, JetBrains, Xcode, Devin Desktop) and no cloud session; no `hidden = 1` helper session (the `devin/helper` kind is unit-tested against a fixture row flipped to `hidden = 1`); no pre-V5 (linear `messages`) database. A fork's parent link is absent by design of the writer (no table or file records it), not by a capture gap.
 
 ### grok-build (xAI `grok` CLI)
 
