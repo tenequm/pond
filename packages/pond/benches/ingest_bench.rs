@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
                             sync_skips += 1;
                             *skip_reasons.entry(bucket_reason(reason)).or_default() += 1;
                         }
-                        SyncStatus::Rejected { reason } => {
+                        SyncStatus::Failed { reason } | SyncStatus::Rejected { reason } => {
                             sync_errors += 1;
                             *error_reasons.entry(bucket_reason(reason)).or_default() += 1;
                         }

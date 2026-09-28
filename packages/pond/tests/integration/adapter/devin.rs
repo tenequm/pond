@@ -6,7 +6,7 @@
 //! behavior (the forest partition, provenance, tool outcomes, the watermark)
 //! stays in the `src/adapter/devin.rs` unit tests.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use pond::{
@@ -15,6 +15,7 @@ use pond::{
     sessions::{RowmapOracle, Store},
     wire::Session,
 };
+use serde_json::Value;
 use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, ensure_clean_ingest, ingest_into_temp_store, path_config};
@@ -160,7 +161,7 @@ async fn a_sync_during_a_subagent_run_stores_what_a_later_sync_would() -> anyhow
 
     let (once, _guard) = ingest_into_temp_store(&stage("after")).await?;
     let (staged, once) = (contents(&staged).await?, contents(&once).await?);
-    let messages = |store: &Contents| -> Vec<(String, BTreeSet<String>)> {
+    let messages = |store: &Contents| -> Vec<(String, BTreeMap<String, Value>)> {
         store
             .iter()
             .map(|(id, (_, messages))| (id.clone(), messages.clone()))
@@ -181,9 +182,9 @@ async fn a_sync_during_a_subagent_run_stores_what_a_later_sync_would() -> anyhow
     Ok(())
 }
 
-type Contents = BTreeMap<String, (Session, BTreeSet<String>)>;
+type Contents = BTreeMap<String, (Session, BTreeMap<String, Value>)>;
 
-/// Every stored session row with its message ids.
+/// Every stored session row with each message's tool state.
 async fn contents(store: &Store) -> anyhow::Result<Contents> {
     let mut out = BTreeMap::new();
     for id in store.session_ids().await? {
@@ -194,7 +195,12 @@ async fn contents(store: &Store) -> anyhow::Result<Contents> {
         let messages = stored
             .messages
             .iter()
-            .map(|message| message.message.id().to_owned())
+            .map(|message| {
+                (
+                    message.message.id().to_owned(),
+                    message.message.options()["devin"]["tool_call_state"].clone(),
+                )
+            })
             .collect();
         out.insert(id, (stored.session, messages));
     }

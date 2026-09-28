@@ -159,6 +159,7 @@ pub trait Adapter: Send + Sync {
         Box::pin(stream.filter_map(|res| match res {
             Ok(AdapterYield::Event(event)) => Some(Ok(event)),
             Ok(AdapterYield::Skipped { .. } | AdapterYield::SkippedBatch { .. }) => None,
+            Ok(AdapterYield::Failed { error, .. }) => Some(Err(error)),
             Err(error) => Some(Err(error)),
         }))
     }
@@ -330,9 +331,13 @@ impl SkipOracle for NoopOracle {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AdapterYield {
     Event(IngestEvent),
+    Failed {
+        session_id: String,
+        error: AdapterError,
+    },
     Skipped {
         /// `None` for files that never yield a session id (empty `.jsonl`).
         session_id: Option<String>,

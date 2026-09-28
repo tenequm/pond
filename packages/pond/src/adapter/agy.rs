@@ -1936,6 +1936,7 @@ mod tests {
                     run.skipped.push((session_id, reason));
                 }
                 Ok(AdapterYield::SkippedBatch { .. }) => {}
+                Ok(AdapterYield::Failed { error, .. }) => run.errors.push(error.to_string()),
                 Err(error) => run.errors.push(error.to_string()),
             }
         }

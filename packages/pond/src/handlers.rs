@@ -116,6 +116,9 @@ mod ingest_handler {
     #[derive(Debug, Clone)]
     pub enum SyncStatus {
         Ok,
+        Failed {
+            reason: String,
+        },
         Partial {
             dropped_events: usize,
             /// First drop's error message; subsequent drops counted, not
@@ -252,6 +255,20 @@ mod ingest_handler {
                 None => break,
             };
             match event {
+                Ok(AdapterYield::Failed { session_id, error }) => {
+                    summary.unreadable_events += 1;
+                    if summary.first_unreadable_reason.is_none() {
+                        summary.first_unreadable_reason = Some(error.to_string());
+                    }
+                    on_event(SyncEvent::SessionDone(SessionOutcome {
+                        project: None,
+                        session_id: Some(session_id),
+                        messages: 0,
+                        status: SyncStatus::Failed {
+                            reason: error.to_string(),
+                        },
+                    }));
+                }
                 Ok(AdapterYield::Skipped {
                     session_id,
                     project,

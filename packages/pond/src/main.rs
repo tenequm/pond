@@ -6297,6 +6297,12 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Failed { reason } => {
+                    errors += 1;
+                    status_label = "failed";
+                    dropped_count = 0;
+                    optional_reason = Some(reason.clone());
+                }
                 SyncStatus::Partial {
                     dropped_events,
                     first_drop_reason,
@@ -6518,6 +6524,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
 
     let (raw_tag, tag_style) = match &outcome.status {
         SyncStatus::Ok => ("ok  ", green()),
+        SyncStatus::Failed { .. } => ("fail", red()),
         SyncStatus::Partial { .. } => ("part", yellow()),
         SyncStatus::Skipped { .. } => ("skip", red()),
         SyncStatus::Rejected { .. } => ("rej ", red()),

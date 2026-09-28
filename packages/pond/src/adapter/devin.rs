@@ -21,9 +21,8 @@
 //! pond keeps the superset it has seen. Restore is refused
 //! ([`RESTORE_UNSUPPORTED`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use async_stream::stream;
 use chrono::DateTime;
@@ -37,8 +36,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark, SyncPlan,
+    Adapter, AdapterError, AdapterErrorKind, AdapterFactory, AdapterYield, AdapterYieldStream,
+    DiscoverFuture, Env, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    SourceWatermark, SyncPlan,
     extract::{Extracted, extract_raw_record, extract_str, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
     sqlite::{self, CHANNEL_CAP, emit},
@@ -116,17 +116,11 @@ fn data_roots(home: &Path) -> [PathBuf; 3] {
 #[derive(Debug)]
 pub struct DevinAdapter {
     root: PathBuf,
-    /// Heads `discover` computed, taken by the `events_with` that follows it:
-    /// one sync per instance, so the node-graph pass runs once per sync.
-    heads: Mutex<Option<Heads>>,
 }
 
 impl DevinAdapter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            heads: Mutex::default(),
-        }
+        Self { root: root.into() }
     }
 
     fn db_path(&self) -> PathBuf {
@@ -143,29 +137,19 @@ impl Adapter for DevinAdapter {
             let heads = tokio::task::spawn_blocking(move || collect_heads(&db))
                 .await
                 .map_err(join_error)??;
-            let count = heads.pond_sessions();
-            if let Ok(mut slot) = self.heads.lock() {
-                *slot = Some(heads);
-            }
-            Ok(count)
+            Ok(heads.pond_sessions())
         })
     }
 
     fn events_with<'a>(&'a self, oracle: &'a dyn SkipOracle) -> AdapterYieldStream<'a> {
         let db = self.db_path();
         Box::pin(stream! {
-            let cached = self.heads.lock().ok().and_then(|mut slot| slot.take());
-            let heads = match cached {
-                Some(heads) => heads,
-                None => {
-                    let heads_db = db.clone();
-                    let peek = tokio::task::spawn_blocking(move || collect_heads(&heads_db));
-                    match peek.await {
-                        Ok(Ok(heads)) => heads,
-                        Ok(Err(error)) => { yield Err(error); return; }
-                        Err(join) => { yield Err(join_error(join)); return; }
-                    }
-                }
+            let heads_db = db.clone();
+            let peek = tokio::task::spawn_blocking(move || collect_heads(&heads_db));
+            let heads = match peek.await {
+                Ok(Ok(heads)) => heads,
+                Ok(Err(error)) => { yield Err(error); return; }
+                Err(join) => { yield Err(join_error(join)); return; }
             };
             if let Some(reason) = heads.unsupported {
                 let reason = SkipReason::Unsupported(reason);
@@ -436,6 +420,9 @@ struct Forest {
     owners: HashMap<String, Vec<usize>>,
     children: Vec<String>,
     rejected: Vec<String>,
+    /// Every node in a subagent tree, for checking report-time links; never
+    /// read for ownership.
+    grouped_nodes: HashSet<i64>,
     /// Newest timestamp per owner, `None` when the owner holds no message.
     newest: Vec<Option<i64>>,
 }
@@ -555,6 +542,12 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         .map(|(position, (_, group))| (*group, position + 1))
         .collect();
 
+    let grouped_nodes = nodes
+        .iter()
+        .filter(|node| seeded(node))
+        .map(|node| node.node_id)
+        .collect();
+
     let mut owners = HashMap::new();
     for (message, (in_root, groups)) in placed {
         if groups.is_empty() {
@@ -580,6 +573,7 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         owners,
         children,
         rejected,
+        grouped_nodes,
         newest: Vec::new(),
     }
 }
@@ -647,9 +641,11 @@ fn child_id(session_id: &str, task_prompt: &str) -> String {
 struct Collected {
     newest: Value,
     newest_raw: String,
+    newest_row_id: i64,
     first: NodeRef,
     variants: Vec<Value>,
     nodes: Vec<Value>,
+    tool_states: Vec<Value>,
 }
 
 fn read_sessions(db: &Path, ids: &[String], tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>) {
@@ -687,8 +683,7 @@ fn read_sessions(db: &Path, ids: &[String], tx: &mpsc::Sender<Result<AdapterYiel
 
 /// One `sessions` row with everything it yields: the root session, its
 /// messages, then each subagent child and its messages. A failure before the
-/// root session is a skip naming this session, so the ingest never charges it
-/// to the session read before.
+/// root carries this session's id so ingest cannot charge it to the prior one.
 fn read_session(
     conn: &Connection,
     db: &Path,
@@ -714,6 +709,14 @@ fn read_session(
         Ok(Some(read)) => read,
         // `devin rm` between listing and read.
         Ok(None) => return skip(SkipReason::Empty),
+        Err(error) if matches!(&error.kind, AdapterErrorKind::Io(_)) => {
+            return tx
+                .blocking_send(Ok(AdapterYield::Failed {
+                    session_id: id.to_owned(),
+                    error,
+                }))
+                .is_ok();
+        }
         Err(error) => return skip(SkipReason::Unsupported(error.to_string())),
     };
 
@@ -725,6 +728,9 @@ fn read_session(
         emit!(tx, Err(error));
     }
     let forest = Forest::new(&read.refs);
+    for error in read.link_drift(&forest, &location) {
+        emit!(tx, Err(error));
+    }
     for message_id in &forest.rejected {
         let error = AdapterError::schema(
             NAME,
@@ -804,11 +810,55 @@ struct SessionRead {
     refs: Vec<NodeRef>,
     collected: BTreeMap<String, Collected>,
     tool_states: Vec<Value>,
+    unmatched_tool_states: Vec<Value>,
     agent_heads: Vec<Value>,
     errors: Vec<AdapterError>,
 }
 
 impl SessionRead {
+    fn link_drift(&self, forest: &Forest, location: &str) -> Vec<AdapterError> {
+        let mut links = BTreeSet::new();
+        for entry in self.collected.values() {
+            for message in std::iter::once(&entry.newest).chain(&entry.variants) {
+                let head = message
+                    .pointer("/metadata/extensions/subagent~1chain_node_id")
+                    .and_then(Value::as_i64);
+                if let Some(head) = head {
+                    let agent = message
+                        .pointer("/metadata/extensions/subagent~1agent_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    links.insert((agent, head));
+                }
+            }
+        }
+        for row in &self.agent_heads {
+            if let Some(head) = row.get("chain_node_id").and_then(Value::as_i64) {
+                let agent = row
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                links.insert((agent, head));
+            }
+        }
+        let present: HashSet<i64> = self.refs.iter().map(|node| node.node_id).collect();
+        links
+            .into_iter()
+            .filter(|(agent, head)| {
+                agent.is_none() || (present.contains(head) && !forest.grouped_nodes.contains(head))
+            })
+            .map(|(agent, head)| {
+                let reason = match agent {
+                    Some(agent) => format!(
+                        "subagent agent {agent} links to node {head}, outside the detected subagent trees"
+                    ),
+                    None => format!("subagent link to node {head} has no agent id"),
+                };
+                AdapterError::schema(NAME, location, reason)
+            })
+            .collect()
+    }
+
     /// `Ok(None)` when the row vanished since the listing.
     fn load(
         conn: &Connection,
@@ -857,11 +907,13 @@ impl SessionRead {
             refs: Vec::new(),
             collected: BTreeMap::new(),
             tool_states,
+            unmatched_tool_states: Vec::new(),
             agent_heads,
             errors: Vec::new(),
         };
         read.collect_nodes(&snapshot, id, location)
             .map_err(|error| db_error(db, "read message_nodes", &error))?;
+        read.unmatched_tool_states = place_tool_states(&read.tool_states, &mut read.collected);
         Ok(Some(read))
     }
 
@@ -902,7 +954,10 @@ impl SessionRead {
             };
             let placement = placement(&node, metadata.as_deref());
             match (self.collected.get_mut(&node.message_id), message) {
-                (Some(entry), None) => entry.nodes.push(placement),
+                (Some(entry), None) => {
+                    entry.newest_row_id = node.row_id;
+                    entry.nodes.push(placement);
+                }
                 (Some(entry), Some(message)) => {
                     // A copy can differ only in key order and still be the
                     // same value; only a real change is a variant.
@@ -913,6 +968,7 @@ impl SessionRead {
                         }
                     }
                     entry.newest_raw = chat_message;
+                    entry.newest_row_id = node.row_id;
                     entry.nodes.push(placement);
                 }
                 (None, Some(message)) => {
@@ -921,9 +977,11 @@ impl SessionRead {
                         Collected {
                             newest: message,
                             newest_raw: chat_message,
+                            newest_row_id: node.row_id,
                             first: node.clone(),
                             variants: Vec::new(),
                             nodes: vec![placement],
+                            tool_states: Vec::new(),
                         },
                     );
                 }
@@ -939,8 +997,8 @@ impl SessionRead {
         if let Some(version) = schema_version {
             devin.insert("schema_version".to_owned(), json!(version));
         }
-        if !self.tool_states.is_empty() {
-            let states = Value::Array(self.tool_states.clone());
+        if !self.unmatched_tool_states.is_empty() {
+            let states = Value::Array(self.unmatched_tool_states.clone());
             devin.insert("tool_call_state".to_owned(), states);
         }
         if !self.agent_heads.is_empty() {
@@ -975,6 +1033,34 @@ impl SessionRead {
         }
         owned
     }
+}
+
+fn place_tool_states(states: &[Value], collected: &mut BTreeMap<String, Collected>) -> Vec<Value> {
+    let mut results = HashMap::new();
+    for (message_id, entry) in collected.iter() {
+        if entry.newest.get("role").and_then(Value::as_str) == Some("tool")
+            && let Some(call_id) = entry.newest.get("tool_call_id").and_then(Value::as_str)
+        {
+            results
+                .entry(call_id.to_owned())
+                .or_insert_with(|| message_id.clone());
+        }
+    }
+    let mut unmatched = Vec::new();
+    for state in states {
+        let Some(call_id) = state.get("tool_call_id").and_then(Value::as_str) else {
+            unmatched.push(state.clone());
+            continue;
+        };
+        let target = results.get(call_id);
+        if let Some(entry) = target.and_then(|id| collected.get_mut(id)) {
+            entry.tool_states.push(state.clone());
+        } else {
+            // Session options are the only carrier when no message matches a state.
+            unmatched.push(state.clone());
+        }
+    }
+    unmatched
 }
 
 fn emit_message(
@@ -1234,6 +1320,12 @@ fn message_events(
 fn message_options(entry: &Collected) -> ProviderOptions {
     let mut devin = Map::new();
     devin.insert("nodes".to_owned(), Value::Array(entry.nodes.clone()));
+    if !entry.tool_states.is_empty() {
+        devin.insert(
+            "tool_call_state".to_owned(),
+            Value::Array(entry.tool_states.clone()),
+        );
+    }
     if !entry.variants.is_empty() {
         let variants = entry.variants.iter().map(extract_raw_record).collect();
         devin.insert("variants".to_owned(), Value::Array(variants));
@@ -1244,7 +1336,7 @@ fn message_options(entry: &Collected) -> ProviderOptions {
         "source".to_owned(),
         json!({
             "adapter": NAME,
-            "row_id": entry.first.row_id,
+            "row_id": entry.newest_row_id,
             "raw_record": extract_raw_record(&entry.newest),
         }),
     );
@@ -1266,7 +1358,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
     use crate::wire::Role;
-    use std::collections::BTreeSet;
+    use futures::StreamExt;
     use tempfile::TempDir;
 
     const MACOS: &str = concat!(
@@ -1450,6 +1542,137 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixture_link_heads_belong_to_detected_subagent_trees() {
+        for db in [
+            Path::new(MACOS).join(DB_FILE),
+            Path::new(WINDOWS).join(DB_FILE),
+            Path::new(MIDRUN).join("after").join("cli").join(DB_FILE),
+        ] {
+            let conn = match open_forest(&db).unwrap() {
+                Opened::Forest(conn) => conn,
+                _ => panic!("fixture is not a forest database"),
+            };
+            for id in session_rows(&conn, &db).unwrap() {
+                let read = SessionRead::load(&conn, &db, &id, &id).unwrap().unwrap();
+                let forest = Forest::new(&read.refs);
+                assert!(
+                    read.link_drift(&forest, &id).is_empty(),
+                    "{}#{id}",
+                    db.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_to_a_main_tree_reports_drift_without_reassigning_messages() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE message_nodes SET chat_message = json_set(
+                    chat_message, '$.metadata.extensions.\"subagent/chain_node_id\"', 1)
+                 WHERE session_id = 'amplified-color'
+                   AND json_extract(chat_message,
+                       '$.metadata.extensions.\"subagent/chain_node_id\"') = 49",
+                [],
+            )
+            .unwrap();
+        let original = macos();
+        let forged = read(&db);
+        assert_eq!(forged.errors.len(), 1);
+        assert!(matches!(
+            &forged.errors[0].kind,
+            AdapterErrorKind::Schema(_)
+        ));
+        let reason = forged.errors[0].to_string();
+        assert!(reason.contains("398e395d") && reason.contains("node 1"));
+        assert!(reason.contains("outside the detected subagent trees"));
+        let position = |item: &str| forged.order.iter().position(|entry| entry == item).unwrap();
+        assert!(position("amplified-color") < position("error"));
+        for id in [
+            "amplified-color",
+            "amplified-color/agent-51d1dc31-ee2a-44d7-b6f8-3be0f0cf5d6e",
+        ] {
+            let ids = |read: &Read| -> BTreeSet<String> {
+                read.messages[id]
+                    .iter()
+                    .map(|message| message.id().to_owned())
+                    .collect()
+            };
+            assert_eq!(ids(&forged), ids(&original));
+        }
+    }
+
+    #[test]
+    fn a_subagent_heads_row_to_a_main_tree_reports_drift() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
+                 VALUES ('level-waterlily', 'forged-agent', 1, 1)",
+                [],
+            )
+            .unwrap();
+        let read = read(&db);
+        assert_eq!(read.errors.len(), 1);
+        let reason = read.errors[0].to_string();
+        assert!(reason.contains("forged-agent") && reason.contains("node 1"));
+    }
+
+    #[test]
+    fn a_seeded_tree_with_a_rejected_name_is_still_grouped() {
+        let node = NodeRef {
+            row_id: 1,
+            node_id: 1,
+            parent: None,
+            node_created: 1,
+            message_id: "bad/id".to_owned(),
+            created_at: None,
+            is_system: false,
+            starts_subagent: true,
+        };
+        let forest = Forest::new(&[node]);
+        assert_eq!(forest.rejected, vec!["bad/id"]);
+        assert!(forest.grouped_nodes.contains(&1));
+    }
+
+    #[test]
+    fn a_link_head_without_an_agent_id_reports_drift() {
+        let db = Path::new(MACOS).join(DB_FILE);
+        let conn = match open_forest(&db).unwrap() {
+            Opened::Forest(conn) => conn,
+            _ => panic!("fixture is not a forest database"),
+        };
+        let mut read = SessionRead::load(&conn, &db, "amplified-color", "amplified-color")
+            .unwrap()
+            .unwrap();
+        let forest = Forest::new(&read.refs);
+        let entry = read
+            .collected
+            .values_mut()
+            .find(|entry| {
+                entry
+                    .newest
+                    .pointer("/metadata/extensions/subagent~1chain_node_id")
+                    == Some(&json!(49))
+            })
+            .unwrap();
+        entry.newest["metadata"]["extensions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subagent/agent_id");
+        let errors = read.link_drift(&forest, "amplified-color");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].to_string().contains("node 49 has no agent id"));
+    }
+
     /// Only typed input is conversational: the compaction summarizer's
     /// user-role inputs are harness-written.
     #[test]
@@ -1532,6 +1755,103 @@ mod tests {
                 .map_or(&[][..], Vec::as_slice);
             assert!(!variants.contains(newest), "{}", message.id());
         }
+    }
+
+    #[test]
+    fn raw_record_row_id_is_its_newest_placement() {
+        let read = macos();
+        for message in read.messages.values().flatten() {
+            let options = message.options();
+            let newest = options[NAME]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|node| node["row_id"].as_i64())
+                .max()
+                .unwrap();
+            assert_eq!(
+                options["source"]["row_id"],
+                json!(newest),
+                "{}",
+                message.id()
+            );
+        }
+    }
+
+    #[test]
+    fn tool_state_uses_only_results_and_unmatched_rows_stay_on_root() {
+        let entry = |id: &str, newest: Value| Collected {
+            newest,
+            newest_raw: String::new(),
+            newest_row_id: 1,
+            first: NodeRef {
+                row_id: 1,
+                node_id: 1,
+                parent: None,
+                node_created: 1,
+                message_id: id.to_owned(),
+                created_at: None,
+                is_system: false,
+                starts_subagent: false,
+            },
+            variants: Vec::new(),
+            nodes: Vec::new(),
+            tool_states: Vec::new(),
+        };
+        let mut collected = BTreeMap::from([
+            (
+                "assistant".to_owned(),
+                entry(
+                    "assistant",
+                    json!({"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]}),
+                ),
+            ),
+            (
+                "result".to_owned(),
+                entry("result", json!({"role": "tool", "tool_call_id": "a"})),
+            ),
+        ]);
+        let states = vec![
+            json!({"tool_call_id": "a", "extra": 1}),
+            json!({"tool_call_id": "b", "extra": 2}),
+            json!({"tool_call_id": "c", "extra": 3}),
+        ];
+        let unmatched = place_tool_states(&states, &mut collected);
+        assert_eq!(
+            message_options(&collected["result"])[NAME]["tool_call_state"],
+            json!([states[0]])
+        );
+        assert_eq!(
+            message_options(&collected["assistant"])[NAME]["tool_call_state"],
+            Value::Null
+        );
+        assert_eq!(unmatched, states[1..]);
+
+        collected.insert(
+            "second_result".to_owned(),
+            entry(
+                "second_result",
+                json!({"role": "tool", "tool_call_id": "b"}),
+            ),
+        );
+        let later_unmatched = place_tool_states(&states[1..], &mut collected);
+        assert_eq!(
+            message_options(&collected["second_result"])[NAME]["tool_call_state"],
+            json!([states[1]])
+        );
+        assert_eq!(later_unmatched, vec![states[2].clone()]);
+
+        let read = macos();
+        assert!(read.sessions["branch-candy"].options[NAME]["tool_call_state"].is_null());
+        let attached: usize = read.messages["branch-candy"]
+            .iter()
+            .map(|message| {
+                message.options()[NAME]["tool_call_state"]
+                    .as_array()
+                    .map_or(0, Vec::len)
+            })
+            .sum();
+        assert_eq!(attached, 3);
     }
 
     const MIDRUN: &str = concat!(
@@ -1743,6 +2063,73 @@ mod tests {
         drop(conn);
         let heads = collect_heads(&db).unwrap();
         assert!(heads.unsupported.unwrap().contains("copy the file aside"));
+    }
+
+    #[tokio::test]
+    async fn events_recompute_heads_after_discovery() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        let adapter = DevinAdapter::new(temp.path());
+        assert_eq!(adapter.discover().await.unwrap(), 8);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (id, working_directory, backend_type, model,
+                    agent_mode, created_at, last_activity_at)
+                 SELECT 'new-session', working_directory, backend_type, model,
+                    agent_mode, created_at, last_activity_at
+                 FROM sessions WHERE id = 'level-waterlily'",
+                [],
+            )
+            .unwrap();
+        let mut events = adapter.events_with(&crate::adapter::NoopOracle);
+        let mut sessions = 0;
+        while let Some(yielded) = events.next().await {
+            if matches!(
+                yielded.unwrap(),
+                AdapterYield::Event(IngestEvent::Session(_))
+            ) {
+                sessions += 1;
+            }
+        }
+        assert_eq!(sessions, 9);
+    }
+
+    #[test]
+    fn sqlite_read_failure_is_typed_and_attributed_to_its_session() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE message_nodes", []).unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(read_session(&conn, &db, "level-waterlily", None, &tx));
+        match rx.try_recv().unwrap().unwrap() {
+            AdapterYield::Failed { session_id, error } => {
+                assert_eq!(session_id, "level-waterlily");
+                assert!(matches!(error.kind, AdapterErrorKind::Io(_)));
+            }
+            other => panic!("expected attributed failure, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+
+        conn.execute(
+            "UPDATE sessions SET working_directory = '' WHERE id = 'level-waterlily'",
+            [],
+        )
+        .unwrap();
+        assert!(read_session(&conn, &db, "level-waterlily", None, &tx));
+        match rx.try_recv().unwrap().unwrap() {
+            AdapterYield::Skipped {
+                session_id,
+                reason: SkipReason::Unsupported(_),
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("level-waterlily"));
+            }
+            other => panic!("expected unsupported source shape, got {other:?}"),
+        }
     }
 
     /// A corrupt node is a typed error attributed to its node; the rest of the
