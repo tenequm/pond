@@ -673,6 +673,14 @@ mod unix {
     /// realtime one empty while being perfectly healthy.
     const NEXT_ELAPSE_PROPERTIES: [&str; 2] = ["NextElapseUSecRealtime", "NextElapseUSecMonotonic"];
 
+    /// What `systemctl show` is asked for: the two elapse properties plus the
+    /// sub-state, which tells a mid-run timer apart from a dead one.
+    const SHOWN_PROPERTIES: [&str; 3] = [
+        "NextElapseUSecRealtime",
+        "NextElapseUSecMonotonic",
+        "SubState",
+    ];
+
     /// A systemd timer can be `enabled` and `active` while having no next
     /// elapse at all, in which case it never fires again. The unit
     /// `start_systemd` writes carries only monotonic anchors - `OnBootSec=`,
@@ -691,20 +699,35 @@ mod unix {
     fn systemd_timer_problem() -> Option<String> {
         let mut command = Command::new("systemctl");
         command.args(["--user", "show", "pond-sync.timer"]);
-        for property in NEXT_ELAPSE_PROPERTIES {
+        for property in SHOWN_PROPERTIES {
             command.arg(format!("--property={property}"));
         }
         let output = command.output().ok()?;
         if !output.status.success() {
             return None;
         }
-        next_elapse_missing(&String::from_utf8_lossy(&output.stdout)).then(|| {
+        timer_is_dead(&String::from_utf8_lossy(&output.stdout)).then(|| {
             "the timer has no next elapse and will never fire again \
              (`systemctl --user list-timers` shows `NEXT: -`); run \
              `systemctl --user start pond-sync.service` once to re-anchor it, \
              or `pond schedule start` to re-register"
                 .to_string()
         })
+    }
+
+    /// Whether the timer will genuinely never fire again.
+    ///
+    /// A timer whose service is running right now has no next elapse either:
+    /// systemd only recomputes one in `timer_enter_waiting()`, after the
+    /// service goes inactive. `pond-sync` runs on this timer, so without this
+    /// guard every status read taken during a sync would call a perfectly
+    /// healthy schedule broken - the same false verdict this change exists to
+    /// remove, pointed the other way.
+    fn timer_is_dead(show: &str) -> bool {
+        if show.lines().any(|line| line.trim() == "SubState=running") {
+            return false;
+        }
+        next_elapse_missing(show)
     }
 
     /// True when the next-elapse properties say the timer has no next elapse.
@@ -1082,6 +1105,22 @@ mod unix {
         #[test]
         fn waiting_timer_with_a_next_elapse_is_not_reported_broken() {
             assert!(!super::next_elapse_missing(SHOW_HEALTHY));
+        }
+
+        /// The timer while `pond-sync.service` is actually running: systemd
+        /// leaves it without a next elapse until the service finishes, so the
+        /// elapse properties alone read exactly like the dead timer above.
+        const SHOW_RUNNING: &str = "LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=running\n\
+             NextElapseUSecRealtime=\n\
+             NextElapseUSecMonotonic=infinity\n";
+
+        #[test]
+        fn a_timer_whose_service_is_running_is_not_reported_broken() {
+            assert!(!super::timer_is_dead(SHOW_RUNNING));
+            // ... while the same reading on a settled timer still is:
+            assert!(super::timer_is_dead(SHOW_DEAD));
         }
 
         #[test]
