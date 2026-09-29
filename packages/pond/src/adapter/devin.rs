@@ -2407,4 +2407,25 @@ mod tests {
             [(None, None, &FileData::String("aGk=".to_owned()))]
         );
     }
+
+    /// An entry without `base64_data` still yields its part, the whole entry
+    /// as compact JSON, its own type and path kept.
+    #[test]
+    fn an_image_without_base64_data_keeps_the_whole_entry() {
+        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
+        let temp = TempDir::new().unwrap();
+        let entry = json!({"width": 2, "mime_type": "image/png", "source_path": "/tmp/a.png"});
+        let read = read(&with_images(&temp, &[(TYPED, json!([entry]))]));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let parts = &read.parts[&format!("level-waterlily:{TYPED}")];
+        assert!(matches!(parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&parts[1..]),
+            [(
+                Some("image/png"),
+                Some("/tmp/a.png"),
+                &FileData::String(compact_json(&entry))
+            )]
+        );
+    }
 }
