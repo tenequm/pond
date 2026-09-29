@@ -1399,6 +1399,9 @@ fn message_options(entry: &Collected) -> ProviderOptions {
         let variants = entry.variants.iter().map(extract_raw_record).collect();
         devin.insert("variants".to_owned(), Value::Array(variants));
     }
+    if let Some(phase) = entry.newest.get("phase").filter(|phase| !phase.is_null()) {
+        devin.insert("phase".to_owned(), phase.clone());
+    }
     let mut options = ProviderOptions::new();
     options.insert(NAME.to_owned(), Value::Object(devin));
     options.insert(
@@ -1950,6 +1953,59 @@ mod tests {
                 assert!(nodes.iter().all(|node| node.get("variant").is_none()));
             }
         }
+    }
+
+    /// `phase` rides on the message's own options when the writer set it,
+    /// and no key appears when it did not.
+    #[test]
+    fn phase_is_surfaced_only_when_present() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        let commentary: String = {
+            let conn = Connection::open(&db).unwrap();
+            let message_id = conn
+                .query_row(
+                    "SELECT chat_message ->> '$.message_id' FROM message_nodes
+                     WHERE session_id = 'branch-candy' AND chat_message ->> '$.role' = 'assistant'
+                       AND json_type(chat_message, '$.phase') IS NULL
+                     ORDER BY node_id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE message_nodes
+                 SET chat_message = json_set(chat_message, '$.phase', 'commentary')
+                 WHERE session_id = 'branch-candy' AND chat_message ->> '$.message_id' = ?1",
+                [&message_id],
+            )
+            .unwrap();
+            message_id
+        };
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let phase_of = |message: &Message| message.options()[NAME].get("phase").cloned();
+        let mut phases = BTreeMap::new();
+        for message in read.messages.values().flatten() {
+            let raw = message.options()["source"]["raw_record"]
+                .get("phase")
+                .cloned();
+            assert_eq!(phase_of(message), raw, "{}", message.id());
+            if let Some(phase) = raw {
+                phases.insert(message.id().to_owned(), phase);
+            }
+        }
+        assert_eq!(
+            phases.get(&format!("branch-candy:{commentary}")),
+            Some(&json!("commentary"))
+        );
+        assert!(phases.values().any(|phase| phase == "final_answer"));
+        assert!(
+            read.messages["level-waterlily"]
+                .iter()
+                .any(|message| phase_of(message).is_none())
+        );
     }
 
     #[test]
