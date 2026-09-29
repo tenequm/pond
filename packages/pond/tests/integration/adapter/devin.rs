@@ -1,6 +1,7 @@
-//! devin adapter integration suite: the shared conformance checks over both
-//! committed data roots (macOS and Windows captures), the subagent and fork
-//! lineage the store must hold after a real ingest, and the same messages per
+//! devin adapter integration suite: the shared conformance checks over the
+//! committed data roots (macOS, Windows and Local Fusion sidekick captures),
+//! the subagent, sidekick and fork lineage the store must hold after a real
+//! ingest, and the same messages per
 //! session (and the same child row) whether the mid-run pair syncs once or
 //! twice. Single-module mapping
 //! behavior (the forest partition, provenance, tool outcomes, the watermark)
@@ -52,6 +53,18 @@ const MIDRUN_PARENT: &str = "gilded-orca";
 const MIDRUN_CHILD: &str = "gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004";
 const MIDRUN_MESSAGES: usize = 69;
 
+// One Local Fusion session: two sidekick handoffs and an explore subagent. The
+// sidekick is one child across both handoffs, so 3 sessions hold its 70
+// distinct messages, each in exactly one of them.
+const SIDEKICK_ROOT: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/adapter/devin/sidekick/cli"
+);
+const SIDEKICK_SESSIONS: usize = 3;
+const SIDEKICK_PARENT: &str = "third-hourglass";
+const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
+const SIDEKICK_MESSAGES: usize = 70;
+
 fn conformance(root: &'static str, sessions: usize) -> Conformance<'static> {
     Conformance {
         factory: &DevinFactory,
@@ -78,13 +91,48 @@ async fn windows_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sidekick_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
+    conformance(SIDEKICK_ROOT, SIDEKICK_SESSIONS)
+        .assert_ingest_counts_and_searchable()
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
     conformance(MACOS_ROOT, MACOS_SESSIONS)
         .assert_resync_is_noop()
         .await?;
     conformance(WINDOWS_ROOT, WINDOWS_SESSIONS)
         .assert_resync_is_noop()
+        .await?;
+    conformance(SIDEKICK_ROOT, SIDEKICK_SESSIONS)
+        .assert_resync_is_noop()
         .await
+}
+
+/// A persistent sidekick's two handoffs land in one child that points at its
+/// parent, and every message is stored exactly once across the three sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sidekick_is_one_child_across_its_handoffs() -> anyhow::Result<()> {
+    let (store, _guard) = ingest_into_temp_store(&DevinAdapter::new(SIDEKICK_ROOT)).await?;
+    let stored = contents(&store).await?;
+    let (child, messages) = &stored[SIDEKICK_CHILD];
+    anyhow::ensure!(child.source_agent == "devin/subagent");
+    anyhow::ensure!(child.parent_session_id.as_deref() == Some(SIDEKICK_PARENT));
+    for brief in ["b1e7050f", "bad34eff"] {
+        anyhow::ensure!(
+            messages.keys().any(|id| id.contains(&format!(":{brief}"))),
+            "brief {brief} is not in the sidekick child"
+        );
+    }
+    let suffixes: Vec<&str> = stored
+        .values()
+        .flat_map(|(_, messages)| messages.keys())
+        .filter_map(|id| id.rsplit_once(':').map(|(_, id)| id))
+        .collect();
+    anyhow::ensure!(suffixes.len() == SIDEKICK_MESSAGES);
+    anyhow::ensure!(suffixes.iter().collect::<HashSet<_>>().len() == SIDEKICK_MESSAGES);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

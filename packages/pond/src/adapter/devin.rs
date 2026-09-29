@@ -14,7 +14,10 @@
 //! and `subagent/chain_node_id` link on the parent's messages), so the
 //! partition ([`group_subagents`]) groups those trees by shape instead: each
 //! child, `<id>/agent-<task prompt message id>`, holds the messages placed in
-//! its trees, and the parent holds the rest - the link included.
+//! its trees, and the parent holds the rest - the link included. The Local
+//! Fusion sidekick is a persistent subagent: every handoff extends one live
+//! tree (marked by its `subagent/handoff` briefs), so it is one child across
+//! all its handoffs.
 //!
 //! The writer deletes nodes on `/revert` and whole sessions on `devin rm`, and
 //! re-saves nodes (same content, new `row_id`) rather than editing them, so
@@ -51,6 +54,11 @@ const SUBAGENT_AGENT: &str = "devin/subagent";
 /// `hidden = 1`, which devin's own session lists filter out (migration V15).
 const HELPER_AGENT: &str = "devin/helper";
 const DB_FILE: &str = "sessions.db";
+/// The telemetry operation of the persistent Local Fusion sidekick's system
+/// prefix. devin keys a persistent subagent by a deterministic agent id (the
+/// V17 `subagent_heads` comment), so every tree this prefix roots in one
+/// session is the same agent across all its handoffs.
+const PERSISTENT_PREFIX: &str = "subagent_sidekick";
 
 const RESTORE_UNSUPPORTED: &str = "devin keeps every session as rows in one live SQLite \
      database it rewrites in place (a revert deletes messages), and pond collapses the \
@@ -305,7 +313,8 @@ fn session_rows(conn: &Connection, db: &Path) -> Result<Vec<String>, AdapterErro
 /// One session's nodes in `row_id` order, as the columns [`NodeRef::from_row`]
 /// reads followed by `extra`. What the partition needs from `chat_message` is
 /// derived here in SQL (the string `message_id` and `metadata.created_at`, and
-/// the two flags `role` and the telemetry `operation` decide), so the peek
+/// the flags `role`, the telemetry `operation` and the `subagent/handoff`
+/// extension decide), so the peek
 /// reads no message body; the peek and the read both go through here, so the
 /// two cannot disagree. Malformed JSON yields NULLs, never a failed statement.
 fn node_query(extra: &str) -> String {
@@ -315,8 +324,11 @@ fn node_query(extra: &str) -> String {
              iif(json_type(doc, '$.metadata.created_at') = 'text',
                  doc ->> '$.metadata.created_at', NULL),
              ifnull(doc ->> '$.role' = 'system', 0),
+             ifnull(json_type(doc, '$.metadata.extensions.\"subagent/handoff\"') = 'true', 0),
              parent_node_id IS NULL AND ifnull(doc ->> '$.role' = 'user'
-                 OR doc ->> '$.metadata.telemetry.operation' GLOB 'subagent_*', 0){extra}
+                 OR doc ->> '$.metadata.telemetry.operation' GLOB 'subagent_*', 0),
+             parent_node_id IS NULL AND ifnull(
+                 doc ->> '$.metadata.telemetry.operation' = '{PERSISTENT_PREFIX}', 0){extra}
          FROM (SELECT row_id, node_id, parent_node_id, created_at, metadata, chat_message,
                    iif(json_valid(chat_message), chat_message, NULL) AS doc
                FROM message_nodes WHERE session_id = ?1)
@@ -373,10 +385,14 @@ struct NodeRef {
     message_id: String,
     created_at: Option<String>,
     is_system: bool,
+    /// Carries `subagent/handoff`: a copy of a persistent subagent's brief.
+    is_handoff: bool,
     /// A root the harness writes only for a subagent: its system prefix
     /// (telemetry operation `subagent_<profile>`), or the parentless copy of
     /// its task prompt.
     starts_subagent: bool,
+    /// A system prefix root of the persistent sidekick ([`PERSISTENT_PREFIX`]).
+    starts_persistent: bool,
 }
 
 impl NodeRef {
@@ -394,7 +410,9 @@ impl NodeRef {
             message_id,
             created_at: row.get(5)?,
             is_system: row.get(6)?,
-            starts_subagent: row.get(7)?,
+            is_handoff: row.get(7)?,
+            starts_subagent: row.get(8)?,
+            starts_persistent: row.get(9)?,
         }))
     }
 
@@ -413,23 +431,30 @@ impl NodeRef {
 /// Which pond sessions hold each message: owner 0 is the root session, owner
 /// `i` is the child named by `children[i - 1]`, the `message_id` of that
 /// subagent's task prompt. A message absent from `owners` belongs to the root
-/// alone; one listed with no owner waits for a sync that can name its
+/// alone; one listed with no owner is held back until a sync can name its
 /// subagent.
 #[derive(Default)]
 struct Forest {
     owners: HashMap<String, Vec<usize>>,
     children: Vec<String>,
     rejected: Vec<String>,
-    /// Every node in a subagent tree, for checking report-time links; never
-    /// read for ownership.
-    grouped_nodes: HashSet<i64>,
+    /// Every node in a subagent tree, mapped to its group, for checking
+    /// report-time links; never read for ownership.
+    grouped_nodes: HashMap<i64, i64>,
+    /// How many messages are held back, and the roots of the unnamed trees
+    /// placing them.
+    held: usize,
+    held_trees: Vec<i64>,
     /// Newest timestamp per owner, `None` when the owner holds no message.
     newest: Vec<Option<i64>>,
 }
 
 impl Forest {
     fn new(nodes: &[NodeRef]) -> Self {
-        let mut forest = if nodes.iter().any(|node| node.starts_subagent) {
+        let mut forest = if nodes
+            .iter()
+            .any(|node| node.starts_subagent || node.is_handoff)
+        {
             group_subagents(nodes)
         } else {
             Self::default()
@@ -457,6 +482,11 @@ impl Forest {
     }
 
     fn watermark(&self, owner: usize) -> SourceWatermark {
+        // Held-back messages are stored nowhere yet, so no stored watermark
+        // can cover them: the root stays pending until a sync names them.
+        if owner == 0 && self.held > 0 {
+            return SourceWatermark::Opaque;
+        }
         match self.newest.get(owner).copied().flatten() {
             Some(micros) => SourceWatermark::At(micros),
             None => SourceWatermark::Empty,
@@ -471,9 +501,29 @@ impl Forest {
 fn group_subagents(nodes: &[NodeRef]) -> Forest {
     let by_node: HashMap<i64, &NodeRef> = nodes.iter().map(|node| (node.node_id, node)).collect();
     let tree_of = tree_roots(&by_node);
-    let seeded = |node: &NodeRef| by_node[&tree_of[&node.node_id]].starts_subagent;
+    let root = |node: &NodeRef| by_node[&tree_of[&node.node_id]];
+    // The sidekick's live tree is rooted by a prefix no different from the
+    // lead's (telemetry `unknown`); only the handoff brief it holds marks it.
+    let seeded_trees: HashSet<i64> = nodes
+        .iter()
+        .filter(|node| node.is_handoff || root(node).starts_subagent)
+        .map(|node| tree_of[&node.node_id])
+        .collect();
+    let seeded = |node: &NodeRef| seeded_trees.contains(&tree_of[&node.node_id]);
+    // The task prompt: a handoff brief, or a non-system node that is
+    // parentless or sits directly under a subagent prefix root.
+    let task_prompt = |node: &NodeRef| {
+        node.is_handoff
+            || (!node.is_system
+                && node.parent.is_none_or(|parent| {
+                    by_node
+                        .get(&parent)
+                        .is_some_and(|up| up.is_system && up.starts_subagent)
+                }))
+    };
 
-    // A main message two subagents both copied must not merge them.
+    // A main message two subagents both copied must not merge them, unless
+    // both open with it: a task prompt names exactly one subagent.
     let in_main: HashSet<&str> = nodes
         .iter()
         .filter(|node| !seeded(node))
@@ -481,14 +531,23 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         .collect();
     let mut sets: HashMap<i64, i64> = HashMap::new();
     let mut first_tree: HashMap<&str, i64> = HashMap::new();
-    for node in nodes.iter().filter(|node| {
-        seeded(node) && !node.is_system && !in_main.contains(node.message_id.as_str())
-    }) {
+    let mut persistent = None;
+    for node in nodes.iter().filter(|node| seeded(node)) {
         let tree = tree_of[&node.node_id];
-        match first_tree.entry(node.message_id.as_str()) {
-            Entry::Occupied(entry) => union(&mut sets, *entry.get(), tree),
-            Entry::Vacant(entry) => {
-                entry.insert(tree);
+        if !node.is_system && (!in_main.contains(node.message_id.as_str()) || task_prompt(node)) {
+            match first_tree.entry(node.message_id.as_str()) {
+                Entry::Occupied(entry) => union(&mut sets, *entry.get(), tree),
+                Entry::Vacant(entry) => {
+                    entry.insert(tree);
+                }
+            }
+        }
+        // One agent across every handoff, even one that shares no message
+        // with the others (devin starts a fresh chain when its head is gone).
+        if root(node).starts_persistent {
+            match persistent {
+                Some(first) => union(&mut sets, first, tree),
+                None => persistent = Some(tree),
             }
         }
     }
@@ -496,27 +555,25 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
     // Per message: whether a tree outside the subagents places it, and the
     // subagent groups whose trees do.
     let mut placed: HashMap<&str, (bool, Vec<i64>)> = HashMap::new();
-    // The task prompt: a non-system node that is parentless or sits directly
-    // under a subagent prefix root. It is the subagent's first message, so
-    // the earliest candidate wins and one arriving later cannot rename it.
+    // The task prompt is the subagent's first message, so the earliest
+    // candidate wins and one arriving later (a later brief) cannot rename it.
     let mut names: HashMap<i64, (i64, &str)> = HashMap::new();
+    let mut grouped_nodes = HashMap::new();
+    let mut group_trees: HashMap<i64, BTreeSet<i64>> = HashMap::new();
     for node in nodes {
         let (in_root, groups) = placed.entry(&node.message_id).or_default();
         if !seeded(node) {
             *in_root = true;
             continue;
         }
-        let group = find(&sets, tree_of[&node.node_id]);
+        let tree = tree_of[&node.node_id];
+        let group = find(&sets, tree);
+        grouped_nodes.insert(node.node_id, group);
+        group_trees.entry(group).or_default().insert(tree);
         if !groups.contains(&group) {
             groups.push(group);
         }
-        let task_prompt = !node.is_system
-            && node.parent.is_none_or(|parent| {
-                by_node
-                    .get(&parent)
-                    .is_some_and(|up| up.is_system && up.starts_subagent)
-            });
-        if task_prompt {
+        if task_prompt(node) {
             let candidate = (node.micros(), node.message_id.as_str());
             let name = names.entry(group).or_insert(candidate);
             *name = (*name).min(candidate);
@@ -542,18 +599,14 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         .map(|(position, (_, group))| (*group, position + 1))
         .collect();
 
-    let grouped_nodes = nodes
-        .iter()
-        .filter(|node| seeded(node))
-        .map(|node| node.node_id)
-        .collect();
-
     let mut owners = HashMap::new();
+    let mut held = 0;
+    let mut held_trees = BTreeSet::new();
     for (message, (in_root, groups)) in placed {
         if groups.is_empty() {
             continue;
         }
-        let mut held: Vec<usize> = groups
+        let mut owned: Vec<usize> = groups
             .iter()
             .filter_map(|group| match index.get(group) {
                 Some(&owner) => Some(owner),
@@ -562,11 +615,15 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
             })
             .collect();
         if in_root {
-            held.push(0);
+            owned.push(0);
         }
-        held.sort_unstable();
-        held.dedup();
-        owners.insert(message.to_owned(), held);
+        owned.sort_unstable();
+        owned.dedup();
+        if owned.is_empty() {
+            held += 1;
+            held_trees.extend(groups.iter().flat_map(|group| &group_trees[group]));
+        }
+        owners.insert(message.to_owned(), owned);
     }
     let children = valid.into_iter().map(|(name, _)| name.to_owned()).collect();
     Forest {
@@ -574,6 +631,8 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         children,
         rejected,
         grouped_nodes,
+        held,
+        held_trees: held_trees.into_iter().collect(),
         newest: Vec::new(),
     }
 }
@@ -818,6 +877,19 @@ fn read_session(
         );
         emit!(tx, Err(error));
     }
+    if forest.held > 0 {
+        let error = AdapterError::schema(
+            NAME,
+            location.clone(),
+            format!(
+                "{} messages of the subagent trees rooted at nodes {:?} have no task \
+                 prompt to name their child session yet; they are held back and \
+                 this session re-reads on every sync until one does",
+                forest.held, forest.held_trees
+            ),
+        );
+        emit!(tx, Err(error));
+    }
     let tools = ToolIndex::new(&read.tool_states, read.collected.values());
     let owned = read.partition(&forest);
     for entry in &owned[0] {
@@ -918,20 +990,42 @@ impl SessionRead {
             }
         }
         let present: HashSet<i64> = self.refs.iter().map(|node| node.node_id).collect();
-        links
+        let mut reasons = Vec::new();
+        // A persistent subagent links once per handoff and moves its head
+        // each time; every head must still land in the one group it owns.
+        let mut groups: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
+        for (agent, head) in links {
+            let Some(agent) = agent else {
+                reasons.push(format!("subagent link to node {head} has no agent id"));
+                continue;
+            };
+            // A head devin since removed (a revert, a sidekick starting
+            // fresh) or a fork's copied link names nothing here.
+            if !present.contains(&head) {
+                continue;
+            }
+            match forest.grouped_nodes.get(&head) {
+                Some(&group) => {
+                    groups.entry(agent).or_default().entry(group).or_insert(head);
+                }
+                None => reasons.push(format!(
+                    "subagent agent {agent} links to node {head}, outside the detected subagent trees"
+                )),
+            }
+        }
+        for (agent, heads) in groups {
+            if heads.len() > 1 {
+                let mut heads: Vec<i64> = heads.into_values().collect();
+                heads.sort_unstable();
+                reasons.push(format!(
+                    "subagent agent {agent} links to nodes {heads:?} in separate subagent \
+                     tree groups, so its messages are split across sessions"
+                ));
+            }
+        }
+        reasons
             .into_iter()
-            .filter(|(agent, head)| {
-                agent.is_none() || (present.contains(head) && !forest.grouped_nodes.contains(head))
-            })
-            .map(|(agent, head)| {
-                let reason = match agent {
-                    Some(agent) => format!(
-                        "subagent agent {agent} links to node {head}, outside the detected subagent trees"
-                    ),
-                    None => format!("subagent link to node {head} has no agent id"),
-                };
-                AdapterError::schema(NAME, location, reason)
-            })
+            .map(|reason| AdapterError::schema(NAME, location, reason))
             .collect()
     }
 
@@ -1007,8 +1101,8 @@ impl SessionRead {
         let mut rows = stmt.query([id])?;
         while let Some(row) = rows.next()? {
             let node_id: i64 = row.get(1)?;
-            let metadata: Option<String> = row.get(8)?;
-            let chat_message: String = row.get(9)?;
+            let metadata: Option<String> = row.get(10)?;
+            let chat_message: String = row.get(11)?;
             let node = NodeRef::from_row(row)?;
             let parsed = node.and_then(|node| {
                 let known = copies.get(&node.message_id).and_then(|entry| {
@@ -1647,12 +1741,17 @@ mod tests {
         );
     }
 
+    /// Every captured link head lands in the one group its agent owns -
+    /// including the sidekick's, whose `subagent_heads` row and link records
+    /// name two heads, the stale end of its first handoff and the live one.
     #[test]
     fn fixture_link_heads_belong_to_detected_subagent_trees() {
+        let mut heads_checked = 0;
         for db in [
             Path::new(MACOS).join(DB_FILE),
             Path::new(WINDOWS).join(DB_FILE),
             Path::new(MIDRUN).join("after").join("cli").join(DB_FILE),
+            Path::new(SIDEKICK).join(DB_FILE),
         ] {
             let conn = match open_forest(&db).unwrap() {
                 Opened::Forest(conn) => conn,
@@ -1666,8 +1765,24 @@ mod tests {
                     "{}#{id}",
                     db.display()
                 );
+                heads_checked += read.agent_heads.len();
             }
         }
+        assert_eq!(heads_checked, 1, "the sidekick's head row is checked");
+        let db = Path::new(SIDEKICK).join(DB_FILE);
+        let conn = match open_forest(&db).unwrap() {
+            Opened::Forest(conn) => conn,
+            _ => panic!("fixture is not a forest database"),
+        };
+        let read = SessionRead::load(&conn, &db, SIDEKICK_ROOT, SIDEKICK_ROOT)
+            .unwrap()
+            .unwrap();
+        let forest = Forest::new(&read.refs);
+        let groups: BTreeSet<i64> = [103, 178]
+            .iter()
+            .map(|head| forest.grouped_nodes[head])
+            .collect();
+        assert_eq!(groups.len(), 1, "both sidekick heads lie in one group");
     }
 
     #[test]
@@ -1741,11 +1856,13 @@ mod tests {
             message_id: "bad/id".to_owned(),
             created_at: None,
             is_system: false,
+            is_handoff: false,
             starts_subagent: true,
+            starts_persistent: false,
         };
         let forest = Forest::new(&[node]);
         assert_eq!(forest.rejected, vec!["bad/id"]);
-        assert!(forest.grouped_nodes.contains(&1));
+        assert!(forest.grouped_nodes.contains_key(&1));
     }
 
     #[test]
@@ -2054,7 +2171,9 @@ mod tests {
                 message_id: id.to_owned(),
                 created_at: None,
                 is_system: false,
+                is_handoff: false,
                 starts_subagent: false,
+                starts_persistent: false,
             },
             variants: Vec::new(),
             nodes: Vec::new(),
@@ -2198,6 +2317,7 @@ mod tests {
         for stage in ["before", "after"] {
             assert_peek_matches_read(&Path::new(MIDRUN).join(stage).join("cli").join(DB_FILE));
         }
+        assert_peek_matches_read(&Path::new(SIDEKICK).join(DB_FILE));
     }
 
     /// Without `metadata.created_at` a message falls back to its first node's
@@ -2656,5 +2776,392 @@ mod tests {
                 &FileData::String(compact_json(&entry))
             )]
         );
+    }
+
+    const SIDEKICK: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/adapter/devin/sidekick/cli"
+    );
+    const SIDEKICK_ROOT: &str = "third-hourglass";
+    const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
+    const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";
+
+    /// Every node id the stored messages of `session` place.
+    fn placements(read: &Read, session: &str) -> BTreeSet<i64> {
+        read.messages[session]
+            .iter()
+            .flat_map(|message| message.options()[NAME]["nodes"].as_array().unwrap())
+            .map(|node| node["node_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// Each pond session with the message ids it holds.
+    fn ownership(read: &Read) -> BTreeMap<String, BTreeSet<String>> {
+        read.messages
+            .iter()
+            .map(|(id, messages)| {
+                let ids = messages.iter().map(|m| m.id().to_owned()).collect();
+                (id.clone(), ids)
+            })
+            .collect()
+    }
+
+    /// A copy of the sidekick capture with `edit` applied to it.
+    fn forged_sidekick(temp: &TempDir, edit: impl FnOnce(&Connection)) -> PathBuf {
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(SIDEKICK).join(DB_FILE), &db).unwrap();
+        edit(&Connection::open(&db).unwrap());
+        db
+    }
+
+    /// One forged node of the sidekick session, stamped `at` seconds after
+    /// 22:00; `extensions` lands in `metadata.extensions`.
+    fn add_node(
+        conn: &Connection,
+        (node_id, parent): (i64, Option<i64>),
+        (role, message_id, operation): (&str, &str, &str),
+        at: i64,
+        extensions: Value,
+    ) {
+        let created = DateTime::from_timestamp(1_790_719_200 + at, 0).unwrap();
+        let chat_message = json!({
+            "message_id": message_id,
+            "role": role,
+            "content": message_id,
+            "metadata": {
+                "created_at": created.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                "telemetry": { "source": role, "operation": operation },
+                "extensions": extensions,
+            },
+        });
+        conn.execute(
+            "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message,
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                SIDEKICK_ROOT,
+                node_id,
+                parent,
+                chat_message.to_string(),
+                created.timestamp()
+            ],
+        )
+        .unwrap();
+    }
+
+    fn handoff() -> Value {
+        json!({ "subagent/handoff": true })
+    }
+
+    fn link(agent: &str, head: i64) -> Value {
+        json!({ "subagent/agent_id": agent, "subagent/chain_node_id": head })
+    }
+
+    /// The captured Local Fusion session: two sidekick handoffs, the second
+    /// brief appended to the first handoff's report inside ONE live tree
+    /// whose root carries no subagent telemetry, plus the per-handoff prefix
+    /// copies (`subagent_sidekick`), a parentless brief and an explore
+    /// subagent. The sidekick is one child holding its whole chain - both
+    /// briefs and both reports - named by its first brief; the parent keeps
+    /// the lead's chain and every link record; every node is stored.
+    #[test]
+    fn a_persistent_sidekick_is_one_child_across_handoffs() {
+        let read = read(&Path::new(SIDEKICK).join(DB_FILE));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let sessions: Vec<&str> = read.sessions.keys().map(String::as_str).collect();
+        assert_eq!(sessions, [SIDEKICK_ROOT, EXPLORE_CHILD, SIDEKICK_CHILD]);
+        let child = &read.sessions[SIDEKICK_CHILD];
+        assert_eq!(child.source_agent, SUBAGENT_AGENT);
+        assert_eq!(child.parent_session_id.as_deref(), Some(SIDEKICK_ROOT));
+        let brief: DateTime<chrono::Utc> = "2026-09-29T21:31:41.519472Z".parse().unwrap();
+        assert_eq!(child.created_at, brief);
+
+        let (root, sidekick) = (
+            placements(&read, SIDEKICK_ROOT),
+            placements(&read, SIDEKICK_CHILD),
+        );
+        let work: Vec<i64> = (94..=103).chain([155]).chain(174..=178).collect();
+        for node in &work {
+            assert!(sidekick.contains(node) && !root.contains(node), "{node}");
+        }
+        for node in [105, 106, 180, 181, 207] {
+            assert!(root.contains(&node) && !sidekick.contains(&node), "{node}");
+        }
+        for message in ["b1e7050f", "bad34eff", "04fd5885", "07f67def"] {
+            let held = |session: &str| {
+                read.messages[session]
+                    .iter()
+                    .any(|m| m.id().split(':').nth(1).unwrap().starts_with(message))
+            };
+            assert!(held(SIDEKICK_CHILD) && !held(SIDEKICK_ROOT), "{message}");
+        }
+        let stored: BTreeSet<i64> = read
+            .sessions
+            .keys()
+            .flat_map(|id| placements(&read, id))
+            .collect();
+        assert_eq!(stored, (0..=207).collect(), "every node is stored");
+    }
+
+    /// #315's real sessions yielded no child where devin wrote no parentless
+    /// brief; the brief's `subagent/handoff` copies name the child without it.
+    #[test]
+    fn a_sidekick_without_its_parentless_brief_keeps_its_name() {
+        let temp = TempDir::new().unwrap();
+        let db = forged_sidekick(&temp, |conn| {
+            conn.execute(
+                "DELETE FROM message_nodes WHERE node_id IN (85, 92, 93)",
+                [],
+            )
+            .unwrap();
+        });
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let full = read_sidekick();
+        assert_eq!(read.sessions[SIDEKICK_CHILD], full.sessions[SIDEKICK_CHILD]);
+        assert_eq!(read.sessions.len(), 3);
+        assert!(placements(&read, SIDEKICK_CHILD).is_superset(&(94..=103).collect()));
+    }
+
+    fn read_sidekick() -> Read {
+        let read = read(&Path::new(SIDEKICK).join(DB_FILE));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        read
+    }
+
+    /// A sync at any point of either handoff stores a subset of what the
+    /// final sync stores, each message in the same session, under the same
+    /// child row: the first brief names the child, and the second brief
+    /// arriving later cannot rename it.
+    #[test]
+    fn a_sync_mid_handoff_stores_what_a_later_one_would() {
+        let full = read_sidekick();
+        let later: BTreeSet<String> = ownership(&full).into_values().flatten().collect();
+        for cut in [96, 103, 106, 155, 176, 178] {
+            let temp = TempDir::new().unwrap();
+            let db = forged_sidekick(&temp, |conn| {
+                conn.execute("DELETE FROM message_nodes WHERE node_id > ?1", [cut])
+                    .unwrap();
+            });
+            let early = read(&db);
+            assert!(early.errors.is_empty(), "{cut}: {:?}", early.errors);
+            assert_eq!(
+                early.sessions[SIDEKICK_CHILD], full.sessions[SIDEKICK_CHILD],
+                "{cut}"
+            );
+            let stored: BTreeSet<String> = ownership(&early).into_values().flatten().collect();
+            let moved: Vec<&String> = stored.difference(&later).collect();
+            assert!(moved.is_empty(), "{cut}: {moved:?}");
+            assert_peek_matches_read(&db);
+        }
+    }
+
+    /// The partition never reads `subagent_heads`: emptied, pointing at a
+    /// node devin since removed (it then starts fresh), or naming another
+    /// agent's node, the rows change nothing but the check; only a head in a
+    /// main tree is drift.
+    #[test]
+    fn subagent_heads_are_checked_but_never_partition() {
+        let full = ownership(&read_sidekick());
+        for (edit, drift) in [
+            ("DELETE FROM subagent_heads", None),
+            ("UPDATE subagent_heads SET chain_node_id = 999", None),
+            (
+                "INSERT INTO subagent_heads VALUES ('third-hourglass', 'a90f5090', 203, 1)",
+                None,
+            ),
+            (
+                "UPDATE subagent_heads SET chain_node_id = 1",
+                Some("sidekick links to node 1,"),
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db = forged_sidekick(&temp, |conn| {
+                conn.execute(edit, []).unwrap();
+            });
+            let read = read(&db);
+            let reasons: Vec<String> = read.errors.iter().map(ToString::to_string).collect();
+            match drift {
+                None => assert!(reasons.is_empty(), "{edit}: {reasons:?}"),
+                Some(needle) => {
+                    assert_eq!(reasons.len(), 1, "{edit}: {reasons:?}");
+                    assert!(reasons[0].contains(needle), "{reasons:?}");
+                }
+            }
+            assert_eq!(ownership(&read), full, "{edit}");
+        }
+    }
+
+    /// A link record whose head lies in no subagent tree, or one naming the
+    /// sidekick while pointing into the explore subagent's trees, is drift;
+    /// neither reassigns a message.
+    #[test]
+    fn a_sidekick_link_outside_its_group_reports_drift() {
+        let full = ownership(&read_sidekick());
+        for (node, head, agent, needle) in [
+            (181, 1, "sidekick", "sidekick links to node 1,"),
+            (205, 203, "sidekick", "sidekick links to nodes [103, 203]"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db = forged_sidekick(&temp, |conn| {
+                conn.execute(
+                    "UPDATE message_nodes SET chat_message = json_set(chat_message,
+                         '$.metadata.extensions.\"subagent/chain_node_id\"', ?2,
+                         '$.metadata.extensions.\"subagent/agent_id\"', ?3)
+                     WHERE node_id = ?1",
+                    rusqlite::params![node, head, agent],
+                )
+                .unwrap();
+            });
+            let read = read(&db);
+            let reasons: Vec<String> = read.errors.iter().map(ToString::to_string).collect();
+            assert_eq!(reasons.len(), 1, "{reasons:?}");
+            assert!(reasons[0].contains(needle), "{reasons:?}");
+            assert_eq!(ownership(&read), full);
+        }
+    }
+
+    /// A third handoff that starts fresh - its stored head gone, so its live
+    /// tree and prefix copy share no message with the first two - is still
+    /// the same agent: one child, the same name, its brief and report
+    /// inside, and its link heads accepted. A compaction continuing the live
+    /// tree stays in the child; the summarizer chain stays with the root.
+    #[test]
+    fn a_fresh_handoff_and_a_compaction_stay_in_the_one_sidekick_child() {
+        let temp = TempDir::new().unwrap();
+        let db = forged_sidekick(&temp, |conn| {
+            let none = json!({});
+            add_node(
+                conn,
+                (300, None),
+                ("system", "fresh-root", "unknown"),
+                0,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (301, Some(300)),
+                ("system", "fresh-model", "unknown"),
+                1,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (302, Some(301)),
+                ("user", "brief-3", "unknown"),
+                2,
+                handoff(),
+            );
+            add_node(
+                conn,
+                (303, Some(302)),
+                ("assistant", "report-3", "inference"),
+                3,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (310, None),
+                ("system", "fresh-prefix", PERSISTENT_PREFIX),
+                0,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (311, Some(310)),
+                ("system", "fresh-model", "unknown"),
+                1,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (312, Some(311)),
+                ("user", "brief-3", "unknown"),
+                2,
+                handoff(),
+            );
+            add_node(
+                conn,
+                (320, Some(207)),
+                ("system", "done-3", "unknown"),
+                4,
+                link("sidekick", 303),
+            );
+            add_node(
+                conn,
+                (330, Some(94)),
+                ("system", "continuing", "unknown"),
+                5,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (331, Some(330)),
+                ("assistant", "after-compaction", "inference"),
+                6,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (340, None),
+                ("system", "summarizer", "unknown"),
+                5,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (341, Some(340)),
+                ("user", "summarize-this", "unknown"),
+                6,
+                none,
+            );
+            conn.execute("UPDATE subagent_heads SET chain_node_id = 303", [])
+                .unwrap();
+        });
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        assert_eq!(read.sessions.len(), 3);
+        let child = placements(&read, SIDEKICK_CHILD);
+        for node in [300, 301, 302, 303, 310, 311, 312, 330, 331, 94, 178] {
+            assert!(child.contains(&node), "{node}");
+        }
+        let root = placements(&read, SIDEKICK_ROOT);
+        for node in [320, 340, 341] {
+            assert!(root.contains(&node) && !child.contains(&node), "{node}");
+        }
+        assert_peek_matches_read(&db);
+    }
+
+    /// A subagent tree nothing names is held back, never silently dropped:
+    /// the read reports it and the root stays pending, so each sync re-reads
+    /// it until a task prompt arrives.
+    #[test]
+    fn an_unnamed_subagent_tree_is_reported_and_keeps_the_root_pending() {
+        let temp = TempDir::new().unwrap();
+        let db = forged_sidekick(&temp, |conn| {
+            let none = json!({});
+            add_node(
+                conn,
+                (400, None),
+                ("system", "orphan-prefix", "subagent_general"),
+                0,
+                none.clone(),
+            );
+            add_node(
+                conn,
+                (401, Some(400)),
+                ("system", "orphan-model", "unknown"),
+                1,
+                none,
+            );
+        });
+        let read = read(&db);
+        let reasons: Vec<String> = read.errors.iter().map(ToString::to_string).collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].contains("2 messages of the subagent trees rooted at nodes [400]"),
+            "{reasons:?}"
+        );
+        assert_eq!(ownership(&read), ownership(&read_sidekick()));
+        assert_eq!(peeked(&db)[SIDEKICK_ROOT], SourceWatermark::Opaque);
     }
 }
