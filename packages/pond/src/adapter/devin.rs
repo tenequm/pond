@@ -32,13 +32,13 @@ use tokio::sync::mpsc;
 
 use crate::{
     sessions::{IngestEvent, SessionWithMessages},
-    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
+    wire::{FileData, Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use super::{
     Adapter, AdapterError, AdapterErrorKind, AdapterFactory, AdapterYield, AdapterYieldStream,
     DiscoverFuture, Env, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
-    SourceWatermark, SyncPlan,
+    SourceWatermark, SyncPlan, compact_json,
     extract::{Extracted, extract_raw_record, extract_str, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
     sqlite::{self, CHANNEL_CAP, emit},
@@ -1280,6 +1280,7 @@ fn message_events(
         });
     };
     let text = content.clone().filter(|text| !text.is_empty());
+    let mut image_provenance = None;
 
     let canonical = match message.get("role").and_then(Value::as_str) {
         Some("user") => {
@@ -1297,6 +1298,7 @@ fn message_events(
             if let Some(text) = text {
                 push(provenance, PartKind::Text { text: Some(text) });
             }
+            image_provenance = Some(provenance);
             Message::User {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
@@ -1339,6 +1341,7 @@ fn message_events(
                     },
                 );
             }
+            image_provenance = Some(Provenance::Conversational);
             Message::Assistant {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
@@ -1362,6 +1365,7 @@ fn message_events(
                     result: message.get("content").cloned().unwrap_or(Value::Null),
                 },
             );
+            image_provenance = Some(Provenance::Injected);
             Message::Tool {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
@@ -1379,11 +1383,40 @@ fn message_events(
             options,
         },
     };
+    // Images go after every other part kind: part ids are ordinal-keyed and
+    // an already-stored id is skipped, so an image ahead of the text would
+    // take the stored text part's id when a pre-image store re-reads it.
+    if let Some(provenance) = image_provenance {
+        for image in message
+            .get("images")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            push(provenance, image_part(image));
+        }
+    }
 
     let mut events = Vec::with_capacity(parts.len() + 1);
     events.push(IngestEvent::Message(canonical));
     events.extend(parts.into_iter().map(IngestEvent::Part));
     Ok(events)
+}
+
+/// One `chat_message.images[]` entry, devin's `ImageData {width, height,
+/// base64_data, mime_type, source_path, caption}` (docs/adapters/devin.md):
+/// the base64 payload verbatim, `source_path` as the file name. Width, height
+/// and caption have no slot and stay in the raw record.
+fn image_part(image: &Value) -> PartKind {
+    let data = match image.get("base64_data").and_then(Value::as_str) {
+        Some(base64) => FileData::String(base64.to_owned()),
+        None => FileData::String(compact_json(image)),
+    };
+    PartKind::File {
+        media_type: extract_str(image, "mime_type").map(|mime| mime.as_str().to_owned()),
+        file_name: extract_str(image, "source_path").map(|path| path.as_str().to_owned()),
+        data,
+    }
 }
 
 fn message_options(entry: &Collected) -> ProviderOptions {
@@ -2426,6 +2459,202 @@ mod tests {
                 .restore_unsupported()
                 .unwrap()
                 .contains("--to claude-code")
+        );
+    }
+
+    /// A copy of the macOS fixture where every copy of each message carries
+    /// the given `chat_message.images` - the shape no capture produced,
+    /// grounded in the binary (docs/adapters/devin.md).
+    fn with_images(temp: &TempDir, images: &[(&str, Value)]) -> PathBuf {
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        for (message_id, images) in images {
+            let updated = conn
+                .execute(
+                    "UPDATE message_nodes
+                     SET chat_message = json_set(chat_message, '$.images', json(?1))
+                     WHERE json_extract(chat_message, '$.message_id') = ?2",
+                    rusqlite::params![images.to_string(), message_id],
+                )
+                .unwrap();
+            assert!(updated > 0, "{message_id}");
+        }
+        db
+    }
+
+    fn file_parts(parts: &[Part]) -> Vec<(Option<&str>, Option<&str>, &FileData)> {
+        parts
+            .iter()
+            .map(|part| match &part.kind {
+                PartKind::File {
+                    media_type,
+                    file_name,
+                    data,
+                } => (media_type.as_deref(), file_name.as_deref(), data),
+                other => panic!("{}: not a file part: {other:?}", part.id),
+            })
+            .collect()
+    }
+
+    fn png(base64: &str, path: &str) -> Value {
+        json!({
+            "width": 1, "height": 1, "base64_data": base64,
+            "mime_type": "image/png", "source_path": path, "caption": null,
+        })
+    }
+
+    /// Images land after every part the message already emitted, so a store
+    /// written before images were read keeps its text, reasoning, tool-call
+    /// and tool-result part ids when a re-read adds the images: every
+    /// existing part keeps its ordinal, and only File parts follow.
+    #[test]
+    fn images_become_file_parts_after_the_existing_parts() {
+        const TYPED: &str = "4efb7e3f-b402-4e54-be24-f83d5771d2aa";
+        const CALLS: &str = "520f2475-34a4-4c06-b0a4-082c7b1b32d1";
+        const RESULT: &str = "f3e4968f-c6dc-4108-ad89-dfa3dac613d5";
+        let before = macos();
+        let temp = TempDir::new().unwrap();
+        let db = with_images(
+            &temp,
+            &[
+                (TYPED, json!([png("aGk=", "/tmp/pasted-images/a.png")])),
+                (CALLS, json!([png("Ynll", "/tmp/b.png")])),
+                (
+                    RESULT,
+                    json!([png("eW8=", "/tmp/c.png"), png("d2F2", "/tmp/d.png")]),
+                ),
+            ],
+        );
+        let after = read(&db);
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+
+        for (id, earlier) in &before.parts {
+            let parts = &after.parts[id];
+            assert_eq!(&parts[..earlier.len()], earlier.as_slice(), "{id}");
+            let added = &parts[earlier.len()..];
+            let expected = match id.strip_prefix("branch-candy:") {
+                Some(TYPED | CALLS) => 1,
+                Some(RESULT) => 2,
+                _ => 0,
+            };
+            assert_eq!(added.len(), expected, "{id}");
+            for (offset, part) in added.iter().enumerate() {
+                let ordinal = earlier.len() + offset;
+                assert_eq!(part.id, part_id(id, ordinal));
+                assert_eq!(part.ordinal, part_ordinal(ordinal));
+            }
+        }
+
+        let parts = |message: &str| &after.parts[&format!("branch-candy:{message}")];
+        let typed = parts(TYPED);
+        assert!(matches!(typed[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&typed[1..]),
+            [(
+                Some("image/png"),
+                Some("/tmp/pasted-images/a.png"),
+                &FileData::String("aGk=".to_owned())
+            )]
+        );
+        assert_eq!(typed[1].provenance, Provenance::Conversational);
+
+        let calls = parts(CALLS);
+        assert!(matches!(
+            calls[calls.len() - 2].kind,
+            PartKind::ToolCall { .. }
+        ));
+        assert_eq!(calls.last().unwrap().provenance, Provenance::Conversational);
+
+        let result = parts(RESULT);
+        assert!(matches!(result[0].kind, PartKind::ToolResult { .. }));
+        assert_eq!(
+            file_parts(&result[1..]),
+            [
+                (
+                    Some("image/png"),
+                    Some("/tmp/c.png"),
+                    &FileData::String("eW8=".to_owned())
+                ),
+                (
+                    Some("image/png"),
+                    Some("/tmp/d.png"),
+                    &FileData::String("d2F2".to_owned())
+                ),
+            ]
+        );
+        assert!(
+            result[1..]
+                .iter()
+                .all(|part| part.provenance == Provenance::Injected)
+        );
+    }
+
+    /// A pasted image with no typed text is the message's only part.
+    #[test]
+    fn a_message_with_only_images_yields_only_file_parts() {
+        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
+        let temp = TempDir::new().unwrap();
+        let db = with_images(&temp, &[(TYPED, json!([png("aGk=", "/tmp/a.png")]))]);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE message_nodes SET chat_message = json_set(chat_message, '$.content', '')
+                 WHERE json_extract(chat_message, '$.message_id') = ?1",
+                [TYPED],
+            )
+            .unwrap();
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let id = format!("level-waterlily:{TYPED}");
+        let parts = &read.parts[&id];
+        assert_eq!(
+            file_parts(parts),
+            [(
+                Some("image/png"),
+                Some("/tmp/a.png"),
+                &FileData::String("aGk=".to_owned())
+            )]
+        );
+        assert_eq!(parts[0].id, part_id(&id, 0));
+        assert_eq!(parts[0].provenance, Provenance::Conversational);
+    }
+
+    /// An image without `mime_type` or `source_path` still yields its part,
+    /// those fields absent rather than defaulted (spec.md#model-no-synthesis).
+    #[test]
+    fn an_image_without_a_type_or_path_leaves_them_absent() {
+        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
+        let temp = TempDir::new().unwrap();
+        let bare = json!([{"width": 2, "height": 3, "base64_data": "aGk="}]);
+        let read = read(&with_images(&temp, &[(TYPED, bare)]));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let parts = &read.parts[&format!("level-waterlily:{TYPED}")];
+        assert!(matches!(parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&parts[1..]),
+            [(None, None, &FileData::String("aGk=".to_owned()))]
+        );
+    }
+
+    /// An entry without `base64_data` still yields its part, the whole entry
+    /// as compact JSON, its own type and path kept.
+    #[test]
+    fn an_image_without_base64_data_keeps_the_whole_entry() {
+        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
+        let temp = TempDir::new().unwrap();
+        let entry = json!({"width": 2, "mime_type": "image/png", "source_path": "/tmp/a.png"});
+        let read = read(&with_images(&temp, &[(TYPED, json!([entry]))]));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let parts = &read.parts[&format!("level-waterlily:{TYPED}")];
+        assert!(matches!(parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&parts[1..]),
+            [(
+                Some("image/png"),
+                Some("/tmp/a.png"),
+                &FileData::String(compact_json(&entry))
+            )]
         );
     }
 }
