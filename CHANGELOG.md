@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.3](https://github.com/tenequm/pond/compare/v0.19.2...v0.19.3) - 2026-09-29
+
+### <!-- 1 -->🎉 New Features
+- **adapter:** add devin ([#319](https://github.com/tenequm/pond/pull/319)) ([17f2c20](https://github.com/tenequm/pond/commit/17f2c2040d9c1f90995bc4cbf5e1e48263911a75))
+  pond now ingests Devin CLI sessions (`pond adapters enable devin`) from `~/.local/share/devin/cli` or `%APPDATA%\devin\cli`, subagents included, so they outlive `devin rm`. Ingest-only: resume one elsewhere with `pond resume <id> --to claude-code`.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.2...v0.19.3
+
 ## [0.19.2](https://github.com/tenequm/pond/compare/v0.19.1...v0.19.2) - 2026-09-25
 
 ### <!-- 1 -->🎉 New Features
