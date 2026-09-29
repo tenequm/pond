@@ -124,8 +124,9 @@ enum State {
 use State::{Active, Inactive};
 
 impl State {
-    /// A healthy registration; only `windows::probe` ever reports a problem,
-    /// so every other constructor goes through here.
+    /// A healthy registration; the probes that can detect an unrunnable one
+    /// (`windows::probe`, and `unix::probe` for systemd timers) build `Active`
+    /// directly, so every other constructor goes through here.
     fn active(backend: &'static str, every: Option<ScheduleEvery>) -> Self {
         Active {
             backend,
@@ -375,7 +376,7 @@ mod unix {
     use anyhow::{Context, Result, bail};
 
     use super::{ScheduleEvery, State};
-    use State::Inactive;
+    use State::{Active, Inactive};
 
     const LAUNCHD_LABEL: &str = "sh.pond.sync";
     const CRON_FENCE_BEGIN: &str = "# BEGIN POND SYNC (maintained by pond; do not edit)";
@@ -386,7 +387,11 @@ mod unix {
             "macos" => probe_launchd(),
             "linux" => {
                 if systemd_timer_enabled() {
-                    return Ok(State::active("systemd", read_systemd_interval()));
+                    return Ok(Active {
+                        backend: "systemd",
+                        every: read_systemd_interval(),
+                        problem: systemd_timer_problem(),
+                    });
                 }
                 if let Some(entry) = read_cron_fence_entry()? {
                     return Ok(State::active("cron", cron_entry_interval(&entry)));
@@ -661,6 +666,74 @@ mod unix {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    /// The two properties `systemctl show` answers with for a timer's next
+    /// elapse. Both are asked for because a monotonic-only timer leaves the
+    /// realtime one empty while being perfectly healthy.
+    const NEXT_ELAPSE_PROPERTIES: [&str; 2] = ["NextElapseUSecRealtime", "NextElapseUSecMonotonic"];
+
+    /// A systemd timer can be `enabled` and `active` while having no next
+    /// elapse at all, in which case it never fires again. The unit
+    /// `start_systemd` writes carries only monotonic anchors - `OnBootSec=`,
+    /// already in the past on a host booted before the user manager, and
+    /// `OnUnitActiveSec=`, relative to a service activation a freshly
+    /// restarted user manager has no record of - and `Persistent=` does not
+    /// rescue it, because systemd.timer(5) scopes that setting to
+    /// `OnCalendar=`. The timer then settles into `active (elapsed)` with
+    /// `Trigger: n/a` permanently while `is-enabled` keeps succeeding, which
+    /// is why the status line went on claiming a healthy schedule for the
+    /// 31 hours sync was silently dead.
+    ///
+    /// Same shape as the Windows `launcher_problem`: a registration that
+    /// exists but cannot run, named so the status line can say so instead of
+    /// asserting health.
+    fn systemd_timer_problem() -> Option<String> {
+        let mut command = Command::new("systemctl");
+        command.args(["--user", "show", "pond-sync.timer"]);
+        for property in NEXT_ELAPSE_PROPERTIES {
+            command.arg(format!("--property={property}"));
+        }
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        next_elapse_missing(&String::from_utf8_lossy(&output.stdout)).then(|| {
+            "the timer has no next elapse and will never fire again \
+             (`systemctl --user list-timers` shows `NEXT: -`); run \
+             `systemctl --user start pond-sync.service` once to re-anchor it, \
+             or `pond schedule start` to re-register"
+                .to_string()
+        })
+    }
+
+    /// True when the next-elapse properties say the timer has no next elapse.
+    /// systemd renders an unset elapse as an empty value (realtime) or
+    /// `infinity` (monotonic); other versions print `0` or `n/a`. A healthy
+    /// monotonic timer answers with a duration - `2month 1w 10h 50min
+    /// 22.539762s` - so "not one of the sentinels" is the reading that holds
+    /// across versions and does not depend on parsing a duration format.
+    ///
+    /// Both properties must be missing before this says broken: a
+    /// monotonic-only timer legitimately leaves the realtime one empty. And a
+    /// systemctl that answered with neither property (older version, or a
+    /// unit it would not describe) returns false rather than crying wolf - an
+    /// absent measurement is not evidence of a dead timer.
+    fn next_elapse_missing(show: &str) -> bool {
+        let mut measured = false;
+        for line in show.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !NEXT_ELAPSE_PROPERTIES.contains(&key.trim()) {
+                continue;
+            }
+            measured = true;
+            if !matches!(value.trim(), "" | "0" | "n/a" | "infinity") {
+                return false;
+            }
+        }
+        measured
     }
 
     fn systemd_unit_dir() -> PathBuf {
@@ -981,6 +1054,45 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
+        /// Captured verbatim from `systemctl --user show` (systemd 259,
+        /// Ubuntu 24.04) on a timer carrying pond's exact generated body
+        /// after it elapsed with no anchor left: `systemctl status` shows
+        /// `Active: active (elapsed)` / `Trigger: n/a`, `list-timers` shows
+        /// `NEXT: -`, and `is-enabled` - the only thing the probe used to
+        /// look at - still answers `enabled`.
+        const SHOW_DEAD: &str = "LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=elapsed\n\
+             NextElapseUSecRealtime=\n\
+             NextElapseUSecMonotonic=infinity\n";
+
+        /// Same host, same command, a timer that will fire: the realtime
+        /// property is empty here too, so it alone cannot be the signal.
+        const SHOW_HEALTHY: &str = "LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=waiting\n\
+             NextElapseUSecRealtime=\n\
+             NextElapseUSecMonotonic=2month 1w 10h 50min 22.539762s\n";
+
+        #[test]
+        fn elapsed_timer_with_no_next_elapse_is_reported_broken() {
+            assert!(super::next_elapse_missing(SHOW_DEAD));
+        }
+
+        #[test]
+        fn waiting_timer_with_a_next_elapse_is_not_reported_broken() {
+            assert!(!super::next_elapse_missing(SHOW_HEALTHY));
+        }
+
+        #[test]
+        fn systemctl_that_names_neither_property_is_not_called_broken() {
+            // An older systemctl, or one that would not describe the unit:
+            // no measurement is not the same as a dead timer.
+            assert!(!super::next_elapse_missing(
+                "LoadState=loaded\nActiveState=active\n"
+            ));
+        }
+
         use super::*;
 
         const BIN: &str = "/usr/local/bin/pond";
