@@ -635,17 +635,93 @@ fn child_id(session_id: &str, task_prompt: &str) -> String {
 
 // -- Reading -------------------------------------------------------------------
 
-/// One message: its newest `chat_message` (a later copy can only add fields -
-/// the ACP tool content lands after the fact), every older distinct variant,
-/// and every node placing it.
+/// One message: the `chat_message` its highest `node_id` placement holds, every
+/// other distinct variant, and every node placing it.
 struct Collected {
     newest: Value,
-    newest_raw: String,
     newest_row_id: i64,
     first: NodeRef,
     variants: Vec<Value>,
     nodes: Vec<Value>,
     tool_states: Vec<Value>,
+}
+
+/// One message's copies as its nodes stream in, before the newest is known.
+struct Copies {
+    first: NodeRef,
+    /// Each distinct body: the raw text an identical copy matches without
+    /// parsing, the value, and the lowest `node_id` holding it.
+    bodies: Vec<(String, Value, i64)>,
+    placements: Vec<Placed>,
+    /// The placement with the highest `node_id`.
+    top: usize,
+}
+
+struct Placed {
+    node_id: i64,
+    row_id: i64,
+    body: usize,
+    placement: Value,
+}
+
+impl Copies {
+    fn place(&mut self, node: &NodeRef, body: usize, placement: Value) {
+        let lowest = &mut self.bodies[body].2;
+        *lowest = (*lowest).min(node.node_id);
+        if self
+            .placements
+            .get(self.top)
+            .is_none_or(|top| node.node_id > top.node_id)
+        {
+            self.top = self.placements.len();
+        }
+        self.placements.push(Placed {
+            node_id: node.node_id,
+            row_id: node.row_id,
+            body,
+            placement,
+        });
+    }
+
+    /// The highest `node_id` copy is the newest: node ids follow the writer's
+    /// allocation and survive a re-save, which renumbers `row_id`. Every
+    /// other body is a variant, ordered by the first node holding it; with
+    /// more than one body, each placement names its body as `variant` (0 for
+    /// the newest, `n` for `variants[n - 1]`).
+    fn finish(mut self) -> Collected {
+        let top = &self.placements[self.top];
+        let (newest_body, newest_row_id) = (top.body, top.row_id);
+        let mut others: Vec<usize> = (0..self.bodies.len())
+            .filter(|&body| body != newest_body)
+            .collect();
+        others.sort_by_key(|&body| self.bodies[body].2);
+        let mut tags = vec![0; self.bodies.len()];
+        for (position, &body) in others.iter().enumerate() {
+            tags[body] = position + 1;
+        }
+        let tagged = self.bodies.len() > 1;
+        let nodes = self
+            .placements
+            .into_iter()
+            .map(|placed| {
+                let mut placement = placed.placement;
+                if tagged {
+                    placement["variant"] = json!(tags[placed.body]);
+                }
+                placement
+            })
+            .collect();
+        let mut take = |body: usize| std::mem::take(&mut self.bodies[body].1);
+        let variants = others.iter().map(|&body| take(body)).collect();
+        Collected {
+            newest: take(newest_body),
+            newest_row_id,
+            first: self.first,
+            variants,
+            nodes,
+            tool_states: Vec::new(),
+        }
+    }
 }
 
 fn read_sessions(db: &Path, ids: &[String], tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>) {
@@ -918,14 +994,15 @@ impl SessionRead {
     }
 
     /// Fold every node in as it streams, so only distinct message bodies stay
-    /// resident: an identical copy of the newest known form only adds a
-    /// placement; anything else is parsed.
+    /// resident: an identical copy of a known body only adds a placement;
+    /// anything else is parsed.
     fn collect_nodes(
         &mut self,
         conn: &Connection,
         id: &str,
         location: &str,
     ) -> rusqlite::Result<()> {
+        let mut copies: BTreeMap<String, Copies> = BTreeMap::new();
         let mut stmt = conn.prepare_cached(&node_query(", metadata, chat_message"))?;
         let mut rows = stmt.query([id])?;
         while let Some(row) = rows.next()? {
@@ -934,17 +1011,19 @@ impl SessionRead {
             let chat_message: String = row.get(9)?;
             let node = NodeRef::from_row(row)?;
             let parsed = node.and_then(|node| {
-                let known = self
-                    .collected
-                    .get(&node.message_id)
-                    .is_some_and(|entry| entry.newest_raw == chat_message);
-                if known {
-                    return Some((node, None));
+                let known = copies.get(&node.message_id).and_then(|entry| {
+                    entry
+                        .bodies
+                        .iter()
+                        .position(|(raw, ..)| *raw == chat_message)
+                });
+                if let Some(body) = known {
+                    return Some((node, Ok(body)));
                 }
                 let message = serde_json::from_str::<Value>(&chat_message).ok()?;
-                Some((node, Some(message)))
+                Some((node, Err(message)))
             });
-            let Some((node, message)) = parsed else {
+            let Some((node, body)) = parsed else {
                 self.errors.push(AdapterError::schema(
                     NAME,
                     format!("{location}/node {node_id}"),
@@ -952,43 +1031,33 @@ impl SessionRead {
                 ));
                 continue;
             };
-            let placement = placement(&node, metadata.as_deref());
-            match (self.collected.get_mut(&node.message_id), message) {
-                (Some(entry), None) => {
-                    entry.newest_row_id = node.row_id;
-                    entry.nodes.push(placement);
-                }
-                (Some(entry), Some(message)) => {
-                    // A copy can differ only in key order and still be the
-                    // same value; only a real change is a variant.
-                    if entry.newest != message {
-                        let older = std::mem::replace(&mut entry.newest, message);
-                        if !entry.variants.contains(&older) {
-                            entry.variants.push(older);
-                        }
-                    }
-                    entry.newest_raw = chat_message;
-                    entry.newest_row_id = node.row_id;
-                    entry.nodes.push(placement);
-                }
-                (None, Some(message)) => {
-                    self.collected.insert(
-                        node.message_id.clone(),
-                        Collected {
-                            newest: message,
-                            newest_raw: chat_message,
-                            newest_row_id: node.row_id,
-                            first: node.clone(),
-                            variants: Vec::new(),
-                            nodes: vec![placement],
-                            tool_states: Vec::new(),
-                        },
-                    );
-                }
-                (None, None) => unreachable!("an unknown message is always parsed"),
-            }
+            let entry = copies
+                .entry(node.message_id.clone())
+                .or_insert_with(|| Copies {
+                    first: node.clone(),
+                    bodies: Vec::new(),
+                    placements: Vec::new(),
+                    top: 0,
+                });
+            let body = body.unwrap_or_else(|message| {
+                // A copy can differ only in key order and still be the same
+                // value; only a real change is a variant.
+                let known = entry
+                    .bodies
+                    .iter()
+                    .position(|(_, body, _)| *body == message);
+                known.unwrap_or_else(|| {
+                    entry.bodies.push((chat_message, message, node.node_id));
+                    entry.bodies.len() - 1
+                })
+            });
+            entry.place(&node, body, placement(&node, metadata.as_deref()));
             self.refs.push(node);
         }
+        self.collected = copies
+            .into_iter()
+            .map(|(message_id, entry)| (message_id, entry.finish()))
+            .collect();
         Ok(())
     }
 
@@ -1758,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_record_row_id_is_its_newest_placement() {
+    fn raw_record_row_id_is_its_highest_node_placement() {
         let read = macos();
         for message in read.messages.values().flatten() {
             let options = message.options();
@@ -1766,15 +1835,120 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter_map(|node| node["row_id"].as_i64())
-                .max()
+                .max_by_key(|node| node["node_id"].as_i64())
                 .unwrap();
             assert_eq!(
                 options["source"]["row_id"],
-                json!(newest),
+                newest["row_id"],
                 "{}",
                 message.id()
             );
+        }
+    }
+
+    /// System-prefix churn: one `message_id` whose content changes between
+    /// context rebuilds, with a partial re-save putting the older content at
+    /// the highest `row_id`. The highest `node_id` copy is the raw record
+    /// whatever the row order, every other body is a variant, and each
+    /// placement names the body it held.
+    #[test]
+    fn drifted_copies_keep_every_body_and_tag_each_placement() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        // The level-waterlily prefix message placed most often: at least three
+        // copies to split into drifted bodies.
+        let (message_id, nodes): (String, String) = conn
+            .query_row(
+                "SELECT chat_message ->> '$.message_id', group_concat(node_id)
+                 FROM (SELECT * FROM message_nodes WHERE session_id = 'level-waterlily'
+                       ORDER BY node_id)
+                 WHERE chat_message ->> '$.role' = 'system'
+                 GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let nodes: Vec<i64> = nodes.split(',').map(|id| id.parse().unwrap()).collect();
+        assert!(nodes.len() >= 3, "{nodes:?}");
+        let (lowest, middle, highest) = (nodes[0], nodes[1], nodes[nodes.len() - 1]);
+        let drift = |node_id: i64, content: &str| {
+            conn.execute(
+                "UPDATE message_nodes SET chat_message = json_set(chat_message, '$.content', ?2)
+                 WHERE session_id = 'level-waterlily' AND node_id = ?1",
+                rusqlite::params![node_id, content],
+            )
+            .unwrap();
+        };
+        drift(lowest, "prompt v1");
+        drift(middle, "prompt v2");
+        for &node_id in &nodes[2..] {
+            drift(node_id, "prompt v3");
+        }
+        // The partial re-save: the lowest node gets the newest row id.
+        conn.execute(
+            "UPDATE message_nodes SET row_id = (SELECT max(row_id) + 1 FROM message_nodes)
+             WHERE session_id = 'level-waterlily' AND node_id = ?1",
+            [lowest],
+        )
+        .unwrap();
+        drop(conn);
+
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let message = read.messages["level-waterlily"]
+            .iter()
+            .find(|message| message.id() == format!("level-waterlily:{message_id}"))
+            .unwrap();
+        let options = message.options();
+        assert_eq!(
+            options["source"]["raw_record"]["content"],
+            json!("prompt v3")
+        );
+        let variants: Vec<&Value> = options[NAME]["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| &variant["content"])
+            .collect();
+        assert_eq!(variants, [&json!("prompt v1"), &json!("prompt v2")]);
+        let tags: BTreeMap<i64, i64> = options[NAME]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                (
+                    node["node_id"].as_i64().unwrap(),
+                    node["variant"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        let expected: BTreeMap<i64, i64> = nodes
+            .iter()
+            .map(|&node_id| {
+                let tag = if node_id == lowest {
+                    1
+                } else if node_id == middle {
+                    2
+                } else {
+                    0
+                };
+                (node_id, tag)
+            })
+            .collect();
+        assert_eq!(tags, expected);
+        let placed = options[NAME]["nodes"].as_array().unwrap();
+        let top = placed.iter().find(|node| node["node_id"] == json!(highest));
+        assert_eq!(options["source"]["row_id"], top.unwrap()["row_id"]);
+
+        // A message with one body carries no tags.
+        for message in &read.messages["level-waterlily"] {
+            let options = message.options();
+            if options[NAME]["variants"].is_null() {
+                let nodes = options[NAME]["nodes"].as_array().unwrap();
+                assert!(nodes.iter().all(|node| node.get("variant").is_none()));
+            }
         }
     }
 
@@ -1782,7 +1956,6 @@ mod tests {
     fn tool_state_uses_only_results_and_unmatched_rows_stay_on_root() {
         let entry = |id: &str, newest: Value| Collected {
             newest,
-            newest_raw: String::new(),
             newest_row_id: 1,
             first: NodeRef {
                 row_id: 1,
