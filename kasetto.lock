@@ -14,7 +14,7 @@ skills:
     skill: lance-format
     description: Deep reference for Lance v13 columnar format, its Rust crates, and pylance - file encodings, table format, indexes, schema evolution, time travel. Use when building on the Lance crates or reading .lance datasets, not the LanceDB product.
     source: https://github.com/tenequm/skills
-    source_revision: ref:skills-1cf72df
+    source_revision: ref:skills-1f0f989
     scope: project
   https://github.com/tenequm/skills::mcp-best-practices:
     destination: .claude/skills/mcp-best-practices,.agents/skills/mcp-best-practices
@@ -22,14 +22,14 @@ skills:
     skill: mcp-best-practices
     description: Build, harden, and debug production MCP servers with the TypeScript SDK. Use when writing or reviewing an MCP server - transports, tool schemas, errors, OAuth, token bloat, SDK migrations, MCP Apps, Registry. Assumes a server already exists.
     source: https://github.com/tenequm/skills
-    source_revision: ref:skills-1cf72df
+    source_revision: ref:skills-1f0f989
     scope: project
   https://github.com/tenequm/skills::rust-dev:
     destination: .claude/skills/rust-dev,.agents/skills/rust-dev
-    hash: 0a03c226421917660b341917fc4f13cb94c69527132dcf02c48fd2059ff06c5c
+    hash: 021fea7bcb2923d8478df01305e8595fe6678f6f51c9495454ec52fef71ca2cf
     skill: rust-dev
     description: Day-1 guide to building well in Rust - ownership, errors as values, String vs &str, Box/Rc/Arc, anyhow vs thiserror, and a crate shortlist (tokio, serde, axum, sqlx). Use when starting a Rust project, fighting the borrow checker, or picking crates.
     source: https://github.com/tenequm/skills
-    source_revision: ref:skills-1cf72df
+    source_revision: ref:skills-1f0f989
     scope: project
 assets: {}
