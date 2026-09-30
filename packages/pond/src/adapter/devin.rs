@@ -889,8 +889,10 @@ fn read_session(
             location.clone(),
             format!(
                 "{} messages of the subagent trees rooted at nodes {:?} have no task \
-                 prompt to name their child session yet; they are held back and \
-                 this session re-reads on every sync until one does",
+                 prompt to name their child session yet, so they are held back and \
+                 this session re-reads on every sync; run `pond sync` again once the \
+                 subagent has started; if this persists, devin aborted the spawn, \
+                 and only these messages stay unstored (nothing else to do)",
                 forest.held, forest.held_trees
             ),
         );

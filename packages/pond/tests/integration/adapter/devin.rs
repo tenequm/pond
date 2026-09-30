@@ -64,6 +64,7 @@ const SIDEKICK_SESSIONS: usize = 3;
 const SIDEKICK_PARENT: &str = "third-hourglass";
 const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
 const SIDEKICK_MESSAGES: usize = 70;
+const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";
 
 fn conformance(root: &'static str, sessions: usize) -> Conformance<'static> {
     Conformance {
@@ -292,5 +293,49 @@ async fn a_sync_inside_a_sidekick_handoff_leaves_nothing_behind() -> anyhow::Res
     ensure_clean_ingest("devin", &plain_sync(&store, &cache, late.path()).await?)?;
     let (once, _guard) = ingest_into_temp_store(&DevinAdapter::new(late.path())).await?;
     anyhow::ensure!(messages(&contents(&store).await?) == messages(&contents(&once).await?));
+    Ok(())
+}
+
+/// Pins a known residual (docs/adapters/devin.md row 10). A sync landing
+/// after the explore subagent's parentless task prompt (186) and its prefix
+/// copy (187-188) but before that copy's prompt (189) holds the copy's two
+/// system messages back. The next sync names them, but they are older than
+/// what the child already stored, so it gates fresh and skips them; the
+/// child's next newer message or a full re-read (`pond sync --verify`)
+/// stores them.
+#[tokio::test(flavor = "multi_thread")]
+async fn released_held_messages_wait_for_a_newer_message_or_a_verify() -> anyhow::Result<()> {
+    let (early, late) = (sidekick_cut(188)?, sidekick_cut(189)?);
+    let (once, _guard) = ingest_into_temp_store(&DevinAdapter::new(late.path())).await?;
+    let once = contents(&once).await?;
+    let (full, _full_guard) = ingest_into_temp_store(&DevinAdapter::new(SIDEKICK_ROOT)).await?;
+    let full = contents(&full).await?;
+
+    for recover_with_newer in [false, true] {
+        let dir = TempDir::new()?;
+        let store = Store::open_local(dir.path().join("store")).await?;
+        let cache = dir.path().join("cache");
+        let held = plain_sync(&store, &cache, early.path()).await?;
+        anyhow::ensure!(held.dropped_events == 1, "the held-back error: {held:?}");
+        ensure_clean_ingest("devin", &plain_sync(&store, &cache, late.path()).await?)?;
+        let staged = contents(&store).await?;
+        let skipped: Vec<&String> = once[EXPLORE_CHILD]
+            .1
+            .keys()
+            .filter(|id| !staged[EXPLORE_CHILD].1.contains_key(*id))
+            .collect();
+        anyhow::ensure!(skipped.len() == 2, "{skipped:?}");
+
+        if recover_with_newer {
+            let root = Path::new(SIDEKICK_ROOT);
+            ensure_clean_ingest("devin", &plain_sync(&store, &cache, root).await?)?;
+            anyhow::ensure!(messages(&contents(&store).await?) == messages(&full));
+        } else {
+            let adapter = DevinAdapter::new(late.path());
+            let verify = ingest_adapter(&store, &adapter, &NoopOracle, |_| {}).await?;
+            ensure_clean_ingest("devin", &verify)?;
+            anyhow::ensure!(messages(&contents(&store).await?) == messages(&once));
+        }
+    }
     Ok(())
 }
