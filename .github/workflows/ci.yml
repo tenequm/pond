@@ -370,8 +370,8 @@ jobs:
       # NOT `kache daemon log`: at v0.14.2 its Windows branch shells out to
       # `Get-Content -Wait` (src/service.rs), which follows the file forever and
       # would hold the job to its 180 min timeout. Read the file instead - the
-      # auto-started daemon writes stderr next to its socket, and the socket
-      # defaults to <cache_dir>/daemon.sock.
+      # auto-started daemon writes stderr next to its socket, which lives in
+      # KACHE_RUNTIME_DIR (set per job by kache-action).
       #
       # continue-on-error is load-bearing under pwsh: GitHub appends an
       # `exit $LASTEXITCODE` check, so any non-zero kache exit would otherwise
