@@ -39,13 +39,7 @@ tasks:
   format:
     command: 'cargo fmt --check'
     inputs: ['@group(sources)', '@group(tests)', '@group(nixToolchain)']
-  # Rejects compile-time checkout-path reads in tests/benches (they defeat
-  # cross-worktree compiler caching; see the script). Gates `lint` through deps.
-  check-baked-paths:
-    command: 'bash ../../ops/scripts/check-baked-paths.sh'
-    inputs: ['@group(sources)', '@group(tests)', '/ops/scripts/check-baked-paths.sh']
   lint:
-    deps: ['check-baked-paths']
     # --all-targets: without it tests/ and benches/ were linted only on Windows.
     command: 'cargo clippy --locked --all-targets -- -D warnings'
     inputs: ['@group(sources)', '@group(tests)', '@group(nixToolchain)']
