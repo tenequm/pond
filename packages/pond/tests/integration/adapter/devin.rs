@@ -13,7 +13,7 @@ use std::path::Path;
 use pond::{
     adapter::{DevinAdapter, DevinFactory, NoopOracle},
     handlers::ingest_adapter,
-    sessions::{RowmapOracle, Store},
+    sessions::{IngestSummary, RowmapOracle, Store},
     wire::Session,
 };
 use serde_json::Value;
@@ -209,12 +209,6 @@ async fn a_sync_during_a_subagent_run_stores_what_a_later_sync_would() -> anyhow
 
     let (once, _guard) = ingest_into_temp_store(&stage("after")).await?;
     let (staged, once) = (contents(&staged).await?, contents(&once).await?);
-    let messages = |store: &Contents| -> Vec<(String, BTreeMap<String, Value>)> {
-        store
-            .iter()
-            .map(|(id, (_, messages))| (id.clone(), messages.clone()))
-            .collect()
-    };
     anyhow::ensure!(messages(&staged) == messages(&once));
     anyhow::ensure!(staged[MIDRUN_CHILD].0 == once[MIDRUN_CHILD].0);
 
@@ -231,6 +225,15 @@ async fn a_sync_during_a_subagent_run_stores_what_a_later_sync_would() -> anyhow
 }
 
 type Contents = BTreeMap<String, (Session, BTreeMap<String, Value>)>;
+
+/// Each session's messages alone: the root row's first-sync snapshot of
+/// unmatched tool state legitimately differs between sync histories.
+fn messages(store: &Contents) -> Vec<(&String, &BTreeMap<String, Value>)> {
+    store
+        .iter()
+        .map(|(id, (_, messages))| (id, messages))
+        .collect()
+}
 
 /// Every stored session row with each message's tool state.
 async fn contents(store: &Store) -> anyhow::Result<Contents> {
@@ -253,4 +256,41 @@ async fn contents(store: &Store) -> anyhow::Result<Contents> {
         out.insert(id, (stored.session, messages));
     }
     Ok(out)
+}
+
+/// A copy of the sidekick capture holding only its nodes up to `cut`: what a
+/// sync landing at that point of the write would read.
+fn sidekick_cut(cut: i64) -> anyhow::Result<TempDir> {
+    let dir = TempDir::new()?;
+    let db = dir.path().join("sessions.db");
+    std::fs::copy(Path::new(SIDEKICK_ROOT).join("sessions.db"), &db)?;
+    rusqlite::Connection::open(&db)?
+        .execute("DELETE FROM message_nodes WHERE node_id > ?1", [cut])?;
+    Ok(dir)
+}
+
+/// One plain `pond sync` of the data root into `store`, gated by what the
+/// store already holds.
+async fn plain_sync(store: &Store, cache: &Path, root: &Path) -> anyhow::Result<IngestSummary> {
+    store.ensure_rowmap(cache).await?;
+    let oracle = RowmapOracle(store.rowmap_snapshot());
+    ingest_adapter(store, &DevinAdapter::new(root), &oracle, |_| {}).await
+}
+
+/// A sync landing between the sidekick's parentless first brief (85) and its
+/// prefix copy's brief (88) holds nothing back, so the next sync leaves the
+/// store exactly as one sync after node 88 would.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sync_inside_a_sidekick_handoff_leaves_nothing_behind() -> anyhow::Result<()> {
+    let (early, late) = (sidekick_cut(87)?, sidekick_cut(88)?);
+    let dir = TempDir::new()?;
+    let (store, cache) = (
+        Store::open_local(dir.path().join("store")).await?,
+        dir.path().join("cache"),
+    );
+    ensure_clean_ingest("devin", &plain_sync(&store, &cache, early.path()).await?)?;
+    ensure_clean_ingest("devin", &plain_sync(&store, &cache, late.path()).await?)?;
+    let (once, _guard) = ingest_into_temp_store(&DevinAdapter::new(late.path())).await?;
+    anyhow::ensure!(messages(&contents(&store).await?) == messages(&contents(&once).await?));
+    Ok(())
 }

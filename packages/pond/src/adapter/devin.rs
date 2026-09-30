@@ -501,17 +501,19 @@ impl Forest {
 fn group_subagents(nodes: &[NodeRef]) -> Forest {
     let by_node: HashMap<i64, &NodeRef> = nodes.iter().map(|node| (node.node_id, node)).collect();
     let tree_of = tree_roots(&by_node);
-    let root = |node: &NodeRef| by_node[&tree_of[&node.node_id]];
     // The sidekick's live tree is rooted by a prefix no different from the
     // lead's (telemetry `unknown`); only the handoff brief it holds marks it.
-    let seeded_trees: HashSet<i64> = nodes
+    let handoff_trees: HashSet<i64> = nodes
         .iter()
-        .filter(|node| node.is_handoff || root(node).starts_subagent)
+        .filter(|node| node.is_handoff)
         .map(|node| tree_of[&node.node_id])
         .collect();
+    let seeded_trees: HashSet<i64> = tree_of
+        .values()
+        .copied()
+        .filter(|tree| handoff_trees.contains(tree) || by_node[tree].starts_subagent)
+        .collect();
     let seeded = |node: &NodeRef| seeded_trees.contains(&tree_of[&node.node_id]);
-    // The task prompt: a handoff brief, or a non-system node that is
-    // parentless or sits directly under a subagent prefix root.
     let task_prompt = |node: &NodeRef| {
         node.is_handoff
             || (!node.is_system
@@ -531,10 +533,9 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         .collect();
     let mut sets: HashMap<i64, i64> = HashMap::new();
     let mut first_tree: HashMap<&str, i64> = HashMap::new();
-    let mut persistent = None;
     for node in nodes.iter().filter(|node| seeded(node)) {
-        let tree = tree_of[&node.node_id];
         if !node.is_system && (!in_main.contains(node.message_id.as_str()) || task_prompt(node)) {
+            let tree = tree_of[&node.node_id];
             match first_tree.entry(node.message_id.as_str()) {
                 Entry::Occupied(entry) => union(&mut sets, *entry.get(), tree),
                 Entry::Vacant(entry) => {
@@ -542,13 +543,16 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
                 }
             }
         }
-        // One agent across every handoff, even one that shares no message
-        // with the others (devin starts a fresh chain when its head is gone).
-        if root(node).starts_persistent {
-            match persistent {
-                Some(first) => union(&mut sets, first, tree),
-                None => persistent = Some(tree),
-            }
+    }
+    // One agent across every handoff, even a tree that shares no message
+    // with the others yet: a fresh chain devin starts when its head is gone,
+    // or a brief written before its prefix copy.
+    let mut persistent = seeded_trees
+        .iter()
+        .filter(|&tree| handoff_trees.contains(tree) || by_node[tree].starts_persistent);
+    if let Some(&first) = persistent.next() {
+        for &tree in persistent {
+            union(&mut sets, first, tree);
         }
     }
 
@@ -559,17 +563,14 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
     // candidate wins and one arriving later (a later brief) cannot rename it.
     let mut names: HashMap<i64, (i64, &str)> = HashMap::new();
     let mut grouped_nodes = HashMap::new();
-    let mut group_trees: HashMap<i64, BTreeSet<i64>> = HashMap::new();
     for node in nodes {
         let (in_root, groups) = placed.entry(&node.message_id).or_default();
         if !seeded(node) {
             *in_root = true;
             continue;
         }
-        let tree = tree_of[&node.node_id];
-        let group = find(&sets, tree);
+        let group = find(&sets, tree_of[&node.node_id]);
         grouped_nodes.insert(node.node_id, group);
-        group_trees.entry(group).or_default().insert(tree);
         if !groups.contains(&group) {
             groups.push(group);
         }
@@ -601,7 +602,7 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
 
     let mut owners = HashMap::new();
     let mut held = 0;
-    let mut held_trees = BTreeSet::new();
+    let mut held_groups = HashSet::new();
     for (message, (in_root, groups)) in placed {
         if groups.is_empty() {
             continue;
@@ -621,10 +622,15 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         owned.dedup();
         if owned.is_empty() {
             held += 1;
-            held_trees.extend(groups.iter().flat_map(|group| &group_trees[group]));
+            held_groups.extend(groups);
         }
         owners.insert(message.to_owned(), owned);
     }
+    let mut held_trees: Vec<i64> = seeded_trees
+        .into_iter()
+        .filter(|&tree| held_groups.contains(&find(&sets, tree)))
+        .collect();
+    held_trees.sort_unstable();
     let children = valid.into_iter().map(|(name, _)| name.to_owned()).collect();
     Forest {
         owners,
@@ -632,7 +638,7 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         rejected,
         grouped_nodes,
         held,
-        held_trees: held_trees.into_iter().collect(),
+        held_trees,
         newest: Vec::new(),
     }
 }
@@ -2821,7 +2827,7 @@ mod tests {
         (node_id, parent): (i64, Option<i64>),
         (role, message_id, operation): (&str, &str, &str),
         at: i64,
-        extensions: Value,
+        extensions: &Value,
     ) {
         let created = DateTime::from_timestamp(1_790_719_200 + at, 0).unwrap();
         let chat_message = json!({
@@ -2848,12 +2854,10 @@ mod tests {
         .unwrap();
     }
 
-    fn handoff() -> Value {
-        json!({ "subagent/handoff": true })
-    }
-
-    fn link(agent: &str, head: i64) -> Value {
-        json!({ "subagent/agent_id": agent, "subagent/chain_node_id": head })
+    fn read_sidekick() -> Read {
+        let read = read(&Path::new(SIDEKICK).join(DB_FILE));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        read
     }
 
     /// The captured Local Fusion session: two sidekick handoffs, the second
@@ -2920,12 +2924,6 @@ mod tests {
         assert_eq!(read.sessions[SIDEKICK_CHILD], full.sessions[SIDEKICK_CHILD]);
         assert_eq!(read.sessions.len(), 3);
         assert!(placements(&read, SIDEKICK_CHILD).is_superset(&(94..=103).collect()));
-    }
-
-    fn read_sidekick() -> Read {
-        let read = read(&Path::new(SIDEKICK).join(DB_FILE));
-        assert!(read.errors.is_empty(), "{:?}", read.errors);
-        read
     }
 
     /// A sync at any point of either handoff stores a subset of what the
@@ -3023,112 +3021,103 @@ mod tests {
     /// A third handoff that starts fresh - its stored head gone, so its live
     /// tree and prefix copy share no message with the first two - is still
     /// the same agent: one child, the same name, its brief and report
-    /// inside, and its link heads accepted. A compaction continuing the live
-    /// tree stays in the child; the summarizer chain stays with the root.
+    /// inside, and its link heads accepted. That holds at every cut once a
+    /// fresh tree holds the brief, before its prefix copy exists and whether
+    /// or not a parentless brief comes first. A compaction continuing the
+    /// live tree stays in the child; the summarizer chain stays with the root.
     #[test]
     fn a_fresh_handoff_and_a_compaction_stay_in_the_one_sidekick_child() {
-        let temp = TempDir::new().unwrap();
-        let db = forged_sidekick(&temp, |conn| {
-            let none = json!({});
-            add_node(
-                conn,
-                (300, None),
-                ("system", "fresh-root", "unknown"),
-                0,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (301, Some(300)),
-                ("system", "fresh-model", "unknown"),
-                1,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (302, Some(301)),
-                ("user", "brief-3", "unknown"),
-                2,
-                handoff(),
-            );
-            add_node(
-                conn,
-                (303, Some(302)),
-                ("assistant", "report-3", "inference"),
+        let (none, brief) = (json!({}), json!({ "subagent/handoff": true }));
+        let link = json!({ "subagent/agent_id": "sidekick", "subagent/chain_node_id": 303 });
+        let forged = [
+            (299, None, "user", "brief-3", "unknown", 2, &brief),
+            (300, None, "system", "fresh-root", "unknown", 0, &none),
+            (301, Some(300), "system", "fresh-model", "unknown", 1, &none),
+            (302, Some(301), "user", "brief-3", "unknown", 2, &brief),
+            (
+                303,
+                Some(302),
+                "assistant",
+                "report-3",
+                "inference",
                 3,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (310, None),
-                ("system", "fresh-prefix", PERSISTENT_PREFIX),
+                &none,
+            ),
+            (
+                310,
+                None,
+                "system",
+                "fresh-prefix",
+                PERSISTENT_PREFIX,
                 0,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (311, Some(310)),
-                ("system", "fresh-model", "unknown"),
-                1,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (312, Some(311)),
-                ("user", "brief-3", "unknown"),
-                2,
-                handoff(),
-            );
-            add_node(
-                conn,
-                (320, Some(207)),
-                ("system", "done-3", "unknown"),
-                4,
-                link("sidekick", 303),
-            );
-            add_node(
-                conn,
-                (330, Some(94)),
-                ("system", "continuing", "unknown"),
-                5,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (331, Some(330)),
-                ("assistant", "after-compaction", "inference"),
+                &none,
+            ),
+            (311, Some(310), "system", "fresh-model", "unknown", 1, &none),
+            (312, Some(311), "user", "brief-3", "unknown", 2, &brief),
+            (320, Some(207), "system", "done-3", "unknown", 4, &link),
+            (330, Some(94), "system", "continuing", "unknown", 5, &none),
+            (
+                331,
+                Some(330),
+                "assistant",
+                "after-compaction",
+                "inference",
                 6,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (340, None),
-                ("system", "summarizer", "unknown"),
-                5,
-                none.clone(),
-            );
-            add_node(
-                conn,
-                (341, Some(340)),
-                ("user", "summarize-this", "unknown"),
+                &none,
+            ),
+            (340, None, "system", "summarizer", "unknown", 5, &none),
+            (
+                341,
+                Some(340),
+                "user",
+                "summarize-this",
+                "unknown",
                 6,
-                none,
-            );
-            conn.execute("UPDATE subagent_heads SET chain_node_id = 303", [])
-                .unwrap();
-        });
-        let read = read(&db);
-        assert!(read.errors.is_empty(), "{:?}", read.errors);
-        assert_eq!(read.sessions.len(), 3);
-        let child = placements(&read, SIDEKICK_CHILD);
-        for node in [300, 301, 302, 303, 310, 311, 312, 330, 331, 94, 178] {
-            assert!(child.contains(&node), "{node}");
+                &none,
+            ),
+        ];
+        for parentless_brief in [false, true] {
+            for cut in [299, 302, 312, 341] {
+                let written = |node_id: i64| node_id <= cut && (parentless_brief || node_id != 299);
+                let temp = TempDir::new().unwrap();
+                let db = forged_sidekick(&temp, |conn| {
+                    for (node_id, parent, role, message_id, operation, at, extensions) in forged {
+                        if written(node_id) {
+                            add_node(
+                                conn,
+                                (node_id, parent),
+                                (role, message_id, operation),
+                                at,
+                                extensions,
+                            );
+                        }
+                    }
+                    conn.execute("UPDATE subagent_heads SET chain_node_id = 303", [])
+                        .unwrap();
+                });
+                let case = format!("parentless brief {parentless_brief}, cut {cut}");
+                let read = read(&db);
+                assert!(read.errors.is_empty(), "{case}: {:?}", read.errors);
+                assert_eq!(read.sessions.len(), 3, "{case}: {:?}", read.sessions.keys());
+                let child = placements(&read, SIDEKICK_CHILD);
+                let sidekick = [299, 300, 301, 302, 303, 310, 311, 312, 330, 331];
+                for node in sidekick
+                    .into_iter()
+                    .filter(|&node| written(node))
+                    .chain([94, 178])
+                {
+                    assert!(child.contains(&node), "{case}: {node}");
+                }
+                let root = placements(&read, SIDEKICK_ROOT);
+                for node in [320, 340, 341].into_iter().filter(|&node| written(node)) {
+                    assert!(
+                        root.contains(&node) && !child.contains(&node),
+                        "{case}: {node}"
+                    );
+                }
+                assert_peek_matches_read(&db);
+            }
         }
-        let root = placements(&read, SIDEKICK_ROOT);
-        for node in [320, 340, 341] {
-            assert!(root.contains(&node) && !child.contains(&node), "{node}");
-        }
-        assert_peek_matches_read(&db);
     }
 
     /// A subagent tree nothing names is held back, never silently dropped:
@@ -3144,14 +3133,14 @@ mod tests {
                 (400, None),
                 ("system", "orphan-prefix", "subagent_general"),
                 0,
-                none.clone(),
+                &none,
             );
             add_node(
                 conn,
                 (401, Some(400)),
                 ("system", "orphan-model", "unknown"),
                 1,
-                none,
+                &none,
             );
         });
         let read = read(&db);
