@@ -22,7 +22,7 @@
 # uses PATH) is a separate, staged change.
 #
 # Versions are exact for the same reason every other tool in this repo is
-# pinned exactly (protoc, moon, kache): a floating '24' silently changes what
+# pinned exactly (protoc, moon): a floating '24' silently changes what
 # CI ran between two builds of the same commit.
 #
 # No python/uv toolchains. `unstable_python` provisions cleanly, but proto's uv

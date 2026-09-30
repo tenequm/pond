@@ -71,7 +71,6 @@
         uv = "0.12.13";
         node = "24.21.0";
         npm = "11.19.1";
-        kache = "0.22.0";
       };
 
       v = toolVersions;
@@ -132,20 +131,6 @@
           aarch64-darwin = {
             url = "https://nodejs.org/dist/v${v.node}/node-v${v.node}-darwin-arm64.tar.xz";
             hash = "sha256-YjnUz5LYZEh+yM02FQOPe2fn9Yt3shzS8J6p+9aAZf4=";
-          };
-        };
-        kache = {
-          x86_64-linux = {
-            url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-x86_64-unknown-linux-musl.tar.gz";
-            hash = "sha256-XjBmx+LyeSz0o2XSs66fUHeozSDSFjm5QiibIm5kkoo=";
-          };
-          aarch64-linux = {
-            url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-unknown-linux-musl.tar.gz";
-            hash = "sha256-XJXOGfXhJ39J/bdj9OiVlPL6FqrY5A+FkkgHvJs3+Xc=";
-          };
-          aarch64-darwin = {
-            url = "https://github.com/kunobi-ninja/kache/releases/download/v${v.kache}/kache-aarch64-apple-darwin.tar.gz";
-            hash = "sha256-WUg2Nyyr1K1qc4iPtBiWr1yT8W3uqMGwXATAaqnwoQI=";
           };
         };
         # npm is one tarball for every platform. node bundles an older npm than
@@ -254,14 +239,6 @@
             '';
           };
 
-          kache = prebuilt {
-            pname = "kache";
-            version = v.kache;
-            src = src "kache";
-            sourceRoot = ".";
-            installPhase = "install -Dm755 kache $out/bin/kache";
-          };
-
           nodejs = prebuilt {
             pname = "nodejs";
             version = v.node;
@@ -317,7 +294,6 @@
               protoc
               uv
               nodejs
-              kache
               pkgs.cmake
               pkgs.pkg-config
               # ops/scripts/*.sh and the dist build's patch-macos-sdk.py.
@@ -400,7 +376,7 @@
       # job: this shell is the single source of truth for the toolchain -
       # rust-toolchain.toml's rust, the cross-compile set (zig, cargo-zigbuild,
       # rcodesign, the SDK stubs) and the pinned user-space binaries (moon,
-      # protoc, uv, node/npm, kache). rustup is deliberately absent: it
+      # protoc, uv, node/npm). rustup is deliberately absent: it
       # would be a second Rust pin resolving against a different source. gh is
       # absent too: it is the host's GitHub client, and a shell copy first on
       # PATH would shadow whatever auth the host wires into its own gh.

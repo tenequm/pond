@@ -199,7 +199,8 @@ jobs:
       # carrying its own copies. This step keeps that text form honest: the
       # literals, plus rust-toolchain.toml's channel which is not repeated
       # there, must equal what the flake evaluates to. It does NOT cover
-      # windows-bootstrap's own moon/protoc/kache copies; the "lockstep"
+      # windows-bootstrap's own moon/protoc/kache copies or the kache pin in
+      # dist-build-unix; the "lockstep"
       # comments there are still the only guard for those.
       - name: toolVersions text extraction matches the evaluated attrset
         run: |
@@ -589,6 +590,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
       - uses: ./.github/actions/devshell
+
+      # kache is not in the flake devShell (a per-machine tool, and a repo pin
+      # that disagreed with developers' own daemons), so this job - the only
+      # Linux consumer, through RUSTC_WRAPPER in ops/scripts/build-dist.sh -
+      # installs its own pinned copy. Deliberately not kunobi-ninja/kache-action
+      # as on Windows: that action exports its own RUSTC_WRAPPER, KACHE_CACHE_DIR,
+      # manifest/namespace and daemon lifecycle, all of which would change how
+      # this release-only path behaves and cannot be exercised before a release.
+      # This puts the same static musl binary the flake used to build on PATH
+      # and nothing else. Bumped in lockstep with windows-bootstrap's kache-action
+      # `version` and the k-tag in the S3 prefixes, never alone.
+      - name: Install kache
+        env:
+          KACHE_RELEASE: 0.22.0
+        run: |
+          set -euo pipefail
+          asset="kache-$(uname -m)-unknown-linux-musl.tar.gz"
+          url="https://github.com/kunobi-ninja/kache/releases/download/v${KACHE_RELEASE}/${asset}"
+          dir="$RUNNER_TEMP/kache-bin"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$asset" "$url"
+          (cd "$dir" && curl -fsSL --retry 3 "$url.sha256" | awk -v a="$asset" '{ print $1 "  " a }' | sha256sum -c -)
+          tar -xzf "$dir/$asset" -C "$dir" kache
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/kache" --version
 
       # This job is the only caller that declares a kache remote, and the CLI
       # reads KACHE_S3_PREFIX ahead of the file. Assert the two agree, so the
