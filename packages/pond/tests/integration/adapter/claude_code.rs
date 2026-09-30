@@ -9,15 +9,14 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_code/projects"
-);
+fn fixture_root() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/claude_code/projects")
+}
 
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &ClaudeCodeFactory,
-        fixture_root: Path::new(FIXTURE_ROOT),
+        fixture_root: fixture_root(),
         // 10 top-level sessions plus the `pond` session's 3 subagent sidecars
         // (two direct, one workflow-nested), each a `claude-code/<type>` session.
         expected_sessions: 13,
@@ -43,10 +42,9 @@ async fn native_restore_round_trips_parents_and_subagents_through_reingest() -> 
 }
 
 /// Real native-Windows capture; see the fixture-gate test below.
-const WINDOWS_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_code/windows-projects"
-);
+fn windows_fixtures() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/claude_code/windows-projects")
+}
 
 /// The directory name Claude Code chose for the capture's `cwd`.
 const WINDOWS_SLUG: &str = "C--dev-pond-fixture-demo-v2";
@@ -66,7 +64,7 @@ const WINDOWS_CHILD_SUFFIX: &str = "agent-a44fd74de879ec6e2";
 async fn claude_code_fixtures_ingest_cleanly() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+    let adapter = ClaudeCodeAdapter::new(fixture_root());
 
     let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     assert_eq!(summary.dropped_events, 0);
@@ -92,7 +90,7 @@ async fn claude_code_fixtures_ingest_cleanly() -> anyhow::Result<()> {
 async fn ingest_is_idempotent_for_same_adapter() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+    let adapter = ClaudeCodeAdapter::new(fixture_root());
 
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     let first_counts = store.row_counts().await?;
@@ -113,7 +111,7 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+    let adapter = ClaudeCodeAdapter::new(fixture_root());
 
     let mut events: Vec<SyncEvent> = Vec::new();
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |event| {
@@ -154,7 +152,7 @@ async fn ingest_adapter_emits_discovered_then_session_done_for_each_session() ->
 async fn adapter_names_filters_subagents_by_default() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+    let adapter = ClaudeCodeAdapter::new(fixture_root());
     ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
 
     // `include_subagents=false` (the CLI default): sub-branded sessions
@@ -310,7 +308,7 @@ async fn windows_capture_ingests_its_native_cwd_and_restores_to_the_same_slug() 
 {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path()).await?;
-    let adapter = ClaudeCodeAdapter::new(WINDOWS_FIXTURES);
+    let adapter = ClaudeCodeAdapter::new(windows_fixtures());
 
     let summary = ingest_adapter(&store, &adapter, &pond::adapter::NoopOracle, |_| {}).await?;
     assert_eq!(summary.dropped_events, 0);
@@ -399,7 +397,7 @@ async fn windows_capture_without_cwd_falls_back_to_decoding_the_slug() -> anyhow
     let source = TempDir::new()?;
     let project = source.path().join(WINDOWS_SLUG);
     std::fs::create_dir_all(&project)?;
-    let captured = Path::new(WINDOWS_FIXTURES)
+    let captured = windows_fixtures()
         .join(WINDOWS_SLUG)
         .join(format!("{WINDOWS_PLAIN_SESSION}.jsonl"));
     let stripped: String = std::fs::read_to_string(&captured)?

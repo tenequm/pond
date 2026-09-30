@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Search stored messages.
 
 `--mode fts` (default) matches exact whole words (BM25); `--mode vector` matches on meaning and needs `[embeddings].enabled`. Put the distinctive words you expect in the conversation in the query; scope with `--project`, `--from-date`, and friends instead.

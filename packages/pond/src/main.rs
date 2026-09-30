@@ -8790,7 +8790,7 @@ mod tests {
             .render_long_help()
             .to_string()
             .replace(VERSION.as_str(), "[VERSION]");
-        insta::assert_snapshot!("help_root", root_help);
+        expect_test::expect_file!["snapshots/help_root.txt"].assert_eq(&root_help);
         let visible: Vec<String> = root
             .get_subcommands()
             .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")
@@ -8804,7 +8804,8 @@ mod tests {
             let sub = root
                 .find_subcommand_mut(&name)
                 .expect("visible subcommand exists");
-            insta::assert_snapshot!(format!("help_{name}"), sub.render_long_help().to_string());
+            expect_test::expect_file![format!("snapshots/help_{name}.txt")]
+                .assert_eq(&sub.render_long_help().to_string());
         }
     }
 

@@ -3,21 +3,18 @@
 //! (block -> Part, tool linkage, the `.zip` source form, synthetic ids) stays
 //! in the `src/adapter/claude_ai_export.rs` unit tests.
 
-use std::path::Path;
-
 use pond::adapter::ClaudeAiExportFactory;
 
 use super::{Conformance, RoundTrip, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_ai_export"
-);
+fn fixture_root() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/claude_ai_export")
+}
 
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &ClaudeAiExportFactory,
-        fixture_root: Path::new(FIXTURE_ROOT),
+        fixture_root: fixture_root(),
         // 5 conversations in the fixture export, minus the 0-message one.
         expected_sessions: 4,
         resync_rereads: &[],

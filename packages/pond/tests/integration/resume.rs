@@ -18,14 +18,12 @@ use std::path::Path;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-const PI_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/pi-coding-agent/sessions"
-);
-const CLAUDE_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_code/projects"
-);
+fn pi_fixtures() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/pi-coding-agent/sessions")
+}
+fn claude_fixtures() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/claude_code/projects")
+}
 
 /// A pi-origin v4 session that also has a child session in the same corpus, so
 /// one store covers native fidelity and lineage.
@@ -60,7 +58,7 @@ impl Sandbox {
     }
 
     async fn with_pi_corpus() -> Self {
-        Self::with(&PiCodingAgentAdapter::new(PI_FIXTURES)).await
+        Self::with(&PiCodingAgentAdapter::new(pi_fixtures())).await
     }
 
     /// The pi corpus copied INTO the sandbox and ingested from there, so a test
@@ -71,7 +69,7 @@ impl Sandbox {
             temp: TempDir::new().expect("temp dir"),
         };
         let sessions = sandbox.pi_agent_dir().join("sessions");
-        copy_tree(Path::new(PI_FIXTURES), &sessions);
+        copy_tree(&pi_fixtures(), &sessions);
         sandbox.ingest(&PiCodingAgentAdapter::new(&sessions)).await;
         sandbox
     }
@@ -83,7 +81,7 @@ impl Sandbox {
     }
 
     async fn with_claude_corpus() -> Self {
-        Self::with(&pond::adapter::ClaudeCodeAdapter::new(CLAUDE_FIXTURES)).await
+        Self::with(&pond::adapter::ClaudeCodeAdapter::new(claude_fixtures())).await
     }
 
     fn store_path(&self) -> std::path::PathBuf {
@@ -103,7 +101,7 @@ impl Sandbox {
     /// Run `pond resume ...` against this sandbox's store, in a sandboxed HOME
     /// so no real config or data dir is consulted. Returns (exit code, stdout).
     fn resume(&self, args: &[&str]) -> (i32, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_pond"))
+        let out = Command::new(crate::support::pond_bin())
             .arg("resume")
             .args(args)
             .arg("--storage-path")

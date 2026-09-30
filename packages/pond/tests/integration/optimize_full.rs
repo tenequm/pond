@@ -81,7 +81,7 @@ async fn plant_legacy_store(store_dir: &Path) {
 }
 
 fn pond(temp: &TempDir, args: &[&str]) -> String {
-    let out = assert_cmd::Command::new(env!("CARGO_BIN_EXE_pond"))
+    let out = assert_cmd::Command::new(crate::support::pond_bin())
         .arg("--storage-path")
         .arg(temp.path().join("store"))
         .args(args)

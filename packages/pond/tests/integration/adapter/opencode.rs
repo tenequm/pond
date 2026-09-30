@@ -28,15 +28,14 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/opencode"
-);
+fn fixture_root() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/opencode")
+}
 
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &OpencodeFactory,
-        fixture_root: Path::new(FIXTURE_ROOT),
+        fixture_root: fixture_root(),
         // 10 DB-resident sessions plus 4 legacy split-file-tree sessions; the
         // two source eras carry disjoint ids, so nothing is superseded.
         expected_sessions: 14,

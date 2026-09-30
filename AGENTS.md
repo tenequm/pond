@@ -48,6 +48,7 @@
 - Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
 - Run one test by name: `cargo test <name>` (substring match across all binaries; add `-- --exact` to require a full match).
+- Tests and benches read `CARGO_MANIFEST_DIR` and `CARGO_BIN_EXE_pond` at runtime (`manifest_dir()` / `pond_bin()` helpers), never `env!`: a compile-time read bakes the checkout path into the binary, so the kache compiler cache keys it per worktree and every new worktree recompiles it. `pond:check-baked-paths` (part of `pond:lint`) enforces it. Snapshots are `expect_test::expect_file!` plain files (`UPDATE_EXPECT=1 cargo test ...` rewrites them), because insta's macros expand `env!("CARGO_MANIFEST_DIR")` unconditionally.
 
 ## Testing interactive CLI flows
 

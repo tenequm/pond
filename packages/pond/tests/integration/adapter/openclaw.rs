@@ -826,13 +826,12 @@ async fn source_rewrite_re_syncs_additively_keeping_the_superset() -> anyhow::Re
 // 2026.7.1-2; the DB-era root in its own section further down is 2026.9.3. See
 // `tests/fixtures/README.md`, section `openclaw-captures`.
 
-const CAPTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/openclaw-captures"
-);
+fn captures() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/openclaw-captures")
+}
 
 fn capture(pass: &str) -> std::path::PathBuf {
-    Path::new(CAPTURES).join(pass)
+    captures().join(pass)
 }
 
 /// Every transcript in a captured root, by session id. A `.trajectory.jsonl`

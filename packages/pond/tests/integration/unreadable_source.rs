@@ -62,7 +62,7 @@ fn run(temp: &TempDir, args: &[&str]) -> Value {
     )
     .expect("write config");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_pond"))
+    let out = Command::new(crate::support::pond_bin())
         .args(args)
         .env("HOME", &home)
         .env("USERPROFILE", &home)

@@ -1865,7 +1865,9 @@ mod tests {
     use super::*;
     use crate::adapter::NoopOracle;
 
-    const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adapter/agy");
+    fn fixture_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/agy")
+    }
 
     const CLI_NO_WORKSPACE: &str = "109948f1-ce5f-4ece-bbe0-241cdb686b57";
     const CLI_TOOLS: &str = "3f72cf51-666b-4a7c-a08f-1ade2eaafa0f";
@@ -1944,7 +1946,7 @@ mod tests {
     }
 
     async fn fixture() -> Run {
-        let run = run(Path::new(FIXTURE_ROOT)).await;
+        let run = run(&fixture_root()).await;
         assert!(
             run.errors.is_empty(),
             "fixture ingest errors: {:?}",
@@ -1978,9 +1980,9 @@ mod tests {
 
     fn copy_fixture() -> TempDir {
         let temp = TempDir::new().unwrap();
-        for entry in walkdir::WalkDir::new(FIXTURE_ROOT) {
+        for entry in walkdir::WalkDir::new(fixture_root()) {
             let entry = entry.unwrap();
-            let relative = entry.path().strip_prefix(FIXTURE_ROOT).unwrap();
+            let relative = entry.path().strip_prefix(fixture_root()).unwrap();
             let target = temp.path().join(relative);
             if entry.file_type().is_dir() {
                 std::fs::create_dir_all(&target).unwrap();
@@ -2488,12 +2490,16 @@ mod tests {
                 .unwrap()
         };
         for id in [CLI_TOOLS, CLI_FORK, ACP_TOOL] {
-            let path = if id == ACP_TOOL {
-                format!("{FIXTURE_ROOT}/antigravity-acp/conversations/{id}.db")
+            let harness = if id == ACP_TOOL {
+                "antigravity-acp"
             } else {
-                format!("{FIXTURE_ROOT}/antigravity-cli/conversations/{id}.db")
+                "antigravity-cli"
             };
-            let conn = open_db(Path::new(&path)).unwrap();
+            let path = fixture_root()
+                .join(harness)
+                .join("conversations")
+                .join(format!("{id}.db"));
+            let conn = open_db(&path).unwrap();
             let source: HashMap<i64, Vec<u8>> = conn
                 .prepare("SELECT idx, step_payload FROM steps")
                 .unwrap()
@@ -2537,9 +2543,7 @@ mod tests {
     async fn the_watermark_equals_the_newest_message_so_resync_skips() {
         let run = fixture().await;
         for lane in Lane::ALL {
-            let dir = Path::new(FIXTURE_ROOT)
-                .join(lane.dir())
-                .join(CONVERSATIONS_DIR);
+            let dir = fixture_root().join(lane.dir()).join(CONVERSATIONS_DIR);
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("db") {

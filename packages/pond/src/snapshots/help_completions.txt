@@ -1,17 +1,12 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
-Probe and switch storage destinations.
+Generate shell completions.
 
-`check` probes a destination end-to-end; `use` switches the configured destination - a pointer change that moves no data. To copy data between stores use `pond copy`; to see where data lives and how big it is use `pond status`.
+Writes the completion script for the given shell to stdout.
 
-Usage: pond storage [OPTIONS] <COMMAND>
+Usage: pond completions [OPTIONS] <SHELL>
 
-Commands:
-  check  Probe a destination end-to-end
-  use    Switch the configured destination. Moves no data
-  help   Print this message or the help of the given subcommand(s)
+Arguments:
+  <SHELL>
+          [possible values: bash, elvish, fish, powershell, zsh]
 
 Options:
   -h, --help
@@ -36,6 +31,11 @@ Global options:
   -q, --quiet...
           Decrease logging verbosity
 
-Examples:
-  pond storage check s3+https://host/bucket/pond   probe a destination end-to-end
-  pond storage use s3+https://host/bucket/pond     probe, then switch the destination
+Install:
+  bash:  pond completions bash > ~/.local/share/bash-completion/completions/pond
+  zsh:   pond completions zsh > "${fpath[1]}/_pond"
+  fish:  pond completions fish > ~/.config/fish/completions/pond.fish
+  pwsh:  pond completions powershell > _pond.ps1, then dot-source it from $PROFILE
+         (needs an execution policy of RemoteSigned or looser)
+
+Homebrew and nix packages ship these pre-installed, as does the Windows zip.

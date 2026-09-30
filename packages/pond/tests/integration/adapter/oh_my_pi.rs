@@ -5,8 +5,6 @@
 //! carrier taxonomy, watermark math, the ingest-only restore refusal) stays in
 //! the `src/adapter/oh_my_pi.rs` unit tests.
 
-use std::path::Path;
-
 use pond::{
     adapter::{OhMyPiAdapter, OhMyPiFactory, SkipOracle},
     sessions::RowmapOracle,
@@ -15,10 +13,9 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/oh-my-pi/sessions"
-);
+fn fixture_root() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/oh-my-pi/sessions")
+}
 
 // 2 slot-fronted sessions + 1 legacy slot-less file, plus the artifacts
 // directory omp 17.3.4 writes: a `task` subagent and its own nested child.
@@ -28,7 +25,7 @@ const SLOT_FRONTED_SESSION: &str = "0a1b2c3d4e5f6071";
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &OhMyPiFactory,
-        fixture_root: Path::new(FIXTURE_ROOT),
+        fixture_root: fixture_root(),
         expected_sessions: FIXTURE_SESSIONS,
         resync_rereads: &[],
         round_trip: RoundTrip::IngestOnly,
@@ -54,7 +51,7 @@ async fn restore_is_declared_ingest_only() -> anyhow::Result<()> {
 /// The brand is omp's own, never borrowed from the pi codec it shares.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_omp_row_brands_itself_as_pi() -> anyhow::Result<()> {
-    let (store, _store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(FIXTURE_ROOT)).await?;
+    let (store, _store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(fixture_root())).await?;
 
     let as_pi = store
         .searchable_in_scope(&Predicate::Eq(
@@ -72,7 +69,7 @@ async fn no_omp_row_brands_itself_as_pi() -> anyhow::Result<()> {
 /// say WHY.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_rowmap_keys_the_slot_fronted_session_by_its_header_id() -> anyhow::Result<()> {
-    let (store, store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(FIXTURE_ROOT)).await?;
+    let (store, store_dir) = ingest_into_temp_store(&OhMyPiAdapter::new(fixture_root())).await?;
 
     store.ensure_rowmap(&store_dir.path().join("cache")).await?;
     let oracle = RowmapOracle(store.rowmap_snapshot());

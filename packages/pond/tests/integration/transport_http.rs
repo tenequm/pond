@@ -887,7 +887,7 @@ async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow:
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home)?;
     let serve = || {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pond"));
+        let mut command = std::process::Command::new(crate::support::pond_bin());
         command
             .arg("serve")
             .arg("--storage-path")

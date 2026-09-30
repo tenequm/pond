@@ -6,8 +6,6 @@
 //! native restore, the peek read budget) stays in the
 //! `src/adapter/grok_build.rs` unit tests.
 
-use std::path::Path;
-
 use pond::{
     adapter::{GrokBuildAdapter, GrokBuildFactory},
     wire::{Message, PartKind},
@@ -15,10 +13,9 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/grok-build/sessions"
-);
+fn fixture_root() -> std::path::PathBuf {
+    crate::support::manifest_dir().join("tests/fixtures/adapter/grok-build/sessions")
+}
 
 // 15 session dirs in the capture across three buckets (11 macOS, 1 hash-form
 // long-cwd, 2 Windows, 1 subagent child); the `no-updates` dir holds no
@@ -33,7 +30,7 @@ const SUBAGENT_CHILD: &str = "01a0355c-aead-7641-8548-7eebefb15237";
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &GrokBuildFactory,
-        fixture_root: Path::new(FIXTURE_ROOT),
+        fixture_root: fixture_root(),
         expected_sessions: FIXTURE_SESSIONS,
         resync_rereads: &[],
         round_trip: RoundTrip::Reingest { downgraded: &[] },
@@ -62,7 +59,8 @@ async fn native_restore_round_trips_through_reingest() -> anyhow::Result<()> {
 /// result body, per row 5 of the decision table).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_tool_session_reads_back_with_calls_keyed_to_results() -> anyhow::Result<()> {
-    let (store, _store_dir) = ingest_into_temp_store(&GrokBuildAdapter::new(FIXTURE_ROOT)).await?;
+    let (store, _store_dir) =
+        ingest_into_temp_store(&GrokBuildAdapter::new(fixture_root())).await?;
     let session = store.get_session(TOOLS).await?.expect("tools session");
 
     let mut calls = Vec::new();
@@ -107,7 +105,8 @@ async fn the_tool_session_reads_back_with_calls_keyed_to_results() -> anyhow::Re
 /// harness's brand-scope rules).
 #[tokio::test(flavor = "multi_thread")]
 async fn lineage_and_subagent_taxonomy_survive_the_store() -> anyhow::Result<()> {
-    let (store, _store_dir) = ingest_into_temp_store(&GrokBuildAdapter::new(FIXTURE_ROOT)).await?;
+    let (store, _store_dir) =
+        ingest_into_temp_store(&GrokBuildAdapter::new(fixture_root())).await?;
 
     let fork = store.get_session(FORK).await?.expect("fork");
     assert_eq!(fork.session.parent_session_id.as_deref(), Some(TOOLS));

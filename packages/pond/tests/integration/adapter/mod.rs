@@ -6,7 +6,7 @@
 //! per-adapter file.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pond::{
     adapter::{
@@ -77,7 +77,7 @@ pub(crate) enum RoundTrip {
 /// files.
 pub(crate) struct Conformance<'a> {
     pub(crate) factory: &'a dyn AdapterFactory,
-    pub(crate) fixture_root: &'a Path,
+    pub(crate) fixture_root: PathBuf,
     /// Sessions the store holds after a full-fixture ingest: importable
     /// sessions, not source files - empty sources don't count.
     pub(crate) expected_sessions: usize,
@@ -151,7 +151,7 @@ impl Conformance<'_> {
     }
 
     async fn ingest_fixture(&self) -> anyhow::Result<(Store, TempDir)> {
-        let adapter = self.open_at(self.fixture_root)?;
+        let adapter = self.open_at(&self.fixture_root)?;
         let store_dir = TempDir::new()?;
         let store = Store::open_local(store_dir.path()).await?;
         let summary = ingest_adapter(&store, adapter.as_ref(), &NoopOracle, |_| {}).await?;
@@ -282,7 +282,7 @@ impl Conformance<'_> {
     pub(crate) async fn assert_resync_is_noop(&self) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path().join("store")).await?;
-        let adapter = self.open_at(self.fixture_root)?;
+        let adapter = self.open_at(&self.fixture_root)?;
         let brand = self.factory.name();
 
         let first = ingest_adapter(&store, adapter.as_ref(), &NoopOracle, |_| {}).await?;
@@ -551,7 +551,8 @@ async fn assert_foreign_pair(
         "foreign restore must carry every non-System message ({snapshot_name})",
     );
 
-    insta::assert_snapshot!(snapshot_name, render_files(&files));
+    expect_test::expect_file![format!("snapshots/{snapshot_name}.txt")]
+        .assert_eq(&render_files(&files));
     Ok(())
 }
 

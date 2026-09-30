@@ -1212,7 +1212,7 @@ mod tests {
                 && !line.split_whitespace().take(4).any(|word| word == "mod")
         }
 
-        let adapter_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let adapter_dir = super::test_support::manifest_dir()
             .join("src")
             .join("adapter");
         let mut files = Vec::new();
@@ -1345,6 +1345,13 @@ pub(crate) mod test_support {
 
     use super::{Adapter, AdapterFactory, Env, NoopOracle, RestoreFidelity, SkipOracle};
     use crate::{handlers::ingest_adapter, sessions::Store};
+
+    /// Read at runtime: compile-time `env!` would bake the checkout path into
+    /// the test binary and defeat cross-worktree compiler caching.
+    #[allow(clippy::expect_used)]
+    pub(crate) fn manifest_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("run tests via cargo"))
+    }
 
     /// Oracle that makes every session gate as fresh.
     pub(crate) struct MaxWatermarkOracle;

@@ -1,12 +1,8 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
-Print the bundled SKILL.md - the agent-onboarding pointer for pond.
+Serve the MCP tools over stdio (for agent clients).
 
-The same file an agent loads as a skill, emitted to stdout so it stays in lockstep with the binary (no separate copy to drift).
+Equivalent to `pond serve --transport stdio`. Register once per client; the tools are pond_search, pond_get_session, pond_get_message, and pond_sql, with resources schema://pond, schema://pond-sql, and stats://pond.
 
-Usage: pond skill [OPTIONS]
+Usage: pond mcp [OPTIONS]
 
 Options:
   -h, --help
@@ -30,3 +26,7 @@ Global options:
 
   -q, --quiet...
           Decrease logging verbosity
+
+Examples:
+  claude mcp add -s user pond -- pond mcp    register in Claude Code
+  codex mcp add pond -- pond mcp             register in Codex CLI

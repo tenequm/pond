@@ -110,7 +110,7 @@ fn run(temp: &TempDir, args: &[&str]) -> std::process::Output {
     std::fs::create_dir_all(&home).expect("home");
     let state = temp.path().join("state");
     std::fs::create_dir_all(&state).expect("state");
-    Command::new(env!("CARGO_BIN_EXE_pond"))
+    Command::new(crate::support::pond_bin())
         .args(args)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -570,7 +570,7 @@ fn non_utf8_path_is_a_named_error_not_a_panic() {
     fleet_config(&temp, Healthy::EmptyDir);
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
-    let out = Command::new(env!("CARGO_BIN_EXE_pond"))
+    let out = Command::new(crate::support::pond_bin())
         .args(["sync", "claude-code", "--path"])
         .arg(std::ffi::OsString::from_vec(b"/tmp/pond-\xff".to_vec()))
         .env("HOME", &home)
@@ -892,8 +892,7 @@ fn dropped_events_are_attributed_to_their_adapter() {
 #[test]
 fn a_routine_validator_drop_is_recorded_but_never_warns() {
     let temp = TempDir::new().expect("temp");
-    let src =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/adapter/claude_desktop_app");
+    let src = crate::support::manifest_dir().join("tests/fixtures/adapter/claude_desktop_app");
     write_config(
         &temp,
         &format!(

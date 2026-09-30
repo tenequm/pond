@@ -265,7 +265,7 @@ lance-index = "12.0.0"
 rmcp = { version = "3.2.0", features = ["client"] }
 # Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
 rusqlite = { version = "0.40", features = ["bundled"] }
-insta = "1.47.2"
+expect-test = "1.5.1"
 tempfile = "3.25"
 # `test-util` for `#[tokio::test(start_paused = true)]` + `time::advance`: the
 # embedder's idle eviction keys on `tokio::time::Instant`, so its tests drive
