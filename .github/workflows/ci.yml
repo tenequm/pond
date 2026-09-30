@@ -322,7 +322,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k33
+          s3-prefix: kache/pond/windows-verify/k34
           # Test leg only, never dist-build-windows: a restored harness has
           # unresolved .pdb paths, so a failing test gets a weaker backtrace.
           # Worth ~3 min of link time here; not worth it on the leg whose
@@ -439,7 +439,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k33
+          s3-prefix: kache/pond/windows-dist/k34
 
       # Same reasoning as the sibling job: without this, moon serves the stored
       # hash and nothing is actually compiled or measured. Same `true`-not-`1`
@@ -580,7 +580,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond/linux-dist/k33
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k34
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache
@@ -605,13 +605,13 @@ jobs:
       # the k-tag in the S3 prefixes, never alone.
       - name: Install kache
         env:
-          KACHE_RELEASE: 0.22.0
+          KACHE_RELEASE: 0.28.1
         run: |
           set -euo pipefail
           arch=$(uname -m)
           case "$arch" in
-            x86_64) sha256=5e3066c7e2f2792cf4a365d2b3ae9f5077a8cd20d21639b942289b226e64928a ;;
-            aarch64) sha256=5c95ce19f5e1277f49fdb763f4e89594f2fa16aad8e40f85924807bc9b37f977 ;;
+            x86_64) sha256=68635a9f92ce5015a2c48c98b968d1b3707b6dbee0ca725e51d1671c9346f38f ;;
+            aarch64) sha256=b2110805eb24afe9b408e5b9a1e3d0584b7fdd0b79fe8cbe548ab29fbaf50176 ;;
             *) echo "no pinned kache for $arch" >&2; exit 1 ;;
           esac
           asset="kache-$arch-unknown-linux-musl.tar.gz"

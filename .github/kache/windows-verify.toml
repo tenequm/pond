@@ -22,7 +22,7 @@
 # silence exactly those. Credentials stay in env too - KACHE_S3_ACCESS_KEY and
 # KACHE_S3_SECRET_KEY come from repository secrets and never enter a file.
 #
-# Every key below exists unchanged through 0.22.0
+# Every key below exists unchanged through 0.28.1
 # (RemoteFileConfig). Full reasoning: docs/plans/2608-24-ci-caching-architecture.md.
 [cache.remote]
 type = "s3"
@@ -33,7 +33,7 @@ region = "nbg1"
 # rustc flags differ per unit), the bootstrap's bulk `--pull --all` pulls the
 # whole prefix so the prefix must hold only this job's artifacts, and the tag
 # keeps a rotation a sibling directory instead of a subtree - rotation IS the
-# remote GC. k33 = key schema 31 (kache's CACHE_KEY_VERSION, unchanged 0.17.0
-# through 0.22.0) plus one manual GC rotation, dropping the pre-Lance-12
-# artifacts from the bulk pull.
-prefix = "kache/pond/windows-verify/k33"
+# remote GC. k34 = key schema 32 (kache's CACHE_KEY_VERSION since 0.27.0); the
+# tag only moves forward, so it sits above k33, the schema-31 prefix that one
+# manual GC rotation had already moved past the schema number.
+prefix = "kache/pond/windows-verify/k34"
