@@ -14,9 +14,9 @@ use pond::{
     adapter::{DevinAdapter, DevinFactory, NoopOracle},
     handlers::ingest_adapter,
     sessions::{IngestSummary, RowmapOracle, Store},
-    wire::Session,
+    wire::{Message, Part, PartKind, Session},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, ensure_clean_ingest, ingest_into_temp_store, path_config};
@@ -336,6 +336,84 @@ async fn released_held_messages_wait_for_a_newer_message_or_a_verify() -> anyhow
             ensure_clean_ingest("devin", &verify)?;
             anyhow::ensure!(messages(&contents(&store).await?) == messages(&once));
         }
+    }
+    Ok(())
+}
+
+/// Every stored message with its stored parts, keyed by message id.
+async fn stored_parts(store: &Store) -> anyhow::Result<BTreeMap<String, (Message, Vec<Part>)>> {
+    let mut out = BTreeMap::new();
+    for id in store.session_ids().await? {
+        let stored = store
+            .get_session(&id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("{id} listed but not stored"))?;
+        for message in stored.messages {
+            out.insert(
+                message.message.id().to_owned(),
+                (message.message, message.parts),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// A store synced before images were read gains them on a full re-read
+/// (`pond sync --verify`): every stored message and part stays as it was,
+/// and each image lands as a File part after them. Part ids are keyed by
+/// ordinal and an already-stored id is skipped, so this holds only because
+/// images come after every other part.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_verify_reread_appends_images_after_the_stored_parts() -> anyhow::Result<()> {
+    let (store, _guard) = ingest_into_temp_store(&DevinAdapter::new(MACOS_ROOT)).await?;
+    let before = stored_parts(&store).await?;
+
+    let forged = TempDir::new()?;
+    let db = forged.path().join("sessions.db");
+    std::fs::copy(Path::new(MACOS_ROOT).join("sessions.db"), &db)?;
+    let conn = rusqlite::Connection::open(&db)?;
+    let images = [
+        ("4efb7e3f-b402-4e54-be24-f83d5771d2aa", 1),
+        ("520f2475-34a4-4c06-b0a4-082c7b1b32d1", 1),
+        ("f3e4968f-c6dc-4108-ad89-dfa3dac613d5", 2),
+    ];
+    for (message_id, count) in images {
+        let image =
+            json!({"width": 1, "height": 1, "base64_data": "aGk=", "mime_type": "image/png"});
+        conn.execute(
+            "UPDATE message_nodes SET chat_message = json_set(chat_message, '$.images', json(?1))
+             WHERE chat_message ->> '$.message_id' = ?2",
+            rusqlite::params![json!(vec![image; count]).to_string(), message_id],
+        )?;
+    }
+    drop(conn);
+    let summary = ingest_adapter(
+        &store,
+        &DevinAdapter::new(forged.path()),
+        &NoopOracle,
+        |_| {},
+    )
+    .await?;
+    ensure_clean_ingest("devin", &summary)?;
+
+    let after = stored_parts(&store).await?;
+    anyhow::ensure!(before.keys().eq(after.keys()), "the message set changed");
+    for (id, (message, parts)) in &before {
+        let (stored, now) = &after[id];
+        anyhow::ensure!(stored == message, "{id}: the stored message changed");
+        anyhow::ensure!(now.starts_with(parts), "{id}: a stored part changed");
+        let added = &now[parts.len()..];
+        let expected = images
+            .iter()
+            .find(|(message_id, _)| id == &format!("branch-candy:{message_id}"))
+            .map_or(0, |&(_, count)| count);
+        anyhow::ensure!(added.len() == expected, "{id}: {} parts added", added.len());
+        anyhow::ensure!(
+            added
+                .iter()
+                .all(|part| matches!(part.kind, PartKind::File { .. })),
+            "{id}: a non-File part was added"
+        );
     }
     Ok(())
 }
