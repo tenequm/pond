@@ -199,9 +199,8 @@ jobs:
       # carrying its own copies. This step keeps that text form honest: the
       # literals, plus rust-toolchain.toml's channel which is not repeated
       # there, must equal what the flake evaluates to. It does NOT cover
-      # windows-bootstrap's own moon/protoc/kache copies or the kache pin in
-      # dist-build-unix; the "lockstep"
-      # comments there are still the only guard for those.
+      # windows-bootstrap's own moon/protoc/kache copies or dist-build-unix's
+      # kache pin; the "lockstep" comments there are the only guard for those.
       - name: toolVersions text extraction matches the evaluated attrset
         run: |
           set -euo pipefail
@@ -599,19 +598,28 @@ jobs:
       # manifest/namespace and daemon lifecycle, all of which would change how
       # this release-only path behaves and cannot be exercised before a release.
       # This puts the same static musl binary the flake used to build on PATH
-      # and nothing else. Bumped in lockstep with windows-bootstrap's kache-action
-      # `version` and the k-tag in the S3 prefixes, never alone.
+      # and nothing else. The sha256s are pinned here, as the flake pinned them,
+      # rather than read from the release's own .sha256 sidecar: release assets
+      # are mutable, and this binary wraps every rustc call of a shipped build.
+      # Bumped in lockstep with windows-bootstrap's kache-action `version` and
+      # the k-tag in the S3 prefixes, never alone.
       - name: Install kache
         env:
           KACHE_RELEASE: 0.22.0
         run: |
           set -euo pipefail
-          asset="kache-$(uname -m)-unknown-linux-musl.tar.gz"
-          url="https://github.com/kunobi-ninja/kache/releases/download/v${KACHE_RELEASE}/${asset}"
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64) sha256=5e3066c7e2f2792cf4a365d2b3ae9f5077a8cd20d21639b942289b226e64928a ;;
+            aarch64) sha256=5c95ce19f5e1277f49fdb763f4e89594f2fa16aad8e40f85924807bc9b37f977 ;;
+            *) echo "no pinned kache for $arch" >&2; exit 1 ;;
+          esac
+          asset="kache-$arch-unknown-linux-musl.tar.gz"
           dir="$RUNNER_TEMP/kache-bin"
           mkdir -p "$dir"
-          curl -fsSL --retry 3 -o "$dir/$asset" "$url"
-          (cd "$dir" && curl -fsSL --retry 3 "$url.sha256" | awk -v a="$asset" '{ print $1 "  " a }' | sha256sum -c -)
+          curl -fsSL --retry 3 -o "$dir/$asset" \
+            "https://github.com/kunobi-ninja/kache/releases/download/v${KACHE_RELEASE}/${asset}"
+          echo "$sha256  $dir/$asset" | sha256sum -c -
           tar -xzf "$dir/$asset" -C "$dir" kache
           echo "$dir" >> "$GITHUB_PATH"
           "$dir/kache" --version
