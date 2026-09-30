@@ -912,8 +912,6 @@ pub(crate) fn empty_options() -> ProviderOptions {
 mod tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    use std::path::{Path, PathBuf};
-
     use tempfile::TempDir;
 
     use super::{RestoreFidelity, RestoredFile, validate_path_id, write_restored_files};
@@ -1090,16 +1088,6 @@ mod tests {
             "macro_rules!",
         ];
 
-        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("adapter dir is readable") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
         fn identifiers(text: &str) -> impl Iterator<Item = &str> {
             text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .filter(|ident| !ident.is_empty())
@@ -1216,7 +1204,7 @@ mod tests {
             .join("src")
             .join("adapter");
         let mut files = Vec::new();
-        rust_files(&adapter_dir, &mut files);
+        super::test_support::rust_files(&adapter_dir, &mut files);
         files.sort();
         let mut violations = Vec::new();
         let mut exempt_hits: Vec<usize> = vec![0; EXEMPT.len()];
@@ -1351,6 +1339,18 @@ pub(crate) mod test_support {
     #[allow(clippy::expect_used)]
     pub(crate) fn manifest_dir() -> PathBuf {
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("run tests via cargo"))
+    }
+
+    #[allow(clippy::expect_used)]
+    pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("source dir is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
     }
 
     /// Oracle that makes every session gate as fresh.
