@@ -48,7 +48,7 @@
 - Run one integration suite: `cargo test --test integration -- <module>::` (e.g. `... -- search::`).
 - Run one unit-test module: `cargo test --lib <module>::` (e.g. `... --lib sessions::tests::`).
 - Run one test by name: `cargo test <name>` (substring match across all binaries; add `-- --exact` to require a full match).
-- Tests and benches read `CARGO_MANIFEST_DIR` and `CARGO_BIN_EXE_pond` at runtime (`manifest_dir()` / `pond_bin()` helpers), never `env!`: a compile-time read bakes the checkout path into the binary, so the kache compiler cache keys it per worktree and every new worktree recompiles it. `pond:check-baked-paths` (part of `pond:lint`) enforces it. Snapshots are `expect_test::expect_file!` plain files (`UPDATE_EXPECT=1 cargo test ...` rewrites them), because insta's macros expand `env!("CARGO_MANIFEST_DIR")` unconditionally.
+- Never read the checkout path at compile time (`env!("CARGO_MANIFEST_DIR")`, `env!("CARGO_BIN_EXE_pond")`, ...): it bakes the path into the binary, so the kache compiler cache keys it per worktree and every new worktree recompiles it. Integration tests use cwd-relative fixture paths (cargo runs them from the package root; make one absolute with `std::path::absolute` before handing it to a spawned `pond`), lib unit tests use `manifest_dir()` (absolute, because `figment::Jail` tests change the process cwd), and the binary comes from `pond_bin()`. `pond:check-baked-paths` (part of `pond:lint`) enforces it. Snapshots are `expect_test::expect_file!` plain files (`UPDATE_EXPECT=1 cargo test ...` rewrites them), because insta's macros expand `env!("CARGO_MANIFEST_DIR")` unconditionally.
 
 ## Testing interactive CLI flows
 

@@ -4,13 +4,13 @@
 //! (protobuf decode, project chain, tool pairing, in-flight carriers, the
 //! freshness watermark) stays in the `src/adapter/agy.rs` unit tests.
 
+use std::path::Path;
+
 use pond::adapter::{AgyAdapter, AgyFactory};
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-fn fixture_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/agy")
-}
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/agy";
 
 // 13 conversation databases (10 CLI, 3 ACP); the never-prompted ACP one holds
 // no steps and ingests nothing.
@@ -23,7 +23,7 @@ const FORK_CHILD: &str = "3abd71a7-c181-48a7-a473-16f564089f7a";
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &AgyFactory,
-        fixture_root: fixture_root(),
+        fixture_root: Path::new(FIXTURE_ROOT),
         expected_sessions: FIXTURE_SESSIONS,
         resync_rereads: &[],
         round_trip: RoundTrip::IngestOnly,
@@ -51,7 +51,7 @@ async fn restore_is_declared_ingest_only() -> anyhow::Result<()> {
 /// session actually holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn subagent_and_fork_lineage_resolve_in_the_store() -> anyhow::Result<()> {
-    let (store, _guard) = ingest_into_temp_store(&AgyAdapter::new(fixture_root())).await?;
+    let (store, _guard) = ingest_into_temp_store(&AgyAdapter::new(FIXTURE_ROOT)).await?;
 
     let child = store
         .get_session(SUBAGENT_CHILD)

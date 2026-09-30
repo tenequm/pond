@@ -1684,12 +1684,10 @@ mod tests {
         let temp = TempDir::new()?;
         let (store, _) =
             ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
-        // pi relative paths embed the `sessions/` segment, so the corpus root is
-        // FIXTURES' parent, not FIXTURES itself.
-        let fixtures_dir = fixtures();
-        let corpus = fixtures_dir
-            .parent()
-            .expect("FIXTURES is nested under a corpus root");
+        // pi relative paths embed the `sessions/` segment, so they resolve
+        // against the corpus root above it.
+        let corpus = crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/pi-coding-agent");
 
         let mut replayed = std::collections::BTreeSet::new();
         for session_id in store.session_ids().await? {
@@ -1721,7 +1719,7 @@ mod tests {
             for file in std::fs::read_dir(dir?.path())? {
                 let path = file?.path();
                 if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-                    on_disk.insert(path.strip_prefix(corpus)?.to_path_buf());
+                    on_disk.insert(path.strip_prefix(&corpus)?.to_path_buf());
                 }
             }
         }
@@ -2399,16 +2397,14 @@ mod tests {
 
     // -- harness-v2: SQLite backend ------------------------------------------
 
-    fn sqlite_db() -> std::path::PathBuf {
-        crate::adapter::test_support::manifest_dir()
-            .join("tests/fixtures/adapter/pi-coding-agent/sqlite/pi-sessions.sqlite")
-    }
-
     fn sqlite_only_adapter(temp: &TempDir) -> anyhow::Result<PiCodingAgentAdapter> {
         // An empty JSONL root so the test exercises just the database half.
         let root = temp.path().join("empty-sessions");
         std::fs::create_dir_all(&root)?;
-        Ok(PiCodingAgentAdapter::new(root).with_sqlite(sqlite_db()))
+        Ok(PiCodingAgentAdapter::new(root).with_sqlite(
+            crate::adapter::test_support::manifest_dir()
+                .join("tests/fixtures/adapter/pi-coding-agent/sqlite/pi-sessions.sqlite"),
+        ))
     }
 
     #[tokio::test(flavor = "multi_thread")]

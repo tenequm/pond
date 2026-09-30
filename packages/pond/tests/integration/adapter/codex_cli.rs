@@ -7,6 +7,8 @@
 //! value-equal native restore) stays in the `src/adapter/codex_cli.rs` unit
 //! tests.
 
+use std::path::Path;
+
 use pond::{
     adapter::{CodexCliAdapter, CodexCliFactory},
     wire::{Message, PartKind},
@@ -14,9 +16,7 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-fn fixture_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/codex_cli/sessions")
-}
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/codex_cli/sessions";
 
 const FIXTURE_SESSIONS: usize = 4;
 /// The Codex 0.152 `codex exec` capture (census in the fixture README).
@@ -25,7 +25,7 @@ const JS_RUNTIME: &str = "01a05e4f-6011-7b73-b3cf-742c36deb501";
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &CodexCliFactory,
-        fixture_root: fixture_root(),
+        fixture_root: Path::new(FIXTURE_ROOT),
         expected_sessions: FIXTURE_SESSIONS,
         resync_rereads: &[],
         round_trip: RoundTrip::Reingest { downgraded: &[] },
@@ -55,7 +55,7 @@ async fn native_restore_round_trips_through_reingest() -> anyhow::Result<()> {
 /// where a command exited non-zero - including inside a multi-command script.
 #[tokio::test(flavor = "multi_thread")]
 async fn js_runtime_calls_read_back_named_with_commands_and_verdicts() -> anyhow::Result<()> {
-    let (store, _store_dir) = ingest_into_temp_store(&CodexCliAdapter::new(fixture_root())).await?;
+    let (store, _store_dir) = ingest_into_temp_store(&CodexCliAdapter::new(FIXTURE_ROOT)).await?;
     let session = store
         .get_session(JS_RUNTIME)
         .await?

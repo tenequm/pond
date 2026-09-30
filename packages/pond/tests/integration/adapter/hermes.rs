@@ -18,9 +18,7 @@ use pond::{
 };
 use tempfile::TempDir;
 
-fn fixture_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/hermes")
-}
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/hermes";
 
 // 6 sessions in the default `state.db` + 1 in `profiles/coder/state.db`.
 const FIXTURE_SESSIONS: usize = 7;
@@ -38,7 +36,7 @@ async fn ingest(root: &Path) -> anyhow::Result<(Store, TempDir)> {
 /// the hermes main scope is searchable (the FTS/index path ran end to end).
 #[tokio::test(flavor = "multi_thread")]
 async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
-    let (store, _guard) = ingest(&fixture_root()).await?;
+    let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
 
     let ids = store.session_ids().await?;
     assert_eq!(
@@ -90,7 +88,7 @@ async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
 /// `options.hermes` distinguishes the three hermes edge kinds.
 #[tokio::test(flavor = "multi_thread")]
 async fn lineage_relations_and_parents_are_preserved() -> anyhow::Result<()> {
-    let (store, _guard) = ingest(&fixture_root()).await?;
+    let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
 
     let relation = |session: &pond::sessions::SessionWithMessages| {
         session
@@ -128,7 +126,7 @@ async fn lineage_relations_and_parents_are_preserved() -> anyhow::Result<()> {
 /// for a non-gateway (cli) session that has neither key nor chat_id.
 #[tokio::test(flavor = "multi_thread")]
 async fn project_uses_session_key_then_cwd() -> anyhow::Result<()> {
-    let (store, _guard) = ingest(&fixture_root()).await?;
+    let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
 
     let root = store.get_session("sess-root").await?.expect("root");
     assert_eq!(&*root.session.project, "telegram:100:main");
@@ -143,7 +141,7 @@ async fn project_uses_session_key_then_cwd() -> anyhow::Result<()> {
 /// File Part, and the tool call/result pair links through the store.
 #[tokio::test(flavor = "multi_thread")]
 async fn multimodal_and_tool_parts_survive_the_store() -> anyhow::Result<()> {
-    let (store, _guard) = ingest(&fixture_root()).await?;
+    let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
     let root = store.get_session("sess-root").await?.expect("root");
 
     let has_image = root.messages.iter().any(|stored| {
@@ -182,7 +180,7 @@ async fn multimodal_and_tool_parts_survive_the_store() -> anyhow::Result<()> {
 async fn re_sync_skips_fresh_and_is_additive() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path().join("store")).await?;
-    let adapter = HermesAdapter::new(fixture_root());
+    let adapter = HermesAdapter::new(FIXTURE_ROOT);
 
     let first = ingest_adapter(&store, &adapter, &NoopOracle, |_| {}).await?;
     assert!(first.sessions_inserted > 0, "first sync ingests the corpus");

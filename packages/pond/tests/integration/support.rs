@@ -7,13 +7,9 @@ use std::{
 };
 use tempfile::TempDir;
 
-/// Read at runtime: compile-time `env!` would bake the checkout path into the
-/// test binary and defeat cross-worktree compiler caching.
-pub(crate) fn manifest_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("run tests via cargo"))
-}
-
-/// The compiled `pond` binary, read at runtime for the same caching reason.
+/// The compiled `pond` binary, read at runtime: a compile-time `env!` would
+/// bake the checkout path into the test binary and defeat cross-worktree
+/// compiler caching.
 pub(crate) fn pond_bin() -> PathBuf {
     PathBuf::from(std::env::var_os("CARGO_BIN_EXE_pond").expect("run tests via cargo"))
 }

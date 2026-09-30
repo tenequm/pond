@@ -1783,8 +1783,8 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    // `FIXTURES` is the legacy split-file tree (used to exercise the tree path in
-    // isolation); `DATA_DIR` is the opencode data dir holding BOTH the DB and the
+    // `fixtures()` is the legacy split-file tree (used to exercise the tree path in
+    // isolation); `data_dir()` is the opencode data dir holding BOTH the DB and the
     // tree beside it.
     fn fixtures() -> std::path::PathBuf {
         crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/opencode/storage")
@@ -2369,7 +2369,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn opencode_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyhow::Result<()> {
-        // DATA_DIR ingests BOTH sources (the DB plus the tree beside it).
+        // `data_dir()` ingests BOTH sources (the DB plus the tree beside it).
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
         let adapter = OpencodeAdapter::new(data_dir());

@@ -249,7 +249,9 @@ fn repo_root() -> Result<PathBuf> {
         return Ok(PathBuf::from(top_level));
     }
     // packages/pond -> repo root, for a checkout git cannot read.
-    Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("run via cargo bench"))
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .context("CARGO_MANIFEST_DIR unset: run via cargo bench")?;
+    Path::new(&manifest_dir)
         .ancestors()
         .nth(2)
         .map(Path::to_path_buf)

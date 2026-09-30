@@ -18,12 +18,8 @@ use std::path::Path;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-fn pi_fixtures() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/pi-coding-agent/sessions")
-}
-fn claude_fixtures() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/claude_code/projects")
-}
+const PI_FIXTURES: &str = "tests/fixtures/adapter/pi-coding-agent/sessions";
+const CLAUDE_FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 /// A pi-origin v4 session that also has a child session in the same corpus, so
 /// one store covers native fidelity and lineage.
@@ -58,7 +54,7 @@ impl Sandbox {
     }
 
     async fn with_pi_corpus() -> Self {
-        Self::with(&PiCodingAgentAdapter::new(pi_fixtures())).await
+        Self::with(&PiCodingAgentAdapter::new(PI_FIXTURES)).await
     }
 
     /// The pi corpus copied INTO the sandbox and ingested from there, so a test
@@ -69,7 +65,7 @@ impl Sandbox {
             temp: TempDir::new().expect("temp dir"),
         };
         let sessions = sandbox.pi_agent_dir().join("sessions");
-        copy_tree(&pi_fixtures(), &sessions);
+        copy_tree(Path::new(PI_FIXTURES), &sessions);
         sandbox.ingest(&PiCodingAgentAdapter::new(&sessions)).await;
         sandbox
     }
@@ -81,7 +77,7 @@ impl Sandbox {
     }
 
     async fn with_claude_corpus() -> Self {
-        Self::with(&pond::adapter::ClaudeCodeAdapter::new(claude_fixtures())).await
+        Self::with(&pond::adapter::ClaudeCodeAdapter::new(CLAUDE_FIXTURES)).await
     }
 
     fn store_path(&self) -> std::path::PathBuf {

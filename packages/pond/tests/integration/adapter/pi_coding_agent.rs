@@ -12,9 +12,7 @@ use serde_json::{Value, json};
 
 use super::{Conformance, RoundTrip};
 
-fn fixture_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/pi-coding-agent")
-}
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/pi-coding-agent";
 
 /// pi's config face: the JSONL sessions root plus an optional SQLite database.
 /// The database is declared only where it exists, because a `Reingest` restore
@@ -31,7 +29,7 @@ fn pi_config(root: &Path) -> Value {
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &PiCodingAgentFactory,
-        fixture_root: fixture_root(),
+        fixture_root: Path::new(FIXTURE_ROOT),
         // 4 v3 files + 2 v4 files + 2 SQLite sessions.
         expected_sessions: 8,
         // Both end on a `lane` / `fact` mutation, which carries no timestamp,

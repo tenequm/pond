@@ -5,6 +5,8 @@
 //! watermark, carriers, value-equal native restore, foreign reconstruction)
 //! stays in the `src/adapter/letta_code.rs` unit tests.
 
+use std::path::Path;
+
 use pond::{
     adapter::{LettaCodeAdapter, LettaCodeFactory},
     wire::{Message, PartKind},
@@ -12,9 +14,7 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-fn fixture_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/letta-code/transcripts")
-}
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/letta-code/transcripts";
 
 // Three agents: three conversations under the first (one of them the synthetic
 // legacy shape), one under the second, one under the Windows-captured third;
@@ -25,7 +25,7 @@ const AGENT_A: &str = "agent-local-0ce90846-9803-4ab1-8d67-31baacdd5148";
 fn conformance() -> Conformance<'static> {
     Conformance {
         factory: &LettaCodeFactory,
-        fixture_root: fixture_root(),
+        fixture_root: Path::new(FIXTURE_ROOT),
         expected_sessions: FIXTURE_SESSIONS,
         resync_rereads: &[],
         round_trip: RoundTrip::Reingest { downgraded: &[] },
@@ -54,8 +54,7 @@ async fn native_restore_round_trips_through_reingest() -> anyhow::Result<()> {
 /// reader of this corpus depends on.
 #[tokio::test(flavor = "multi_thread")]
 async fn tool_rows_and_reasoning_read_back_from_the_store() -> anyhow::Result<()> {
-    let (store, _store_dir) =
-        ingest_into_temp_store(&LettaCodeAdapter::new(fixture_root())).await?;
+    let (store, _store_dir) = ingest_into_temp_store(&LettaCodeAdapter::new(FIXTURE_ROOT)).await?;
     let session = store
         .get_session(&format!("{AGENT_A}+default"))
         .await?

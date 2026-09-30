@@ -1404,11 +1404,9 @@ mod tests {
         crate::adapter::test_support::assert_native_restore(
             &CodexCliFactory,
             &adapter,
-            // Codex rollout paths embed the `sessions/` segment, so the corpus
-            // root is FIXTURES' parent, not FIXTURES itself.
-            fixtures()
-                .parent()
-                .expect("FIXTURES is nested under a corpus root"),
+            // Codex rollout paths embed the `sessions/` segment, so restore
+            // compares against the corpus root above it.
+            &crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/codex_cli"),
         )
         .await
     }

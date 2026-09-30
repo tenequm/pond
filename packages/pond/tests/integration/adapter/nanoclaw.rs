@@ -21,12 +21,8 @@ use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
 
-fn fixture_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/nanoclaw")
-}
-fn opencode_db_fixture() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/opencode/opencode.db")
-}
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/nanoclaw";
+const OPENCODE_DB_FIXTURE: &str = "tests/fixtures/adapter/opencode/opencode.db";
 
 // The committed fixture corpus: 3 top-level transcripts (anon main + 2 synthetic
 // mains) and 5 subagent sidecars (anon 1, synthetic 503d... 1, synthetic bebe...
@@ -51,7 +47,7 @@ async fn ingest(root: &Path) -> anyhow::Result<(Store, TempDir)> {
 /// searchable (the FTS/index path ran end to end).
 #[tokio::test(flavor = "multi_thread")]
 async fn full_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
-    let (store, _guard) = ingest(&fixture_root()).await?;
+    let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
 
     let ids = store.session_ids().await?;
     assert_eq!(
@@ -136,7 +132,7 @@ async fn opencode_provider_sessions_are_composed_and_reattributed() -> anyhow::R
         .join("opencode-xdg")
         .join("opencode");
     std::fs::create_dir_all(&xdg)?;
-    std::fs::copy(opencode_db_fixture(), xdg.join("opencode.db"))?;
+    std::fs::copy(OPENCODE_DB_FIXTURE, xdg.join("opencode.db"))?;
 
     // v2.db: the container session is an opencode-provider session; its join
     // metadata (channel, model, provider) enriches options.nanoclaw.
@@ -285,7 +281,7 @@ async fn codex_provider_sessions_are_visibly_skipped() -> anyhow::Result<()> {
 async fn re_sync_skips_fresh_and_is_additive() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let store = Store::open_local(temp.path().join("store")).await?;
-    let adapter = NanoclawAdapter::new(fixture_root());
+    let adapter = NanoclawAdapter::new(FIXTURE_ROOT);
 
     let first = ingest_adapter(&store, &adapter, &NoopOracle, |_| {}).await?;
     assert!(first.sessions_inserted > 0, "first sync ingests the corpus");

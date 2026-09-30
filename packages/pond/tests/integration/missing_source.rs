@@ -892,7 +892,8 @@ fn dropped_events_are_attributed_to_their_adapter() {
 #[test]
 fn a_routine_validator_drop_is_recorded_but_never_warns() {
     let temp = TempDir::new().expect("temp");
-    let src = crate::support::manifest_dir().join("tests/fixtures/adapter/claude_desktop_app");
+    let src = std::path::absolute("tests/fixtures/adapter/claude_desktop_app")
+        .expect("absolute fixture path");
     write_config(
         &temp,
         &format!(

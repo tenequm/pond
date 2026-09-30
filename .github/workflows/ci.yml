@@ -131,7 +131,7 @@ jobs:
       - run: >
           moon ci
           repo:check-changelog
-          pond:check-package pond:format pond:lint pond:test
+          pond:check-package pond:check-baked-paths pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
           hermes-pond:test

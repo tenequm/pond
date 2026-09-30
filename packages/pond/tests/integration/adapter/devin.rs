@@ -7,7 +7,7 @@
 //! stays in the `src/adapter/devin.rs` unit tests.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::Path;
 
 use pond::{
     adapter::{DevinAdapter, DevinFactory, NoopOracle},
@@ -20,12 +20,8 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, ensure_clean_ingest, ingest_into_temp_store, path_config};
 
-fn macos_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/devin/macos/cli")
-}
-fn windows_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/devin/windows/cli")
-}
+const MACOS_ROOT: &str = "tests/fixtures/adapter/devin/macos/cli";
+const WINDOWS_ROOT: &str = "tests/fixtures/adapter/devin/windows/cli";
 
 // 5 sessions rows plus 3 subagent children (one in amplified-color, two in
 // chalk-twig); the fork power-almandine copies a subagent link but no
@@ -42,17 +38,15 @@ const FORK: &str = "power-almandine";
 // link row yet), `after` once it reported back, two compactions and a
 // whole-forest re-save later. `after` holds 69 distinct messages, each placed
 // in either the root's trees or the subagent's, so 69 messages are stored.
-fn midrun_root() -> std::path::PathBuf {
-    crate::support::manifest_dir().join("tests/fixtures/adapter/devin/midrun")
-}
+const MIDRUN_ROOT: &str = "tests/fixtures/adapter/devin/midrun";
 const MIDRUN_PARENT: &str = "gilded-orca";
 const MIDRUN_CHILD: &str = "gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004";
 const MIDRUN_MESSAGES: usize = 69;
 
-fn conformance(root: PathBuf, sessions: usize) -> Conformance<'static> {
+fn conformance(root: &'static str, sessions: usize) -> Conformance<'static> {
     Conformance {
         factory: &DevinFactory,
-        fixture_root: root,
+        fixture_root: Path::new(root),
         expected_sessions: sessions,
         resync_rereads: &[],
         round_trip: RoundTrip::IngestOnly,
@@ -62,31 +56,31 @@ fn conformance(root: PathBuf, sessions: usize) -> Conformance<'static> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn macos_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
-    conformance(macos_root(), MACOS_SESSIONS)
+    conformance(MACOS_ROOT, MACOS_SESSIONS)
         .assert_ingest_counts_and_searchable()
         .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn windows_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
-    conformance(windows_root(), WINDOWS_SESSIONS)
+    conformance(WINDOWS_ROOT, WINDOWS_SESSIONS)
         .assert_ingest_counts_and_searchable()
         .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
-    conformance(macos_root(), MACOS_SESSIONS)
+    conformance(MACOS_ROOT, MACOS_SESSIONS)
         .assert_resync_is_noop()
         .await?;
-    conformance(windows_root(), WINDOWS_SESSIONS)
+    conformance(WINDOWS_ROOT, WINDOWS_SESSIONS)
         .assert_resync_is_noop()
         .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn restore_is_declared_ingest_only() -> anyhow::Result<()> {
-    conformance(macos_root(), MACOS_SESSIONS)
+    conformance(MACOS_ROOT, MACOS_SESSIONS)
         .assert_round_trip()
         .await
 }
@@ -96,7 +90,7 @@ async fn restore_is_declared_ingest_only() -> anyhow::Result<()> {
 /// writer records no link for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn subagent_lineage_resolves_and_forks_stay_roots() -> anyhow::Result<()> {
-    let (store, _guard) = ingest_into_temp_store(&DevinAdapter::new(macos_root())).await?;
+    let (store, _guard) = ingest_into_temp_store(&DevinAdapter::new(MACOS_ROOT)).await?;
 
     let child = store
         .get_session(SUBAGENT_CHILD)
@@ -143,7 +137,7 @@ async fn subagent_lineage_resolves_and_forks_stay_roots() -> anyhow::Result<()> 
 /// depends on when it read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sync_during_a_subagent_run_stores_what_a_later_sync_would() -> anyhow::Result<()> {
-    let stage = |name: &str| DevinAdapter::new(midrun_root().join(name).join("cli"));
+    let stage = |name: &str| DevinAdapter::new(Path::new(MIDRUN_ROOT).join(name).join("cli"));
 
     let staged_dir = TempDir::new()?;
     let staged = Store::open_local(staged_dir.path().join("store")).await?;

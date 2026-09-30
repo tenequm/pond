@@ -39,8 +39,8 @@ tasks:
   format:
     command: 'cargo fmt --check'
     inputs: ['@group(sources)', '@group(tests)', '@group(nixToolchain)']
-  # Kept out of the compile-time path reads that defeat cross-worktree compiler
-  # caching (see the script). Gates `lint` through deps.
+  # Rejects compile-time checkout-path reads in tests/benches (they defeat
+  # cross-worktree compiler caching; see the script). Gates `lint` through deps.
   check-baked-paths:
     command: 'bash ../../ops/scripts/check-baked-paths.sh'
     inputs: ['@group(sources)', '@group(tests)', '/ops/scripts/check-baked-paths.sh']
