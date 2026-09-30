@@ -714,12 +714,18 @@ struct Collected {
 /// One message's copies as its nodes stream in, before the newest is known.
 struct Copies {
     first: NodeRef,
-    /// Each distinct body: the raw text an identical copy matches without
-    /// parsing, the value, and the lowest `node_id` holding it.
-    bodies: Vec<(String, Value, i64)>,
+    bodies: Vec<Body>,
     placements: Vec<Placed>,
     /// The placement with the highest `node_id`.
     top: usize,
+}
+
+/// One distinct `chat_message` value among a message's copies.
+struct Body {
+    /// The text an identical copy matches without parsing.
+    raw: String,
+    value: Value,
+    lowest_node: i64,
 }
 
 struct Placed {
@@ -730,8 +736,19 @@ struct Placed {
 }
 
 impl Copies {
-    fn place(&mut self, node: &NodeRef, body: usize, placement: Value) {
-        let lowest = &mut self.bodies[body].2;
+    fn new(first: NodeRef) -> Self {
+        Self {
+            first,
+            bodies: Vec::new(),
+            placements: Vec::new(),
+            top: 0,
+        }
+    }
+
+    /// Adds `node`'s copy, holding `raw`; `None` when `raw` is not JSON.
+    fn place(&mut self, node: &NodeRef, raw: String, placement: Value) -> Option<()> {
+        let body = self.body_of(raw, node.node_id)?;
+        let lowest = &mut self.bodies[body].lowest_node;
         *lowest = (*lowest).min(node.node_id);
         if self
             .placements
@@ -746,6 +763,27 @@ impl Copies {
             body,
             placement,
         });
+        Some(())
+    }
+
+    /// The body `raw` holds, added when new. A copy can differ only in key
+    /// order and still be the same value, never a variant; its text then
+    /// replaces the stored one, so the next such copy matches without parsing.
+    fn body_of(&mut self, raw: String, node_id: i64) -> Option<usize> {
+        if let Some(known) = self.bodies.iter().position(|body| body.raw == raw) {
+            return Some(known);
+        }
+        let value: Value = serde_json::from_str(&raw).ok()?;
+        if let Some(known) = self.bodies.iter().position(|body| body.value == value) {
+            self.bodies[known].raw = raw;
+            return Some(known);
+        }
+        self.bodies.push(Body {
+            raw,
+            value,
+            lowest_node: node_id,
+        });
+        Some(self.bodies.len() - 1)
     }
 
     /// The highest `node_id` copy is the newest: node ids follow the writer's
@@ -759,7 +797,7 @@ impl Copies {
         let mut others: Vec<usize> = (0..self.bodies.len())
             .filter(|&body| body != newest_body)
             .collect();
-        others.sort_by_key(|&body| self.bodies[body].2);
+        others.sort_by_key(|&body| self.bodies[body].lowest_node);
         let mut tags = vec![0; self.bodies.len()];
         for (position, &body) in others.iter().enumerate() {
             tags[body] = position + 1;
@@ -776,7 +814,7 @@ impl Copies {
                 placement
             })
             .collect();
-        let mut take = |body: usize| std::mem::take(&mut self.bodies[body].1);
+        let mut take = |body: usize| std::mem::take(&mut self.bodies[body].value);
         let variants = others.iter().map(|&body| take(body)).collect();
         Collected {
             newest: take(newest_body),
@@ -1111,21 +1149,19 @@ impl SessionRead {
             let node_id: i64 = row.get(1)?;
             let metadata: Option<String> = row.get(10)?;
             let chat_message: String = row.get(11)?;
-            let node = NodeRef::from_row(row)?;
-            let parsed = node.and_then(|node| {
-                let known = copies.get(&node.message_id).and_then(|entry| {
-                    entry
-                        .bodies
-                        .iter()
-                        .position(|(raw, ..)| *raw == chat_message)
-                });
-                if let Some(body) = known {
-                    return Some((node, Ok(body)));
+            let placed = NodeRef::from_row(row)?.and_then(|node| {
+                let at = placement(&node, metadata.as_deref());
+                match copies.get_mut(&node.message_id) {
+                    Some(entry) => entry.place(&node, chat_message, at)?,
+                    None => {
+                        let mut entry = Copies::new(node.clone());
+                        entry.place(&node, chat_message, at)?;
+                        copies.insert(node.message_id.clone(), entry);
+                    }
                 }
-                let message = serde_json::from_str::<Value>(&chat_message).ok()?;
-                Some((node, Err(message)))
+                Some(node)
             });
-            let Some((node, body)) = parsed else {
+            let Some(node) = placed else {
                 self.errors.push(AdapterError::schema(
                     NAME,
                     format!("{location}/node {node_id}"),
@@ -1133,27 +1169,6 @@ impl SessionRead {
                 ));
                 continue;
             };
-            let entry = copies
-                .entry(node.message_id.clone())
-                .or_insert_with(|| Copies {
-                    first: node.clone(),
-                    bodies: Vec::new(),
-                    placements: Vec::new(),
-                    top: 0,
-                });
-            let body = body.unwrap_or_else(|message| {
-                // A copy can differ only in key order and still be the same
-                // value; only a real change is a variant.
-                let known = entry
-                    .bodies
-                    .iter()
-                    .position(|(_, body, _)| *body == message);
-                known.unwrap_or_else(|| {
-                    entry.bodies.push((chat_message, message, node.node_id));
-                    entry.bodies.len() - 1
-                })
-            });
-            entry.place(&node, body, placement(&node, metadata.as_deref()));
             self.refs.push(node);
         }
         self.collected = copies
