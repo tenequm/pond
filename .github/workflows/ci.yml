@@ -384,7 +384,7 @@ jobs:
         run: |
           kache stats
           Get-PSDrive C, D | Format-Table -AutoSize
-          $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
+          $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
           # windows-bootstrap's warm pull runs detached, so this log is the only
           # record of whether it finished before the build did - and the only
@@ -495,7 +495,7 @@ jobs:
         run: |
           kache stats
           Get-PSDrive C, D | Format-Table -AutoSize
-          $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
+          $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
           # windows-bootstrap's warm pull runs detached, so this log is the only
           # record of whether it finished before the build did - and the only
