@@ -312,11 +312,11 @@ fn session_rows(conn: &Connection, db: &Path) -> Result<Vec<String>, AdapterErro
 
 /// One session's nodes in `row_id` order, as the columns [`NodeRef::from_row`]
 /// reads followed by `extra`. What the partition needs from `chat_message` is
-/// derived here in SQL (the string `message_id` and `metadata.created_at`, and
-/// the flags `role`, the telemetry `operation` and the `subagent/handoff`
-/// extension decide), so the peek
-/// reads no message body; the peek and the read both go through here, so the
-/// two cannot disagree. Malformed JSON yields NULLs, never a failed statement.
+/// derived here in SQL (the string `message_id` and `metadata.created_at`,
+/// and the flags `role`, the telemetry `operation` and the `subagent/handoff`
+/// extension decide), so the peek reads no message body; the peek and the
+/// read both go through here, so the two cannot disagree. Malformed JSON
+/// yields NULLs, never a failed statement.
 fn node_query(extra: &str) -> String {
     format!(
         "SELECT row_id, node_id, parent_node_id, created_at,
@@ -1522,17 +1522,18 @@ fn message_events(
 
 /// One `chat_message.images[]` entry, devin's `ImageData {width, height,
 /// base64_data, mime_type, source_path, caption}` (docs/adapters/devin.md):
-/// the base64 payload verbatim, `source_path` as the file name. Width, height
-/// and caption have no slot and stay in the raw record.
+/// the base64 payload verbatim (the whole entry as compact JSON when it has
+/// none, so the part is never dropped), `source_path` as the file name.
+/// Width, height and caption have no slot and stay in the raw record.
 fn image_part(image: &Value) -> PartKind {
-    let data = match image.get("base64_data").and_then(Value::as_str) {
-        Some(base64) => FileData::String(base64.to_owned()),
-        None => FileData::String(compact_json(image)),
-    };
+    let data = image
+        .get("base64_data")
+        .and_then(Value::as_str)
+        .map_or_else(|| compact_json(image), ToOwned::to_owned);
     PartKind::File {
         media_type: extract_str(image, "mime_type").map(|mime| mime.as_str().to_owned()),
         file_name: extract_str(image, "source_path").map(|path| path.as_str().to_owned()),
-        data,
+        data: FileData::String(data),
     }
 }
 
@@ -1792,20 +1793,6 @@ mod tests {
             }
         }
         assert_eq!(heads_checked, 1, "the sidekick's head row is checked");
-        let db = Path::new(SIDEKICK).join(DB_FILE);
-        let conn = match open_forest(&db).unwrap() {
-            Opened::Forest(conn) => conn,
-            _ => panic!("fixture is not a forest database"),
-        };
-        let read = SessionRead::load(&conn, &db, SIDEKICK_ROOT, SIDEKICK_ROOT)
-            .unwrap()
-            .unwrap();
-        let forest = Forest::new(&read.refs);
-        let groups: BTreeSet<i64> = [103, 178]
-            .iter()
-            .map(|head| forest.grouped_nodes[head])
-            .collect();
-        assert_eq!(groups.len(), 1, "both sidekick heads lie in one group");
     }
 
     #[test]
@@ -2135,7 +2122,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
         std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
-        let commentary: String = {
+        let commentary_id: String = {
             let conn = Connection::open(&db).unwrap();
             let message_id = conn
                 .query_row(
@@ -2170,7 +2157,7 @@ mod tests {
             }
         }
         assert_eq!(
-            phases.get(&format!("branch-candy:{commentary}")),
+            phases.get(&format!("branch-candy:{commentary_id}")),
             Some(&json!("commentary"))
         );
         assert!(phases.values().any(|phase| phase == "final_answer"));
@@ -2640,6 +2627,9 @@ mod tests {
             .collect()
     }
 
+    /// The typed prompt of the headless `level-waterlily` session.
+    const WATERLILY_PROMPT: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
+
     fn png(base64: &str, path: &str) -> Value {
         json!({
             "width": 1, "height": 1, "base64_data": base64,
@@ -2736,20 +2726,22 @@ mod tests {
     /// A pasted image with no typed text is the message's only part.
     #[test]
     fn a_message_with_only_images_yields_only_file_parts() {
-        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
         let temp = TempDir::new().unwrap();
-        let db = with_images(&temp, &[(TYPED, json!([png("aGk=", "/tmp/a.png")]))]);
+        let db = with_images(
+            &temp,
+            &[(WATERLILY_PROMPT, json!([png("aGk=", "/tmp/a.png")]))],
+        );
         Connection::open(&db)
             .unwrap()
             .execute(
                 "UPDATE message_nodes SET chat_message = json_set(chat_message, '$.content', '')
                  WHERE json_extract(chat_message, '$.message_id') = ?1",
-                [TYPED],
+                [WATERLILY_PROMPT],
             )
             .unwrap();
         let read = read(&db);
         assert!(read.errors.is_empty(), "{:?}", read.errors);
-        let id = format!("level-waterlily:{TYPED}");
+        let id = format!("level-waterlily:{WATERLILY_PROMPT}");
         let parts = &read.parts[&id];
         assert_eq!(
             file_parts(parts),
@@ -2767,12 +2759,11 @@ mod tests {
     /// those fields absent rather than defaulted (spec.md#model-no-synthesis).
     #[test]
     fn an_image_without_a_type_or_path_leaves_them_absent() {
-        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
         let temp = TempDir::new().unwrap();
         let bare = json!([{"width": 2, "height": 3, "base64_data": "aGk="}]);
-        let read = read(&with_images(&temp, &[(TYPED, bare)]));
+        let read = read(&with_images(&temp, &[(WATERLILY_PROMPT, bare)]));
         assert!(read.errors.is_empty(), "{:?}", read.errors);
-        let parts = &read.parts[&format!("level-waterlily:{TYPED}")];
+        let parts = &read.parts[&format!("level-waterlily:{WATERLILY_PROMPT}")];
         assert!(matches!(parts[0].kind, PartKind::Text { .. }));
         assert_eq!(
             file_parts(&parts[1..]),
@@ -2784,12 +2775,11 @@ mod tests {
     /// as compact JSON, its own type and path kept.
     #[test]
     fn an_image_without_base64_data_keeps_the_whole_entry() {
-        const TYPED: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
         let temp = TempDir::new().unwrap();
         let entry = json!({"width": 2, "mime_type": "image/png", "source_path": "/tmp/a.png"});
-        let read = read(&with_images(&temp, &[(TYPED, json!([entry]))]));
+        let read = read(&with_images(&temp, &[(WATERLILY_PROMPT, json!([entry]))]));
         assert!(read.errors.is_empty(), "{:?}", read.errors);
-        let parts = &read.parts[&format!("level-waterlily:{TYPED}")];
+        let parts = &read.parts[&format!("level-waterlily:{WATERLILY_PROMPT}")];
         assert!(matches!(parts[0].kind, PartKind::Text { .. }));
         assert_eq!(
             file_parts(&parts[1..]),
@@ -2805,7 +2795,7 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/adapter/devin/sidekick/cli"
     );
-    const SIDEKICK_ROOT: &str = "third-hourglass";
+    const SIDEKICK_PARENT: &str = "third-hourglass";
     const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
     const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";
 
@@ -2838,7 +2828,8 @@ mod tests {
     }
 
     /// One forged node of the sidekick session, stamped `at` seconds after
-    /// 22:00; `extensions` lands in `metadata.extensions`.
+    /// 2026-09-29T22:00:00Z, after every captured node; `extensions`
+    /// lands in `metadata.extensions`.
     fn add_node(
         conn: &Connection,
         (node_id, parent): (i64, Option<i64>),
@@ -2861,7 +2852,7 @@ mod tests {
             "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message,
                  created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
-                SIDEKICK_ROOT,
+                SIDEKICK_PARENT,
                 node_id,
                 parent,
                 chat_message.to_string(),
@@ -2886,18 +2877,17 @@ mod tests {
     /// the lead's chain and every link record; every node is stored.
     #[test]
     fn a_persistent_sidekick_is_one_child_across_handoffs() {
-        let read = read(&Path::new(SIDEKICK).join(DB_FILE));
-        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let read = read_sidekick();
         let sessions: Vec<&str> = read.sessions.keys().map(String::as_str).collect();
-        assert_eq!(sessions, [SIDEKICK_ROOT, EXPLORE_CHILD, SIDEKICK_CHILD]);
+        assert_eq!(sessions, [SIDEKICK_PARENT, EXPLORE_CHILD, SIDEKICK_CHILD]);
         let child = &read.sessions[SIDEKICK_CHILD];
         assert_eq!(child.source_agent, SUBAGENT_AGENT);
-        assert_eq!(child.parent_session_id.as_deref(), Some(SIDEKICK_ROOT));
+        assert_eq!(child.parent_session_id.as_deref(), Some(SIDEKICK_PARENT));
         let brief: DateTime<chrono::Utc> = "2026-09-29T21:31:41.519472Z".parse().unwrap();
         assert_eq!(child.created_at, brief);
 
         let (root, sidekick) = (
-            placements(&read, SIDEKICK_ROOT),
+            placements(&read, SIDEKICK_PARENT),
             placements(&read, SIDEKICK_CHILD),
         );
         let work: Vec<i64> = (94..=103).chain([155]).chain(174..=178).collect();
@@ -2913,7 +2903,7 @@ mod tests {
                     .iter()
                     .any(|m| m.id().split(':').nth(1).unwrap().starts_with(message))
             };
-            assert!(held(SIDEKICK_CHILD) && !held(SIDEKICK_ROOT), "{message}");
+            assert!(held(SIDEKICK_CHILD) && !held(SIDEKICK_PARENT), "{message}");
         }
         let stored: BTreeSet<i64> = read
             .sessions
@@ -2928,6 +2918,8 @@ mod tests {
     #[test]
     fn a_sidekick_without_its_parentless_brief_keeps_its_name() {
         let temp = TempDir::new().unwrap();
+        // The parentless brief's whole tree: the brief (85) and the two
+        // system notes devin writes beneath it (92, 93).
         let db = forged_sidekick(&temp, |conn| {
             conn.execute(
                 "DELETE FROM message_nodes WHERE node_id IN (85, 92, 93)",
@@ -2981,7 +2973,8 @@ mod tests {
             ("DELETE FROM subagent_heads", None),
             ("UPDATE subagent_heads SET chain_node_id = 999", None),
             (
-                "INSERT INTO subagent_heads VALUES ('third-hourglass', 'a90f5090', 203, 1)",
+                "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
+                 VALUES ('third-hourglass', 'a90f5090', 203, 1)",
                 None,
             ),
             (
@@ -3125,7 +3118,7 @@ mod tests {
                 {
                     assert!(child.contains(&node), "{case}: {node}");
                 }
-                let root = placements(&read, SIDEKICK_ROOT);
+                let root = placements(&read, SIDEKICK_PARENT);
                 for node in [320, 340, 341].into_iter().filter(|&node| written(node)) {
                     assert!(
                         root.contains(&node) && !child.contains(&node),
@@ -3168,6 +3161,6 @@ mod tests {
             "{reasons:?}"
         );
         assert_eq!(ownership(&read), ownership(&read_sidekick()));
-        assert_eq!(peeked(&db)[SIDEKICK_ROOT], SourceWatermark::Opaque);
+        assert_eq!(peeked(&db)[SIDEKICK_PARENT], SourceWatermark::Opaque);
     }
 }

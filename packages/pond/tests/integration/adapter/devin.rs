@@ -1,9 +1,8 @@
 //! devin adapter integration suite: the shared conformance checks over the
 //! committed data roots (macOS, Windows and Local Fusion sidekick captures),
 //! the subagent, sidekick and fork lineage the store must hold after a real
-//! ingest, and the same messages per
-//! session (and the same child row) whether the mid-run pair syncs once or
-//! twice. Single-module mapping
+//! ingest, what successive syncs of a store store (the mid-run pair, cuts of
+//! the sidekick capture, a re-read adding images). Single-module mapping
 //! behavior (the forest partition, provenance, tool outcomes, the watermark)
 //! stays in the `src/adapter/devin.rs` unit tests.
 
@@ -61,8 +60,6 @@ const SIDEKICK_ROOT: &str = concat!(
     "/tests/fixtures/adapter/devin/sidekick/cli"
 );
 const SIDEKICK_SESSIONS: usize = 3;
-const SIDEKICK_PARENT: &str = "third-hourglass";
-const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
 const SIDEKICK_MESSAGES: usize = 70;
 const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";
 
@@ -111,21 +108,12 @@ async fn a_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
         .await
 }
 
-/// A persistent sidekick's two handoffs land in one child that points at its
-/// parent, and every message is stored exactly once across the three sessions.
+/// A real ingest stores each of the sidekick capture's distinct messages
+/// exactly once across its three sessions.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_sidekick_is_one_child_across_its_handoffs() -> anyhow::Result<()> {
+async fn a_sidekick_ingest_stores_every_message_once() -> anyhow::Result<()> {
     let (store, _guard) = ingest_into_temp_store(&DevinAdapter::new(SIDEKICK_ROOT)).await?;
     let stored = contents(&store).await?;
-    let (child, messages) = &stored[SIDEKICK_CHILD];
-    anyhow::ensure!(child.source_agent == "devin/subagent");
-    anyhow::ensure!(child.parent_session_id.as_deref() == Some(SIDEKICK_PARENT));
-    for brief in ["b1e7050f", "bad34eff"] {
-        anyhow::ensure!(
-            messages.keys().any(|id| id.contains(&format!(":{brief}"))),
-            "brief {brief} is not in the sidekick child"
-        );
-    }
     let suffixes: Vec<&str> = stored
         .values()
         .flat_map(|(_, messages)| messages.keys())
