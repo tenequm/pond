@@ -1,9 +1,11 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 // `run_sync` instantiates the lib's deep async sync future; its layout
 // computation exceeds rustc's default query-depth limit of 128.
 #![recursion_limit = "256"]
-// `libc::getrusage` is the cross-platform peak-RSS sampler; needs `unsafe`.
-#![allow(unsafe_code)]
 
 //! End-to-end timing for `pond status`, `pond sync`, and `pond copy` against a
 //! real corpus. Drives the same library entry points the CLI does, so a perf
@@ -146,6 +148,7 @@ impl RunReport {
 /// deviation from BSD) and KiB on Linux. Normalize to KiB so peak comparisons
 /// across platforms read the same.
 #[cfg(unix)]
+#[expect(unsafe_code, reason = "getrusage FFI")]
 fn peak_rss_kb() -> i64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {

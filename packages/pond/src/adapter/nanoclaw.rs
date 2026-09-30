@@ -837,7 +837,11 @@ mod tests {
     //! degradation, rotated-file ingestion, native restore, and nanoclaw's own
     //! wiring of the shared claude-JSONL seams (opencode-xdg pruning, the
     //! unrecognized-subagents refusal, the watermark walk-back).
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::Message};

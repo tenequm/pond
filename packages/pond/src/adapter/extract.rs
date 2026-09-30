@@ -39,7 +39,10 @@ pub struct Extracted<T>(T);
 
 impl<T> Extracted<T> {
     /// Borrow the inner value.
-    #[allow(clippy::should_implement_trait)]
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "the seam wrapper exposes no conversion traits; borrowing is inherent"
+    )]
     pub fn as_ref(&self) -> &T {
         &self.0
     }
@@ -347,7 +350,11 @@ impl Source for Value {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use serde_json::json;

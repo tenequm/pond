@@ -9,7 +9,7 @@
 //! output being reworded: raising verbosity changes stderr and leaves stdout
 //! byte-for-byte identical. The pipe tests pin the other end of the channel: a
 //! closed stdout is a quiet exit, and SIGPIPE never kills a running server.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use tempfile::TempDir;
 

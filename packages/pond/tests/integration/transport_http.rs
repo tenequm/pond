@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 //! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
 //! `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`, and

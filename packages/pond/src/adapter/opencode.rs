@@ -1770,7 +1770,11 @@ mod tests {
     //! split-file fixture corpus and assert pond's canonical shape comes out
     //! the other side, including the fused-tool-part split. The fixture lives
     //! under `tests/fixtures/adapter/opencode/storage/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{

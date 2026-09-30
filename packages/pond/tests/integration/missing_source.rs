@@ -16,7 +16,7 @@
 //! `main.rs` (dry-run text and JSON, real-sync stderr and JSON summary) that no
 //! adapter-level test reaches - the exact thing a later refactor would quietly
 //! undo while every adapter test still passed.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use assert_cmd::Command;
 use serde_json::Value;

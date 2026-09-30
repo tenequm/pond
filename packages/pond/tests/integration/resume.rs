@@ -5,7 +5,11 @@
 //! `--format json` document a plugin branches on (spec.md 7.8). The store is
 //! populated in-process first, then the binary is pointed at it with
 //! `--storage-path`.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use assert_cmd::Command;
 use pond::{

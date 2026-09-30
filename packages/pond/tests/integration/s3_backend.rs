@@ -2,7 +2,11 @@
 //! spec.md#lance-chokepoints-storage). Proves Lance's commit handler reaches
 //! `If-None-Match: *` -> 412 PreconditionFailed end-to-end, which `memory://`
 //! sidesteps.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

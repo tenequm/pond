@@ -359,6 +359,8 @@ unreachable_pub = "warn"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 dbg_macro = "warn"
 expect_used = "warn"
 implicit_clone = "warn"

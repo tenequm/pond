@@ -1137,7 +1137,7 @@ mod tests {
     //! End-to-end tests over the committed Cowork fixture corpus
     //! (`tests/fixtures/adapter/claude_desktop_app/`), including the regression
     //! guard that the nested `.claude/` inner Claude Code loop is never ingested.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store};

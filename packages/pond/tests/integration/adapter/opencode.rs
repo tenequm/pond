@@ -67,7 +67,10 @@ async fn native_restore_serves_full_fidelity_import_envelopes() -> anyhow::Resul
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real-corpus oracle: set POND_OPENCODE_DATA_DIR and run with --ignored"]
-#[allow(clippy::print_stdout)] // the oracle's coverage summary is its evidence
+#[expect(
+    clippy::print_stdout,
+    reason = "the oracle's coverage summary is its evidence"
+)]
 async fn native_restore_is_value_equal_to_real_db_corpus() -> anyhow::Result<()> {
     let data_dir = PathBuf::from(std::env::var("POND_OPENCODE_DATA_DIR").expect(
         "set POND_OPENCODE_DATA_DIR to an opencode data dir (e.g. ~/.local/share/opencode)",

@@ -3,7 +3,11 @@
 //! orphaned index must be reported by `pond status` and bare `pond optimize`
 //! without being touched, healed by `--full`, and a second `--full` must find
 //! nothing left to do.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::path::Path;
 

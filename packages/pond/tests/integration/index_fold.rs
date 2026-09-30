@@ -12,7 +12,11 @@
 //! re-folds regardless), while the address-domain zonemap does NOT survive -
 //! compaction orphans its payload, and the same-run staleness probe must
 //! detect that and recreate it.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::sync::{Arc, Mutex};
 

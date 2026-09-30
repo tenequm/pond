@@ -9,7 +9,11 @@
 //! resumed copy never double-appends - all consequences of
 //! `lance-deterministic-pk` + append-only storage, asserted here rather than
 //! promised.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use chrono::{DateTime, Utc};
 use pond::{

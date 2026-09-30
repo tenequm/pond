@@ -4,7 +4,7 @@
 //! loop is asserted - other suites invoke it only as setup. Query-instruction
 //! format is unit-tested in `src/embed/mod.rs`, the vector-on-`messages`
 //! schema in `src/sessions.rs`.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
 use std::sync::Mutex;
 

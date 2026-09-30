@@ -13,7 +13,11 @@
 //! stub model - four file-era (2026.7.1-2) and one DB-era (2026.9.3). Synthetic
 //! trees are what let issue #224 hide - they encoded what we believed OpenClaw
 //! writes, and that belief was wrong.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::path::Path;
 

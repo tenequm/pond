@@ -1,4 +1,8 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! Concurrent multi-writer OCC against a real object store - the proof
 //! `s3_backend.rs` defers to "a real bucket" because s3s-fs implements

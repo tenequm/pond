@@ -1165,7 +1165,11 @@ mod tests {
     //! corpus and assert pond's canonical Session/Message/Part shape comes out
     //! the other side. The fixture lives under
     //! `tests/fixtures/adapter/codex_cli/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};

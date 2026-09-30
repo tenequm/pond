@@ -268,7 +268,7 @@ impl RowMetaMap {
             File::open(path).with_context(|| format!("open row meta map {}", path.display()))?;
         // SAFETY: the file is immutable once renamed into place, so the mapping
         // never sees concurrent truncation/mutation.
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code, reason = "memory-mapping a file is unsafe")]
         let mmap = unsafe { Mmap::map(&file)? };
         ensure!(
             mmap.len() >= size_of::<Header>(),
@@ -1423,7 +1423,11 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
     use super::*;
 
     fn entry(

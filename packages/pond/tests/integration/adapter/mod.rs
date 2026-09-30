@@ -4,7 +4,7 @@
 //! harness - the seam analog of `src/adapter/mod.rs`, which likewise carries
 //! the cross-adapter test support. Single-adapter behavior stays in its
 //! per-adapter file.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use std::path::Path;
 

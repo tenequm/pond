@@ -538,7 +538,11 @@ mod tests {
     //! (`tests/fixtures/adapter/claude_ai_export/conversations.json`), covering
     //! the directory and `.zip` source forms, the 0-message skip, the empty-name
     //! conversation, and tool_use/tool_result linkage.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store};

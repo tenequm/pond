@@ -901,7 +901,7 @@ fn reconstruct_rows(session_id: &str, messages: &[&MessageWithParts]) -> Vec<Val
 mod tests {
     //! Mapping decisions from `docs/adapters/grok-build.md`, checked against
     //! the committed sandbox capture under `tests/fixtures/adapter/grok-build/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::{

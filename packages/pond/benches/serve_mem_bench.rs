@@ -1,7 +1,8 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
-// The macOS `proc_pid_rusage` FFI for phys_footprint sampling needs `unsafe`.
-#![allow(unsafe_code)]
-#![allow(unreachable_pub, dead_code)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! Read-path bench for `pond mcp` / `pond serve`. Opens an existing
 //! `~/.local/share/pond/` corpus and measures *pond's own* steady-state read
@@ -190,6 +191,11 @@ struct Args {
 /// pages. We sample both: RSS shows the resident cache's mmap pages, PF shows
 /// they don't count against the memory budget.
 #[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "proc_pid_rusage FFI")]
+#[expect(
+    unreachable_pub,
+    reason = "items are reached only from the parent module"
+)]
 mod footprint {
     // Mirror of `<sys/resource.h>` `rusage_info_v4` (Apple's stable layout).
     // We need `ri_phys_footprint`, `ri_lifetime_max_phys_footprint`, and
@@ -458,6 +464,10 @@ fn get_request(message_id: String) -> GetMessageRequest {
 }
 
 #[derive(Default, Clone)]
+#[expect(
+    dead_code,
+    reason = "start and global-peak samples are recorded but not reported"
+)]
 struct PhaseStats {
     name: &'static str,
     queries: usize,
@@ -491,7 +501,6 @@ fn percentile(values: &[u128], p: f64) -> u128 {
     }
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
-    #[allow(clippy::cast_precision_loss)]
     let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }

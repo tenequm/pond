@@ -5,7 +5,11 @@
 //!
 //! Plus: the JSONL wire stream produces `IngestEvent`s that round-trip back
 //! through `ingest_events`, so `copy --to - | ingest` is a portable backup.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

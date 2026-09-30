@@ -10,7 +10,7 @@
 //! on all platforms. Only a local-FS dir exercises the Windows commit path, so
 //! swapping the backend here would silently stop testing it - and this is the
 //! job the windows-verify gate leans on to prove OCC works there at all.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
 use std::sync::Arc;
 

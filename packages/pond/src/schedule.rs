@@ -1523,7 +1523,7 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        #![expect(clippy::expect_used, reason = "tests fail by panicking")]
         use super::*;
 
         /// The action shape `start()` builds, for tests that need one.
@@ -1686,7 +1686,6 @@ mod windows {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     #[test]

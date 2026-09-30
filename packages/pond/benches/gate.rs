@@ -1,4 +1,4 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::print_stdout, reason = "bench harness: results go to stdout")]
 
 //! The release gate, one target for both halves of it:
 //!

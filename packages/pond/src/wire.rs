@@ -309,10 +309,10 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
-// The success/error size gap is fine here: a `GetEnvelope` is one per-request
-// return value, serialized immediately - never stored in bulk where the gap
-// would waste memory.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per request and serialized immediately, never stored in bulk"
+)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetEnvelope {
@@ -926,7 +926,7 @@ pub fn storage_error(error_value: anyhow::Error) -> ErrorEnvelope {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
     use serde_json::json;

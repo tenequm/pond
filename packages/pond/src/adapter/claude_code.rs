@@ -1334,7 +1334,11 @@ mod tests {
     //! Each test builds a tiny synthetic corpus under a `TempDir` so the
     //! assertions exercise the real adapter end-to-end without depending on
     //! committed fixtures.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};

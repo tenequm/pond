@@ -51,9 +51,7 @@ mod counting {
 
     pub(super) struct CountingAlloc;
 
-    // The crate denies `unsafe_code` rather than forbidding it precisely so a
-    // wrapper like this can opt in with its reasoning stated (see `embed.rs`).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "a GlobalAlloc impl is unsafe by definition")]
     // SAFETY: every method forwards its arguments to `System` unchanged and
     // returns what `System` returned, so the `GlobalAlloc` contract is whatever
     // `System` already guarantees; the counters only observe sizes.
@@ -212,9 +210,7 @@ pub fn reset_peak_rss() -> bool {
 #[cfg(unix)]
 #[must_use]
 pub fn ru_maxrss_kb() -> Option<u64> {
-    // Narrow opt-in past the crate's `unsafe_code = "deny"`, same as the FFI in
-    // `embed.rs` and the bench harnesses.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "getrusage FFI")]
     let usage = {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: `getrusage` either fills the caller-owned `rusage` it is
@@ -292,7 +288,7 @@ impl Drop for RssSampler {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
     use super::*;
 
     #[test]

@@ -659,7 +659,11 @@ fn fold_result(row: &mut Value, result: ReconstructedResult) {
 mod tests {
     //! Mapping decisions from `docs/adapters/letta-code.md`, checked against
     //! the committed sandbox capture under `tests/fixtures/adapter/letta-code/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{

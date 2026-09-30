@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 //! `pond_sql` over the stdio-MCP transport (spec.md#protocol): an
 //! in-process rmcp client drives read-only SQL against a synthetic corpus.

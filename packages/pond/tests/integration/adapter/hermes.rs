@@ -5,7 +5,7 @@
 //! classification, watermark math, serialize) stays in the
 //! `src/adapter/hermes.rs` unit tests; this suite covers the cross-module paths.
 //! The whole corpus is synthetic - no real `~/.hermes` data was copied in.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use std::path::Path;
 

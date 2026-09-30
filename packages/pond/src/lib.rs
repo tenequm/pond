@@ -110,7 +110,6 @@ pub mod output {
         Style::new().fg_color(Some(AnsiColor::Cyan.into()))
     }
 
-    #[allow(clippy::print_stdout)]
     pub fn line(message: &str) -> anyhow::Result<()> {
         let mut stdout = io::stdout().lock();
         writeln!(stdout, "{message}")
@@ -224,7 +223,7 @@ impl Error {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use crate::adapter::test_support::{manifest_dir, rust_files};
 

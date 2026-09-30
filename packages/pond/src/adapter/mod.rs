@@ -910,7 +910,7 @@ pub(crate) fn empty_options() -> ProviderOptions {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use tempfile::TempDir;
 
@@ -1336,12 +1336,12 @@ pub(crate) mod test_support {
 
     /// Read at runtime: compile-time `env!` would bake the checkout path into
     /// the test binary and defeat cross-worktree compiler caching.
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used, reason = "test helpers fail by panicking")]
     pub(crate) fn manifest_dir() -> PathBuf {
         PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("run tests via cargo"))
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used, reason = "test helpers fail by panicking")]
     pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("source dir is readable") {
             let path = entry.expect("dir entry").path();

@@ -1635,7 +1635,11 @@ mod tests {
     //! End-to-end test for the pi-coding-agent adapter: ingest the committed fixture corpus
     //! and assert pond's canonical Session/Message/Part shape comes out the
     //! other side. The fixture lives under `tests/fixtures/adapter/pi-coding-agent/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};

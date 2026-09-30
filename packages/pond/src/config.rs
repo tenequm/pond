@@ -1086,9 +1086,15 @@ pub fn write_config_file(path: &Path, contents: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    // `result_large_err`: `figment::Jail` closures return `figment::Error`
-    // by contract; the size is figment's, not ours.
-    #![allow(clippy::expect_used, clippy::unwrap_used, clippy::result_large_err)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
+    #![expect(
+        clippy::result_large_err,
+        reason = "figment::Jail closures return figment::Error by contract"
+    )]
 
     use super::*;
     use serde_json::Value;

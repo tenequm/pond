@@ -1,4 +1,4 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::print_stdout, reason = "bench harness: results go to stdout")]
 
 //! Empirically rank candidate "sync change-detection oracles" against the real
 //! S3 corpus, so the answer is measured, not guessed.

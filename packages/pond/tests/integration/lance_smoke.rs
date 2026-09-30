@@ -2,7 +2,6 @@
 //! `MergeInsertBuilder` treating an unenforced primary key as a find-or-create
 //! match key. If Lance ever changed that behavior, every Store upsert would
 //! silently double-insert. The remaining test pins that one contract.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 

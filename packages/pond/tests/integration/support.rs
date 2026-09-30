@@ -1,5 +1,5 @@
 //! Helpers for the suites that drive the compiled `pond` binary.
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used, reason = "test helpers fail by panicking")]
 
 use std::{
     path::PathBuf,

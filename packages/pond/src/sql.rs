@@ -1489,7 +1489,7 @@ fn encode_ndjson(batches: &[RecordBatch]) -> Result<Vec<u8>, SqlError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
 

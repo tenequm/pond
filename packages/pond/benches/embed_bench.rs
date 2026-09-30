@@ -1,4 +1,8 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! Embedding stress-test harness: a repeatable run of the real [`EmbedWorker`]
 //! over a corpus, instrumented for the three questions that matter when sizing
@@ -209,7 +213,6 @@ fn sample_rss_kb(pid: &str) -> Option<u64> {
 
 /// Render a byte count with a binary unit - readable for both a 13-message
 /// fixture and a full corpus.
-#[allow(clippy::cast_precision_loss)]
 fn human_bytes(n: usize) -> String {
     let bytes = n as f64;
     if bytes >= 1024.0 * 1024.0 {
@@ -319,7 +322,6 @@ struct Report<'a> {
     stats: &'a [BatchStat],
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn report(r: &Report<'_>) {
     let embed_s = r.embed_elapsed.as_secs_f64();
     let msg_per_s = if embed_s > 0.0 {

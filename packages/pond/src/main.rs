@@ -469,9 +469,6 @@ struct StoreArgs {
     state_dir: Option<PathBuf>,
 }
 
-// Parsed once, matched once, immediately destructured - the size spread
-// between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Set up pond (idempotent: safe to re-run).
@@ -1110,9 +1107,6 @@ enum AdaptersCmd {
     },
 }
 
-// Parsed once, matched once, immediately destructured - the size spread
-// between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
     /// Show the resolved configuration.
@@ -1186,7 +1180,7 @@ fn raise_lance_mem_pool() {
     }
     // Process-wide, set once at startup before tokio spawns Lance work. Safe
     // here per Rust 2024's set_var contract (no other threads reading env).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "set_var is unsafe in Rust 2024")]
     unsafe {
         std::env::set_var("LANCE_MEM_POOL_SIZE", "1073741824");
     }
@@ -1210,7 +1204,7 @@ fn cap_scan_io_buffer() {
     }
     // Process-wide, set once before opening the store. Safe per Rust 2024's
     // set_var contract (no other threads reading env yet).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "set_var is unsafe in Rust 2024")]
     unsafe {
         std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "268435456");
     }
@@ -2159,7 +2153,6 @@ fn prepare_serve_socket(
     transport::http::SocketClaim::acquire(path)
 }
 
-#[allow(clippy::print_stdout)]
 fn output(message: &str) -> anyhow::Result<()> {
     pond::output::line(message)
 }
@@ -2755,9 +2748,10 @@ async fn run_storage_command(
 
 /// A `pond copy` endpoint after the suffix sniff: a pond store, a `.pond`
 /// archive, or the JSONL wire stream (a `.jsonl` file or `-` for stdio).
-// Built once, matched once, immediately consumed - the StorageUrl-vs-PathBuf
-// size spread has no runtime cost.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "built once and consumed immediately; the size spread costs nothing"
+)]
 enum CopyEndpoint {
     Store(StorageUrl),
     Archive(PathBuf),
@@ -4736,7 +4730,6 @@ async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
 /// import -> openclaw deletion reconciliation -> gated optimize -> summary,
 /// routing progress + summary per `sink` (stdout HUD for the CLI, tracing for
 /// the in-serve loop). Every failure lands in the caller's last-sync record.
-#[allow(clippy::too_many_arguments)]
 async fn run_sync_pipeline(
     store: &Store,
     loaded: &Config,
@@ -7925,7 +7918,11 @@ fn render_error_pretty(error: &ErrorEnvelope) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
 

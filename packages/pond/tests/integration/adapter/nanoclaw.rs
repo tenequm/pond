@@ -7,7 +7,11 @@
 //! additive re-sync freshness through the store's rowmap oracle. All non-fixture
 //! data is synthetic - the committed `agentgroup-anon-001` capture is never
 //! mutated.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::path::Path;
 
