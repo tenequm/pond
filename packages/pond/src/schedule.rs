@@ -2,8 +2,8 @@
 //!
 //! macOS uses launchd ONLY (cron on macOS runs without the user's GUI
 //! context, trips TCC folder-access denials, and silently drops jobs that
-//! span sleep). Linux prefers systemd user timers (`Persistent=true` catches
-//! up after downtime) and falls back to a fenced crontab block. Windows uses
+//! span sleep). Linux prefers systemd user timers and falls back to a fenced
+//! crontab block. Windows uses
 //! Task Scheduler: the task Execs `pondw.exe`, pond's windowless launcher,
 //! and the task XML provides the settings that align it with the
 //! launchd/systemd posture (battery-friendly, catch-up after missed runs).
@@ -390,7 +390,9 @@ mod unix {
                     return Ok(Active {
                         backend: "systemd",
                         every: read_systemd_interval(),
-                        problem: systemd_timer_problem(),
+                        problem: systemd_timer_show()
+                            .as_deref()
+                            .and_then(systemd_timer_problem),
                     });
                 }
                 if let Some(entry) = read_cron_fence_entry()? {
@@ -673,44 +675,57 @@ mod unix {
     /// realtime one empty while being perfectly healthy.
     const NEXT_ELAPSE_PROPERTIES: [&str; 2] = ["NextElapseUSecRealtime", "NextElapseUSecMonotonic"];
 
-    /// What `systemctl show` is asked for: the two elapse properties plus the
-    /// sub-state, which tells a mid-run timer apart from a dead one.
-    const SHOWN_PROPERTIES: [&str; 3] = [
-        "NextElapseUSecRealtime",
-        "NextElapseUSecMonotonic",
-        "SubState",
-    ];
+    /// Asked for alongside them: the sub-state tells a mid-run timer apart
+    /// from a settled one. Kept as a single extra rather than a second list,
+    /// so the set asked for cannot drift from the set read.
+    const SUB_STATE_PROPERTY: &str = "SubState";
 
-    /// A systemd timer can be `enabled` and `active` while having no next
-    /// elapse at all, in which case it never fires again. The unit
-    /// `start_systemd` writes carries only monotonic anchors - `OnBootSec=`,
-    /// already in the past on a host booted before the user manager, and
-    /// `OnUnitActiveSec=`, relative to a service activation a freshly
-    /// restarted user manager has no record of - and `Persistent=` does not
-    /// rescue it, because systemd.timer(5) scopes that setting to
-    /// `OnCalendar=`. The timer then settles into `active (elapsed)` with
-    /// `Trigger: n/a` permanently while `is-enabled` keeps succeeding, which
-    /// is why the status line went on claiming a healthy schedule for the
-    /// 31 hours sync was silently dead.
+    /// Ask `systemctl` what the timer's next elapse and sub-state are.
     ///
-    /// Same shape as the Windows `launcher_problem`: a registration that
-    /// exists but cannot run, named so the status line can say so instead of
-    /// asserting health.
-    fn systemd_timer_problem() -> Option<String> {
+    /// Split from the reading below so the verdict is a pure function of the
+    /// text, and the remedy it names can be pinned by a test - which matters
+    /// doubly when the remedy is the part under review.
+    fn systemd_timer_show() -> Option<String> {
         let mut command = Command::new("systemctl");
         command.args(["--user", "show", "pond-sync.timer"]);
-        for property in SHOWN_PROPERTIES {
+        for property in NEXT_ELAPSE_PROPERTIES {
             command.arg(format!("--property={property}"));
         }
+        command.arg(format!("--property={SUB_STATE_PROPERTY}"));
         let output = command.output().ok()?;
         if !output.status.success() {
             return None;
         }
-        timer_is_dead(&String::from_utf8_lossy(&output.stdout)).then(|| {
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// A systemd timer can be `enabled` and `active` while having no next
+    /// elapse at all, in which case it never fires again.
+    ///
+    /// `Persistent=true` is what *produces* that state, not merely what fails
+    /// to rescue it. The stamp file it maintains is loaded into the unit's
+    /// `last_trigger` by `timer_start`; in `timer_enter_waiting` a set
+    /// `last_trigger` disables the already-past `OnBootSec=` one-shot, while
+    /// `OnUnitActiveSec=` skips on a zero base under a freshly restarted user
+    /// manager that has no record of a previous activation. With no anchor
+    /// left the timer parks in `active (elapsed)` with `Trigger: n/a`
+    /// permanently, while `is-enabled` keeps succeeding - which is why the
+    /// status line claimed a healthy schedule for the 31 hours sync was
+    /// silently dead. Without the stamp, the past `OnBootSec=` fires
+    /// immediately on manager start and the unit heals itself. (Read off
+    /// timer.c: the stamp load in `timer_start`, then the one-shot disable
+    /// and the `base <= 0 -> continue` skip in `timer_enter_waiting`.)
+    ///
+    /// Same shape as the Windows `launcher_problem`: a registration that
+    /// exists but cannot run, named so the status line can say so instead of
+    /// asserting health. The remedy names `pond schedule start` because
+    /// `start_systemd` repairs this state - it does not early-return on it,
+    /// and it starts the service to re-anchor the timer.
+    fn systemd_timer_problem(show: &str) -> Option<String> {
+        timer_is_dead(show).then(|| {
             "the timer has no next elapse and will never fire again \
              (`systemctl --user list-timers` shows `NEXT: -`); run \
-             `systemctl --user start pond-sync.service` once to re-anchor it, \
-             or `pond schedule start` to re-register"
+             `pond schedule start` to repair it"
                 .to_string()
         })
     }
@@ -720,9 +735,8 @@ mod unix {
     /// A timer whose service is running right now has no next elapse either:
     /// systemd only recomputes one in `timer_enter_waiting()`, after the
     /// service goes inactive. `pond-sync` runs on this timer, so without this
-    /// guard every status read taken during a sync would call a perfectly
-    /// healthy schedule broken - the same false verdict this change exists to
-    /// remove, pointed the other way.
+    /// guard every status read taken during a sync calls a perfectly healthy
+    /// schedule broken - the same false verdict, pointed the other way.
     fn timer_is_dead(show: &str) -> bool {
         if show.lines().any(|line| line.trim() == "SubState=running") {
             return false;
@@ -819,7 +833,15 @@ mod unix {
             && std::fs::read_to_string(&timer_path)
                 .map(|existing| existing == timer)
                 .unwrap_or(false);
-        if unchanged && systemd_timer_enabled() {
+        // A timer can be enabled, with unit files unchanged, and still never
+        // fire again (see `systemd_timer_problem`). Returning early on those
+        // two facts alone is what made `pond schedule start` a no-op on
+        // precisely the state it is supposed to repair.
+        let needs_repair = systemd_timer_show()
+            .as_deref()
+            .and_then(systemd_timer_problem)
+            .is_some();
+        if unchanged && systemd_timer_enabled() && !needs_repair {
             pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
@@ -839,6 +861,27 @@ mod unix {
                 bail!(
                     "systemctl {} exited {}: {}",
                     args.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                );
+            }
+        }
+        // `enable --now` issues a start job on a timer that is already active
+        // (`elapsed`), and systemd treats that as a no-op: `timer_start`
+        // asserts TIMER_DEAD/TIMER_FAILED, and daemon-reload coldplug re-enters
+        // ELAPSED verbatim. Starting the *service* is the one action that
+        // re-anchors `OnUnitActiveSec=`, and it covers the stopped and
+        // failed-but-enabled sub-states too, which `timer_trigger_notify`
+        // ignores. `--no-block` so the sync it triggers does not hold this
+        // command open.
+        if needs_repair {
+            let output = Command::new("systemctl")
+                .args(["--user", "start", "--no-block", "pond-sync.service"])
+                .output()
+                .context("failed to run systemctl")?;
+            if !output.status.success() {
+                bail!(
+                    "systemctl --user start --no-block pond-sync.service exited {}: {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim(),
                 );
@@ -1077,12 +1120,19 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
+        use super::*;
+
+        const BIN: &str = "/usr/local/bin/pond";
+        const LOG: &str = "/tmp/sync.log";
+        const STATE: &str = "/home/user/.local/state";
+        const CONFIG: &str = "/home/user/.config/pond/config.toml";
+
         /// Captured verbatim from `systemctl --user show` (systemd 259,
         /// Ubuntu 24.04) on a timer carrying pond's exact generated body
         /// after it elapsed with no anchor left: `systemctl status` shows
         /// `Active: active (elapsed)` / `Trigger: n/a`, `list-timers` shows
-        /// `NEXT: -`, and `is-enabled` - the only thing the probe used to
-        /// look at - still answers `enabled`.
+        /// `NEXT: -`, and `is-enabled`, which on its own cannot tell these
+        /// apart, still answers `enabled`.
         const SHOW_DEAD: &str = "LoadState=loaded\n\
              ActiveState=active\n\
              SubState=elapsed\n\
@@ -1097,16 +1147,6 @@ mod unix {
              NextElapseUSecRealtime=\n\
              NextElapseUSecMonotonic=2month 1w 10h 50min 22.539762s\n";
 
-        #[test]
-        fn elapsed_timer_with_no_next_elapse_is_reported_broken() {
-            assert!(super::next_elapse_missing(SHOW_DEAD));
-        }
-
-        #[test]
-        fn waiting_timer_with_a_next_elapse_is_not_reported_broken() {
-            assert!(!super::next_elapse_missing(SHOW_HEALTHY));
-        }
-
         /// The timer while `pond-sync.service` is actually running: systemd
         /// leaves it without a next elapse until the service finishes, so the
         /// elapse properties alone read exactly like the dead timer above.
@@ -1117,27 +1157,56 @@ mod unix {
              NextElapseUSecMonotonic=infinity\n";
 
         #[test]
+        fn elapsed_timer_with_no_next_elapse_is_reported_broken() {
+            assert!(next_elapse_missing(SHOW_DEAD));
+        }
+
+        #[test]
+        fn waiting_timer_with_a_next_elapse_is_not_reported_broken() {
+            assert!(!next_elapse_missing(SHOW_HEALTHY));
+        }
+
+        #[test]
         fn a_timer_whose_service_is_running_is_not_reported_broken() {
-            assert!(!super::timer_is_dead(SHOW_RUNNING));
+            assert!(!timer_is_dead(SHOW_RUNNING));
             // ... while the same reading on a settled timer still is:
-            assert!(super::timer_is_dead(SHOW_DEAD));
+            assert!(timer_is_dead(SHOW_DEAD));
         }
 
         #[test]
         fn systemctl_that_names_neither_property_is_not_called_broken() {
             // An older systemctl, or one that would not describe the unit:
             // no measurement is not the same as a dead timer.
-            assert!(!super::next_elapse_missing(
+            assert!(!next_elapse_missing(
                 "LoadState=loaded\nActiveState=active\n"
             ));
         }
 
-        use super::*;
-
-        const BIN: &str = "/usr/local/bin/pond";
-        const LOG: &str = "/tmp/sync.log";
-        const STATE: &str = "/home/user/.local/state";
-        const CONFIG: &str = "/home/user/.config/pond/config.toml";
+        /// The Windows precedent (`launcher_problem_flags_only_a_missing_command`)
+        /// pins that the problem message names its fix. Same here, and it is
+        /// the part that was wrong: the message used to offer
+        /// `pond schedule start` as a fallback remedy while `start_systemd`
+        /// early-returned on this exact state, so the advice was a no-op.
+        #[test]
+        fn the_problem_message_names_the_command_that_repairs_it() {
+            // `expect_used` is a warn-level lint here and CI runs clippy with
+            // `-D warnings`, so use the file's own let-else idiom.
+            let Some(problem) = systemd_timer_problem(SHOW_DEAD) else {
+                panic!("a dead timer must be reported as a problem");
+            };
+            assert!(
+                problem.contains("`pond schedule start` to repair it"),
+                "remedy must name the repairing command: {problem}"
+            );
+            // The old advice pointed at the service directly; `start_systemd`
+            // now does that itself, so the message must not ask the user to.
+            assert!(
+                !problem.contains("systemctl --user start pond-sync.service"),
+                "remedy must not hand the user the internal step: {problem}"
+            );
+            assert!(systemd_timer_problem(SHOW_HEALTHY).is_none());
+            assert!(systemd_timer_problem(SHOW_RUNNING).is_none());
+        }
 
         #[test]
         fn cron_entries_reverse_map_to_their_cadence() {
