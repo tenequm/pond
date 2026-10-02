@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.19.5](https://github.com/tenequm/pond/compare/v0.19.4...v0.19.5) - 2026-10-02
+
+### <!-- 2 -->🐛 Bug Fixes
+- **devin:** group sidekick subagents, surface images, variants and phase ([#322](https://github.com/tenequm/pond/pull/322)) ([0aa49ba](https://github.com/tenequm/pond/commit/0aa49ba2b9201369e4dc719a30d34b7a511b72c7))
+  Devin: persistent sidekick subagents now import as one child session instead of degrading the sync, images become typed file parts, and chat phase and variant tags appear in options.devin. Run `pond sync`; add `--verify` to enrich already-synced devin sessions.
+- **mcp:** keep stdio open after a malformed opener ([#334](https://github.com/tenequm/pond/pull/334)) ([bb27e33](https://github.com/tenequm/pond/commit/bb27e3361dfe6ce399b2a70f30374567571dd650))
+  `pond mcp` no longer exits when a client's first request lacks MCP 2026-07-28 request metadata; it answers with an error and keeps the connection open, so Claude Code can fall back to `initialize` and connect normally.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.4...v0.19.5
+
 ## [0.19.4](https://github.com/tenequm/pond/compare/v0.19.3...v0.19.4) - 2026-10-02
 
 ### <!-- 2 -->🐛 Bug Fixes
