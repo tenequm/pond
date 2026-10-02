@@ -1,0 +1,1053 @@
+//! The per-herdr-server `pond serve` owner: startup hook and detached
+//! watchdog.
+//!
+//! Startup hooks are one-shot and unserialized, so the hook only decides and
+//! detaches; the `--owner` watchdog holds `lock` for its whole life, so at
+//! most one supervised serve exists per herdr server, and it never outlives
+//! that server.
+
+use std::collections::hash_map::RandomState;
+use std::future::Future;
+use std::hash::BuildHasher;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use anyhow::bail;
+use chrono::Utc;
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+
+use crate::api::{SEARCH_PATH, SQL_PATH, Socket, sql_deadline};
+use crate::config::{cap_log, log_line, try_lock};
+use crate::serve::{
+    Endpoint, READY_DEADLINE, ServeChild, ServeDir, probe, read_endpoint, remove_endpoint_if_owned,
+    retire, write_endpoint,
+};
+use crate::types::{
+    LISTING_ROWS, ListingScope, SearchRequest, SearchResponse, SqlRequest, SqlResponse, listing_sql,
+};
+use crate::{herdr, runtime, shutdown_signal};
+
+struct Timing {
+    tick: Duration,
+    liveness_every: Duration,
+    /// A live handoff swaps herdr's socket, and the new server waits up to 5s
+    /// for the old one to close before binding: only misses spanning longer
+    /// than this mean herdr is gone.
+    handoff_window: Duration,
+    ready_deadline: Duration,
+    /// The historical 47-300s cold FTS load is paid here, not by the desk.
+    warmup_deadline: Duration,
+    grace: Duration,
+}
+
+const TIMING: Timing = Timing {
+    tick: Duration::from_millis(500),
+    liveness_every: Duration::from_secs(20),
+    handoff_window: Duration::from_secs(10),
+    ready_deadline: READY_DEADLINE,
+    warmup_deadline: Duration::from_secs(300),
+    grace: Duration::from_secs(10),
+};
+
+const WARMUP_QUERY: &str = "session";
+
+pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
+    match args {
+        [] => {
+            startup();
+            Ok(())
+        }
+        [flag] if flag == "--owner" => {
+            herdr::detach();
+            owner()
+        }
+        _ => bail!(crate::USAGE),
+    }
+}
+
+/// The startup hook: exits at once, failures go to `daemon.log`.
+fn startup() {
+    let Ok(dir) = ServeDir::from_env() else {
+        return;
+    };
+    let log = dir.daemon_log();
+    let result = start(&dir, || {
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args(["serve-daemon", "--owner"]);
+        herdr::spawn_detached(command, &log)
+    });
+    if let Err(error) = result {
+        log_line(&log, &format!("serve-daemon: {error:#}"));
+    }
+}
+
+/// Spawns an owner unless a live one holds the lock. A free lock means no
+/// owner supervises whatever the endpoint names, so the owner replaces it.
+fn start(dir: &ServeDir, spawn_owner: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    if try_lock(&dir.lock())?.is_none() {
+        return Ok(());
+    }
+    spawn_owner()
+}
+
+fn owner() -> anyhow::Result<()> {
+    let dir = ServeDir::from_env()?;
+    let socket = herdr::socket_path()?;
+    let state_dir = herdr::state_dir()?;
+    let config_dir = herdr::config_dir()?;
+    let log = dir.daemon_log();
+    runtime()?.block_on(async {
+        let shutdown = shutdown_signal()?;
+        own(
+            &dir,
+            &socket,
+            &TIMING,
+            || herdr::resolve_pond_or_toast(&config_dir, &state_dir, &log),
+            shutdown,
+        )
+        .await
+    })
+}
+
+/// Holds the lock and supervises one serve until the serve dies, herdr goes
+/// away, or `shutdown` fires; every ending tears down the same way.
+async fn own(
+    dir: &ServeDir,
+    socket: &Path,
+    timing: &Timing,
+    resolve_pond: impl FnOnce() -> Option<PathBuf>,
+    shutdown: impl Future<Output = &'static str>,
+) -> anyhow::Result<()> {
+    let log = dir.daemon_log();
+    let Some(_lock) = try_lock(&dir.lock())? else {
+        return Ok(());
+    };
+    // Before any orphan is stopped: a working serve must not go for a
+    // replacement that cannot be spawned.
+    let Some(pond) = resolve_pond() else {
+        return Ok(());
+    };
+    let owner_socket = dir.socket("owner");
+    // A record aimed anywhere but this dir's owner socket is corrupt: never
+    // let it steer a signal at a desk fallback or elsewhere.
+    if let Some(orphan) =
+        read_endpoint(&dir.endpoint()).filter(|record| record.socket == owner_socket)
+    {
+        let answers = match Socket::new(orphan.socket.clone()) {
+            Ok(socket) => probe(&socket).await.is_ok(),
+            Err(_) => false,
+        };
+        if answers || still_serving(&orphan) {
+            log_line(
+                &log,
+                &format!(
+                    "owner: {} (pid {}) {} but no owner supervises it (a dead owner's \
+                     orphan) - stopping it for a fresh serve",
+                    orphan.socket.display(),
+                    orphan.pid,
+                    if answers { "answers" } else { "holds its lock" }
+                ),
+            );
+            if let Err(error) = stop_orphan(&orphan, timing).await {
+                log_line(&log, &format!("owner: cannot stop the orphan - {error}"));
+                return Ok(());
+            }
+            remove_endpoint_if_owned(&dir.endpoint(), &orphan.token);
+        }
+    }
+    let mut serve = ServeChild::spawn(&pond, owner_socket.clone(), log.clone(), timing.grace)?;
+    // Published at spawn, so the record names the owner's latest serve;
+    // desks treat it as absent until it answers. An owner killed between
+    // spawn and publish leaves an unrecorded serve no pid can reach.
+    let record = Endpoint {
+        socket: owner_socket,
+        token: random_token(),
+        pid: serve.id(),
+    };
+    let reason = match write_endpoint(&dir.endpoint(), &record) {
+        Err(error) => format!("cannot publish the endpoint: {error}"),
+        Ok(()) => {
+            log_line(
+                &log,
+                &format!(
+                    "owner: started {} (pid {}), published {}",
+                    pond.display(),
+                    record.pid,
+                    record.socket.display()
+                ),
+            );
+            tokio::select! {
+                reason = supervise(&mut serve, &log, timing) => reason,
+                reason = herdr_gone(socket, &log, timing) => reason,
+                signal = shutdown => format!("received {signal}"),
+            }
+        }
+    };
+    log_line(&log, &format!("owner: stopping - {reason}"));
+    let _ = retire(serve).await;
+    remove_endpoint_if_owned(&dir.endpoint(), &record.token);
+    log_line(&log, "owner: stopped");
+    Ok(())
+}
+
+fn random_token() -> String {
+    let state = RandomState::new();
+    format!(
+        "{:016x}{:016x}",
+        state.hash_one(std::process::id()),
+        state.hash_one(Instant::now())
+    )
+}
+
+/// Stops the serve a record names: published at spawn, the record names the
+/// latest serve on its socket, and its command line must still say so.
+async fn stop_orphan(orphan: &Endpoint, timing: &Timing) -> Result<(), String> {
+    let pid = record_pid(orphan)
+        .ok_or_else(|| format!("the record names no usable pid ({})", orphan.pid))?;
+    if !serves_at(pid, &orphan.socket) {
+        return Err(format!(
+            "pid {pid} is not a pond serve on {}",
+            orphan.socket.display()
+        ));
+    }
+    for signal in [Signal::SIGTERM, Signal::SIGKILL] {
+        if !still_serving(orphan) {
+            return Ok(());
+        }
+        match kill(pid, signal) {
+            Ok(()) => {}
+            Err(Errno::ESRCH) => return Ok(()),
+            Err(error) => return Err(format!("{signal} to pid {pid}: {error}")),
+        }
+        let deadline = Instant::now() + timing.grace;
+        while Instant::now() < deadline {
+            if !still_serving(orphan) {
+                return Ok(());
+            }
+            tokio::time::sleep(timing.tick).await;
+        }
+    }
+    Err(format!("pid {pid} survived SIGKILL"))
+}
+
+fn record_pid(record: &Endpoint) -> Option<Pid> {
+    i32::try_from(record.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .map(Pid::from_raw)
+}
+
+/// Whether the recorded pid still runs as the serve on its socket. A
+/// zombie's command line is empty and a reused pid's differs, so neither
+/// counts.
+fn still_serving(record: &Endpoint) -> bool {
+    record_pid(record)
+        .is_some_and(|pid| kill(pid, None) != Err(Errno::ESRCH) && serves_at(pid, &record.socket))
+}
+
+/// Whether `pid`'s command line serves `socket`, so a pid the record got
+/// wrong is never signalled.
+fn serves_at(pid: Pid, socket: &Path) -> bool {
+    names_socket(&command_line(pid), socket)
+}
+
+/// `pid`'s arguments joined by spaces; empty for a gone or zombie process.
+#[cfg(target_os = "linux")]
+fn command_line(pid: Pid) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
+        |_| String::new(),
+        |argv| {
+            argv.strip_suffix(b"\0")
+                .unwrap_or(&argv)
+                .split(|byte| *byte == 0)
+                .map(String::from_utf8_lossy)
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+    )
+}
+
+/// `pid`'s arguments as `ps` prints them; empty for a gone process or a `ps`
+/// that does not answer within [`PS_DEADLINE`].
+#[cfg(not(target_os = "linux"))]
+fn command_line(pid: Pid) -> String {
+    let child = Command::new("ps")
+        .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        return String::new();
+    };
+    let deadline = Instant::now() + PS_DEADLINE;
+    while matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child
+        .wait_with_output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+const PS_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Whether a command line passes `--socket <socket>`. Paths may hold spaces,
+/// so the line is never split: the argument ends it or is followed by a space.
+fn names_socket(command_line: &str, socket: &Path) -> bool {
+    let Some(socket) = socket.to_str() else {
+        return false;
+    };
+    let argument = format!(" --socket {socket}");
+    let line = command_line.trim_end_matches('\n');
+    line.ends_with(&argument) || line.contains(&format!("{argument} "))
+}
+
+/// Waits for serve to answer the capability probe, warms it up, and returns
+/// why the owner must stop.
+async fn supervise(serve: &mut ServeChild, log: &Path, timing: &Timing) -> String {
+    let socket = match serve.ready(timing.ready_deadline).await {
+        Ok(socket) => socket,
+        Err(error) => return error.to_string(),
+    };
+    log_line(log, &format!("owner: ready on {}", socket.path.display()));
+    let ((), reason) = tokio::join!(
+        warm_up(&socket, log, timing.warmup_deadline),
+        exited(serve, timing.tick)
+    );
+    reason
+}
+
+async fn exited(serve: &mut ServeChild, tick: Duration) -> String {
+    loop {
+        if let Some(reason) = serve.exited() {
+            return reason;
+        }
+        tokio::time::sleep(tick).await;
+    }
+}
+
+/// Returns once herdr's socket has refused connections for longer than a live
+/// handoff takes. Each check also caps `daemon.log`, which the long-lived
+/// serve appends to.
+async fn herdr_gone(socket: &Path, log: &Path, timing: &Timing) -> String {
+    let mut first_miss: Option<Instant> = None;
+    loop {
+        let _ = cap_log(log);
+        match UnixStream::connect(socket) {
+            Ok(_) => first_miss = None,
+            Err(error) => {
+                if first_miss.get_or_insert_with(Instant::now).elapsed() > timing.handoff_window {
+                    return format!("herdr server is gone ({error})");
+                }
+            }
+        }
+        let next = if first_miss.is_some() {
+            timing.tick
+        } else {
+            timing.liveness_every
+        };
+        tokio::time::sleep(next).await;
+    }
+}
+
+/// The desk's opening listing and a first FTS search, once, so their cold
+/// cost lands here instead of on the first desk open. The listing may take
+/// all of `budget` (a cold one exceeds the desk's own timeout); the search
+/// gets what is left. Failure is not fatal.
+async fn warm_up(socket: &Socket, log: &Path, budget: Duration) {
+    let started = Instant::now();
+    let timeout_seconds = budget.as_secs();
+    let listing = SqlRequest::new(
+        listing_sql(&ListingScope::recent(None, Utc::now())),
+        LISTING_ROWS,
+        timeout_seconds,
+    );
+    let search = SearchRequest::new(WARMUP_QUERY.to_owned(), 1);
+    let listing_deadline = sql_deadline(timeout_seconds);
+    let result = async {
+        socket
+            .post::<_, SqlResponse>(SQL_PATH, &listing, listing_deadline)
+            .await?;
+        let search_deadline = budget.saturating_sub(started.elapsed());
+        socket
+            .post::<_, SearchResponse>(SEARCH_PATH, &search, search_deadline)
+            .await
+    }
+    .await;
+    let outcome = match result {
+        Ok(_) => "done".to_owned(),
+        Err(error) => format!("failed: {error}"),
+    };
+    log_line(
+        log,
+        &format!(
+            "owner: warm-up {outcome} ({:.1}s)",
+            started.elapsed().as_secs_f64()
+        ),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::fake_pond::{
+        FakePond, Reply, Sandbox, alive, endpoint, golden, stale_socket, write_script,
+    };
+    use crate::serve::socket_lock;
+
+    const FAST: Timing = Timing {
+        tick: Duration::from_millis(20),
+        liveness_every: Duration::from_millis(100),
+        handoff_window: Duration::from_millis(300),
+        ready_deadline: Duration::from_secs(1),
+        warmup_deadline: Duration::from_secs(5),
+        grace: Duration::from_secs(2),
+    };
+
+    struct Setup {
+        sandbox: Sandbox,
+        pond: FakePond,
+        socket: PathBuf,
+        dir: ServeDir,
+    }
+
+    impl Setup {
+        async fn new() -> Self {
+            Self::with(
+                FakePond::with_sql(
+                    vec![
+                        ("SELECT 1", Reply::json(golden::SQL_READY)),
+                        ("GROUP BY session_id", Reply::json(golden::SQL_LISTING)),
+                    ],
+                    Reply::json(golden::SEARCH),
+                )
+                .await,
+            )
+        }
+
+        fn with(pond: FakePond) -> Self {
+            let sandbox = Sandbox::new();
+            let socket = sandbox.path("herdr.sock");
+            let dir = ServeDir::new(&sandbox.state_dir(), &socket);
+            Self {
+                sandbox,
+                pond,
+                socket,
+                dir,
+            }
+        }
+
+        /// A fake `pond serve` that answers through the fake server when
+        /// `publish`, then runs `after`.
+        fn fake_pond(&self, publish: bool, after: &str) -> PathBuf {
+            let target = publish.then_some(self.pond.socket.as_path());
+            self.sandbox.fake_serve(target, after)
+        }
+
+        async fn own(&self, pond: &Path) -> anyhow::Result<()> {
+            self.own_until(pond, std::future::pending()).await
+        }
+
+        async fn own_until(
+            &self,
+            pond: &Path,
+            shutdown: impl Future<Output = &'static str>,
+        ) -> anyhow::Result<()> {
+            let pond = pond.to_path_buf();
+            own(&self.dir, &self.socket, &FAST, move || Some(pond), shutdown).await
+        }
+
+        fn serve_calls(&self) -> usize {
+            self.sandbox
+                .lines("calls")
+                .iter()
+                .filter(|line| {
+                    **line == format!("serve --socket {}", self.owner_socket().display())
+                })
+                .count()
+        }
+
+        fn owner_socket(&self) -> PathBuf {
+            self.dir.socket("owner")
+        }
+
+        fn log(&self) -> String {
+            fs::read_to_string(self.dir.daemon_log()).unwrap_or_default()
+        }
+
+        fn endpoint(&self) -> Option<Endpoint> {
+            read_endpoint(&self.dir.endpoint())
+        }
+
+        /// Serve answered the probe; the record was published at spawn.
+        async fn published(&self) {
+            wait_until("a ready serve", || self.log().contains("owner: ready on")).await;
+        }
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn one_owner_serves_until_herdr_goes_away() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            wait_until("the endpoint and warm-up", || {
+                setup.endpoint().is_some()
+                    && setup.pond.recorded().iter().any(|r| r.path == SEARCH_PATH)
+            })
+            .await;
+            assert!(alive(setup.sandbox.serve_pid()));
+            drop(listener);
+        };
+        let ((first, second), ()) = tokio::join!(
+            async { tokio::join!(setup.own(&pond), setup.own(&pond)) },
+            herdr_stops
+        );
+        first.unwrap();
+        second.unwrap();
+
+        assert_eq!(setup.serve_calls(), 1, "{}", setup.log());
+        assert!(setup.endpoint().is_none(), "endpoint outlived its serve");
+        assert!(
+            fs::symlink_metadata(setup.owner_socket()).is_err(),
+            "socket outlived its serve"
+        );
+        assert!(
+            socket_lock(&setup.owner_socket()).exists(),
+            "the owner's lock is its successor's"
+        );
+        assert!(
+            !alive(setup.sandbox.serve_pid()),
+            "pond serve outlived herdr"
+        );
+        assert!(setup.log().contains("herdr server is gone"));
+        let warmup = &setup.pond.recorded()[1];
+        assert_eq!(warmup.path, SQL_PATH);
+        assert!(
+            warmup.body.contains("timestamp >= TIMESTAMP"),
+            "{}",
+            warmup.body
+        );
+        let body: serde_json::Value = serde_json::from_str(&warmup.body).unwrap();
+        assert_eq!(
+            body["timeout_seconds"],
+            FAST.warmup_deadline.as_secs(),
+            "the warm-up listing gets the whole budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_gap_is_not_herdr_leaving() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let old_server = UnixListener::bind(&setup.socket).unwrap();
+        let handoff = async {
+            setup.published().await;
+            drop(old_server);
+            fs::remove_file(&setup.socket).unwrap();
+            tokio::time::sleep(FAST.handoff_window / 2).await;
+            let new_server = UnixListener::bind(&setup.socket).unwrap();
+            fs::write(setup.dir.daemon_log(), vec![b'x'; 2 << 20]).unwrap();
+            tokio::time::sleep(FAST.handoff_window * 2).await;
+            assert!(setup.endpoint().is_some(), "{}", setup.log());
+            assert!(alive(setup.sandbox.serve_pid()));
+            let log_len = fs::metadata(setup.dir.daemon_log()).unwrap().len();
+            assert!(log_len < 1 << 20, "daemon.log not capped: {log_len}");
+            drop(new_server);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), handoff);
+        owner.unwrap();
+        assert!(setup.log().contains("herdr server is gone"));
+        assert!(setup.endpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_signal_tears_down_like_herdr_leaving() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        let signal = async {
+            setup.published().await;
+            "SIGTERM"
+        };
+        setup.own_until(&pond, signal).await.unwrap();
+        assert!(setup.log().contains("received SIGTERM"), "{}", setup.log());
+        assert!(setup.endpoint().is_none());
+        assert!(!alive(setup.sandbox.serve_pid()));
+    }
+
+    #[tokio::test]
+    async fn teardown_keeps_a_successors_endpoint() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let successor = async {
+            setup.published().await;
+            let mut endpoint = setup.endpoint().unwrap();
+            endpoint.token = "successor".to_owned();
+            write_endpoint(&setup.dir.endpoint(), &endpoint).unwrap();
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), successor);
+        owner.unwrap();
+        assert_eq!(setup.endpoint().unwrap().token, "successor");
+    }
+
+    /// A dead owner's serve, detached so it is nobody's child here: it takes
+    /// `owner.sock`'s lock as pond does and, given a `target`, answers there
+    /// through it; `ignore_term` makes it one only SIGKILL stops.
+    fn orphan_serve(setup: &Setup, target: Option<&Path>, ignore_term: bool) -> u32 {
+        let trap = if ignore_term { "trap '' TERM" } else { "" };
+        let publish = target.map_or_else(String::new, |target| {
+            format!(r#"ln -s '{}' "$socket""#, target.display())
+        });
+        let script = write_script(
+            &setup.sandbox.path("bin/orphan"),
+            &format!(
+                r#"{trap}
+eval "socket=\${{$#}}"
+echo $$ > "$socket.lock"
+{publish}
+sleep 30; :"#
+            ),
+        );
+        let owner_socket = setup.owner_socket();
+        fs::create_dir_all(owner_socket.parent().unwrap()).unwrap();
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "'{}' serve --socket '{}' >/dev/null 2>&1 & echo $!",
+                script.display(),
+                owner_socket.display()
+            ))
+            .output()
+            .unwrap();
+        let pid = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let started = if target.is_some() {
+            owner_socket.clone()
+        } else {
+            socket_lock(&owner_socket)
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::symlink_metadata(&started).is_err() {
+            assert!(Instant::now() < deadline, "the orphan never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pid
+    }
+
+    /// The orphan holds `owner.sock`'s lock, so a fresh serve starts only once
+    /// the owner has stopped it; its answer must not pass for the fresh serve's.
+    #[tokio::test]
+    async fn an_unsupervised_live_endpoint_is_replaced() {
+        let setup = Setup::new().await;
+        let orphan = FakePond::with_sql(
+            vec![("SELECT 1", Reply::json(golden::SQL_READY))],
+            Reply::json(golden::SEARCH),
+        )
+        .await;
+        let owner_socket = setup.owner_socket();
+        let orphan_pid = orphan_serve(&setup, Some(&orphan.socket), false);
+        let record = Endpoint {
+            pid: orphan_pid,
+            ..endpoint(&owner_socket, "orphan")
+        };
+        write_endpoint(&setup.dir.endpoint(), &record).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            setup.published().await;
+            let fresh = setup.endpoint().unwrap();
+            assert_eq!(fresh.socket, owner_socket);
+            assert_eq!(fresh.pid, setup.sandbox.serve_pid());
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(!alive(orphan_pid), "the orphan still runs");
+        assert_eq!(setup.serve_calls(), 1);
+        assert_eq!(orphan.recorded().len(), 1, "only the liveness probe");
+        assert!(!setup.pond.recorded().is_empty());
+        assert!(
+            setup.log().contains("no owner supervises"),
+            "{}",
+            setup.log()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_neither_answering_nor_naming_the_socket_is_spared() {
+        let setup = Setup::new().await;
+        let owner_socket = setup.owner_socket();
+        stale_socket(&owner_socket);
+        let mut bystander = Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :"])
+            .spawn()
+            .unwrap();
+        let record = Endpoint {
+            pid: bystander.id(),
+            ..endpoint(&owner_socket, "dead")
+        };
+        write_endpoint(&setup.dir.endpoint(), &record).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            setup.published().await;
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(alive(bystander.id()), "a dead record's pid was signalled");
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_orphan_ignoring_sigterm_is_killed_after_the_grace() {
+        let setup = Setup::new().await;
+        let orphan = FakePond::with_sql(
+            vec![("SELECT 1", Reply::json(golden::SQL_READY))],
+            Reply::json(golden::SEARCH),
+        )
+        .await;
+        let orphan_pid = orphan_serve(&setup, Some(&orphan.socket), true);
+        let record = Endpoint {
+            pid: orphan_pid,
+            ..endpoint(&setup.owner_socket(), "orphan")
+        };
+        write_endpoint(&setup.dir.endpoint(), &record).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let started = Instant::now();
+        let herdr_stops = async {
+            setup.published().await;
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(!alive(orphan_pid), "the orphan still runs");
+        assert!(
+            started.elapsed() >= FAST.grace,
+            "killed before the grace ran out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_aimed_elsewhere_is_ignored() {
+        let setup = Setup::new().await;
+        let orphan = FakePond::with_sql(
+            vec![("SELECT 1", Reply::json(golden::SQL_READY))],
+            Reply::json(golden::SEARCH),
+        )
+        .await;
+        let mut bystander = Command::new("sleep").arg("30").spawn().unwrap();
+        let record = Endpoint {
+            pid: bystander.id(),
+            ..endpoint(&orphan.socket, "elsewhere")
+        };
+        write_endpoint(&setup.dir.endpoint(), &record).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            setup.published().await;
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(
+            alive(bystander.id()),
+            "a record aimed elsewhere was signalled"
+        );
+        assert!(
+            !setup.log().contains("no owner supervises"),
+            "{}",
+            setup.log()
+        );
+        bystander.kill().unwrap();
+        bystander.wait().unwrap();
+    }
+
+    #[test]
+    fn a_command_line_names_the_socket_only_as_the_whole_argument() {
+        let socket = Path::new("/Users/me/Library/Application Support/herdr/owner.sock");
+        let serve = format!("/opt/pond serve --socket {}", socket.display());
+        assert!(names_socket(&serve, socket));
+        assert!(
+            names_socket(&format!("{serve}\n"), socket),
+            "ps ends its line"
+        );
+        assert!(names_socket(&format!("{serve} --verbose"), socket));
+        for other in ["owner.sock.lock", "owner.sock.bak"] {
+            let line = format!(
+                "/opt/pond serve --socket {}",
+                socket.with_file_name(other).display()
+            );
+            assert!(!names_socket(&line, socket), "{line}");
+            assert!(
+                !names_socket(&format!("{line} --verbose"), socket),
+                "{line}"
+            );
+        }
+        assert!(!names_socket("", socket), "a gone or zombie process");
+        let bare = format!("sleep 30 {}", socket.display());
+        assert!(!names_socket(&bare, socket), "not a --socket argument");
+    }
+
+    #[test]
+    fn this_process_has_a_command_line() {
+        let pid = Pid::from_raw(i32::try_from(std::process::id()).unwrap());
+        assert!(!command_line(pid).is_empty());
+    }
+
+    /// Still opening its store, an orphan holds the lock without answering.
+    #[tokio::test]
+    async fn a_silent_orphan_holding_the_lock_is_stopped() {
+        let setup = Setup::new().await;
+        let owner_socket = setup.owner_socket();
+        let orphan_pid = orphan_serve(&setup, None, false);
+        let record = Endpoint {
+            pid: orphan_pid,
+            ..endpoint(&owner_socket, "orphan")
+        };
+        write_endpoint(&setup.dir.endpoint(), &record).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            setup.published().await;
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(!alive(orphan_pid), "the orphan still runs");
+        assert!(setup.log().contains("holds its lock"), "{}", setup.log());
+    }
+
+    /// An answering record whose pid is not a serve on its socket is never
+    /// signalled, and no serve is spawned beside it.
+    #[tokio::test]
+    async fn an_answering_record_naming_another_process_is_left_alone() {
+        let setup = Setup::new().await;
+        let orphan = FakePond::with_sql(
+            vec![("SELECT 1", Reply::json(golden::SQL_READY))],
+            Reply::json(golden::SEARCH),
+        )
+        .await;
+        let owner_socket = setup.owner_socket();
+        fs::create_dir_all(owner_socket.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&orphan.socket, &owner_socket).unwrap();
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let record = Endpoint {
+            pid: sleeper.id(),
+            ..endpoint(&owner_socket, "orphan")
+        };
+        write_endpoint(&setup.dir.endpoint(), &record).unwrap();
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        setup.own(&pond).await.unwrap();
+        assert!(alive(sleeper.id()), "an unrelated process was signalled");
+        assert_eq!(setup.serve_calls(), 0);
+        assert!(
+            setup.log().contains("cannot stop the orphan"),
+            "{}",
+            setup.log()
+        );
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_record_names_the_serve_before_it_answers() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(false, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            wait_until("the record", || {
+                setup.endpoint().is_some() && !setup.sandbox.lines("pid").is_empty()
+            })
+            .await;
+            assert_eq!(setup.endpoint().unwrap().pid, setup.sandbox.serve_pid());
+            assert!(!setup.log().contains("owner: ready on"));
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(setup.endpoint().is_none(), "the record outlived its serve");
+    }
+
+    #[tokio::test]
+    async fn a_probe_failing_while_serve_settles_is_retried() {
+        let unready = Arc::new(AtomicUsize::new(2));
+        let setup = Setup::with(
+            FakePond::start(move |_, body| {
+                let settling = body.contains("SELECT 1")
+                    && unready
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok();
+                if settling {
+                    Reply::plain(503, "starting")
+                } else {
+                    Reply::json(golden::SQL_READY)
+                }
+            })
+            .await,
+        );
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let listener = UnixListener::bind(&setup.socket).unwrap();
+        let herdr_stops = async {
+            setup.published().await;
+            drop(listener);
+        };
+        let (owner, ()) = tokio::join!(setup.own(&pond), herdr_stops);
+        owner.unwrap();
+        assert!(!setup.log().contains("did not answer"), "{}", setup.log());
+        let probes = setup
+            .pond
+            .recorded()
+            .iter()
+            .filter(|request| request.body.contains("SELECT 1"))
+            .count();
+        assert!(
+            probes >= 3,
+            "two refused probes, then a passing one: {probes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_passes_gives_up() {
+        let setup = Setup::with(FakePond::start(|_, _| Reply::plain(503, "starting")).await);
+        let pond = setup.fake_pond(true, "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        let log = setup.log();
+        assert!(
+            log.contains("did not answer") && log.contains("HTTP 503: starting"),
+            "{log}"
+        );
+        assert!(setup.pond.recorded().len() > 1, "never retried");
+        assert!(!alive(setup.sandbox.serve_pid()));
+        assert!(setup.endpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dying_serve_ends_the_owner_without_restart() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(true, "sleep 0.3; exit 1");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        assert!(setup.log().contains("pond serve exited"), "{}", setup.log());
+        assert!(setup.endpoint().is_none());
+        assert_eq!(setup.serve_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_serve_that_never_listens_is_killed_at_the_deadline() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(false, "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        assert!(setup.log().contains("did not answer"), "{}", setup.log());
+        assert!(!alive(setup.sandbox.serve_pid()));
+        assert!(setup.endpoint().is_none());
+    }
+
+    /// A socket left by a SIGKILLed serve exists but refuses: never ready.
+    #[tokio::test]
+    async fn a_stale_socket_is_not_ready() {
+        let setup = Setup::new().await;
+        let stale = setup.sandbox.path("stale.sock");
+        stale_socket(&stale);
+        let pond = setup.sandbox.fake_serve(Some(&stale), "exec sleep 30");
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        let log = setup.log();
+        assert!(
+            log.contains("did not answer") && log.contains("Connection refused"),
+            "{log}"
+        );
+        assert!(setup.endpoint().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_pond_without_socket_is_named_too_old() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(
+            false,
+            "echo \"error: unexpected argument '--socket' found\" >&2; exit 2",
+        );
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        assert!(setup.log().contains("too old"), "{}", setup.log());
+        assert!(setup.log().contains("upgrade pond"), "{}", setup.log());
+    }
+
+    #[tokio::test]
+    async fn another_usage_error_names_the_log_not_an_upgrade() {
+        let setup = Setup::new().await;
+        let pond = setup.fake_pond(
+            false,
+            "echo \"error: invalid value 'x' for '--storage-path <PATH>'\" >&2; exit 2",
+        );
+        let _listener = UnixListener::bind(&setup.socket).unwrap();
+        setup.own(&pond).await.unwrap();
+        let log = setup.log();
+        assert!(!log.contains("too old"), "{log}");
+        assert!(
+            log.contains("exited (exit status: 2) before listening - see")
+                && log.contains("daemon.log"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn start_spawns_an_owner_unless_the_lock_is_held() {
+        let sandbox = Sandbox::new();
+        let dir = sandbox.origin().dir;
+        let spawned = std::cell::Cell::new(0);
+        let spawn = || {
+            spawned.set(spawned.get() + 1);
+            Ok(())
+        };
+        start(&dir, spawn).unwrap();
+        assert_eq!(spawned.get(), 1);
+
+        let held = try_lock(&dir.lock()).unwrap().unwrap();
+        start(&dir, spawn).unwrap();
+        assert_eq!(spawned.get(), 1, "an owner holds the lock");
+        drop(held);
+    }
+
+    #[test]
+    fn tokens_differ() {
+        assert_ne!(random_token(), random_token());
+        assert_eq!(random_token().len(), 32);
+    }
+}
