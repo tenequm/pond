@@ -599,12 +599,19 @@ fn render_part_summary(out: &mut String, summary: &PartSummary) {
         .as_deref()
         .map(|id| format!(" [{id}]"))
         .unwrap_or_default();
+    // The preview is what makes a tool line readable: two `Bash` calls are
+    // otherwise indistinguishable without fetching their bodies.
+    let preview = summary
+        .preview
+        .as_deref()
+        .map(|preview| format!(" {preview}"))
+        .unwrap_or_default();
     match summary.kind.as_str() {
         "tool_call" => {
-            let _ = writeln!(out, "  -> {label}{call}");
+            let _ = writeln!(out, "  -> {label}{call}{preview}");
         }
         "tool_result" => {
-            let _ = writeln!(out, "  <- {label}{call}");
+            let _ = writeln!(out, "  <- {label}{call}{preview}");
         }
         "file" => {
             let _ = writeln!(out, "  [file {label}]");
