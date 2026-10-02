@@ -21,6 +21,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use pond::erase::EraseEpoch;
 use pond::rowmap::{RowMetaEntry, RowMetaMap};
 use tempfile::TempDir;
 
@@ -65,7 +66,12 @@ fn purge_then_same_version_rebuild_under_a_live_mapping_leaves_a_readable_segmen
 -> anyhow::Result<()> {
     let cache = TempDir::new()?;
     let segment = RowMetaMap::path_for(cache.path(), STORE_KEY, VERSION);
-    RowMetaMap::build(&segment, VERSION, entries(64, "original"))?;
+    RowMetaMap::build(
+        &segment,
+        VERSION,
+        EraseEpoch::Never,
+        entries(64, "original"),
+    )?;
 
     // Hold the segment mapped from a second process for the whole cycle. A
     // mapping inside this process would not probe anything: the platform rule
@@ -96,7 +102,7 @@ fn purge_then_same_version_rebuild_under_a_live_mapping_leaves_a_readable_segmen
     // The cycle: purge (best-effort, `let _ =` in sessions.rs) then a rebuild
     // at the same version, which renames a fresh temp over the same name.
     let purged = std::fs::remove_file(&segment);
-    let rebuilt = RowMetaMap::build(&segment, VERSION, entries(96, "rebuilt"));
+    let rebuilt = RowMetaMap::build(&segment, VERSION, EraseEpoch::Never, entries(96, "rebuilt"));
     let rebuild_failed = rebuilt.is_err();
 
     if cfg!(unix) {

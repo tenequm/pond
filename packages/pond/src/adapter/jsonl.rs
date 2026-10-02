@@ -245,6 +245,14 @@ pub(crate) fn jsonl_tree_events<'a, D: JsonlTree>(
         let mut survivors = Vec::with_capacity(heads.len());
         let mut fresh_count = 0usize;
         for head in heads {
+            if let Some(skip) = head
+                .session_id
+                .as_deref()
+                .and_then(|id| crate::adapter::erased_skip(oracle, id))
+            {
+                yield Ok(skip);
+                continue;
+            }
             if source_in_sync(oracle, head.session_id.as_deref(), head.watermark) {
                 fresh_count += 1;
                 continue;

@@ -67,9 +67,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark, SyncPlan,
-    by_timestamp_then_id, compact_json, empty_options, expand_home,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    SourceWatermark, SyncPlan, by_timestamp_then_id, compact_json, empty_options, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text, is_session_fresh,
     jsonl::{
@@ -100,6 +100,16 @@ pub struct PiCodingAgentFactory;
 impl AdapterFactory for PiCodingAgentFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // pi persists no spawned children. v4 and SQLite forks link through `parentSessionId`, but a
+    // v3 header's path-valued `parentSession` stays unresolved.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::None,
+            continuations: EdgeFidelity::Partial,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -483,6 +493,7 @@ impl Adapter for PiCodingAgentAdapter {
                 sessions: files.sessions + db.sessions,
                 fresh: files.fresh + db.fresh,
                 pending: files.pending + db.pending,
+                erased: files.erased + db.erased,
             }))
         })
     }
@@ -1274,6 +1285,10 @@ fn sqlite_events<'a>(db_path: PathBuf, oracle: &'a dyn SkipOracle) -> AdapterYie
         let mut survivors = Vec::with_capacity(heads.len());
         let mut fresh = 0usize;
         for (session, watermark) in heads {
+            if let Some(skip) = crate::adapter::erased_skip(oracle, &session.id) {
+                yield Ok(skip);
+                continue;
+            }
             if is_session_fresh(oracle, &session.id, watermark) {
                 fresh += 1;
                 continue;

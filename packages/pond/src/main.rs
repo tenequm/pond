@@ -1,7 +1,7 @@
 // Lance nests `init::run` futures past the default query depth limit.
 #![recursion_limit = "256"]
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fs::{self, File},
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -329,6 +329,7 @@ Commands:
     sync         Make pond current: import, embed, index
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
+    erase        Lift a session's erase denylist entry
 
   Query
     search       Search stored messages
@@ -560,7 +561,7 @@ enum Command {
   pond status                       the one-screen overview
   pond status --hosts               which machines feed this store, and when
   pond status --include-subagents   count each subagent as its own adapter")]
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Status {
         /// Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`)
         /// as its own adapter. Default counts only main agents.
@@ -585,7 +586,7 @@ enum Command {
   pond search \"auth retry\" --project pond --limit 5
   pond search \"merge_insert\" --mode fts --sort-by recency
   pond search \"migration plan\" --from-date 2026-05-01 --format json")]
-    #[command(display_order = 10)]
+    #[command(display_order = 11)]
     Search {
         /// Free-text query: the distinctive words you expect in the
         /// conversation. Project names belong in `--project`.
@@ -639,7 +640,7 @@ enum Command {
   pond get-session 58a96901-4a4f-40be-a3c1-62419ec8c580
   pond get-session <ID> --from end               most recent messages
   pond get-session <ID> --after-message-id <ID>  page down")]
-    #[command(display_order = 11)]
+    #[command(display_order = 12)]
     GetSession {
         /// Session id (a message id resolves to its parent session).
         #[arg(value_name = "ID")]
@@ -677,7 +678,7 @@ enum Command {
     #[command(after_long_help = "Examples:
   pond get-message <ID>
   pond get-message <ID> --context-before 5 --context-after 5")]
-    #[command(display_order = 12)]
+    #[command(display_order = 13)]
     GetMessage {
         /// Message id.
         #[arg(value_name = "ID")]
@@ -707,7 +708,7 @@ enum Command {
   pond sql \"SELECT count(*) FROM sessions\"
   pond sql \"SELECT session_id, ts, role FROM messages WHERE contains_tokens(search_text, 'occ retry') LIMIT 20\"
   pond sql \"SELECT * FROM messages\" --format parquet -o messages.parquet")]
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Sql {
         /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
         sql: String,
@@ -741,7 +742,7 @@ enum Command {
 
 --out-dir is the directory the adapter's own layout is rooted at, so for
 pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Resume {
         /// Session id (from `pond search`).
         #[arg(value_name = "SESSION_ID")]
@@ -762,7 +763,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// setups want `pond mcp` instead; `serve` is for the HTTP transport and
     /// for supervised deployments.
     #[command(after_long_help = SERVE_EXAMPLES_HELP)]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
         #[arg(long, value_enum, default_value_t = ServeTransport::Http)]
@@ -838,7 +839,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI")]
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Mcp {},
     /// Manage the automatic sync schedule.
     ///
@@ -924,6 +925,23 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         #[arg(long)]
         verify_only: bool,
     },
+    /// Lift a session's erase denylist entry on this store.
+    ///
+    /// `--lift` removes this session's denylist entry on this store only,
+    /// typically one imported by `pond copy` or an archive restore. It deletes
+    /// no data: the next `pond sync` re-ingests the session if a source still
+    /// holds it, and a copy from a store that still denylists it re-imports
+    /// the entry.
+    #[command(after_long_help = "Examples:
+  pond erase --lift 0192d4a8-6f1e-7c3a-9b2d-5e8f7a6b4c3d   let a denylisted session sync again")]
+    #[command(display_order = 10)]
+    Erase {
+        /// The denylisted session id.
+        session_id: String,
+        /// Remove the session's denylist entry.
+        #[arg(long, required = true)]
+        lift: bool,
+    },
     /// Inspect configuration.
     ///
     /// Resolved values with provenance (show), the config file location
@@ -946,7 +964,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
          (needs an execution policy of RemoteSigned or looser)
 
 Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
-    #[command(display_order = 18)]
+    #[command(display_order = 19)]
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
@@ -955,7 +973,7 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
     ///
     /// The same file an agent loads as a skill, emitted to stdout so it stays in
     /// lockstep with the binary (no separate copy to drift).
-    #[command(display_order = 19)]
+    #[command(display_order = 20)]
     Skill,
     /// Keep the lake queryable: embed the backlog, then fold the search indexes.
     ///
@@ -1509,6 +1527,8 @@ async fn run() -> anyhow::Result<()> {
                     embedding,
                     searchable_only,
                     host_activity,
+                    erase_intent,
+                    erase_epoch,
                     findings,
                 ) = tokio::try_join!(
                     store.table_sizes(),
@@ -1518,6 +1538,8 @@ async fn run() -> anyhow::Result<()> {
                     embedding_fut,
                     searchable_fut,
                     hosts_fut,
+                    store.erase_intent(),
+                    store.erase_epoch_value(),
                     // A failed footer read must not take the health surface
                     // down with it; the other checks still render.
                     async { Ok(store.diagnose().await) },
@@ -1541,6 +1563,8 @@ async fn run() -> anyhow::Result<()> {
                         .or(searchable_only.map(|n| n as u64)),
                     embedding,
                     findings: &findings,
+                    erased_sessions: erase_intent.len(),
+                    erase_epoch,
                 };
                 // One scheduler probe (a launchctl/systemctl spawn) serves
                 // both the rendered line and the next-run estimate.
@@ -2005,6 +2029,11 @@ async fn run() -> anyhow::Result<()> {
             verify_only,
         } => {
             run_copy(from, to, verify_only, storage_path, config).await?;
+        }
+        Command::Erase { session_id, .. } => {
+            let loaded = Config::load(config_path(config))?;
+            let (resolved, store) = open_store(storage_path, &loaded, true, false).await?;
+            run_erase_lift(&store, &resolved.display(), &session_id).await?;
         }
         Command::Sql {
             sql,
@@ -2802,6 +2831,76 @@ fn resolve_copy_endpoint(
     sniff_copy_endpoint(raw)
 }
 
+/// `pond erase --lift`: drop one session's denylist entry on this store
+/// (spec.md#session-append-only-exception).
+async fn run_erase_lift(store: &Store, resolved: &str, session_id: &str) -> anyhow::Result<()> {
+    use pond::erase::ErasedIntent;
+    use pond::output::{dim, paint};
+    if !store.initialized().await? {
+        bail!(
+            "store {resolved} holds no sessions; check --storage-path (a mistyped path opens as an empty store)"
+        );
+    }
+    let Some(lifted) = store.lift_erase_intent(session_id).await? else {
+        bail!("session \"{session_id}\" is not denylisted on {resolved}");
+    };
+    let lifted = serde_json::from_str::<ErasedIntent>(&lifted).ok();
+    let detail = lifted
+        .as_ref()
+        .map(|intent| {
+            format!(
+                " (erased {}, root {})",
+                intent.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                intent.root
+            )
+        })
+        .unwrap_or_default();
+    output(&format!("lifted    {session_id}{detail}"))?;
+    output_err(&paint(
+        "note      the next pond sync re-ingests this session if a source still holds it",
+        dim(),
+    ))?;
+    output_err(&paint(
+        "note      lift is per-store: a copy from a store that still holds this intent re-imports it",
+        dim(),
+    ))?;
+    let Some(lifted) = lifted else {
+        return Ok(());
+    };
+    // Erase cascades from a root, lift does not: name the siblings still held.
+    let same_root: std::collections::BTreeMap<String, String> = store
+        .erase_intent()
+        .await?
+        .into_iter()
+        .filter(|(_, value)| {
+            serde_json::from_str::<ErasedIntent>(value)
+                .is_ok_and(|intent| intent.root == lifted.root)
+        })
+        .collect();
+    let mut ids: Vec<String> = pond::erase::intent_ids(&same_root).into_iter().collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    ids.sort();
+    let count = ids.len();
+    let (noun, verb) = if count == 1 {
+        ("entry", "shares")
+    } else {
+        ("entries", "share")
+    };
+    let elided = if count > 10 { ", ..." } else { "" };
+    ids.truncate(10);
+    output_err(&paint(
+        &format!(
+            "note      {count} more {noun} {verb} root {}: {}{elided} - lift each to re-allow them",
+            lifted.root,
+            ids.join(", "),
+        ),
+        dim(),
+    ))?;
+    Ok(())
+}
+
 /// `pond copy`: move canonical data between pond stores, `.pond` archives, and
 /// the JSONL wire stream. Both endpoints are required; the verb routes on the
 /// sniffed endpoint kinds (spec.md#session-durable-copy).
@@ -2907,17 +3006,33 @@ async fn run_store_to_store_copy(
             from_resolved.display(),
         );
     }
+    // Intent lands before any row, so the destination never weakens its
+    // denylist; the plan already withholds every session either end erased.
+    let imported_intent = to_store
+        .import_erase_intent(from_store.erase_intent())
+        .await?;
+    if imported_intent > 0 {
+        spinner.println(format!(
+            "{} {imported_intent} erased sessions denylisted on the destination (pond erase --lift <id> reverses one)",
+            pond::output::paint("erase:", dim),
+        ));
+    }
     let new_sessions = plan.new_sessions();
     let grown_sessions = plan.total().saturating_sub(new_sessions);
     spinner.println(stage_line(
         plan_elapsed,
         "plan",
         &format!(
-            "{} sessions to copy ({} new + {} grown, {} on source)",
+            "{} sessions to copy ({} new + {} grown, {} on source{})",
             plan.total(),
             new_sessions,
             grown_sessions,
             plan.source_sessions,
+            if plan.withheld > 0 {
+                format!(", {} erased withheld", plan.withheld)
+            } else {
+                String::new()
+            },
         ),
     ));
 
@@ -2985,6 +3100,7 @@ async fn run_store_to_store_copy(
                 verify.total_duplicates(),
             ),
         ))?;
+        render_erase_verify(&verify)?;
     } else {
         output(&stage_line(verify_elapsed, "verify", "FAILED"))?;
         render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?;
@@ -3071,6 +3187,20 @@ async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> 
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
     let dim = pond::output::dim();
+    if summary.imported_intent > 0 {
+        output(&format!(
+            "{} {} erased sessions denylisted on the destination (pond erase --lift <id> reverses one)",
+            pond::output::paint("erase:", dim),
+            summary.imported_intent,
+        ))?;
+    }
+    if summary.withheld_sessions > 0 {
+        output(&format!(
+            "{} {} erased sessions withheld from the restore",
+            pond::output::paint("erase:", dim),
+            summary.withheld_sessions,
+        ))?;
+    }
     let policy = configured_maintenance_policy(loaded, None)?;
     // Same finalize seam as optimize/sync; the archive carries embeddings as
     // data columns, so finalize's embed pass no-ops (or fills the backlog if the
@@ -3836,6 +3966,14 @@ struct TableVerify {
 struct StorageVerify {
     tables: Vec<TableVerify>,
     dest_indexes: IndexCoverage,
+    /// Source rows left out of the comparison because either end erased their
+    /// session - intended, never a gap.
+    withheld_rows: usize,
+    withheld_sessions: BTreeSet<String>,
+    /// Destination rows of sessions either end erased: no duplicate and no
+    /// gap, but content the destination should not hold.
+    erased_present: usize,
+    erased_sessions: BTreeSet<String>,
 }
 
 impl StorageVerify {
@@ -3886,16 +4024,29 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
     // session (fork/compaction reuses the parent's message ids) verifies per
     // session, so a wholly-absent replayed session is caught as missing where a
     // bare-`id` check would false-negative it. Three tables verify concurrently.
+    // Both ends' denylists, so `--verify-only` before any intent has travelled
+    // withholds the same sessions the copy would.
+    let (from_erased, to_erased) =
+        tokio::try_join!(from.erased_session_ids(), to.erased_session_ids())?;
+    let erased: std::collections::HashSet<String> =
+        from_erased.union(&to_erased).cloned().collect();
+    let erased = &erased;
     let verify_table = |table: Table| async move {
-        let (dest_keys, dest_rows) = to.composite_pk_index(table).await?;
-        let dest_duplicates = dest_rows - dest_keys.len();
-        let (source_rows, missing) = from.composite_pk_diff_against(table, &dest_keys).await?;
-        anyhow::Ok(TableVerify {
-            table,
-            source_rows,
-            missing,
-            dest_duplicates,
-        })
+        let dest = to.composite_pk_index(table, erased).await?;
+        let dest_duplicates = dest.rows - dest.keys.len();
+        let source = from
+            .composite_pk_diff_against(table, &dest.keys, erased)
+            .await?;
+        anyhow::Ok((
+            TableVerify {
+                table,
+                source_rows: source.rows,
+                missing: source.absent,
+                dest_duplicates,
+            },
+            source,
+            dest,
+        ))
     };
     // The embedding probe is two data-page count_rows scans (~7 s each on a
     // remote store) and its result is read only on the enabled path - do not
@@ -3914,7 +4065,16 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
         to.index_status(),
         embedding_probe,
     )?;
-    let tables = vec![sessions, messages, parts];
+    let mut tables = Vec::with_capacity(3);
+    let (mut withheld_rows, mut withheld_sessions) = (0, BTreeSet::new());
+    let (mut erased_present, mut erased_sessions) = (0, BTreeSet::new());
+    for (table, source, dest) in [sessions, messages, parts] {
+        tables.push(table);
+        withheld_rows += source.withheld_rows;
+        withheld_sessions.extend(source.withheld_sessions);
+        erased_present += dest.erased_present;
+        erased_sessions.extend(dest.erased_sessions);
+    }
     let fts_present = dest_index_status
         .iter()
         .any(|status| status.intent_name == MESSAGES_FTS_INDEX && status.exists);
@@ -3932,7 +4092,43 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
     Ok(StorageVerify {
         tables,
         dest_indexes,
+        withheld_rows,
+        withheld_sessions,
+        erased_present,
+        erased_sessions,
     })
+}
+
+/// The erase half of a verify verdict: withheld source rows are reported as
+/// intended, and erased rows the destination still holds are named by session.
+/// Neither fails the verify.
+fn render_erase_verify(verify: &StorageVerify) -> anyhow::Result<()> {
+    use pond::output::{dim, paint, yellow};
+    if verify.withheld_rows > 0 {
+        output(&format!(
+            "{} withheld: {} rows of {} erased sessions",
+            paint("verify:", dim()),
+            format_thousands(verify.withheld_rows as u64),
+            format_thousands(verify.withheld_sessions.len() as u64),
+        ))?;
+    }
+    if verify.erased_present > 0 {
+        let ids = verify
+            .erased_sessions
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        output_err(&paint(
+            &format!(
+                "verify: destination still holds {} rows of {} erased sessions: {ids}",
+                format_thousands(verify.erased_present as u64),
+                format_thousands(verify.erased_sessions.len() as u64),
+            ),
+            yellow(),
+        ))?;
+    }
+    Ok(())
 }
 
 /// A 0-row source almost always means a mistyped `--from`: a remote store
@@ -3940,7 +4136,7 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
 /// nothing. The `run_copy` guard catches a missing local path; this catches
 /// the remote/empty case for parity (spec.md#session-durable-copy).
 fn ensure_source_not_empty(verify: &StorageVerify, from_display: &str) -> anyhow::Result<()> {
-    if verify.total_source_rows() == 0 {
+    if verify.total_source_rows() == 0 && verify.withheld_rows == 0 {
         bail!(
             "source store {from_display} has 0 rows; check --from (a mistyped source opens as an empty store)"
         );
@@ -3957,6 +4153,7 @@ fn render_storage_verify(
     to_display: &str,
 ) -> anyhow::Result<VerifyOutcome> {
     use pond::output::{dim, paint};
+    render_erase_verify(verify)?;
     if verify.synced() {
         let detail = verify
             .tables
@@ -4664,20 +4861,58 @@ async fn run_sync_stages(
 /// that the store-validated cursor covers the restart gap. With none of them
 /// the empty map yields no watermark and every source re-reads (safe, just
 /// slower).
+///
+/// Whichever watermark source it settles on goes through [`with_erased`].
 async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::SkipOracle> {
+    // Here, not in `usable_sync_cursor`: a cycle served by the rowmap never
+    // reads the cursor, and `persist_sync_cursor` would keep the stale one.
+    if store.take_heal_cursor_discard() {
+        syncstate::remove_sync_cursor(&store.store_key());
+    }
     let rowmap = sync_rowmap_oracle_with_spinner(store, quiet).await;
-    if rowmap.0.is_some() {
-        return Box::new(rowmap);
+    let inner: Box<dyn pond::adapter::SkipOracle> = if rowmap.0.is_some() {
+        Box::new(rowmap)
+    } else {
+        match usable_sync_cursor(store).await {
+            Some(cursor) => Box::new(cursor),
+            None => Box::new(rowmap),
+        }
+    };
+    with_erased(store, inner).await
+}
+
+/// `inner` plus the store's erased ids, so erased sessions skip undecoded and
+/// never count as pending. An optimization only: the ingest chokepoint drops
+/// their rows regardless, so the cheap `messages` replica suffices and a
+/// failed read degrades to decoding them.
+async fn with_erased(
+    store: &Store,
+    inner: Box<dyn pond::adapter::SkipOracle>,
+) -> Box<dyn pond::adapter::SkipOracle> {
+    let erased = store
+        .messages_erased_session_ids()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read the erase denylist; erased sources are decoded and dropped at ingest");
+            Default::default()
+        });
+    if erased.is_empty() {
+        return inner;
     }
-    match usable_sync_cursor(store).await {
-        Some(cursor) => Box::new(cursor),
-        None => Box::new(rowmap),
-    }
+    Box::new(pond::erase::ErasedOracle { inner, erased })
 }
 
 async fn usable_sync_cursor(store: &Store) -> Option<syncstate::SyncCursor> {
     let store_key = &store.store_key();
     let cursor = syncstate::read_sync_cursor(store_key)?;
+    if !cursor.admitted_by(store.erase_epoch().await.ok()?, store.heal_purge_pending()) {
+        tracing::info!(
+            store = store_key,
+            "sync cursor predates an erase or a self-heal of this store; discarding it"
+        );
+        syncstate::remove_sync_cursor(store_key);
+        return None;
+    }
     let current_version = store.messages_version().await.ok()?;
     let probe = store.message_store_probe().await.ok()?;
     if cursor.messages_version <= current_version
@@ -4715,12 +4950,7 @@ async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
     };
     syncstate::write_sync_cursor(
         store_key,
-        &syncstate::SyncCursor {
-            messages_version: rowmap.version(),
-            row_count: rowmap.len(),
-            oldest_messages: probe.oldest_messages,
-            watermarks: rowmap.session_watermarks(),
-        },
+        &syncstate::SyncCursor::from_rowmap(&rowmap, probe.oldest_messages),
     );
 }
 
@@ -4895,6 +5125,7 @@ fn add_reconciliation(summary: &mut Value, report: &SyncReport) -> anyhow::Resul
 /// deletions worth surfacing.
 fn attach_adapter_verdicts(summary: &mut Value, report: &SyncReport) -> anyhow::Result<()> {
     add_reconciliation(summary, report)?;
+    add_erase_counts(summary, report);
     add_when_non_empty(summary, "failed_adapters", &report.failed_adapters)?;
     add_when_non_empty(summary, "degraded_adapters", &report.degraded_adapters)?;
     add_skipped_unimportable(summary, report);
@@ -4915,6 +5146,23 @@ fn add_drop_reasons(summary: &mut Value, report: &SyncReport) -> anyhow::Result<
         );
     }
     Ok(())
+}
+
+/// Sessions skipped undecoded and rows withheld at ingest because their session
+/// is erased here, and sessions a flush wrote while an erase denylisted them
+/// mid-flight - each only when non-zero.
+fn add_erase_counts(summary: &mut Value, report: &SyncReport) {
+    if let Value::Object(map) = summary {
+        for (key, count) in [
+            ("skipped_erased", report.ingest.skipped_erased),
+            ("denylisted", report.ingest.denylisted),
+            ("wrote_erased", report.ingest.wrote_erased),
+        ] {
+            if count > 0 {
+                map.insert(key.to_owned(), count.into());
+            }
+        }
+    }
 }
 
 fn add_skipped_unimportable(summary: &mut Value, report: &SyncReport) {
@@ -5211,6 +5459,7 @@ async fn run_sync_dry_run(
                     "sessions": row.error.is_none().then_some(row.sessions),
                     "fresh": row.plan.map(|plan| plan.fresh),
                     "pending": row.plan.map(|plan| plan.pending),
+                    "erased": row.plan.map(|plan| plan.erased),
                     "error": row.error.as_ref().map(RowError::message),
                     "reason": row.error.as_ref().and_then(RowError::reason),
                 })
@@ -5227,18 +5476,27 @@ async fn run_sync_dry_run(
         let detail = if let Some(error) = &row.error {
             pond::output::paint(&error.detail(), pond::output::red())
         } else {
+            let erased = |plan: &pond::adapter::SyncPlan| {
+                if plan.erased > 0 {
+                    format!(", {} erased", format_thousands(plan.erased as u64))
+                } else {
+                    String::new()
+                }
+            };
             match &row.plan {
                 Some(plan) if plan.pending == 0 => {
                     format!(
-                        "{} sessions - up to date",
-                        format_thousands(row.sessions as u64)
+                        "{} sessions - up to date{}",
+                        format_thousands(row.sessions as u64),
+                        erased(plan),
                     )
                 }
                 Some(plan) => format!(
-                    "{} sessions - {} to sync, {} fresh",
+                    "{} sessions - {} to sync, {} fresh{}",
                     format_thousands(row.sessions as u64),
                     format_thousands(plan.pending as u64),
                     format_thousands(plan.fresh as u64),
+                    erased(plan),
                 ),
                 None => format!(
                     "{} sessions (pending unknown - this adapter has no cheap freshness preview)",
@@ -6344,6 +6602,11 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Erased => {
+                    status_label = "erased";
+                    dropped_count = 0;
+                    optional_reason = None;
+                }
                 SyncStatus::Unimportable { reason } => {
                     status_label = "unimportable";
                     dropped_count = 0;
@@ -6359,6 +6622,7 @@ async fn sync_with_progress(
                 outcome.status,
                 SyncStatus::Ok
                     | SyncStatus::Fresh
+                    | SyncStatus::Erased
                     | SyncStatus::Empty
                     | SyncStatus::Superseded
                     | SyncStatus::Unimportable { .. }
@@ -6524,6 +6788,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
         SyncStatus::Fresh => ("fresh", green()),
         SyncStatus::Empty => ("empty", dim()),
         SyncStatus::Superseded => ("superseded", dim()),
+        SyncStatus::Erased => ("erased", dim()),
         SyncStatus::Unimportable { .. } => ("unimportable", dim()),
     };
     let tag = paint(raw_tag, tag_style);
@@ -7141,6 +7406,16 @@ fn status_json(
     if !checks.findings.is_empty() {
         doc["maintenance"] = checks.findings.iter().map(finding_json).collect();
     }
+    if checks.erased_sessions > 0 || checks.erase_epoch.is_some() {
+        let in_flight = checks.erase_epoch.as_deref().is_some_and(|epoch| {
+            pond::erase::EraseEpoch::from_value(epoch) == pond::erase::EraseEpoch::InFlight
+        });
+        doc["erase"] = serde_json::json!({
+            "denylisted_sessions": checks.erased_sessions,
+            "epoch": checks.erase_epoch,
+            "in_flight": in_flight,
+        });
+    }
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
 }
 
@@ -7266,6 +7541,9 @@ struct StatusChecks<'a> {
     embedding: Option<EmbeddingProgress>,
     /// What `pond optimize --full` would heal (`Store::diagnose`).
     findings: &'a [MaintenanceFinding],
+    erased_sessions: usize,
+    /// The raw `pond.erase.epoch` value, `None` on a store no erase touched.
+    erase_epoch: Option<String>,
 }
 
 /// Render the checks that can take longer on a large corpus. The command
@@ -7307,6 +7585,7 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         paint("agents", dim()),
         checks.adapter_count,
     ))?;
+    render_erase_state(checks.erased_sessions, checks.erase_epoch.as_deref())?;
     render_findings(checks.findings, true)?;
     if checks.searchable.is_none() {
         let hint = if pond::embed::embeddings_enabled() {
@@ -7315,6 +7594,38 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
             "(use -v for searchable message count)"
         };
         output_err(&paint(hint, dim()))?;
+    }
+    Ok(())
+}
+
+/// The erase lines of `pond status`: the denylist size and an in-flight
+/// epoch; a settled epoch is an internal token, so only the JSON carries it.
+fn render_erase_state(erased_sessions: usize, epoch: Option<&str>) -> anyhow::Result<()> {
+    use pond::erase::EraseEpoch;
+    use pond::output::{dim, paint, yellow};
+    if erased_sessions > 0 {
+        let noun = if erased_sessions == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        output(&format!(
+            "{}    {} {noun} denylisted",
+            paint("erased", dim()),
+            format_thousands(erased_sessions as u64),
+        ))?;
+    }
+    if let Some(value) = epoch
+        && EraseEpoch::from_value(value) == EraseEpoch::InFlight
+    {
+        output(&paint(
+            &format!(
+                "warn      erase epoch in flight ({value}): row caches are disabled and every \
+                 sync re-reads its sources until the erase that set it completes - re-run \
+                 that pond erase to finish it"
+            ),
+            yellow(),
+        ))?;
     }
     Ok(())
 }
@@ -7392,7 +7703,7 @@ async fn local_status(
     // a number it cannot stand behind.
     let rowmap = store.open_cached_rowmap(&default_cache_dir()).await;
     let pending_known = rowmap.is_some();
-    let oracle = pond::sessions::RowmapOracle(rowmap);
+    let oracle = with_erased(store, Box::new(pond::sessions::RowmapOracle(rowmap))).await;
     let mut adapters = Vec::new();
     let (resolved, adapters_error) = match loaded.resolve_adapters(None) {
         Ok(resolved) => (resolved, None),
@@ -7435,7 +7746,7 @@ async fn local_status(
             continue;
         };
         let plan = if pending_known {
-            opened.plan(&oracle).await.ok().flatten()
+            opened.plan(oracle.as_ref()).await.ok().flatten()
         } else {
             None
         };
@@ -8853,21 +9164,20 @@ mod tests {
             missing: 0,
             dest_duplicates: 0,
         };
-        let empty = StorageVerify {
-            tables: vec![table(0)],
+        let verify = |source_rows, withheld_rows| StorageVerify {
+            tables: vec![table(source_rows)],
             dest_indexes: IndexCoverage {
                 fts_present: false,
                 vector_present_or_below_activation: true,
             },
+            withheld_rows,
+            withheld_sessions: BTreeSet::new(),
+            erased_present: 0,
+            erased_sessions: BTreeSet::new(),
         };
-        assert!(ensure_source_not_empty(&empty, "s3://typo/bucket").is_err());
-        let populated = StorageVerify {
-            tables: vec![table(3)],
-            dest_indexes: IndexCoverage {
-                fts_present: false,
-                vector_present_or_below_activation: true,
-            },
-        };
-        assert!(ensure_source_not_empty(&populated, "local").is_ok());
+        assert!(ensure_source_not_empty(&verify(0, 0), "s3://typo/bucket").is_err());
+        assert!(ensure_source_not_empty(&verify(3, 0), "local").is_ok());
+        // Every source row withheld as erased is a populated source, not a typo.
+        assert!(ensure_source_not_empty(&verify(0, 4), "local").is_ok());
     }
 }

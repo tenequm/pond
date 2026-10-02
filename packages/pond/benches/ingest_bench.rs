@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
                         SyncStatus::Superseded => sync_superseded += 1,
                         SyncStatus::Ok
                         | SyncStatus::Fresh
+                        | SyncStatus::Erased
                         | SyncStatus::Empty
                         | SyncStatus::Unimportable { .. } => {}
                     }

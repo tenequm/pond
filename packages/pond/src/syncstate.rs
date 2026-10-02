@@ -199,16 +199,52 @@ pub(crate) enum SyncOutcome {
 
 /// The resident row-meta map's per-session watermarks, spilled to disk so a
 /// restarted sync can still skip fresh sessions while another process owns the
-/// map build. The three leading fields are lineage, not payload: the store must
-/// be the same one and no older than the store these watermarks were read from,
-/// or a watermark could outrun what that store actually holds and silently drop
-/// messages (`usable_sync_cursor`).
+/// map build. The leading fields are lineage, not payload: the store must be
+/// the same one, no older than the store these watermarks were read from, and
+/// under the same erase epoch as the map they came from, or a watermark could
+/// outrun what that store actually holds and silently drop messages - or gate
+/// an erased-then-re-allowed session fresh forever (`usable_sync_cursor`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SyncCursor {
     pub messages_version: u64,
     pub row_count: usize,
     pub oldest_messages: Vec<(u64, String)>,
+    /// Inherited from the map the watermarks were read out of, never re-read
+    /// from the store at persist time. Absent in a pre-erase cursor, which
+    /// reads as `Never`.
+    #[serde(default)]
+    pub erase_epoch: pond::erase::EraseEpoch,
     pub watermarks: BTreeMap<String, i64>,
+}
+
+impl SyncCursor {
+    /// The cursor for `rowmap`, lineage included: the erase epoch is the map's
+    /// own, so a map built before an erase yields a cursor the next read
+    /// rejects instead of one blessed with the store's newer epoch.
+    pub(crate) fn from_rowmap(
+        rowmap: &pond::rowmap::RowMetaSet,
+        oldest_messages: Vec<(u64, String)>,
+    ) -> Self {
+        Self {
+            messages_version: rowmap.version(),
+            row_count: rowmap.len(),
+            oldest_messages,
+            erase_epoch: rowmap.epoch(),
+            watermarks: rowmap.session_watermarks(),
+        }
+    }
+
+    /// The erase half of the lineage check: the store's `current` epoch must
+    /// admit this cursor's, and a self-heal rollback of `messages` (which can
+    /// restore an epoch a stale cursor matches again) voids it until the
+    /// heal's chains are purged.
+    pub(crate) fn admitted_by(
+        &self,
+        current: pond::erase::EraseEpoch,
+        heal_purge_pending: bool,
+    ) -> bool {
+        !heal_purge_pending && current.admits(self.erase_epoch)
+    }
 }
 
 impl pond::adapter::SkipOracle for SyncCursor {
@@ -357,6 +393,7 @@ mod tests {
             messages_version: 17,
             row_count: 2,
             oldest_messages: vec![(3, "message-a".to_owned())],
+            erase_epoch: pond::erase::EraseEpoch::Settled([7; 16]),
             watermarks: BTreeMap::from([
                 ("session-a".to_owned(), 1_700_000_000_000_000),
                 ("session-b".to_owned(), 1_700_000_000_000_100),
@@ -375,11 +412,74 @@ mod tests {
     }
 
     #[test]
+    fn cursor_takes_its_erase_epoch_from_the_map_it_was_read_out_of() {
+        use pond::erase::EraseEpoch;
+        use pond::rowmap::{RowMetaEntry, RowMetaMap, RowMetaSet, discover_chain};
+        let dir = tempfile::TempDir::new().unwrap();
+        let built_under = EraseEpoch::Settled([3; 16]);
+        RowMetaMap::build(
+            &RowMetaMap::path_for(dir.path(), "k", 5),
+            5,
+            built_under,
+            vec![RowMetaEntry {
+                row_id: 0,
+                session_id: "s".to_owned(),
+                message_id: "m".to_owned(),
+                role: "user".to_owned(),
+                project: "p".to_owned(),
+                source_agent: "a".to_owned(),
+                timestamp_micros: 1,
+                search_text: "t".to_owned(),
+            }],
+        )
+        .unwrap();
+        let map = RowMetaSet::open(&discover_chain(dir.path(), "k").unwrap()).unwrap();
+        let cursor = SyncCursor::from_rowmap(&map, Vec::new());
+        assert_eq!(cursor.erase_epoch, built_under);
+        // The store moved on (an erase settled since the map was built): the
+        // cursor inherits the map's stale epoch, so the gate rejects it.
+        assert!(cursor.admitted_by(built_under, false));
+        assert!(!cursor.admitted_by(EraseEpoch::Settled([4; 16]), false));
+    }
+
+    #[test]
+    fn a_stale_in_flight_or_healed_epoch_rejects_the_cursor() {
+        use pond::erase::EraseEpoch;
+        let cursor = |erase_epoch| SyncCursor {
+            messages_version: 1,
+            row_count: 0,
+            oldest_messages: Vec::new(),
+            erase_epoch,
+            watermarks: BTreeMap::new(),
+        };
+        let settled = EraseEpoch::Settled([1; 16]);
+        assert!(cursor(EraseEpoch::Never).admitted_by(EraseEpoch::Never, false));
+        assert!(cursor(settled).admitted_by(settled, false));
+        assert!(!cursor(EraseEpoch::Never).admitted_by(settled, false));
+        assert!(!cursor(settled).admitted_by(EraseEpoch::InFlight, false));
+        assert!(!cursor(EraseEpoch::InFlight).admitted_by(EraseEpoch::InFlight, false));
+        assert!(!cursor(settled).admitted_by(settled, true));
+    }
+
+    #[test]
+    fn a_cursor_written_before_the_erase_epoch_reads_as_never_erased() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            sync_cursor_path(dir.path(), "store-a"),
+            r#"{"messages_version":4,"row_count":1,"oldest_messages":[],"watermarks":{}}"#,
+        )
+        .unwrap();
+        let cursor = read_sync_cursor_in(dir.path(), "store-a").expect("legacy cursor parses");
+        assert_eq!(cursor.erase_epoch, pond::erase::EraseEpoch::Never);
+    }
+
+    #[test]
     fn sync_cursor_gates_freshness_on_its_watermarks() {
         let cursor = SyncCursor {
             messages_version: 3,
             row_count: 1,
             oldest_messages: Vec::new(),
+            erase_epoch: pond::erase::EraseEpoch::Never,
             watermarks: BTreeMap::from([("session-a".to_owned(), 1_700_000_000_000_000)]),
         };
 

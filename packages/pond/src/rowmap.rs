@@ -36,7 +36,9 @@ use anyhow::{Context, Result, ensure};
 use bytemuck::{Pod, Zeroable};
 use memmap2::Mmap;
 
-const MAGIC: [u8; 8] = *b"PONDRMM5";
+use crate::erase::EraseEpoch;
+
+const MAGIC: [u8; 8] = *b"PONDRMM6";
 const BLOCK_ROWS: usize = 256;
 const ZSTD_LEVEL: i32 = 3;
 
@@ -63,6 +65,29 @@ struct Header {
     role_count: u64,
     block_count: u64,
     blob_offset: u64,
+    /// The erase epoch of the snapshot this segment was scanned from (see
+    /// [`epoch_to_header`]); a chain is usable only under that epoch.
+    epoch: [u8; 16],
+    epoch_state: u64,
+}
+
+/// An erase epoch's fixed-width header form: the uuid bytes plus a state word
+/// (0 never, 1 settled, 2 in flight).
+fn epoch_to_header(epoch: EraseEpoch) -> ([u8; 16], u64) {
+    match epoch {
+        EraseEpoch::Never => ([0; 16], 0),
+        EraseEpoch::Settled(bytes) => (bytes, 1),
+        EraseEpoch::InFlight => ([0; 16], 2),
+    }
+}
+
+fn epoch_from_header(bytes: [u8; 16], state: u64) -> Option<EraseEpoch> {
+    match state {
+        0 => Some(EraseEpoch::Never),
+        1 => Some(EraseEpoch::Settled(bytes)),
+        2 => Some(EraseEpoch::InFlight),
+        _ => None,
+    }
 }
 
 #[repr(C)]
@@ -213,6 +238,7 @@ pub struct RowMeta<'a> {
 pub struct RowMetaMap {
     mmap: Mmap,
     version: u64,
+    epoch: EraseEpoch,
     count: usize,
     session_count: usize,
     project_count: usize,
@@ -232,6 +258,7 @@ impl std::fmt::Debug for RowMetaMap {
         formatter
             .debug_struct("RowMetaMap")
             .field("version", &self.version)
+            .field("epoch", &self.epoch)
             .field("count", &self.count)
             .field("session_count", &self.session_count)
             .finish_non_exhaustive()
@@ -250,13 +277,23 @@ impl RowMetaMap {
         cache_dir.join(format!("rowmetamap-{store_key}-d{version}.rmm"))
     }
 
+    /// The per-store build `flock` every chain writer and purger takes.
+    pub fn lock_path(cache_dir: &Path, store_key: &str) -> PathBuf {
+        cache_dir.join(format!("rowmetamap-{store_key}.lock"))
+    }
+
     /// Encode `entries` into a segment at `path`. Buffering entry point: the
     /// whole corpus is already owned here, so it sorts and replays into
     /// [`RowMetaBuilder`]. A caller that can stream rows in `row_id` order
     /// should drive the builder directly and never materialize this `Vec`.
-    pub fn build(path: &Path, version: u64, mut entries: Vec<RowMetaEntry>) -> Result<()> {
+    pub fn build(
+        path: &Path,
+        version: u64,
+        epoch: EraseEpoch,
+        mut entries: Vec<RowMetaEntry>,
+    ) -> Result<()> {
         entries.sort_unstable_by_key(|entry| entry.row_id);
-        let mut builder = RowMetaBuilder::new(path, version, entries.len())?;
+        let mut builder = RowMetaBuilder::new(path, version, epoch, entries.len())?;
         for entry in &entries {
             builder.push(entry.as_row())?;
         }
@@ -288,6 +325,8 @@ impl RowMetaMap {
         let role_count = usize::try_from(header.role_count).context("role_count")?;
         let block_count = usize::try_from(header.block_count).context("block_count")?;
         let blob_offset = usize::try_from(header.blob_offset).context("blob_offset overflow")?;
+        let epoch = epoch_from_header(header.epoch, header.epoch_state)
+            .with_context(|| format!("row meta map {} bad erase epoch", path.display()))?;
 
         let sessions_off = size_of::<Header>() + count * size_of::<Record>();
         let projects_off = sessions_off + session_count * size_of::<SessionEntry>();
@@ -303,6 +342,7 @@ impl RowMetaMap {
         Ok(Self {
             mmap,
             version: header.version,
+            epoch,
             count,
             session_count,
             project_count,
@@ -320,6 +360,10 @@ impl RowMetaMap {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub fn epoch(&self) -> EraseEpoch {
+        self.epoch
     }
 
     pub fn len(&self) -> usize {
@@ -620,6 +664,7 @@ pub struct RowMetaBuilder {
     /// Temp the finished segment is written to, then renamed from.
     tmp: PathBuf,
     version: u64,
+    epoch: EraseEpoch,
     blocks: Staging,
     rows: Staging,
     block_entries: Vec<BlockEntry>,
@@ -649,7 +694,7 @@ pub struct RowMetaBuilder {
 impl RowMetaBuilder {
     /// `expected_rows` sizes the record spine up front; it is a hint, and a
     /// stream that runs longer or shorter still encodes correctly.
-    pub fn new(path: &Path, version: u64, expected_rows: usize) -> Result<Self> {
+    pub fn new(path: &Path, version: u64, epoch: EraseEpoch, expected_rows: usize) -> Result<Self> {
         // Unique temp names per builder (pid + nonce): two processes prewarming
         // the same store+version must not share one temp inode, or the second's
         // create would mutate the file the first is mapping. All three carry the
@@ -660,6 +705,7 @@ impl RowMetaBuilder {
             target: path.to_path_buf(),
             tmp: path.with_extension(&stamp),
             version,
+            epoch,
             blocks: Staging::create(path.with_extension(format!("{stamp}-blocks")))?,
             rows: Staging::create(path.with_extension(format!("{stamp}-rows")))?,
             block_entries: Vec::with_capacity(expected_rows.div_ceil(BLOCK_ROWS)),
@@ -772,6 +818,7 @@ impl RowMetaBuilder {
             + sessions.len() * size_of::<SessionEntry>()
             + (projects.len() + agents.len() + roles.len()) * size_of::<DictEntry>()
             + self.block_entries.len() * size_of::<BlockEntry>()) as u64;
+        let (epoch, epoch_state) = epoch_to_header(self.epoch);
         let header = Header {
             magic: MAGIC,
             version: self.version,
@@ -782,6 +829,8 @@ impl RowMetaBuilder {
             role_count: roles.len() as u64,
             block_count: self.block_entries.len() as u64,
             blob_offset,
+            epoch,
+            epoch_state,
         };
         // The blocks extent lands first in the blob, so every staged row offset
         // shifts past it.
@@ -1077,14 +1126,30 @@ impl std::fmt::Debug for RowMetaSet {
 }
 
 impl RowMetaSet {
-    /// Open every segment in `paths` (base first, then deltas ascending).
+    /// Open every segment in `paths` (base first, then deltas ascending). A
+    /// chain whose segments were scanned under different erase epochs is no
+    /// chain at all: its base may hold rows an erase removed since.
     pub fn open(paths: &ChainPaths) -> Result<Self> {
         let mut segments = Vec::with_capacity(1 + paths.deltas.len());
         segments.push(RowMetaMap::open(&paths.base)?);
         for (_, delta) in &paths.deltas {
             segments.push(RowMetaMap::open(delta)?);
         }
+        ensure!(
+            segments
+                .iter()
+                .all(|segment| segment.epoch() == segments[0].epoch()),
+            "row meta map chain at {} mixes erase epochs",
+            paths.base.display()
+        );
         Ok(Self { segments })
+    }
+
+    /// The erase epoch every segment of this chain was scanned under.
+    pub fn epoch(&self) -> EraseEpoch {
+        self.segments
+            .first()
+            .map_or(EraseEpoch::Never, RowMetaMap::epoch)
     }
 
     pub fn version(&self) -> u64 {
@@ -1274,7 +1339,8 @@ impl RowMetaSet {
         let mut dropped = 0usize;
         // An upper bound, not a count: the spine shrinks by however many row ids
         // the merge collapses.
-        let mut builder = RowMetaBuilder::new(path, version, self.len() + appended.len())?;
+        let mut builder =
+            RowMetaBuilder::new(path, version, self.epoch(), self.len() + appended.len())?;
         loop {
             let mut row_id = appended.get(next_appended).map(|entry| entry.row_id);
             for cursor in &cursors {
@@ -1350,7 +1416,7 @@ impl RowMetaSet {
         for entry in appended {
             merged.insert(entry.row_id, entry);
         }
-        RowMetaMap::build(path, version, merged.into_values().collect())
+        RowMetaMap::build(path, version, self.epoch(), merged.into_values().collect())
     }
 }
 
@@ -1456,6 +1522,7 @@ mod tests {
         RowMetaMap::build(
             &base_path,
             1,
+            EraseEpoch::Never,
             vec![
                 entry(1, "sess-a", "msg-1", 1_000, "hello"),
                 entry(2, "sess-a", "msg-2", 2_000, ""), // bare tool call: not conversational
@@ -1467,6 +1534,7 @@ mod tests {
         RowMetaMap::build(
             &delta_path,
             2,
+            EraseEpoch::Never,
             vec![entry(9, "sess-a", "msg-9", 9_000, "newest")],
         )
         .unwrap();
@@ -1508,7 +1576,7 @@ mod tests {
             entry(3, "sess-b/agent-x", "msg-2", 2_000, ""),
             three,
         ];
-        RowMetaMap::build(&path, 7, entries).unwrap();
+        RowMetaMap::build(&path, 7, EraseEpoch::Never, entries).unwrap();
 
         let map = RowMetaMap::open(&path).unwrap();
         assert_eq!(map.version(), 7);
@@ -1556,7 +1624,7 @@ mod tests {
             entry(2, "s", "msg-b", 9_000, "b"),
             entry(3, "s", "msg-c", 7_000, "c"),
         ];
-        RowMetaMap::build(&path, 1, entries).unwrap();
+        RowMetaMap::build(&path, 1, EraseEpoch::Never, entries).unwrap();
         let map = RowMetaMap::open(&path).unwrap();
         assert_eq!(map.lookup_max_ts("s"), Some(9_000));
     }
@@ -1576,7 +1644,7 @@ mod tests {
                 )
             })
             .collect();
-        RowMetaMap::build(&path, 1, entries).unwrap();
+        RowMetaMap::build(&path, 1, EraseEpoch::Never, entries).unwrap();
 
         let map = RowMetaMap::open(&path).unwrap();
         // One cache reused across rows spanning several blocks - same-block hits
@@ -1598,12 +1666,24 @@ mod tests {
             entry(11, "sess-a", "m11", 2, "base eleven"),
             entry(12, "sess-b", "m12", 3, "base twelve"),
         ];
-        RowMetaMap::build(&RowMetaMap::path_for(dir.path(), "k", 1), 1, base).unwrap();
+        RowMetaMap::build(
+            &RowMetaMap::path_for(dir.path(), "k", 1),
+            1,
+            EraseEpoch::Never,
+            base,
+        )
+        .unwrap();
         let delta = vec![
             entry(20, "sess-a", "m20", 4, "delta twenty"),
             entry(21, "sess-c", "m21", 5, "delta twentyone"),
         ];
-        RowMetaMap::build(&RowMetaMap::delta_path(dir.path(), "k", 2), 2, delta).unwrap();
+        RowMetaMap::build(
+            &RowMetaMap::delta_path(dir.path(), "k", 2),
+            2,
+            EraseEpoch::Never,
+            delta,
+        )
+        .unwrap();
 
         let chain = discover_chain(dir.path(), "k").expect("chain present");
         assert_eq!(chain.base_version, 1);
@@ -1696,10 +1776,17 @@ mod tests {
         delta.sort_unstable_by_key(|entry| entry.row_id);
         let appended = vec![entry(400, "sess-9", "a400", 1_000, "appended four hundred")];
 
-        RowMetaMap::build(&RowMetaMap::path_for(dir.path(), "c", 1), 1, base.clone()).unwrap();
+        RowMetaMap::build(
+            &RowMetaMap::path_for(dir.path(), "c", 1),
+            1,
+            EraseEpoch::Never,
+            base.clone(),
+        )
+        .unwrap();
         RowMetaMap::build(
             &RowMetaMap::delta_path(dir.path(), "c", 2),
             2,
+            EraseEpoch::Never,
             delta.clone(),
         )
         .unwrap();
@@ -1715,7 +1802,13 @@ mod tests {
             expected_rows.insert(entry.row_id, entry);
         }
         let expected = dir.path().join("expected.rmm");
-        RowMetaMap::build(&expected, 3, expected_rows.into_values().collect()).unwrap();
+        RowMetaMap::build(
+            &expected,
+            3,
+            EraseEpoch::Never,
+            expected_rows.into_values().collect(),
+        )
+        .unwrap();
 
         assert_eq!(
             digest(&compacted),
@@ -1739,7 +1832,7 @@ mod tests {
                 )
             })
             .collect();
-        RowMetaMap::build(&path, 1, entries).unwrap();
+        RowMetaMap::build(&path, 1, EraseEpoch::Never, entries).unwrap();
 
         let map = RowMetaMap::open(&path).unwrap();
         // The role dictionary is the last thing the blob pass writes, so its
@@ -1818,17 +1911,18 @@ mod tests {
     /// path - the chunked scan window, a reordered pass, a different scratch
     /// structure - cannot silently change what lands on disk.
     ///
-    /// A zstd upgrade that changes its output for the same input is the one
-    /// legitimate way to break this. Recompute the digest then (and only then),
-    /// and treat it as a format revision.
+    /// A deliberate format revision (a `MAGIC` bump, like `PONDRMM6`'s erase
+    /// epoch) or a zstd upgrade that changes its output for the same input are
+    /// the only legitimate ways to break this. Recompute the digest then (and
+    /// only then).
     #[test]
     fn build_output_is_byte_stable() {
-        const EXPECTED: &str = "0f103bfcf49fdb9f1f3e5c697ec64557cd63d5e516fa939daed0b0b4a13949de";
+        const EXPECTED: &str = "30b913084a6d052b9b360df3c5ea1dfea10db4a37e2b1c16e35b816a80ca7c9f";
         let dir = tempfile::tempdir().unwrap();
         let sorted = compat_fixture();
 
         let from_sorted = dir.path().join("sorted.rmm");
-        RowMetaMap::build(&from_sorted, 42, sorted.clone()).unwrap();
+        RowMetaMap::build(&from_sorted, 42, EraseEpoch::Never, sorted.clone()).unwrap();
 
         // Same rows, scrambled: the build sorts by row_id, so the bytes must not
         // depend on the caller's order.
@@ -1838,7 +1932,7 @@ mod tests {
             scrambled.swap(i, len - 1 - i * 2 % len);
         }
         let from_scrambled = dir.path().join("scrambled.rmm");
-        RowMetaMap::build(&from_scrambled, 42, scrambled).unwrap();
+        RowMetaMap::build(&from_scrambled, 42, EraseEpoch::Never, scrambled).unwrap();
 
         assert_eq!(
             digest(&from_sorted),
@@ -1859,12 +1953,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rows = compat_fixture();
         let buffered = dir.path().join("buffered.rmm");
-        RowMetaMap::build(&buffered, 42, rows.clone()).unwrap();
+        RowMetaMap::build(&buffered, 42, EraseEpoch::Never, rows.clone()).unwrap();
         let expected = digest(&buffered);
 
         for chunk in [1usize, 5, 7, 64, 255, 256, 257, 300, 1000] {
             let path = dir.path().join(format!("chunked-{chunk}.rmm"));
-            let mut builder = RowMetaBuilder::new(&path, 42, rows.len()).unwrap();
+            let mut builder =
+                RowMetaBuilder::new(&path, 42, EraseEpoch::Never, rows.len()).unwrap();
             for batch in rows.chunks(chunk) {
                 // Owned per chunk and dropped at the end of the iteration: a
                 // batch the builder still needed would fail here, not silently
@@ -1909,12 +2004,13 @@ mod tests {
         );
 
         let buffered = dir.path().join("buffered.rmm");
-        RowMetaMap::build(&buffered, 42, rows.clone()).unwrap();
+        RowMetaMap::build(&buffered, 42, EraseEpoch::Never, rows.clone()).unwrap();
         let expected = digest(&buffered);
 
         for chunk in [1usize, 7, 256, 1000] {
             let path = dir.path().join(format!("chunked-{chunk}.rmm"));
-            let mut builder = RowMetaBuilder::new(&path, 42, rows.len()).unwrap();
+            let mut builder =
+                RowMetaBuilder::new(&path, 42, EraseEpoch::Never, rows.len()).unwrap();
             for batch in rows.chunks(chunk) {
                 let batch: Vec<RowMetaEntry> = batch.to_vec();
                 for row in &batch {
@@ -1969,6 +2065,7 @@ mod tests {
         RowMetaMap::build(
             &RowMetaMap::path_for(dir.path(), "dup", 1),
             1,
+            EraseEpoch::Never,
             vec![entry(1, "sess-a", "m1", 10, "one")],
         )
         .unwrap();
@@ -2007,7 +2104,7 @@ mod tests {
         let rows: Vec<RowMetaEntry> = (1..=5u64)
             .map(|i| entry(i, "sess-a", &format!("m{i}"), i as i64, &format!("row {i}")))
             .collect();
-        RowMetaMap::build(&base, 1, rows).unwrap();
+        RowMetaMap::build(&base, 1, EraseEpoch::Never, rows).unwrap();
 
         // Swap two records in the spine: both still point at valid blob offsets
         // inside the one text block, so every row still reads - the file is
@@ -2055,7 +2152,7 @@ mod tests {
             entry(10, "sess-a", "m10", 1, "ten"),
             entry(9, "sess-a", "m9", 2, "nine"),
         ];
-        let mut builder = RowMetaBuilder::new(&path, 1, rows.len()).unwrap();
+        let mut builder = RowMetaBuilder::new(&path, 1, EraseEpoch::Never, rows.len()).unwrap();
         builder.push(rows[0].as_row()).unwrap();
         let error = builder
             .push(rows[1].as_row())
@@ -2082,12 +2179,68 @@ mod tests {
     fn empty_map_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = RowMetaMap::path_for(dir.path(), "empty", 1);
-        RowMetaMap::build(&path, 1, Vec::new()).unwrap();
+        RowMetaMap::build(&path, 1, EraseEpoch::Never, Vec::new()).unwrap();
         let map = RowMetaMap::open(&path).unwrap();
         assert!(map.is_empty());
         assert_eq!(map.lookup(0), None);
         assert!(map.lookup_meta(0, &mut None).is_none());
         assert_eq!(map.lookup_count("anything"), None);
         assert_eq!(map.lookup_max_ts("anything"), None);
+    }
+
+    #[test]
+    fn segments_record_their_erase_epoch_and_a_mixed_chain_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let settled = EraseEpoch::Settled([5; 16]);
+        RowMetaMap::build(
+            &RowMetaMap::path_for(dir.path(), "e", 1),
+            1,
+            settled,
+            vec![entry(0, "s", "m0", 1, "a")],
+        )
+        .unwrap();
+        let chain = discover_chain(dir.path(), "e").unwrap();
+        assert_eq!(RowMetaSet::open(&chain).unwrap().epoch(), settled);
+
+        // A delta scanned under another epoch must not join the base.
+        RowMetaMap::build(
+            &RowMetaMap::delta_path(dir.path(), "e", 2),
+            2,
+            EraseEpoch::Settled([6; 16]),
+            vec![entry(1, "s", "m1", 2, "b")],
+        )
+        .unwrap();
+        let chain = discover_chain(dir.path(), "e").unwrap();
+        assert!(RowMetaSet::open(&chain).is_err());
+    }
+
+    #[test]
+    fn header_epoch_round_trips_and_rejects_unknown_states() {
+        for epoch in [
+            EraseEpoch::Never,
+            EraseEpoch::Settled([9; 16]),
+            EraseEpoch::InFlight,
+        ] {
+            let (bytes, state) = epoch_to_header(epoch);
+            assert_eq!(epoch_from_header(bytes, state), Some(epoch));
+        }
+        assert_eq!(epoch_from_header([0; 16], 3), None);
+    }
+
+    #[test]
+    fn a_pre_epoch_segment_is_rejected_by_its_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = RowMetaMap::path_for(dir.path(), "old", 1);
+        RowMetaMap::build(
+            &path,
+            1,
+            EraseEpoch::Never,
+            vec![entry(0, "s", "m", 1, "t")],
+        )
+        .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..8].copy_from_slice(b"PONDRMM5");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(RowMetaMap::open(&path).is_err());
     }
 }
