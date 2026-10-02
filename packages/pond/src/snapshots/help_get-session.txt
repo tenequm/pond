@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Read a whole session as a transcript.
 
 Returns the session as a conversational transcript (user/assistant text + one-line tool/file refs); expand any tool body with `pond get-message`. A message id also works: it resolves to its parent session with the page anchored at that message.

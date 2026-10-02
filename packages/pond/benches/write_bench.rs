@@ -1,4 +1,9 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! pond write-path benchmark. Exercises and profiles every path that writes to
 //! a store - on local, in-memory, or a real S3 dest (`--dest-url`):

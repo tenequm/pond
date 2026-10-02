@@ -2,7 +2,7 @@ language: python
 
 # Runs the plugin's pytest suite via uv (pure-stdlib runtime; pytest is the only
 # dev dep). Uses the system toolchain: proto's uv plugin fails to unpack a
-# usable binary, so uv comes from the flake devShell alongside protoc and kache
+# usable binary, so uv comes from the flake devShell alongside protoc
 # - see .moon/toolchains.yml. `uv run` handles the rest itself, resolving the dev
 # group from pyproject.toml and downloading a managed Python if the machine has
 # none, so this needs no separate install task the way the TypeScript plugin

@@ -199,8 +199,8 @@ jobs:
       # carrying its own copies. This step keeps that text form honest: the
       # literals, plus rust-toolchain.toml's channel which is not repeated
       # there, must equal what the flake evaluates to. It does NOT cover
-      # windows-bootstrap's own moon/protoc/kache copies; the "lockstep"
-      # comments there are still the only guard for those.
+      # windows-bootstrap's own moon/protoc/kache copies or dist-build-unix's
+      # kache pin; the "lockstep" comments there are the only guard for those.
       - name: toolVersions text extraction matches the evaluated attrset
         run: |
           set -euo pipefail
@@ -322,7 +322,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k33
+          s3-prefix: kache/pond/windows-verify/k34
           # Test leg only, never dist-build-windows: a restored harness has
           # unresolved .pdb paths, so a failing test gets a weaker backtrace.
           # Worth ~3 min of link time here; not worth it on the leg whose
@@ -370,8 +370,8 @@ jobs:
       # NOT `kache daemon log`: at v0.14.2 its Windows branch shells out to
       # `Get-Content -Wait` (src/service.rs), which follows the file forever and
       # would hold the job to its 180 min timeout. Read the file instead - the
-      # auto-started daemon writes stderr next to its socket, and the socket
-      # defaults to <cache_dir>/daemon.sock.
+      # auto-started daemon writes stderr next to its socket, which lives in
+      # KACHE_RUNTIME_DIR (set per job by kache-action).
       #
       # continue-on-error is load-bearing under pwsh: GitHub appends an
       # `exit $LASTEXITCODE` check, so any non-zero kache exit would otherwise
@@ -384,7 +384,7 @@ jobs:
         run: |
           kache stats
           Get-PSDrive C, D | Format-Table -AutoSize
-          $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
+          $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
           # windows-bootstrap's warm pull runs detached, so this log is the only
           # record of whether it finished before the build did - and the only
@@ -439,7 +439,7 @@ jobs:
           kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k33
+          s3-prefix: kache/pond/windows-dist/k34
 
       # Same reasoning as the sibling job: without this, moon serves the stored
       # hash and nothing is actually compiled or measured. Same `true`-not-`1`
@@ -495,7 +495,7 @@ jobs:
         run: |
           kache stats
           Get-PSDrive C, D | Format-Table -AutoSize
-          $log = Join-Path $env:KACHE_CACHE_DIR 'daemon.log'
+          $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
           # windows-bootstrap's warm pull runs detached, so this log is the only
           # record of whether it finished before the build did - and the only
@@ -580,7 +580,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond/linux-dist/k33
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k34
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache
@@ -589,6 +589,40 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { fetch-depth: 0, persist-credentials: false }
       - uses: ./.github/actions/devshell
+
+      # kache is not in the flake devShell (a per-machine tool, and a repo pin
+      # that disagreed with developers' own daemons), so this job - the only
+      # Linux consumer, through RUSTC_WRAPPER in ops/scripts/build-dist.sh -
+      # installs its own pinned copy. Deliberately not kunobi-ninja/kache-action
+      # as on Windows: that action exports its own RUSTC_WRAPPER, KACHE_CACHE_DIR,
+      # manifest/namespace and daemon lifecycle, all of which would change how
+      # this release-only path behaves and cannot be exercised before a release.
+      # This puts the same static musl binary the flake used to build on PATH
+      # and nothing else. The sha256s are pinned here, as the flake pinned them,
+      # rather than read from the release's own .sha256 sidecar: release assets
+      # are mutable, and this binary wraps every rustc call of a shipped build.
+      # Bumped in lockstep with windows-bootstrap's kache-action `version` and
+      # the k-tag in the S3 prefixes, never alone.
+      - name: Install kache
+        env:
+          KACHE_RELEASE: 0.28.1
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64) sha256=68635a9f92ce5015a2c48c98b968d1b3707b6dbee0ca725e51d1671c9346f38f ;;
+            aarch64) sha256=b2110805eb24afe9b408e5b9a1e3d0584b7fdd0b79fe8cbe548ab29fbaf50176 ;;
+            *) echo "no pinned kache for $arch" >&2; exit 1 ;;
+          esac
+          asset="kache-$arch-unknown-linux-musl.tar.gz"
+          dir="$RUNNER_TEMP/kache-bin"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 -o "$dir/$asset" \
+            "https://github.com/kunobi-ninja/kache/releases/download/v${KACHE_RELEASE}/${asset}"
+          echo "$sha256  $dir/$asset" | sha256sum -c -
+          tar -xzf "$dir/$asset" -C "$dir" kache
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/kache" --version
 
       # This job is the only caller that declares a kache remote, and the CLI
       # reads KACHE_S3_PREFIX ahead of the file. Assert the two agree, so the

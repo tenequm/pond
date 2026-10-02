@@ -20,14 +20,8 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, ensure_clean_ingest, ingest_into_temp_store, path_config};
 
-const MACOS_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/macos/cli"
-);
-const WINDOWS_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/windows/cli"
-);
+const MACOS_ROOT: &str = "tests/fixtures/adapter/devin/macos/cli";
+const WINDOWS_ROOT: &str = "tests/fixtures/adapter/devin/windows/cli";
 
 // 5 sessions rows plus 3 subagent children (one in amplified-color, two in
 // chalk-twig); the fork power-almandine copies a subagent link but no
@@ -44,10 +38,7 @@ const FORK: &str = "power-almandine";
 // link row yet), `after` once it reported back, two compactions and a
 // whole-forest re-save later. `after` holds 69 distinct messages, each placed
 // in either the root's trees or the subagent's, so 69 messages are stored.
-const MIDRUN_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/midrun"
-);
+const MIDRUN_ROOT: &str = "tests/fixtures/adapter/devin/midrun";
 const MIDRUN_PARENT: &str = "gilded-orca";
 const MIDRUN_CHILD: &str = "gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004";
 const MIDRUN_MESSAGES: usize = 69;
@@ -55,10 +46,7 @@ const MIDRUN_MESSAGES: usize = 69;
 // One Local Fusion session: two sidekick handoffs and an explore subagent. The
 // sidekick is one child across both handoffs, so 3 sessions hold its 70
 // distinct messages, each in exactly one of them.
-const SIDEKICK_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/devin/sidekick/cli"
-);
+const SIDEKICK_ROOT: &str = "tests/fixtures/adapter/devin/sidekick/cli";
 const SIDEKICK_SESSIONS: usize = 3;
 const SIDEKICK_MESSAGES: usize = 70;
 const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";

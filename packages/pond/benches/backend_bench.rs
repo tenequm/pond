@@ -1,4 +1,8 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 // The deep async ingest futures in `run_bench` exceed rustc's default
 // query-depth limit of 128.
 #![recursion_limit = "256"]
@@ -100,7 +104,6 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
-            #[allow(clippy::cast_precision_loss)]
             let unit = (state >> 33) as f32 / (1u64 << 31) as f32;
             unit - 1.0
         })

@@ -14,10 +14,7 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/letta-code/transcripts"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/letta-code/transcripts";
 
 // Three agents: three conversations under the first (one of them the synthetic
 // legacy shape), one under the second, one under the Windows-captured third;

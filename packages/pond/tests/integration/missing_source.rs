@@ -16,7 +16,7 @@
 //! `main.rs` (dry-run text and JSON, real-sync stderr and JSON summary) that no
 //! adapter-level test reaches - the exact thing a later refactor would quietly
 //! undo while every adapter test still passed.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -110,7 +110,7 @@ fn run(temp: &TempDir, args: &[&str]) -> std::process::Output {
     std::fs::create_dir_all(&home).expect("home");
     let state = temp.path().join("state");
     std::fs::create_dir_all(&state).expect("state");
-    Command::new(env!("CARGO_BIN_EXE_pond"))
+    Command::new(crate::support::pond_bin())
         .args(args)
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -570,7 +570,7 @@ fn non_utf8_path_is_a_named_error_not_a_panic() {
     fleet_config(&temp, Healthy::EmptyDir);
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
-    let out = Command::new(env!("CARGO_BIN_EXE_pond"))
+    let out = Command::new(crate::support::pond_bin())
         .args(["sync", "claude-code", "--path"])
         .arg(std::ffi::OsString::from_vec(b"/tmp/pond-\xff".to_vec()))
         .env("HOME", &home)
@@ -892,8 +892,8 @@ fn dropped_events_are_attributed_to_their_adapter() {
 #[test]
 fn a_routine_validator_drop_is_recorded_but_never_warns() {
     let temp = TempDir::new().expect("temp");
-    let src =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/adapter/claude_desktop_app");
+    let src = std::path::absolute("tests/fixtures/adapter/claude_desktop_app")
+        .expect("absolute fixture path");
     write_config(
         &temp,
         &format!(

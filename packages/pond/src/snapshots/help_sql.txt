@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Run one read-only SQL query over the corpus.
 
 DataFusion / PostgreSQL-compatible SELECT/WITH over the sessions, messages, and parts tables; writes and side-effecting statements are rejected. Same surface as the `pond_sql` MCP tool - the MCP resource `schema://pond-sql` documents columns, indexed predicates, and pagination patterns.

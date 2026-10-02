@@ -10,7 +10,7 @@ use pond::adapter::{AgyAdapter, AgyFactory};
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adapter/agy");
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/agy";
 
 // 13 conversation databases (10 CLI, 3 ACP); the never-prompted ACP one holds
 // no steps and ingests nothing.

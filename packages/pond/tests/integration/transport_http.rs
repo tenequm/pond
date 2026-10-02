@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 //! HTTP+JSON transport (spec.md#protocol, spec.md#protocol):
 //! `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`, and
@@ -887,7 +891,7 @@ async fn pond_serve_socket_ignores_tcp_env_and_cleans_up_on_sigterm() -> anyhow:
     let home = temp.path().join("home");
     std::fs::create_dir_all(&home)?;
     let serve = || {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pond"));
+        let mut command = std::process::Command::new(crate::support::pond_bin());
         command
             .arg("serve")
             .arg("--storage-path")

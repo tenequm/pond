@@ -1,4 +1,9 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! Memory scenarios for #245 - the harness behind the `gate` bench.
 //!
@@ -81,9 +86,7 @@ use pond::memprobe;
 /// so a feature-less run still produces a row with wall time and nulls.
 #[cfg(not(any(feature = "mem-probe", feature = "dhat-heap")))]
 mod memprobe {
-    // Mirrors the real module's surface, so the items are `pub` without a
-    // crate boundary to be reachable from.
-    #![allow(unreachable_pub)]
+    #![expect(unreachable_pub, reason = "mirrors the real module's pub surface")]
     use std::time::Duration;
 
     pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);

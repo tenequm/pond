@@ -9,10 +9,7 @@ use tempfile::TempDir;
 
 use super::{Conformance, RoundTrip, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_code/projects"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_code/projects";
 
 fn conformance() -> Conformance<'static> {
     Conformance {
@@ -43,10 +40,7 @@ async fn native_restore_round_trips_parents_and_subagents_through_reingest() -> 
 }
 
 /// Real native-Windows capture; see the fixture-gate test below.
-const WINDOWS_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_code/windows-projects"
-);
+const WINDOWS_FIXTURES: &str = "tests/fixtures/adapter/claude_code/windows-projects";
 
 /// The directory name Claude Code chose for the capture's `cwd`.
 const WINDOWS_SLUG: &str = "C--dev-pond-fixture-demo-v2";

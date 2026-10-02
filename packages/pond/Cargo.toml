@@ -3,7 +3,7 @@
 # crate). The library and binary stay `pond` via [lib]/[[bin]] below, so the
 # command and `use pond::...` are unchanged - only `cargo install pond-db` differs.
 name = "pond-db"
-version = "0.19.3"
+version = "0.19.4"
 edition = "2024"
 # MSRV pinned to the toolchain we build and test with (rust-toolchain.toml).
 rust-version = "1.98"
@@ -265,7 +265,7 @@ lance-index = "12.0.0"
 rmcp = { version = "3.2.0", features = ["client"] }
 # Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
 rusqlite = { version = "0.40", features = ["bundled"] }
-insta = "1.47.2"
+expect-test = "1.5.1"
 tempfile = "3.25"
 # `test-util` for `#[tokio::test(start_paused = true)]` + `time::advance`: the
 # embedder's idle eviction keys on `tokio::time::Instant`, so its tests drive
@@ -359,6 +359,8 @@ unreachable_pub = "warn"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 dbg_macro = "warn"
 expect_used = "warn"
 implicit_clone = "warn"

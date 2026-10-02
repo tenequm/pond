@@ -15,7 +15,7 @@
 //! a segment pond can still read, and any temp left behind is shaped so
 //! `sweep_orphan_temps` reclaims it on a later run. pond must never end up with
 //! a segment it can neither open nor replace.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use std::path::Path;
 use std::process::{Command, Stdio};

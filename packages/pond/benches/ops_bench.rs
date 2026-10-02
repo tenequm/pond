@@ -1,4 +1,4 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::print_stdout, reason = "bench harness: results go to stdout")]
 
 //! Where does the wall-clock go on `pond status`, `pond sync`, `pond optimize`,
 //! and `pond copy` against a real store (especially a remote S3 one)?

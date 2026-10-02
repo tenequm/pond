@@ -9,10 +9,7 @@ use pond::adapter::ClaudeAiExportFactory;
 
 use super::{Conformance, RoundTrip, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_ai_export"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/claude_ai_export";
 
 fn conformance() -> Conformance<'static> {
     Conformance {

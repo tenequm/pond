@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 //! stdio-MCP transport (spec.md#protocol): the `pond_search` /
 //! `pond_get_session` / `pond_get_message` tools are driven by an in-process

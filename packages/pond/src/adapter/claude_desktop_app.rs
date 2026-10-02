@@ -1137,7 +1137,7 @@ mod tests {
     //! End-to-end tests over the committed Cowork fixture corpus
     //! (`tests/fixtures/adapter/claude_desktop_app/`), including the regression
     //! guard that the nested `.claude/` inner Claude Code loop is never ingested.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store};
@@ -1145,10 +1145,10 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/claude_desktop_app/local-agent-mode-sessions"
-    );
+    fn fixtures() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/claude_desktop_app/local-agent-mode-sessions")
+    }
     /// The inner Claude Code loop transcript nested under one session's
     /// `.claude/projects/`; the adapter must never surface it as a session.
     const INNER_LOOP_ID: &str = "a9985b0b-2f5e-4125-b105-7f62376f5509";
@@ -1284,7 +1284,7 @@ mod tests {
     async fn plan_matches_the_events_gate() -> anyhow::Result<()> {
         use tokio_stream::StreamExt;
 
-        let adapter = ClaudeDesktopAppAdapter::new(FIXTURES);
+        let adapter = ClaudeDesktopAppAdapter::new(fixtures());
         let first_sync = adapter
             .plan(&crate::adapter::NoopOracle)
             .await?
@@ -1327,7 +1327,7 @@ mod tests {
     async fn ingests_cowork_fixture_into_canonical_shape() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = ClaudeDesktopAppAdapter::new(FIXTURES);
+        let adapter = ClaudeDesktopAppAdapter::new(fixtures());
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert_eq!(summary.dropped_sessions, 0, "no session-level rejections");
 
@@ -1390,7 +1390,7 @@ mod tests {
     async fn native_restore_round_trips() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path().join("store")).await?;
-        let adapter = ClaudeDesktopAppAdapter::new(FIXTURES);
+        let adapter = ClaudeDesktopAppAdapter::new(fixtures());
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         let original = store.session_ids().await?;
 

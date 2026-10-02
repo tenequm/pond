@@ -8,7 +8,11 @@
 //! window, and the shared `lance::Session` routing all four datasets through
 //! one ObjectStoreRegistry. The classifier helpers (`is_local`, `local_path`)
 //! live in `src/config.rs::tests`.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use chrono::Utc;
 use pond::{

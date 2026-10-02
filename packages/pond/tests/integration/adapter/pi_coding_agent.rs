@@ -12,10 +12,7 @@ use serde_json::{Value, json};
 
 use super::{Conformance, RoundTrip};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/pi-coding-agent"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/pi-coding-agent";
 
 /// pi's config face: the JSONL sessions root plus an optional SQLite database.
 /// The database is declared only where it exists, because a `Reingest` restore

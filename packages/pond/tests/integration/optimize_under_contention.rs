@@ -9,7 +9,11 @@
 //! production `ConditionalPutCommitHandler` (lance-table/src/io/commit.rs:1111),
 //! the same OCC handler S3 uses. A `file://`/`TempDir` test would route
 //! through the local-FS commit lock instead and prove a different primitive.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::sync::Arc;
 

@@ -7,7 +7,11 @@
 //! additive re-sync freshness through the store's rowmap oracle. All non-fixture
 //! data is synthetic - the committed `agentgroup-anon-001` capture is never
 //! mutated.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::path::Path;
 
@@ -21,14 +25,8 @@ use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/nanoclaw"
-);
-const OPENCODE_DB_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/opencode/opencode.db"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/nanoclaw";
+const OPENCODE_DB_FIXTURE: &str = "tests/fixtures/adapter/opencode/opencode.db";
 
 // The committed fixture corpus: 3 top-level transcripts (anon main + 2 synthetic
 // mains) and 5 subagent sidecars (anon 1, synthetic 503d... 1, synthetic bebe...

@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Expand one message with its full part bodies.
 
 Returns the message with its full parts (tool_call / tool_result / reasoning bodies included) plus conversational neighbors. For the whole session use `pond get-session`.

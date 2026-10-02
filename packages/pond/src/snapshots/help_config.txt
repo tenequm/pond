@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Inspect configuration.
 
 Resolved values with provenance (show), the config file location (path), and the fully-annotated template (schema).

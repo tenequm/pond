@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Keep the lake queryable: embed the backlog, then fold the search indexes.
 
 The maintenance verb. `embed` fills vectors for every message with a null `vector` (idempotent: a re-run resumes exactly where it stopped); `index` folds trailing fragments into the text + semantic indexes and runs the `[maintenance]` compaction / version-cleanup pass. `pond sync` embeds inline and folds by default; this is the on-demand maintenance run. It also diagnoses the expensive conditions it does not fix - a model swap, piled-up index segments, orphaned indexes, the legacy tiny-page layout - and names the cost of healing them with `--full`.

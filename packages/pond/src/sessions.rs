@@ -6926,7 +6926,11 @@ fn part_kind_from_json(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{
@@ -8793,7 +8797,6 @@ mod tests {
         (0..embedding_dim())
             .map(|_| {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                #[allow(clippy::cast_precision_loss)]
                 let unit = (state >> 33) as f32 / (1u64 << 31) as f32;
                 unit - 1.0
             })

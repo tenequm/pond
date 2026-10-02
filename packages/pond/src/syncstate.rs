@@ -297,7 +297,11 @@ fn read_last_sync_in(dir: &Path, store_key: &str) -> Option<LastSyncRecord> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
 
@@ -407,7 +411,7 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod lock_release_regression {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
     use super::*;
 
     /// Guards the fix in `SyncLockGuard::drop`. `flock` belongs to the open file

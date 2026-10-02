@@ -843,7 +843,7 @@ fn capped_string<R: Read>(json: &mut JsonStreamReader<R>) -> CapResult<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::adapter::extract::truncated_values_count;

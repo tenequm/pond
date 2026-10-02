@@ -1,18 +1,13 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
-Manage the automatic sync schedule.
+Manage URL-scoped credential sets in config.toml.
 
-Registers `pond sync -q --no-wait` with the OS scheduler: launchd on macOS, systemd user timers (or a crontab fence) on Linux, Task Scheduler on Windows. `pond init` offers the same setup interactively.
+`add` captures a set's keys (secret via hidden prompt) and writes `[creds.<name>]`; `list` shows configured sets with secrets redacted; `delete` removes one. Sets bind to storage URLs by scope match, never by activation (spec.md#creds-scope-match) - there is no "current" set.
 
-Usage: pond schedule [OPTIONS] <COMMAND>
+Usage: pond creds [OPTIONS] <COMMAND>
 
 Commands:
-  start   Register the schedule (idempotent: safe to re-run)
-  stop    Remove the schedule
-  status  Show whether a schedule is active
-  logs    Show recent scheduled-sync output
+  add     Add or replace a credential set (secret captured via a hidden prompt)
+  list    List configured credential sets (secrets redacted)
+  delete  Remove a credential set
   help    Print this message or the help of the given subcommand(s)
 
 Options:
@@ -39,8 +34,7 @@ Global options:
           Decrease logging verbosity
 
 Examples:
-  pond schedule start              every 5 minutes (the default)
-  pond schedule start --every 15m
-  pond schedule status
-  pond schedule logs
-  pond schedule stop
+  pond creds add                            interactive: name (default), key, hidden secret
+  pond creds add work --scope s3+https://host/work
+  pond creds list
+  pond creds delete work

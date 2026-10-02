@@ -16,10 +16,7 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/codex_cli/sessions"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/codex_cli/sessions";
 
 const FIXTURE_SESSIONS: usize = 4;
 /// The Codex 0.152 `codex exec` capture (census in the fixture README).

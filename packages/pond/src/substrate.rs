@@ -1902,7 +1902,6 @@ pub struct Handle {
     /// three datasets - load-bearing on object-store backends where a
     /// per-dataset client would mean 3x the connection pools and 3x the
     /// credential refreshes (lance/src/dataset/builder.rs:509-517).
-    #[allow(dead_code)]
     session: Arc<Session>,
     /// The `lance-namespace` catalog seam. v1 uses the Directory impl;
     /// future hosted pond swaps to "rest" without touching read/write paths
@@ -4517,7 +4516,7 @@ pub mod index_cache {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::unwrap_used)]
+        #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
         use super::*;
         use object_store::memory::InMemory;
 
@@ -4817,7 +4816,7 @@ pub mod durability {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::unwrap_used)]
+        #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
         use super::*;
         use object_store::ObjectStoreExt;
 
@@ -5589,7 +5588,11 @@ fn like_contains(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use tempfile::TempDir;

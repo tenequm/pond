@@ -14,7 +14,7 @@
 // glibc extension that the `libc` crate declares only for the gnu environment,
 // so a musl target would not even compile against the branch below.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "malloc_trim FFI")]
 pub fn trim_allocator() {
     // SAFETY: malloc_trim has no caller-side safety invariants.
     let released = unsafe { libc::malloc_trim(0) != 0 };

@@ -1,7 +1,7 @@
 [workspace]
 publish = true
 # Skip the `cargo publish` verify build: build-and-test-linux already compiled this
-# exact code on the self-hosted runner (with protoc + kache), and a cold lance
+# exact code on the self-hosted runner (with protoc), and a cold lance
 # build on ubuntu-latest risks the publish timeout. Packaging contents are
 # gated in CI by pond:check-package (cargo package --list vs include_str!).
 publish_no_verify = true

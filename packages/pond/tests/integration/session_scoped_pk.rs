@@ -1,4 +1,8 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::collections::HashSet;
 use std::path::Path;

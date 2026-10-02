@@ -1,7 +1,3 @@
----
-source: packages/pond/src/main.rs
-expression: sub.render_long_help().to_string()
----
 Resume a stored session in a client's own format.
 
 Writes the session - and its child sessions - back out as the target client's native files, so you can open it there and keep going. Fidelity is decided by pond, never asked for: a session captured from that same client resumes value-complete (native); anything else is a best-effort idiomatic reconstruction (foreign). Nothing is ever overwritten.

@@ -2,11 +2,11 @@
 //!
 //! macOS uses launchd ONLY (cron on macOS runs without the user's GUI
 //! context, trips TCC folder-access denials, and silently drops jobs that
-//! span sleep). Linux prefers systemd user timers (`Persistent=true` catches
-//! up after downtime) and falls back to a fenced crontab block. Windows uses
-//! Task Scheduler: the task Execs `pondw.exe`, pond's windowless launcher,
-//! and the task XML provides the settings that align it with the
-//! launchd/systemd posture (battery-friendly, catch-up after missed runs).
+//! span sleep). Linux prefers systemd user timers and falls back to a fenced
+//! crontab block. Windows uses Task Scheduler: the task Execs `pondw.exe`,
+//! pond's windowless launcher, and the task XML provides the settings that
+//! align it with the launchd/systemd posture (battery-friendly, catch-up
+//! after missed runs).
 //!
 //! The scheduled job is `pond sync -q --no-wait`: NOT `--yes`, so an
 //! unattended run can never auto-enable freshly-detected adapters, and
@@ -124,8 +124,9 @@ enum State {
 use State::{Active, Inactive};
 
 impl State {
-    /// A healthy registration; only `windows::probe` ever reports a problem,
-    /// so every other constructor goes through here.
+    /// A healthy registration; the probes that can detect an unrunnable one
+    /// (`windows::probe`, and `unix::probe` for systemd timers) build `Active`
+    /// directly, so every other constructor goes through here.
     fn active(backend: &'static str, every: Option<ScheduleEvery>) -> Self {
         Active {
             backend,
@@ -375,7 +376,7 @@ mod unix {
     use anyhow::{Context, Result, bail};
 
     use super::{ScheduleEvery, State};
-    use State::Inactive;
+    use State::{Active, Inactive};
 
     const LAUNCHD_LABEL: &str = "sh.pond.sync";
     const CRON_FENCE_BEGIN: &str = "# BEGIN POND SYNC (maintained by pond; do not edit)";
@@ -386,7 +387,13 @@ mod unix {
             "macos" => probe_launchd(),
             "linux" => {
                 if systemd_timer_enabled() {
-                    return Ok(State::active("systemd", read_systemd_interval()));
+                    return Ok(Active {
+                        backend: "systemd",
+                        every: read_systemd_interval(),
+                        problem: systemd_timer_show()
+                            .as_deref()
+                            .and_then(systemd_timer_problem),
+                    });
                 }
                 if let Some(entry) = read_cron_fence_entry()? {
                     return Ok(State::active("cron", cron_entry_interval(&entry)));
@@ -663,6 +670,79 @@ mod unix {
             .unwrap_or(false)
     }
 
+    /// The two properties `systemctl show` answers with for a timer's next
+    /// elapse. Both are asked for because a monotonic-only timer leaves the
+    /// realtime one empty while being perfectly healthy.
+    const NEXT_ELAPSE_PROPERTIES: [&str; 2] = ["NextElapseUSecRealtime", "NextElapseUSecMonotonic"];
+
+    /// Asked for alongside them: the sub-state tells a mid-run timer apart
+    /// from a settled one. Kept as a single extra rather than a second list,
+    /// so the set asked for cannot drift from the set read.
+    const SUB_STATE_PROPERTY: &str = "SubState";
+
+    /// Ask `systemctl` for the timer's next elapse and sub-state, split from
+    /// the reading so the verdict and its remedy stay a testable pure function.
+    fn systemd_timer_show() -> Option<String> {
+        let mut command = Command::new("systemctl");
+        command.args(["--user", "show", "pond-sync.timer"]);
+        for property in NEXT_ELAPSE_PROPERTIES {
+            command.arg(format!("--property={property}"));
+        }
+        command.arg(format!("--property={SUB_STATE_PROPERTY}"));
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// A timer can be `enabled` and `active` with no next elapse, never
+    /// firing again - and `Persistent=true` is what causes it: its stamp
+    /// disables the already-past `OnBootSec=` one-shot on a fresh user
+    /// manager while `OnUnitActiveSec=` has no base (timer.c: the stamp load
+    /// in `timer_start`, the skips in `timer_enter_waiting`). `is-enabled`
+    /// still succeeds, so the elapse properties are the only honest probe.
+    fn systemd_timer_problem(show: &str) -> Option<String> {
+        timer_is_dead(show).then(|| {
+            "the timer has no next elapse and will never fire again \
+             (`systemctl --user list-timers` shows `NEXT: -`); run \
+             `pond schedule start` to repair it"
+                .to_string()
+        })
+    }
+
+    /// A running timer also has no next elapse - systemd recomputes it only
+    /// once the service goes inactive - so without the `SubState` guard every
+    /// status read taken mid-sync would call a healthy schedule broken.
+    fn timer_is_dead(show: &str) -> bool {
+        if show.lines().any(|line| line.trim() == "SubState=running") {
+            return false;
+        }
+        next_elapse_missing(show)
+    }
+
+    /// True when the answered properties name no elapse: an unset one renders
+    /// as "" (realtime) or `infinity` (monotonic), `0` / `n/a` on other
+    /// versions, while a healthy value is a duration - so sentinel-matching
+    /// holds across versions. A healthy monotonic-only timer leaves realtime
+    /// empty, and answering neither property is no measurement, not a verdict.
+    fn next_elapse_missing(show: &str) -> bool {
+        let mut measured = false;
+        for line in show.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if !NEXT_ELAPSE_PROPERTIES.contains(&key.trim()) {
+                continue;
+            }
+            measured = true;
+            if !matches!(value.trim(), "" | "0" | "n/a" | "infinity") {
+                return false;
+            }
+        }
+        measured
+    }
+
     fn systemd_unit_dir() -> PathBuf {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -723,7 +803,13 @@ mod unix {
             && std::fs::read_to_string(&timer_path)
                 .map(|existing| existing == timer)
                 .unwrap_or(false);
-        if unchanged && systemd_timer_enabled() {
+        // An enabled timer with unchanged units can still be dead, so the
+        // early return must also require health (`systemd_timer_problem`).
+        let needs_repair = systemd_timer_show()
+            .as_deref()
+            .and_then(systemd_timer_problem)
+            .is_some();
+        if unchanged && systemd_timer_enabled() && !needs_repair {
             pond::output::line(&format!("already scheduled (every {})", every.label()))?;
             return Ok(());
         }
@@ -743,6 +829,24 @@ mod unix {
                 bail!(
                     "systemctl {} exited {}: {}",
                     args.join(" "),
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                );
+            }
+        }
+        // `enable --now` cannot revive a dead timer - a start job on an
+        // active (`elapsed`) unit is a no-op and `timer_trigger_notify`
+        // ignores dead/failed; only a fresh service activation re-anchors
+        // `OnUnitActiveSec=`. `--no-block` keeps the triggered sync from
+        // holding this command open.
+        if needs_repair {
+            let output = Command::new("systemctl")
+                .args(["--user", "start", "--no-block", "pond-sync.service"])
+                .output()
+                .context("failed to run systemctl")?;
+            if !output.status.success() {
+                bail!(
+                    "systemctl --user start --no-block pond-sync.service exited {}: {}",
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim(),
                 );
@@ -987,6 +1091,83 @@ mod unix {
         const LOG: &str = "/tmp/sync.log";
         const STATE: &str = "/home/user/.local/state";
         const CONFIG: &str = "/home/user/.config/pond/config.toml";
+
+        /// Captured verbatim from `systemctl --user show` (systemd 259,
+        /// Ubuntu 24.04) on a timer carrying pond's exact generated body
+        /// after it elapsed with no anchor left: `systemctl status` shows
+        /// `Active: active (elapsed)` / `Trigger: n/a`, `list-timers` shows
+        /// `NEXT: -`, and `is-enabled`, which on its own cannot tell these
+        /// apart, still answers `enabled`.
+        const SHOW_DEAD: &str = "LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=elapsed\n\
+             NextElapseUSecRealtime=\n\
+             NextElapseUSecMonotonic=infinity\n";
+
+        /// Same host, same command, a timer that will fire: the realtime
+        /// property is empty here too, so it alone cannot be the signal.
+        const SHOW_HEALTHY: &str = "LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=waiting\n\
+             NextElapseUSecRealtime=\n\
+             NextElapseUSecMonotonic=2month 1w 10h 50min 22.539762s\n";
+
+        /// The timer while `pond-sync.service` is actually running: systemd
+        /// leaves it without a next elapse until the service finishes, so the
+        /// elapse properties alone read exactly like the dead timer above.
+        const SHOW_RUNNING: &str = "LoadState=loaded\n\
+             ActiveState=active\n\
+             SubState=running\n\
+             NextElapseUSecRealtime=\n\
+             NextElapseUSecMonotonic=infinity\n";
+
+        #[test]
+        fn elapsed_timer_with_no_next_elapse_is_reported_broken() {
+            assert!(next_elapse_missing(SHOW_DEAD));
+        }
+
+        #[test]
+        fn waiting_timer_with_a_next_elapse_is_not_reported_broken() {
+            assert!(!next_elapse_missing(SHOW_HEALTHY));
+        }
+
+        #[test]
+        fn a_timer_whose_service_is_running_is_not_reported_broken() {
+            assert!(!timer_is_dead(SHOW_RUNNING));
+            // ... while the same reading on a settled timer still is:
+            assert!(timer_is_dead(SHOW_DEAD));
+        }
+
+        #[test]
+        fn systemctl_that_names_neither_property_is_not_called_broken() {
+            // An older systemctl, or one that would not describe the unit:
+            // no measurement is not the same as a dead timer.
+            assert!(!next_elapse_missing(
+                "LoadState=loaded\nActiveState=active\n"
+            ));
+        }
+
+        /// The Windows precedent (`launcher_problem_flags_only_a_missing_command`)
+        /// pins that a problem message names its fix; this pins the same.
+        #[test]
+        fn the_problem_message_names_the_command_that_repairs_it() {
+            // `expect_used` warns here: unlike the windows tests, this module does not expect it.
+            let Some(problem) = systemd_timer_problem(SHOW_DEAD) else {
+                panic!("a dead timer must be reported as a problem");
+            };
+            assert!(
+                problem.contains("`pond schedule start` to repair it"),
+                "remedy must name the repairing command: {problem}"
+            );
+            // `start_systemd` starts the service itself, so the message must not
+            // hand the user the internal step.
+            assert!(
+                !problem.contains("systemctl --user start pond-sync.service"),
+                "remedy must not hand the user the internal step: {problem}"
+            );
+            assert!(systemd_timer_problem(SHOW_HEALTHY).is_none());
+            assert!(systemd_timer_problem(SHOW_RUNNING).is_none());
+        }
 
         #[test]
         fn cron_entries_reverse_map_to_their_cadence() {
@@ -1523,7 +1704,7 @@ mod windows {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        #![expect(clippy::expect_used, reason = "tests fail by panicking")]
         use super::*;
 
         /// The action shape `start()` builds, for tests that need one.
@@ -1686,7 +1867,6 @@ mod windows {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     #[test]

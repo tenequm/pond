@@ -15,10 +15,7 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/oh-my-pi/sessions"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/oh-my-pi/sessions";
 
 // 2 slot-fronted sessions + 1 legacy slot-less file, plus the artifacts
 // directory omp 17.3.4 writes: a `task` subagent and its own nested child.

@@ -15,10 +15,7 @@ use pond::{
 
 use super::{Conformance, RoundTrip, ingest_into_temp_store, path_config};
 
-const FIXTURE_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/grok-build/sessions"
-);
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/grok-build/sessions";
 
 // 15 session dirs in the capture across three buckets (11 macOS, 1 hash-form
 // long-cwd, 2 Windows, 1 subagent child); the `no-updates` dir holds no

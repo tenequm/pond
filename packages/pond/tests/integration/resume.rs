@@ -5,7 +5,11 @@
 //! `--format json` document a plugin branches on (spec.md 7.8). The store is
 //! populated in-process first, then the binary is pointed at it with
 //! `--storage-path`.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use assert_cmd::Command;
 use pond::{
@@ -18,14 +22,8 @@ use std::path::Path;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
-const PI_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/pi-coding-agent/sessions"
-);
-const CLAUDE_FIXTURES: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/adapter/claude_code/projects"
-);
+const PI_FIXTURES: &str = "tests/fixtures/adapter/pi-coding-agent/sessions";
+const CLAUDE_FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
 /// A pi-origin v4 session that also has a child session in the same corpus, so
 /// one store covers native fidelity and lineage.
@@ -103,7 +101,7 @@ impl Sandbox {
     /// Run `pond resume ...` against this sandbox's store, in a sandboxed HOME
     /// so no real config or data dir is consulted. Returns (exit code, stdout).
     fn resume(&self, args: &[&str]) -> (i32, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_pond"))
+        let out = Command::new(crate::support::pond_bin())
             .arg("resume")
             .args(args)
             .arg("--storage-path")

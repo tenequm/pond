@@ -20,6 +20,12 @@ class Pond < Formula
       url "@BASE@/pond-aarch64-apple-darwin.tar.xz"
       sha256 "@SHA_aarch64-apple-darwin@"
     end
+    # Never downloaded: the arch dependency above stops Intel first. It is here
+    # because `brew readall` needs every platform to resolve a URL.
+    on_intel do
+      url "@BASE@/pond-aarch64-apple-darwin.tar.xz"
+      sha256 "@SHA_aarch64-apple-darwin@"
+    end
   end
 
   on_linux do

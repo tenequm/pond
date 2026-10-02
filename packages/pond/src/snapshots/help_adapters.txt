@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Manage which adapters `pond sync` ingests (the `[adapters.*]` entries).
 
 Enabling an adapter is the explicit owner of adapter state: `list` shows what is configured and what was detected, `discover` probes and enables interactively, `enable`/`disable` flip one by name. `pond sync` reads these but never writes them.

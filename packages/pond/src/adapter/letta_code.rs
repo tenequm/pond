@@ -659,7 +659,11 @@ fn fold_result(row: &mut Value, result: ReconstructedResult) {
 mod tests {
     //! Mapping decisions from `docs/adapters/letta-code.md`, checked against
     //! the committed sandbox capture under `tests/fixtures/adapter/letta-code/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{
@@ -669,10 +673,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/letta-code/transcripts"
-    );
+    fn fixtures() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/letta-code/transcripts")
+    }
     const AGENT_A: &str = "agent-local-0ce90846-9803-4ab1-8d67-31baacdd5148";
     const AGENT_B: &str = "agent-local-61c7e9e2-999a-453d-99d5-cac7c76a0543";
     /// The agent captured on Windows 11, the leg that proves the writer's
@@ -681,7 +685,7 @@ mod tests {
     const LEGACY: &str = "conversation-00000000-0000-4000-8000-000000000001";
 
     fn fixture_path(agent: &str, conversation: &str) -> PathBuf {
-        Path::new(FIXTURES)
+        fixtures()
             .join(agent)
             .join(conversation)
             .join(TRANSCRIPT_FILE)
@@ -691,7 +695,7 @@ mod tests {
         let store = Store::open_local(temp.path().join("store")).await?;
         let summary = ingest_adapter(
             &store,
-            &LettaCodeAdapter::new(FIXTURES),
+            &LettaCodeAdapter::new(fixtures()),
             &crate::adapter::NoopOracle,
             |_| {},
         )
@@ -713,7 +717,7 @@ mod tests {
     /// byte, and the agent id is the project.
     #[test]
     fn the_session_id_and_project_come_from_the_path() {
-        let adapter = LettaCodeAdapter::new(FIXTURES);
+        let adapter = LettaCodeAdapter::new(fixtures());
         let path = fixture_path(AGENT_A, "default");
         assert_eq!(
             adapter.peek_session_id(&path, ""),
@@ -745,8 +749,8 @@ mod tests {
     /// borrowing a neighbouring directory as its id.
     #[test]
     fn a_transcript_at_the_wrong_depth_is_a_named_skip() {
-        let adapter = LettaCodeAdapter::new(FIXTURES);
-        let shallow = Path::new(FIXTURES).join(AGENT_A).join(TRANSCRIPT_FILE);
+        let adapter = LettaCodeAdapter::new(fixtures());
+        let shallow = fixtures().join(AGENT_A).join(TRANSCRIPT_FILE);
         assert_eq!(adapter.peek_session_id(&shallow, ""), None);
         let reason = adapter
             .unsupported_path(&shallow)
@@ -765,7 +769,7 @@ mod tests {
     /// budget the sync gate is held to.
     #[test]
     fn the_freshness_peek_stays_within_one_tail_window_per_file() -> anyhow::Result<()> {
-        let adapter = LettaCodeAdapter::new(FIXTURES);
+        let adapter = LettaCodeAdapter::new(fixtures());
         for (agent, conversation) in [
             (AGENT_A, "default"),
             (AGENT_A, "local-conv-2"),
@@ -792,7 +796,7 @@ mod tests {
     /// The watermark is the last row's stamp; an unparseable tail re-reads.
     #[test]
     fn the_watermark_is_the_last_captured_at() -> anyhow::Result<()> {
-        let adapter = LettaCodeAdapter::new(FIXTURES);
+        let adapter = LettaCodeAdapter::new(fixtures());
         let expected = DateTime::parse_from_rfc3339("2026-08-24T16:44:38.369Z")?
             .with_timezone(&Utc)
             .timestamp_micros();
@@ -930,7 +934,7 @@ mod tests {
             assert_eq!(files.len(), 1);
             let file = &files[0];
             assert_eq!(file.actual_fidelity, RestoreFidelity::Native, "{id}");
-            let source = Path::new(FIXTURES).join(&file.relative_path);
+            let source = fixtures().join(&file.relative_path);
             let expected: Vec<Value> = std::str::from_utf8(&std::fs::read(&source)?)?
                 .lines()
                 .filter(|line| !line.trim().is_empty())

@@ -203,18 +203,16 @@ runs:
         s3-access-key-id: ${{ inputs.kache-access-key-id }}
         s3-secret-access-key: ${{ inputs.kache-secret-access-key }}
         github-cache: false
-        # Pinned like the Linux legs pin `kache` in flake.nix's toolVersions: the
+        # Pinned exactly (dist-build-unix pins its own copy in ci.yml): the
         # default resolves latest at run time, so an upstream cache-key bump
         # invalidates the store with no commit here. 0.14.0's bump cost a 138 min
         # run against 9.5 min warm.
-        # Bumped in lockstep with that flake pin and the k-tag in the
+        # Bumped in lockstep with the dist-build-unix pin and the k-tag in the
         # prefixes, never alone. kache strips the remote env from daemons it
-        # spawns, which is harmless here because the daemon reads KACHE_CONFIG;
-        # what the bump buys is key schema 31; schema 25 could under-key
-        # module-body swaps and include_dir renames. 0.22.0 keeps schema 31
-        # (unchanged since 0.17.0). The k33 prefixes are schema 31 plus one
-        # manual GC rotation (post-Lance-12), so they start cold on purpose.
-        version: v0.22.0
+        # spawns, which is harmless here because the daemon reads KACHE_CONFIG.
+        # 0.27.0 moved the key schema 31 -> 32, so no 0.22 entry matches and
+        # the k34 prefixes start cold on purpose.
+        version: v0.28.1
         manifest-key: ${{ inputs.manifest-key }}
         # Above kache's 5%-of-disk default because the cap MUST stay above the
         # remote prefix, while still leaving room for target/ and CARGO_HOME.

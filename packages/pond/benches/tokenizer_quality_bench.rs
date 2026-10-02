@@ -1,5 +1,4 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
-#![allow(unreachable_pub, dead_code)]
+#![expect(clippy::print_stdout, reason = "bench harness: results go to stdout")]
 
 //! FTS tokenizer *quality* bench: the durable, in-tree successor to the
 //! `docs/researches/tokenizer-experiment-*` harness (originally a temp

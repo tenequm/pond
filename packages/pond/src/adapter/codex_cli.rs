@@ -1165,7 +1165,11 @@ mod tests {
     //! corpus and assert pond's canonical Session/Message/Part shape comes out
     //! the other side. The fixture lives under
     //! `tests/fixtures/adapter/codex_cli/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
@@ -1173,10 +1177,10 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/codex_cli/sessions"
-    );
+    fn fixtures() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/codex_cli/sessions")
+    }
 
     fn wrapped(script: &str) -> Option<&str> {
         wrapped_tool_name(script).map(|range| &script[range])
@@ -1400,15 +1404,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
-        let adapter = CodexCliAdapter::new(FIXTURES);
+        let adapter = CodexCliAdapter::new(fixtures());
         crate::adapter::test_support::assert_native_restore(
             &CodexCliFactory,
             &adapter,
-            // Codex rollout paths embed the `sessions/` segment, so the corpus
-            // root is FIXTURES' parent, not FIXTURES itself.
-            std::path::Path::new(FIXTURES)
-                .parent()
-                .expect("FIXTURES is nested under a corpus root"),
+            // Codex rollout paths embed the `sessions/` segment, so restore
+            // compares against the corpus root above it.
+            &crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/codex_cli"),
         )
         .await
     }
@@ -1417,7 +1419,7 @@ mod tests {
     async fn codex_cli_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = CodexCliAdapter::new(FIXTURES);
+        let adapter = CodexCliAdapter::new(fixtures());
 
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert!(summary.accepted() > 0, "ingest must accept rows");
@@ -1551,7 +1553,7 @@ mod tests {
     async fn legacy_rollout_ingests_into_canonical_shape() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = CodexCliAdapter::new(FIXTURES);
+        let adapter = CodexCliAdapter::new(fixtures());
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         // The legacy fixture's bare first row -> Session: id and timestamp

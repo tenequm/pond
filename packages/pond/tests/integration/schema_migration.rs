@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
 //! In-place additive schema migration: a store written before the
 //! materialized tool columns (#89) upgrades on first open via the

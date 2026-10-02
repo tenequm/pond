@@ -1334,7 +1334,11 @@ mod tests {
     //! Each test builds a tiny synthetic corpus under a `TempDir` so the
     //! assertions exercise the real adapter end-to-end without depending on
     //! committed fixtures.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
@@ -1342,17 +1346,17 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    const FIXTURE_ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/claude_code/projects"
-    );
+    fn fixture_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/claude_code/projects")
+    }
 
     /// The native Windows 11 capture, in its own root so the posix corpus
     /// counts above stay untouched.
-    const WINDOWS_FIXTURE_ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/claude_code/windows-projects"
-    );
+    fn windows_fixture_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/claude_code/windows-projects")
+    }
 
     #[test]
     fn probe_default_finds_claude_projects_under_home() -> anyhow::Result<()> {
@@ -1535,11 +1539,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_fixture_corpus() -> anyhow::Result<()> {
-        let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+        let adapter = ClaudeCodeAdapter::new(fixture_root());
         crate::adapter::test_support::assert_native_restore(
             &ClaudeCodeFactory,
             &adapter,
-            std::path::Path::new(FIXTURE_ROOT),
+            &fixture_root(),
         )
         .await
     }
@@ -1550,11 +1554,11 @@ mod tests {
     /// contents rather than just the slug.
     #[tokio::test(flavor = "multi_thread")]
     async fn native_restore_is_value_equal_to_the_windows_capture() -> anyhow::Result<()> {
-        let adapter = ClaudeCodeAdapter::new(WINDOWS_FIXTURE_ROOT);
+        let adapter = ClaudeCodeAdapter::new(windows_fixture_root());
         crate::adapter::test_support::assert_native_restore(
             &ClaudeCodeFactory,
             &adapter,
-            std::path::Path::new(WINDOWS_FIXTURE_ROOT),
+            &windows_fixture_root(),
         )
         .await
     }
@@ -1567,7 +1571,7 @@ mod tests {
     async fn plan_classifies_fresh_vs_pending_without_decoding() -> anyhow::Result<()> {
         use crate::adapter::{Adapter, test_support::MaxWatermarkOracle};
 
-        let adapter = ClaudeCodeAdapter::new(FIXTURE_ROOT);
+        let adapter = ClaudeCodeAdapter::new(fixture_root());
         let first_sync = adapter
             .plan(&crate::adapter::NoopOracle)
             .await?

@@ -1770,7 +1770,11 @@ mod tests {
     //! split-file fixture corpus and assert pond's canonical shape comes out
     //! the other side, including the fused-tool-part split. The fixture lives
     //! under `tests/fixtures/adapter/opencode/storage/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{
@@ -1783,21 +1787,19 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    // `FIXTURES` is the legacy split-file tree (used to exercise the tree path in
-    // isolation); `DATA_DIR` is the opencode data dir holding BOTH the DB and the
+    // `fixtures()` is the legacy split-file tree (used to exercise the tree path in
+    // isolation); `data_dir()` is the opencode data dir holding BOTH the DB and the
     // tree beside it.
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/opencode/storage"
-    );
-    const DATA_DIR: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/opencode"
-    );
-    const DB_FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/opencode/opencode.db"
-    );
+    fn fixtures() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/opencode/storage")
+    }
+    fn data_dir() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/opencode")
+    }
+    fn db_fixture() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/opencode/opencode.db")
+    }
     const FRESH_SESSION_ID: &str = "ses_6405e5a5cffeIG2QHRuTmm4mA7";
     const FRESH_MESSAGE_ID: &str = "msg_zzzzfresh0001";
     const FRESH_PART_ID: &str = "prt_zzzzfresh0001";
@@ -1818,7 +1820,7 @@ mod tests {
     fn db_data_dir(temp: &std::path::Path) -> anyhow::Result<PathBuf> {
         let dir = temp.join("data");
         std::fs::create_dir_all(&dir)?;
-        std::fs::copy(DB_FIXTURE, dir.join("opencode.db"))?;
+        std::fs::copy(db_fixture(), dir.join("opencode.db"))?;
         Ok(dir)
     }
 
@@ -1935,7 +1937,7 @@ mod tests {
     async fn native_restore_emits_import_shape_from_tree() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
-        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        copy_dir(&fixtures(), &source)?;
         let store = Store::open_local(temp.path().join("store")).await?;
         let adapter = OpencodeAdapter::new(&source);
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
@@ -1991,8 +1993,8 @@ mod tests {
         .await?;
 
         // Independently reconstruct the expected records from the raw DB rows.
-        let db = std::path::Path::new(DB_FIXTURE);
-        let conn = open_db(db)?;
+        let db = db_fixture();
+        let conn = open_db(&db)?;
         let expected_session: HashMap<String, Value> = conn
             .prepare(&format!("SELECT {SESSION_COLUMNS} FROM session"))?
             .query_map([], session_info_from_row)?
@@ -2162,7 +2164,7 @@ mod tests {
     async fn plan_matches_the_events_gate() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
-        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        copy_dir(&fixtures(), &source)?;
         let empty_dir = source.join("session").join("proj-empty");
         std::fs::create_dir_all(&empty_dir)?;
         std::fs::write(
@@ -2192,7 +2194,7 @@ mod tests {
     async fn freshness_re_reads_a_session_that_gained_a_newer_message() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
-        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        copy_dir(&fixtures(), &source)?;
 
         let store = Store::open_local(temp.path().join("store")).await?;
         let adapter = OpencodeAdapter::new(&source);
@@ -2231,7 +2233,7 @@ mod tests {
     async fn freshness_skips_a_session_not_newer_than_the_watermark() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
-        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        copy_dir(&fixtures(), &source)?;
 
         let store = Store::open_local(temp.path().join("store")).await?;
         let adapter = OpencodeAdapter::new(&source);
@@ -2371,10 +2373,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn opencode_adapter_ingests_fixture_corpus_into_canonical_shape() -> anyhow::Result<()> {
-        // DATA_DIR ingests BOTH sources (the DB plus the tree beside it).
+        // `data_dir()` ingests BOTH sources (the DB plus the tree beside it).
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = OpencodeAdapter::new(DATA_DIR);
+        let adapter = OpencodeAdapter::new(data_dir());
 
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert!(summary.accepted() > 0, "ingest must accept rows");
@@ -2441,7 +2443,7 @@ mod tests {
     async fn fused_tool_part_splits_into_call_and_result() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = OpencodeAdapter::new(DATA_DIR);
+        let adapter = OpencodeAdapter::new(data_dir());
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         let mut call_ids = std::collections::HashSet::new();
@@ -2596,10 +2598,9 @@ mod tests {
 
         // The freshness watermark also ignores the column: it is derived from the
         // data timestamps (all months before the doctored column value).
-        let conn = open_db(std::path::Path::new(DB_FIXTURE))?;
-        let watermark =
-            db_session_watermark(&conn, std::path::Path::new(DB_FIXTURE), DOCTORED_SESSION_ID)?
-                .expect("session has a message");
+        let conn = open_db(&db_fixture())?;
+        let watermark = db_session_watermark(&conn, &db_fixture(), DOCTORED_SESSION_ID)?
+            .expect("session has a message");
         assert!(
             watermark < DOCTORED_COLUMN_CREATED_MS * 1_000,
             "watermark ({watermark} micros) must ignore the future time_created column",
@@ -2810,7 +2811,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn config_path_ending_in_storage_reads_parent_db() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        std::fs::copy(DB_FIXTURE, temp.path().join("opencode.db"))?;
+        std::fs::copy(db_fixture(), temp.path().join("opencode.db"))?;
         let store = Store::open_local(temp.path().join("store")).await?;
         // A legacy config points at `<data-dir>/storage`; normalization resolves
         // it to the parent, where the DB lives.
@@ -2963,7 +2964,7 @@ mod tests {
     async fn legacy_tree_only_root_still_ingests() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = temp.path().join("storage");
-        copy_dir(std::path::Path::new(FIXTURES), &source)?;
+        copy_dir(&fixtures(), &source)?;
         let store = Store::open_local(temp.path().join("store")).await?;
         ingest_adapter(
             &store,
@@ -2991,10 +2992,10 @@ mod tests {
     async fn foreign_serialization_emits_import_shape() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let origin_store = Store::open_local(temp.path().join("origin-store")).await?;
-        let origin = crate::adapter::PiCodingAgentAdapter::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/adapter/pi-coding-agent/sessions"
-        ));
+        let origin = crate::adapter::PiCodingAgentAdapter::new(
+            crate::adapter::test_support::manifest_dir()
+                .join("tests/fixtures/adapter/pi-coding-agent/sessions"),
+        );
         ingest_adapter(&origin_store, &origin, &crate::adapter::NoopOracle, |_| {}).await?;
 
         let mut saw_tool = false;

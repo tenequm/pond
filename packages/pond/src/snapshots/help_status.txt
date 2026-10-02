@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Show pond health, data, and adapter status.
 
 Storage destination and size, row counts, index readiness, embedding backlog, configured adapters, and the sync schedule. Anything off names its fix inline.

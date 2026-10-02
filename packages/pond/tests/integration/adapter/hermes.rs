@@ -5,7 +5,7 @@
 //! classification, watermark math, serialize) stays in the
 //! `src/adapter/hermes.rs` unit tests; this suite covers the cross-module paths.
 //! The whole corpus is synthetic - no real `~/.hermes` data was copied in.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use std::path::Path;
 
@@ -18,7 +18,7 @@ use pond::{
 };
 use tempfile::TempDir;
 
-const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adapter/hermes");
+const FIXTURE_ROOT: &str = "tests/fixtures/adapter/hermes";
 
 // 6 sessions in the default `state.db` + 1 in `profiles/coder/state.db`.
 const FIXTURE_SESSIONS: usize = 7;

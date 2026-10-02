@@ -1578,20 +1578,19 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
     use super::*;
     use crate::wire::Role;
     use futures::StreamExt;
     use tempfile::TempDir;
 
-    const MACOS: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/devin/macos/cli"
-    );
-    const WINDOWS: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/devin/windows/cli"
-    );
+    fn macos_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/devin/macos/cli")
+    }
+    fn windows_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/devin/windows/cli")
+    }
 
     #[derive(Default)]
     struct Read {
@@ -1671,7 +1670,7 @@ mod tests {
     }
 
     fn macos() -> Read {
-        let read = read(&Path::new(MACOS).join(DB_FILE));
+        let read = read(&macos_root().join(DB_FILE));
         assert!(read.errors.is_empty(), "{:?}", read.errors);
         read
     }
@@ -1772,10 +1771,10 @@ mod tests {
     fn fixture_link_heads_belong_to_detected_subagent_trees() {
         let mut heads_checked = 0;
         for db in [
-            Path::new(MACOS).join(DB_FILE),
-            Path::new(WINDOWS).join(DB_FILE),
-            Path::new(MIDRUN).join("after").join("cli").join(DB_FILE),
-            Path::new(SIDEKICK).join(DB_FILE),
+            macos_root().join(DB_FILE),
+            windows_root().join(DB_FILE),
+            midrun_root().join("after").join("cli").join(DB_FILE),
+            sidekick_root().join(DB_FILE),
         ] {
             let conn = match open_forest(&db).unwrap() {
                 Opened::Forest(conn) => conn,
@@ -1799,7 +1798,7 @@ mod tests {
     fn a_link_to_a_main_tree_reports_drift_without_reassigning_messages() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         Connection::open(&db)
             .unwrap()
             .execute(
@@ -1841,7 +1840,7 @@ mod tests {
     fn a_subagent_heads_row_to_a_main_tree_reports_drift() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         Connection::open(&db)
             .unwrap()
             .execute(
@@ -1877,7 +1876,7 @@ mod tests {
 
     #[test]
     fn a_link_head_without_an_agent_id_reports_drift() {
-        let db = Path::new(MACOS).join(DB_FILE);
+        let db = macos_root().join(DB_FILE);
         let conn = match open_forest(&db).unwrap() {
             Opened::Forest(conn) => conn,
             _ => panic!("fixture is not a forest database"),
@@ -2018,7 +2017,7 @@ mod tests {
     fn drifted_copies_keep_every_body_and_tag_each_placement() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         let conn = Connection::open(&db).unwrap();
         // The level-waterlily prefix message placed most often: at least three
         // copies to split into drifted bodies.
@@ -2121,7 +2120,7 @@ mod tests {
     fn phase_is_surfaced_only_when_present() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         let commentary_id: String = {
             let conn = Connection::open(&db).unwrap();
             let message_id = conn
@@ -2245,14 +2244,13 @@ mod tests {
         assert_eq!(attached, 3);
     }
 
-    const MIDRUN: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/devin/midrun"
-    );
+    fn midrun_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/devin/midrun")
+    }
     const MIDRUN_CHILD: &str = "gilded-orca/agent-e9b73e40-5526-42b0-acae-45389ecfe004";
 
     fn midrun(stage: &str) -> Read {
-        let read = read(&Path::new(MIDRUN).join(stage).join("cli").join(DB_FILE));
+        let read = read(&midrun_root().join(stage).join("cli").join(DB_FILE));
         assert!(read.errors.is_empty(), "{stage}: {:?}", read.errors);
         read
     }
@@ -2321,13 +2319,13 @@ mod tests {
     /// each pond session, so an unchanged database gates fresh.
     #[test]
     fn watermark_matches_the_read() {
-        for root in [MACOS, WINDOWS] {
-            assert_peek_matches_read(&Path::new(root).join(DB_FILE));
+        for root in [macos_root(), windows_root()] {
+            assert_peek_matches_read(&root.join(DB_FILE));
         }
         for stage in ["before", "after"] {
-            assert_peek_matches_read(&Path::new(MIDRUN).join(stage).join("cli").join(DB_FILE));
+            assert_peek_matches_read(&midrun_root().join(stage).join("cli").join(DB_FILE));
         }
-        assert_peek_matches_read(&Path::new(SIDEKICK).join(DB_FILE));
+        assert_peek_matches_read(&sidekick_root().join(DB_FILE));
     }
 
     /// Without `metadata.created_at` a message falls back to its first node's
@@ -2337,7 +2335,7 @@ mod tests {
     fn a_message_without_created_at_keeps_peek_and_read_equal() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         let conn = Connection::open(&db).unwrap();
         conn.execute(
             "UPDATE message_nodes
@@ -2461,7 +2459,7 @@ mod tests {
     async fn events_recompute_heads_after_discovery() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         let adapter = DevinAdapter::new(temp.path());
         assert_eq!(adapter.discover().await.unwrap(), 8);
         Connection::open(&db)
@@ -2492,7 +2490,7 @@ mod tests {
     fn sqlite_read_failure_is_typed_and_attributed_to_its_session() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         let conn = Connection::open(&db).unwrap();
         conn.execute("DROP TABLE message_nodes", []).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
@@ -2531,7 +2529,7 @@ mod tests {
     fn a_corrupt_node_is_a_typed_error_and_the_peek_goes_opaque() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         Connection::open(&db)
             .unwrap()
             .execute(
@@ -2569,7 +2567,7 @@ mod tests {
     fn hidden_helper_sessions_take_the_helper_kind() {
         let temp = TempDir::new().unwrap();
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         Connection::open(&db)
             .unwrap()
             .execute(
@@ -2597,7 +2595,7 @@ mod tests {
     /// grounded in the binary (docs/adapters/devin.md).
     fn with_images(temp: &TempDir, images: &[(&str, Value)]) -> PathBuf {
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(MACOS).join(DB_FILE), &db).unwrap();
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
         let conn = Connection::open(&db).unwrap();
         for (message_id, images) in images {
             let updated = conn
@@ -2791,10 +2789,10 @@ mod tests {
         );
     }
 
-    const SIDEKICK: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/devin/sidekick/cli"
-    );
+    fn sidekick_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/devin/sidekick/cli")
+    }
     const SIDEKICK_PARENT: &str = "third-hourglass";
     const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
     const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";
@@ -2822,7 +2820,7 @@ mod tests {
     /// A copy of the sidekick capture with `edit` applied to it.
     fn forged_sidekick(temp: &TempDir, edit: impl FnOnce(&Connection)) -> PathBuf {
         let db = temp.path().join(DB_FILE);
-        std::fs::copy(Path::new(SIDEKICK).join(DB_FILE), &db).unwrap();
+        std::fs::copy(sidekick_root().join(DB_FILE), &db).unwrap();
         edit(&Connection::open(&db).unwrap());
         db
     }
@@ -2863,7 +2861,7 @@ mod tests {
     }
 
     fn read_sidekick() -> Read {
-        let read = read(&Path::new(SIDEKICK).join(DB_FILE));
+        let read = read(&sidekick_root().join(DB_FILE));
         assert!(read.errors.is_empty(), "{:?}", read.errors);
         read
     }

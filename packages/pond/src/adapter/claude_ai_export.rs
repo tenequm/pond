@@ -538,7 +538,11 @@ mod tests {
     //! (`tests/fixtures/adapter/claude_ai_export/conversations.json`), covering
     //! the directory and `.zip` source forms, the 0-message skip, the empty-name
     //! conversation, and tool_use/tool_result linkage.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store};
@@ -546,10 +550,9 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    const FIXTURE_DIR: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/claude_ai_export"
-    );
+    fn fixture_dir() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/claude_ai_export")
+    }
     const ACCOUNT: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
     const TOOL_CONV: &str = "33333333-3333-3333-3333-333333333333";
     const EMPTY_NAME_CONV: &str = "44444444-4444-4444-4444-444444444444";
@@ -571,7 +574,7 @@ mod tests {
         let store = Store::open_local(temp.path()).await?;
         let summary = ingest_adapter(
             &store,
-            &ClaudeAiExportAdapter::new(FIXTURE_DIR),
+            &ClaudeAiExportAdapter::new(fixture_dir()),
             &crate::adapter::NoopOracle,
             |_| {},
         )
@@ -688,7 +691,7 @@ mod tests {
         use std::io::Write;
         let temp = TempDir::new()?;
         let zip_path = temp.path().join("data-2026-01-15-00-00-00-batch-0000.zip");
-        let conversations = std::fs::read(format!("{FIXTURE_DIR}/conversations.json"))?;
+        let conversations = std::fs::read(fixture_dir().join("conversations.json"))?;
         {
             let file = std::fs::File::create(&zip_path)?;
             let mut zip = zip::ZipWriter::new(file);
@@ -724,7 +727,7 @@ mod tests {
         let store = Store::open_local(temp.path().join("store")).await?;
         ingest_adapter(
             &store,
-            &ClaudeAiExportAdapter::new(FIXTURE_DIR),
+            &ClaudeAiExportAdapter::new(fixture_dir()),
             &crate::adapter::NoopOracle,
             |_| {},
         )

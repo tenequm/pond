@@ -2127,7 +2127,11 @@ mod search_handler {
 
     #[cfg(test)]
     mod grouping_helpers_tests {
-        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        #![expect(
+            clippy::expect_used,
+            clippy::unwrap_used,
+            reason = "tests fail by panicking"
+        )]
 
         use super::*;
 
@@ -2207,7 +2211,7 @@ pub use search_handler::{
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::wire::{ProjectFilter, SearchFilters, SearchRequest};
@@ -2488,7 +2492,11 @@ mod tests {
 
 #[cfg(test)]
 mod get_tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use crate::sessions::Store;
     use crate::wire::{

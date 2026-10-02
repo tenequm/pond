@@ -626,7 +626,14 @@ pub mod http {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        #![cfg_attr(
+            unix,
+            expect(
+                clippy::expect_used,
+                clippy::unwrap_used,
+                reason = "tests fail by panicking; the panicking ones are unix-only"
+            )
+        )]
 
         use super::*;
 
@@ -1760,7 +1767,6 @@ Examples (4 patterns the agent should recognize):
                         if progress.total == 0 {
                             0.0
                         } else {
-                            #[allow(clippy::cast_precision_loss)]
                             let pct = (progress.embedded as f64 / progress.total as f64) * 100.0;
                             (pct * 10.0).round() / 10.0
                         }
@@ -2043,7 +2049,11 @@ Examples (4 patterns the agent should recognize):
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        #![expect(
+            clippy::expect_used,
+            clippy::unwrap_used,
+            reason = "tests fail by panicking"
+        )]
 
         use std::sync::Arc;
 

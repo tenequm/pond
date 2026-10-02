@@ -89,7 +89,7 @@ impl CandleEmbedder {
         // cast transients regardless (iokit_mapped contribution to
         // phys_footprint, candle-core/src/metal_backend/device.rs:44-57).
         let model_path = fetch("model.safetensors")?;
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code, reason = "candle's mmap safetensors loader is unsafe")]
         let vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[model_path], DType::F16, &device)? };
         let model = XLMRobertaModel::new(&config, vb)
@@ -676,7 +676,7 @@ impl<'a, B: Embedder> EmbedWorker<'a, B> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};

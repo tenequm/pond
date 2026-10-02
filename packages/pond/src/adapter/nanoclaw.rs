@@ -837,16 +837,19 @@ mod tests {
     //! degradation, rotated-file ingestion, native restore, and nanoclaw's own
     //! wiring of the shared claude-JSONL seams (opencode-xdg pruning, the
     //! unrecognized-subagents refusal, the watermark walk-back).
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::Message};
     use tempfile::TempDir;
 
-    const FIXTURE_ROOT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/nanoclaw"
-    );
+    fn fixture_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/nanoclaw")
+    }
 
     const ANON_GROUP: &str = "agentgroup-anon-001";
     const ANON_MAIN: &str = "cc6ea1c9-cab4-43e6-8fdf-7346aae26cbb";
@@ -902,7 +905,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn fixture_maps_claude_jsonl_with_nanoclaw_identity() -> anyhow::Result<()> {
-        let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
+        let (store, _guard) = ingest(&fixture_root()).await?;
 
         let main = store
             .get_session(ANON_MAIN)
@@ -950,7 +953,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn subagent_sidecar_becomes_its_own_session() -> anyhow::Result<()> {
-        let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
+        let (store, _guard) = ingest(&fixture_root()).await?;
         let child_id = format!("{ANON_SUB_PARENT}/agent-{ANON_SUB_HASH}");
         let child = store
             .get_session(&child_id)
@@ -972,7 +975,7 @@ mod tests {
     /// Multi-subagent fan-out from the synthetic fixture: session B spawns 3.
     #[tokio::test(flavor = "multi_thread")]
     async fn synthetic_fan_out_yields_three_subagent_sessions() -> anyhow::Result<()> {
-        let (store, _guard) = ingest(Path::new(FIXTURE_ROOT)).await?;
+        let (store, _guard) = ingest(&fixture_root()).await?;
         let parent = "bebe90ad-7812-475f-b96c-bd7558d7d8d5";
         for hash in [
             "a0e5a13152ff2a47c",
@@ -1174,7 +1177,7 @@ mod tests {
     async fn plan_classifies_fresh_vs_pending() -> anyhow::Result<()> {
         use crate::adapter::test_support::MaxWatermarkOracle;
 
-        let adapter = NanoclawAdapter::new(FIXTURE_ROOT);
+        let adapter = NanoclawAdapter::new(fixture_root());
         let first = adapter
             .plan(&crate::adapter::NoopOracle)
             .await?

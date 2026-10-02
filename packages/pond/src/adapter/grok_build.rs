@@ -901,7 +901,7 @@ fn reconstruct_rows(session_id: &str, messages: &[&MessageWithParts]) -> Vec<Val
 mod tests {
     //! Mapping decisions from `docs/adapters/grok-build.md`, checked against
     //! the committed sandbox capture under `tests/fixtures/adapter/grok-build/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::{
@@ -911,10 +911,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/grok-build/sessions"
-    );
+    fn fixtures() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/grok-build/sessions")
+    }
     const MAC_BUCKET: &str = "%2Fprivate%2Ftmp%2Fgrok-fixture%2Fproject";
     const WIN_BUCKET: &str = "C%3A%5Cgf%5Cproject";
     const HASH_BUCKET: &str = "nested-directory-014-d57c02c5ec15a4db";
@@ -929,17 +929,14 @@ mod tests {
     const FIXTURE_SESSIONS: usize = 14;
 
     fn fixture_path(bucket: &str, session: &str) -> PathBuf {
-        Path::new(FIXTURES)
-            .join(bucket)
-            .join(session)
-            .join(UPDATES_FILE)
+        fixtures().join(bucket).join(session).join(UPDATES_FILE)
     }
 
     async fn ingest_fixtures(temp: &TempDir) -> anyhow::Result<Store> {
         let store = Store::open_local(temp.path().join("store")).await?;
         let summary = ingest_adapter(
             &store,
-            &GrokBuildAdapter::new(FIXTURES),
+            &GrokBuildAdapter::new(fixtures()),
             &crate::adapter::NoopOracle,
             |_| {},
         )
@@ -961,12 +958,12 @@ mod tests {
     /// a transcript at any other depth is a named skip.
     #[test]
     fn the_session_id_comes_from_the_path_and_depth_is_enforced() {
-        let adapter = GrokBuildAdapter::new(FIXTURES);
+        let adapter = GrokBuildAdapter::new(fixtures());
         let path = fixture_path(MAC_BUCKET, TOOLS);
         assert_eq!(adapter.peek_session_id(&path, ""), Some(TOOLS.to_owned()));
         assert!(adapter.unsupported_path(&path).is_none());
 
-        let shallow = Path::new(FIXTURES).join(MAC_BUCKET).join(UPDATES_FILE);
+        let shallow = fixtures().join(MAC_BUCKET).join(UPDATES_FILE);
         assert_eq!(adapter.peek_session_id(&shallow, ""), None);
         let reason = adapter
             .unsupported_path(&shallow)
@@ -1019,7 +1016,7 @@ mod tests {
     /// re-reads.
     #[test]
     fn the_watermark_is_the_last_line_stamp() -> anyhow::Result<()> {
-        let adapter = GrokBuildAdapter::new(FIXTURES);
+        let adapter = GrokBuildAdapter::new(fixtures());
         let path = fixture_path(MAC_BUCKET, TUI);
         let last: Value = serde_json::from_str(&peek_last_line(&path).expect("tail"))?;
         let expected = row_timestamp_micros(&last).expect("stamped");
@@ -1046,9 +1043,9 @@ mod tests {
     /// budget the sync gate is held to.
     #[test]
     fn the_freshness_peek_stays_within_one_tail_window_per_file() -> anyhow::Result<()> {
-        let adapter = GrokBuildAdapter::new(FIXTURES);
+        let adapter = GrokBuildAdapter::new(fixtures());
         let mut files = Vec::new();
-        collect_updates_files(Path::new(FIXTURES), &mut files);
+        collect_updates_files(&fixtures(), &mut files);
         assert_eq!(files.len(), FIXTURE_SESSIONS);
         for path in files {
             let (watermark, bytes) = peek_metering::measure(|| adapter.peek_watermark(&path));
@@ -1294,7 +1291,7 @@ mod tests {
             assert!(files.len() >= 2, "{id}: updates + summary at minimum");
             for file in &files {
                 assert_eq!(file.actual_fidelity, RestoreFidelity::Native, "{id}");
-                let source = Path::new(FIXTURES).join(&file.relative_path);
+                let source = fixtures().join(&file.relative_path);
                 let expected = std::fs::read(&source)
                     .map_err(|err| anyhow::anyhow!("read {}: {err}", source.display()))?;
                 if file

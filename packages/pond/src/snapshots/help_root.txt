@@ -1,7 +1,3 @@
----
-source: packages/pond/src/main.rs
-expression: root_help
----
 Lossless storage and semantic search for sessions from any AI agent client
 pond [VERSION]
 

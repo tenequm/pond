@@ -1,7 +1,3 @@
----
-source: src/main.rs
-expression: sub.render_long_help().to_string()
----
 Make pond current: import, embed, update indexes.
 
 The everyday command: pulls fresh sessions from every enabled `[adapters.*]` entry (or one named adapter), embedding each message inline as it is written, and folds new rows into the search indexes. It only ever syncs adapters you have already enabled - enabling one is an explicit step (`pond adapters enable` / `pond adapters discover` / `pond init`), never a side effect of sync.

@@ -1,7 +1,3 @@
----
-source: packages/pond/src/main.rs
-expression: sub.render_long_help().to_string()
----
 Run the HTTP API server (or MCP over stdio with --transport stdio).
 
 Serves the wire protocol over HTTP on --host:--port. Most agent setups want `pond mcp` instead; `serve` is for the HTTP transport and for supervised deployments.

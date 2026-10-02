@@ -5,7 +5,8 @@ description: >
   zero Nix overhead - no `nix develop -c` wrapper per command, which would
   re-evaluate the flake after every file edit. Replaces the curl-bootstrap that
   hand-installed moon/protoc/uv/kache/rustup onto the /ci-cache PVC; the flake
-  is now the single source of truth for every tool (plan 2609-16 2.1/2.2).
+  is now the single source of truth for every tool but kache, which only
+  dist-build-unix installs (plan 2609-16 2.1/2.2).
   The /ci-cache exports that bootstrap also owned survive here - they are cache
   locations, not tools, and the PVC is still what makes a warm pod warm.
 outputs:
@@ -158,10 +159,12 @@ runs:
         # is gone with rustup itself; PROTO_HOME stays only because
         # .moon/toolchains.yml still pins node/npm, so moon provisions them
         # through proto - it goes when those go versionless (plan 2.3).
-        # KACHE_CONFIG points at the committed remote settings: a daemon cannot
-        # watch an environment, and kache strips KACHE_S3_BUCKET/ENDPOINT/
-        # REGION/PREFIX/PROFILE from every daemon it spawns itself while keeping
-        # KACHE_CONFIG. Inert in the jobs that never set RUSTC_WRAPPER.
+        # kache itself is not in the devshell (a per-machine tool; dist-build-unix
+        # installs its pinned copy). KACHE_CONFIG points at the committed remote
+        # settings: a daemon cannot watch an environment, and kache strips
+        # KACHE_S3_BUCKET/ENDPOINT/REGION/PREFIX/PROFILE from every daemon it
+        # spawns itself while keeping KACHE_CONFIG. Inert in the jobs that never
+        # set RUSTC_WRAPPER.
         mkdir -p /ci-cache/cargo /ci-cache/target /ci-cache/proto /ci-cache/npm /ci-cache/uv
         {
           echo "CARGO_HOME=/ci-cache/cargo"
@@ -199,7 +202,6 @@ runs:
         cargo --version
         moon --version
         protoc --version
-        kache --version
         zig version
         cargo-zigbuild --version
         rcodesign --version

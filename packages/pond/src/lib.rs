@@ -110,7 +110,6 @@ pub mod output {
         Style::new().fg_color(Some(AnsiColor::Cyan.into()))
     }
 
-    #[allow(clippy::print_stdout)]
     pub fn line(message: &str) -> anyhow::Result<()> {
         let mut stdout = io::stdout().lock();
         writeln!(stdout, "{message}")
@@ -219,5 +218,51 @@ impl Error {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
+
+    use crate::adapter::test_support::{manifest_dir, rust_files};
+
+    /// A compile-time read of a checkout path bakes it into the binary, so the
+    /// compiler cache keys that binary per worktree and every new worktree
+    /// recompiles it. Clippy's `disallowed_macros` cannot see an `env!` nested
+    /// in `concat!`, so this scans the source text instead.
+    #[test]
+    fn no_compile_time_checkout_path_reads() {
+        const PATH_VARS: [&str; 4] = [
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_BIN_EXE_",
+            "CARGO_TARGET_TMPDIR",
+        ];
+        let root = manifest_dir();
+        let mut files = Vec::new();
+        for dir in ["src", "tests", "benches"] {
+            rust_files(&root.join(dir), &mut files);
+        }
+        let mut violations = Vec::new();
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("source is readable");
+            for (at, needle) in text.match_indices("env!(") {
+                let arg = text[at + needle.len()..].trim_start();
+                let reads_path = arg
+                    .strip_prefix('"')
+                    .is_some_and(|name| PATH_VARS.iter().any(|var| name.starts_with(var)));
+                if reads_path {
+                    let line = text[..at].matches('\n').count() + 1;
+                    let file = path.strip_prefix(&root).unwrap_or(path).display();
+                    violations.push(format!("{file}:{line}"));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "read these at runtime (`std::env::var_os`, a cwd-relative path, `pond_bin()`), \
+             never via `env!`/`option_env!`: {violations:#?}"
+        );
     }
 }

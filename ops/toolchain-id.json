@@ -1,5 +1,5 @@
 {
-  "aarch64-darwin": "/nix/store/33hlh39f57k9m2vral6b1353j4mnayv1-pond-dev.drv",
-  "aarch64-linux": "/nix/store/05ypgmv36n7dm4q86wqw82a2r6lr23nk-pond-dev.drv",
-  "x86_64-linux": "/nix/store/ar7z42xkfk21fqs2fpiqyla9mgr5wlhm-pond-dev.drv"
+  "aarch64-darwin": "/nix/store/p3wmrg6dqf0ksyfcprdcw0fvz34kyn14-pond-dev.drv",
+  "aarch64-linux": "/nix/store/imwj0gyxckg9ydij0z8n8r0hk5kb666h-pond-dev.drv",
+  "x86_64-linux": "/nix/store/rwc7398lslmnbbhh9zd8bj1cggy2y0pg-pond-dev.drv"
 }

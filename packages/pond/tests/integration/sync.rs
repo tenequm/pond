@@ -4,7 +4,6 @@
 //! re-decoding or re-writing. `--verify` (a [`NoopOracle`]) bypasses the gate and
 //! re-reads everything. This exercises the production wiring end to end, not a
 //! hand-built oracle.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use pond::{
     adapter::{AgyAdapter, ClaudeCodeAdapter, NoopOracle, SkipOracle},

@@ -1,4 +1,8 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! Substring-index probe over the real `parts.variant_data` corpus: FM-Index vs
 //! ngram vs FTS, on-disk size / build cost / query latency / resident RSS. This

@@ -1635,7 +1635,11 @@ mod tests {
     //! End-to-end test for the pi-coding-agent adapter: ingest the committed fixture corpus
     //! and assert pond's canonical Session/Message/Part shape comes out the
     //! other side. The fixture lives under `tests/fixtures/adapter/pi-coding-agent/`.
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
     use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
@@ -1643,10 +1647,10 @@ mod tests {
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
     // (figment::Jail chdirs the whole test process while config tests run).
-    const FIXTURES: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/pi-coding-agent/sessions"
-    );
+    fn fixtures() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/pi-coding-agent/sessions")
+    }
 
     #[test]
     fn probe_default_finds_pi_sessions_under_home() -> anyhow::Result<()> {
@@ -1683,12 +1687,11 @@ mod tests {
     async fn codec_replays_every_fixture_back_to_its_source_bytes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
-        // pi relative paths embed the `sessions/` segment, so the corpus root is
-        // FIXTURES' parent, not FIXTURES itself.
-        let corpus = Path::new(FIXTURES)
-            .parent()
-            .expect("FIXTURES is nested under a corpus root");
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
+        // pi relative paths embed the `sessions/` segment, so they resolve
+        // against the corpus root above it.
+        let corpus = crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/pi-coding-agent");
 
         let mut replayed = std::collections::BTreeSet::new();
         for session_id in store.session_ids().await? {
@@ -1716,11 +1719,11 @@ mod tests {
         }
 
         let mut on_disk = std::collections::BTreeSet::new();
-        for dir in std::fs::read_dir(FIXTURES)? {
+        for dir in std::fs::read_dir(fixtures())? {
             for file in std::fs::read_dir(dir?.path())? {
                 let path = file?.path();
                 if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-                    on_disk.insert(path.strip_prefix(corpus)?.to_path_buf());
+                    on_disk.insert(path.strip_prefix(&corpus)?.to_path_buf());
                 }
             }
         }
@@ -1738,7 +1741,7 @@ mod tests {
     async fn resume_emits_v3_for_every_origin_and_reports_the_downgrade() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
 
         for (session_id, expected_fidelity) in [
             // Captured from v4, so a value-complete replay is impossible in a
@@ -1778,7 +1781,7 @@ mod tests {
     async fn a_downgraded_restore_is_named_apart_from_its_source_file() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
 
         let v4 = store
             .get_session(V4_SESSION)
@@ -1836,7 +1839,7 @@ mod tests {
     -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = PiCodingAgentAdapter::new(FIXTURES);
+        let adapter = PiCodingAgentAdapter::new(fixtures());
 
         let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
         assert!(summary.accepted() > 0, "ingest must accept rows");
@@ -2033,10 +2036,10 @@ mod tests {
     async fn foreign_serialization_reparses_as_pi_coding_agent() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let origin_store = Store::open_local(temp.path().join("origin-store")).await?;
-        let origin = crate::adapter::OpencodeAdapter::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/adapter/opencode/storage"
-        ));
+        let origin = crate::adapter::OpencodeAdapter::new(
+            crate::adapter::test_support::manifest_dir()
+                .join("tests/fixtures/adapter/opencode/storage"),
+        );
         ingest_adapter(&origin_store, &origin, &crate::adapter::NoopOracle, |_| {}).await?;
         let session_id = origin_store
             .session_ids()
@@ -2074,7 +2077,7 @@ mod tests {
     async fn tool_results_are_injected_assistant_parts_are_conversational() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
-        let adapter = PiCodingAgentAdapter::new(FIXTURES);
+        let adapter = PiCodingAgentAdapter::new(fixtures());
         ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
 
         for session_id in store.session_ids().await? {
@@ -2108,7 +2111,7 @@ mod tests {
     /// mutate it (append a future mutation kind, tear the tail) without
     /// touching the corpus every other test reads.
     fn scratch_v4_corpus(temp: &TempDir) -> anyhow::Result<(PathBuf, PathBuf)> {
-        let source = Path::new(FIXTURES)
+        let source = fixtures()
             .join("--Users-user-Projects-harness-v2--")
             .join("2026-08-06T00-00-01-000Z_v4-main-session.jsonl");
         let root = temp.path().join("sessions");
@@ -2132,7 +2135,7 @@ mod tests {
     async fn v4_header_carries_lineage_project_and_metadata() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, summary) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
         assert_eq!(summary.dropped_events, 0);
         assert_eq!(summary.dropped_sessions, 0);
 
@@ -2175,7 +2178,7 @@ mod tests {
     async fn v4_orchestration_mutations_are_system_carriers() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
         let session = store
             .get_session(V4_SESSION)
             .await?
@@ -2398,16 +2401,14 @@ mod tests {
 
     // -- harness-v2: SQLite backend ------------------------------------------
 
-    const SQLITE_DB: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/adapter/pi-coding-agent/sqlite/pi-sessions.sqlite"
-    );
-
     fn sqlite_only_adapter(temp: &TempDir) -> anyhow::Result<PiCodingAgentAdapter> {
         // An empty JSONL root so the test exercises just the database half.
         let root = temp.path().join("empty-sessions");
         std::fs::create_dir_all(&root)?;
-        Ok(PiCodingAgentAdapter::new(root).with_sqlite(SQLITE_DB))
+        Ok(PiCodingAgentAdapter::new(root).with_sqlite(
+            crate::adapter::test_support::manifest_dir()
+                .join("tests/fixtures/adapter/pi-coding-agent/sqlite/pi-sessions.sqlite"),
+        ))
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2632,7 +2633,7 @@ mod tests {
     async fn restore_refuses_to_overwrite_an_existing_file() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
         let session = store
             .get_session(V4_SESSION)
             .await?
@@ -2667,7 +2668,7 @@ mod tests {
     async fn restore_refuses_a_destination_occupied_by_a_dangling_symlink() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let (store, _) =
-            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(FIXTURES)).await?;
+            ingest_into_temp_store(&temp, &PiCodingAgentAdapter::new(fixtures())).await?;
         let session = store
             .get_session(V4_SESSION)
             .await?
