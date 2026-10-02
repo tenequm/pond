@@ -156,7 +156,7 @@ object_store = { version = "0.14.1", default-features = false }
 # crate the SQL tool adds (lance reads/writes its own format, not parquet).
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
 parquet = { version = "58.3", default-features = false, features = ["arrow"] }
-rmcp = { version = "3.2.0", features = ["transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.5.0", features = ["transport-io", "transport-streamable-http-server"] }
 # Already in the tree via lance-table (`IndexMetadata::fragment_bitmap`); named
 # directly so the address-domain staleness probe can compare fragment bitmaps
 # with set ops instead of decomposing them into hash sets.
@@ -262,7 +262,7 @@ lance-linalg = "12.0.0"
 lance = { version = "12.0.0" }
 lance-index = "12.0.0"
 # Re-declared so the MCP tests can drive the server in-process via the `client` feature.
-rmcp = { version = "3.2.0", features = ["client"] }
+rmcp = { version = "3.5.0", features = ["client"] }
 # Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
 rusqlite = { version = "0.40", features = ["bundled"] }
 expect-test = "1.5.1"

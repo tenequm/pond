@@ -762,16 +762,16 @@ pub mod mcp {
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
-            CacheScope, CallToolResult, ContentBlock, ErrorCode as JsonRpcErrorCode,
-            Implementation, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-            MetaObject, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-            ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
-            ServerCapabilities, ServerInfo,
+            CacheScope, CallToolResult, ClientJsonRpcMessage, ClientRequest, ContentBlock,
+            ErrorCode as JsonRpcErrorCode, GetMeta, Implementation, ListResourceTemplatesResult,
+            ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+            ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
+            Resource, ResourceContents, ServerCapabilities, ServerConfig, ServerJsonRpcMessage,
         },
         schemars,
         service::RequestContext,
         tool, tool_handler, tool_router,
-        transport::stdio,
+        transport::{Transport, async_rw::AsyncRwTransport, stdio},
     };
     use serde::Deserialize;
     use uuid::Uuid;
@@ -1600,8 +1600,8 @@ Examples (4 patterns the agent should recognize):
     // the router via `Self::tool_router()` on every call instead.
     #[tool_handler(router = self.tool_router)]
     impl ServerHandler for PondMcp {
-        fn get_info(&self) -> ServerInfo {
-            ServerInfo::new(
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(
                 ServerCapabilities::builder()
                     .enable_tools()
                     .enable_resources()
@@ -1940,21 +1940,96 @@ Examples (4 patterns the agent should recognize):
     /// Run the stdio MCP server until the client disconnects. All diagnostics
     /// go to stderr (the shared `tracing` subscriber); stdout carries only
     /// JSON-RPC frames, written by rmcp's stdio transport (spec.md#scope).
-    ///
-    /// TODO(rust-sdk#1248): a first request carrying incomplete 2026-07-28
-    /// `_meta` is answered `-32602` and then still ends the process, so a
-    /// client opening with a malformed probe never gets to fall back. Upstream
-    /// is making that recoverable (rust-sdk#1157 -> #1160 shipped the error
-    /// response, <https://github.com/modelcontextprotocol/rust-sdk/pull/1248>
-    /// keeps the connection open), so pond stays on the default
-    /// `.serve(stdio())` and inherits it on the next rmcp bump.
     pub async fn serve_stdio(state: AppState) -> anyhow::Result<()> {
+        let (stdin, stdout) = stdio();
+        serve_io(state, stdin, stdout).await
+    }
+
+    async fn serve_io<R, W>(state: AppState, read: R, write: W) -> anyhow::Result<()>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
         let service = PondMcp::new(state)
-            .serve(stdio())
+            .serve(RecoverableOpener {
+                inner: AsyncRwTransport::new_server(read, write),
+                opened: false,
+            })
             .await
             .context("failed to start stdio MCP server")?;
         service.waiting().await.context("stdio MCP server error")?;
         Ok(())
+    }
+
+    /// rmcp answers a first request lacking complete 2026-07-28 `_meta` with
+    /// `-32602` and then ends the connection, so the client never reaches its
+    /// `initialize` fallback; this answers it the same way and keeps reading.
+    /// Drop it once rust-sdk#1248 ships
+    /// (<https://github.com/modelcontextprotocol/rust-sdk/pull/1248>).
+    struct RecoverableOpener<T> {
+        inner: T,
+        opened: bool,
+    }
+
+    impl<T: Transport<RoleServer>> Transport<RoleServer> for RecoverableOpener<T> {
+        type Error = T::Error;
+
+        fn send(
+            &mut self,
+            item: ServerJsonRpcMessage,
+        ) -> impl Future<Output = Result<(), T::Error>> + Send + 'static {
+            self.inner.send(item)
+        }
+
+        async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+            loop {
+                let message = self.inner.receive().await?;
+                if self.opened {
+                    return Some(message);
+                }
+                let rejection = match &message {
+                    ClientJsonRpcMessage::Request(request) => match &request.request {
+                        ClientRequest::PingRequest(_) => return Some(message),
+                        ClientRequest::InitializeRequest(_) => None,
+                        other => {
+                            let missing = other
+                                .get_meta()
+                                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
+                            (!missing.is_empty()).then(|| {
+                                ServerJsonRpcMessage::error(
+                                    ErrorData::invalid_params(
+                                        format!(
+                                            "request _meta is missing or has malformed \
+                                             required fields: {}",
+                                            missing.join(", ")
+                                        ),
+                                        None,
+                                    ),
+                                    Some(request.id.clone()),
+                                )
+                            })
+                        }
+                    },
+                    _ => None,
+                };
+                match rejection {
+                    Some(rejection) => {
+                        if let Err(error) = self.inner.send(rejection).await {
+                            tracing::error!(%error, "failed to send pre-init metadata error");
+                            return None;
+                        }
+                    }
+                    None => {
+                        self.opened = true;
+                        return Some(message);
+                    }
+                }
+            }
+        }
+
+        fn close(&mut self) -> impl Future<Output = Result<(), T::Error>> + Send {
+            self.inner.close()
+        }
     }
 
     /// Build an MCP tool result from a rendered transcript. Deliberately text
@@ -2064,8 +2139,8 @@ Examples (4 patterns the agent should recognize):
 
         /// A 2026-07-28 client opens with `server/discover` before
         /// `initialize`, which rmcp 1.7 treated as fatal. `V_2026_07_28` is
-        /// deliberately not `ProtocolVersion::LATEST` (2025-11-25) - `LATEST`
-        /// negotiates the classic handshake and stops exercising discovery.
+        /// pinned rather than `ProtocolVersion::LATEST` so a future `LATEST`
+        /// bump cannot silently stop exercising discovery.
         #[tokio::test]
         async fn discovery_startup_exposes_pond_tools() -> anyhow::Result<()> {
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -2091,10 +2166,95 @@ Examples (4 patterns the agent should recognize):
             .await?
         }
 
-        /// Spin pond's MCP server over an in-memory duplex and connect a client,
-        /// negotiating either the 2026-07-28 discovery handshake or the classic
-        /// one. The returned `TempDir` backs the store, so hold it until the
-        /// server task is joined.
+        /// A client probing with a bare `tools/list` (no 2026-07-28 `_meta`)
+        /// gets `-32602` and can still fall back to `initialize` on the same
+        /// connection, at a classic version or at 2026-07-28 itself.
+        #[tokio::test]
+        async fn malformed_opener_leaves_initialize_fallback_open() -> anyhow::Result<()> {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                for version in ["2025-06-18", "2026-07-28"] {
+                    let temp = tempfile::TempDir::new()?;
+                    let (client_io, server_task) = spawn_server(&temp).await?;
+                    let (read, mut write) = tokio::io::split(client_io);
+                    let mut lines = BufReader::new(read).lines();
+                    let mut send = async |frame: serde_json::Value| {
+                        write.write_all(format!("{frame}\n").as_bytes()).await
+                    };
+                    let mut recv = async || -> anyhow::Result<serde_json::Value> {
+                        let line = lines.next_line().await?.context("server hung up")?;
+                        Ok(serde_json::from_str(&line)?)
+                    };
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+                    }))
+                    .await?;
+                    let rejected = recv().await?;
+                    assert_eq!(rejected["id"], 1, "{version}");
+                    assert_eq!(
+                        rejected["error"]["code"],
+                        JsonRpcErrorCode::INVALID_PARAMS.0,
+                        "{version}"
+                    );
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 2, "method": "initialize",
+                        "params": {
+                            "protocolVersion": version,
+                            "capabilities": {},
+                            "clientInfo": {"name": "probe", "version": "0"}
+                        }
+                    }))
+                    .await?;
+                    assert!(
+                        recv().await?["result"]["protocolVersion"].is_string(),
+                        "{version}"
+                    );
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0", "method": "notifications/initialized"
+                    }))
+                    .await?;
+                    send(serde_json::json!({
+                        "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+                    }))
+                    .await?;
+                    assert!(
+                        recv().await?["result"]["tools"]
+                            .as_array()
+                            .is_some_and(|tools| !tools.is_empty()),
+                        "{version}"
+                    );
+                    drop((lines, write));
+                    server_task.await??;
+                }
+                anyhow::Ok(())
+            })
+            .await?
+        }
+
+        /// Serve pond over an in-memory duplex through `serve_io`, the path
+        /// `serve_stdio` takes, returning the client end. `temp` backs the
+        /// store, so hold it until the server task is joined.
+        async fn spawn_server(
+            temp: &tempfile::TempDir,
+        ) -> anyhow::Result<(
+            tokio::io::DuplexStream,
+            tokio::task::JoinHandle<anyhow::Result<()>>,
+        )> {
+            let state = AppState::new(
+                Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
+                Arc::new(crate::embed::LazyEmbedder::candle()),
+                crate::config::SearchConfig::default(),
+            );
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (read, write) = tokio::io::split(server_io);
+            Ok((client_io, tokio::spawn(serve_io(state, read, write))))
+        }
+
+        /// Connect a client to `spawn_server`, negotiating either the
+        /// 2026-07-28 discovery handshake or the classic one. The returned
+        /// `TempDir` backs the store, so hold it until the server task is
+        /// joined.
         async fn connect(
             modern: bool,
         ) -> anyhow::Result<(
@@ -2105,16 +2265,7 @@ Examples (4 patterns the agent should recognize):
             use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
             let temp = tempfile::TempDir::new()?;
-            let server = PondMcp::new(AppState::new(
-                Arc::new(crate::sessions::Store::open_local(temp.path()).await?),
-                Arc::new(crate::embed::LazyEmbedder::candle()),
-                crate::config::SearchConfig::default(),
-            ));
-            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-            let server_task = tokio::spawn(async move {
-                server.serve(server_io).await?.waiting().await?;
-                anyhow::Ok(())
-            });
+            let (client_io, server_task) = spawn_server(&temp).await?;
             let client = if modern {
                 ().serve_with_lifecycle(
                     client_io,
