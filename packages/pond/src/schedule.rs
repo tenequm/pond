@@ -3,10 +3,10 @@
 //! macOS uses launchd ONLY (cron on macOS runs without the user's GUI
 //! context, trips TCC folder-access denials, and silently drops jobs that
 //! span sleep). Linux prefers systemd user timers and falls back to a fenced
-//! crontab block. Windows uses
-//! Task Scheduler: the task Execs `pondw.exe`, pond's windowless launcher,
-//! and the task XML provides the settings that align it with the
-//! launchd/systemd posture (battery-friendly, catch-up after missed runs).
+//! crontab block. Windows uses Task Scheduler: the task Execs `pondw.exe`,
+//! pond's windowless launcher, and the task XML provides the settings that
+//! align it with the launchd/systemd posture (battery-friendly, catch-up
+//! after missed runs).
 //!
 //! The scheduled job is `pond sync -q --no-wait`: NOT `--yes`, so an
 //! unattended run can never auto-enable freshly-detected adapters, and
@@ -683,8 +683,7 @@ mod unix {
     /// Ask `systemctl` what the timer's next elapse and sub-state are.
     ///
     /// Split from the reading below so the verdict is a pure function of the
-    /// text, and the remedy it names can be pinned by a test - which matters
-    /// doubly when the remedy is the part under review.
+    /// text, and the remedy it names can be pinned by a test.
     fn systemd_timer_show() -> Option<String> {
         let mut command = Command::new("systemctl");
         command.args(["--user", "show", "pond-sync.timer"]);
@@ -709,12 +708,11 @@ mod unix {
     /// `OnUnitActiveSec=` skips on a zero base under a freshly restarted user
     /// manager that has no record of a previous activation. With no anchor
     /// left the timer parks in `active (elapsed)` with `Trigger: n/a`
-    /// permanently, while `is-enabled` keeps succeeding - which is why the
-    /// status line claimed a healthy schedule for the 31 hours sync was
-    /// silently dead. Without the stamp, the past `OnBootSec=` fires
-    /// immediately on manager start and the unit heals itself. (Read off
-    /// timer.c: the stamp load in `timer_start`, then the one-shot disable
-    /// and the `base <= 0 -> continue` skip in `timer_enter_waiting`.)
+    /// permanently, while `is-enabled` keeps succeeding. Without the stamp,
+    /// the past `OnBootSec=` fires immediately on manager start and the unit
+    /// heals itself. (Read off timer.c: the stamp load in `timer_start`, then
+    /// the one-shot disable and the `base <= 0 -> continue` skip in
+    /// `timer_enter_waiting`.)
     ///
     /// Same shape as the Windows `launcher_problem`: a registration that
     /// exists but cannot run, named so the status line can say so instead of
@@ -834,9 +832,9 @@ mod unix {
                 .map(|existing| existing == timer)
                 .unwrap_or(false);
         // A timer can be enabled, with unit files unchanged, and still never
-        // fire again (see `systemd_timer_problem`). Returning early on those
-        // two facts alone is what made `pond schedule start` a no-op on
-        // precisely the state it is supposed to repair.
+        // fire again (see `systemd_timer_problem`). The early return must also
+        // require health, or `pond schedule start` no-ops on the exact state
+        // it exists to repair.
         let needs_repair = systemd_timer_show()
             .as_deref()
             .and_then(systemd_timer_problem)
@@ -1183,14 +1181,10 @@ mod unix {
         }
 
         /// The Windows precedent (`launcher_problem_flags_only_a_missing_command`)
-        /// pins that the problem message names its fix. Same here, and it is
-        /// the part that was wrong: the message used to offer
-        /// `pond schedule start` as a fallback remedy while `start_systemd`
-        /// early-returned on this exact state, so the advice was a no-op.
+        /// pins that a problem message names its fix; this pins the same.
         #[test]
         fn the_problem_message_names_the_command_that_repairs_it() {
-            // `expect_used` is a warn-level lint here and CI runs clippy with
-            // `-D warnings`, so use the file's own let-else idiom.
+            // `expect_used` warns here: unlike the windows tests, this module does not expect it.
             let Some(problem) = systemd_timer_problem(SHOW_DEAD) else {
                 panic!("a dead timer must be reported as a problem");
             };
@@ -1198,8 +1192,8 @@ mod unix {
                 problem.contains("`pond schedule start` to repair it"),
                 "remedy must name the repairing command: {problem}"
             );
-            // The old advice pointed at the service directly; `start_systemd`
-            // now does that itself, so the message must not ask the user to.
+            // `start_systemd` starts the service itself, so the message must not
+            // hand the user the internal step.
             assert!(
                 !problem.contains("systemctl --user start pond-sync.service"),
                 "remedy must not hand the user the internal step: {problem}"
