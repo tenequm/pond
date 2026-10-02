@@ -680,10 +680,8 @@ mod unix {
     /// so the set asked for cannot drift from the set read.
     const SUB_STATE_PROPERTY: &str = "SubState";
 
-    /// Ask `systemctl` what the timer's next elapse and sub-state are.
-    ///
-    /// Split from the reading below so the verdict is a pure function of the
-    /// text, and the remedy it names can be pinned by a test.
+    /// Ask `systemctl` for the timer's next elapse and sub-state, split from
+    /// the reading so the verdict and its remedy stay a testable pure function.
     fn systemd_timer_show() -> Option<String> {
         let mut command = Command::new("systemctl");
         command.args(["--user", "show", "pond-sync.timer"]);
@@ -698,27 +696,12 @@ mod unix {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// A systemd timer can be `enabled` and `active` while having no next
-    /// elapse at all, in which case it never fires again.
-    ///
-    /// `Persistent=true` is what *produces* that state, not merely what fails
-    /// to rescue it. The stamp file it maintains is loaded into the unit's
-    /// `last_trigger` by `timer_start`; in `timer_enter_waiting` a set
-    /// `last_trigger` disables the already-past `OnBootSec=` one-shot, while
-    /// `OnUnitActiveSec=` skips on a zero base under a freshly restarted user
-    /// manager that has no record of a previous activation. With no anchor
-    /// left the timer parks in `active (elapsed)` with `Trigger: n/a`
-    /// permanently, while `is-enabled` keeps succeeding. Without the stamp,
-    /// the past `OnBootSec=` fires immediately on manager start and the unit
-    /// heals itself. (Read off timer.c: the stamp load in `timer_start`, then
-    /// the one-shot disable and the `base <= 0 -> continue` skip in
-    /// `timer_enter_waiting`.)
-    ///
-    /// Same shape as the Windows `launcher_problem`: a registration that
-    /// exists but cannot run, named so the status line can say so instead of
-    /// asserting health. The remedy names `pond schedule start` because
-    /// `start_systemd` repairs this state - it does not early-return on it,
-    /// and it starts the service to re-anchor the timer.
+    /// A timer can be `enabled` and `active` with no next elapse, never
+    /// firing again - and `Persistent=true` is what causes it: its stamp
+    /// disables the already-past `OnBootSec=` one-shot on a fresh user
+    /// manager while `OnUnitActiveSec=` has no base (timer.c: the stamp load
+    /// in `timer_start`, the skips in `timer_enter_waiting`). `is-enabled`
+    /// still succeeds, so the elapse properties are the only honest probe.
     fn systemd_timer_problem(show: &str) -> Option<String> {
         timer_is_dead(show).then(|| {
             "the timer has no next elapse and will never fire again \
@@ -728,13 +711,9 @@ mod unix {
         })
     }
 
-    /// Whether the timer will genuinely never fire again.
-    ///
-    /// A timer whose service is running right now has no next elapse either:
-    /// systemd only recomputes one in `timer_enter_waiting()`, after the
-    /// service goes inactive. `pond-sync` runs on this timer, so without this
-    /// guard every status read taken during a sync calls a perfectly healthy
-    /// schedule broken - the same false verdict, pointed the other way.
+    /// A running timer also has no next elapse - systemd recomputes it only
+    /// once the service goes inactive - so without the `SubState` guard every
+    /// status read taken mid-sync would call a healthy schedule broken.
     fn timer_is_dead(show: &str) -> bool {
         if show.lines().any(|line| line.trim() == "SubState=running") {
             return false;
@@ -742,18 +721,11 @@ mod unix {
         next_elapse_missing(show)
     }
 
-    /// True when the next-elapse properties say the timer has no next elapse.
-    /// systemd renders an unset elapse as an empty value (realtime) or
-    /// `infinity` (monotonic); other versions print `0` or `n/a`. A healthy
-    /// monotonic timer answers with a duration - `2month 1w 10h 50min
-    /// 22.539762s` - so "not one of the sentinels" is the reading that holds
-    /// across versions and does not depend on parsing a duration format.
-    ///
-    /// Both properties must be missing before this says broken: a
-    /// monotonic-only timer legitimately leaves the realtime one empty. And a
-    /// systemctl that answered with neither property (older version, or a
-    /// unit it would not describe) returns false rather than crying wolf - an
-    /// absent measurement is not evidence of a dead timer.
+    /// True when the answered properties name no elapse: an unset one renders
+    /// as "" (realtime) or `infinity` (monotonic), `0` / `n/a` on other
+    /// versions, while a healthy value is a duration - so sentinel-matching
+    /// holds across versions. A healthy monotonic-only timer leaves realtime
+    /// empty, and answering neither property is no measurement, not a verdict.
     fn next_elapse_missing(show: &str) -> bool {
         let mut measured = false;
         for line in show.lines() {
@@ -831,10 +803,8 @@ mod unix {
             && std::fs::read_to_string(&timer_path)
                 .map(|existing| existing == timer)
                 .unwrap_or(false);
-        // A timer can be enabled, with unit files unchanged, and still never
-        // fire again (see `systemd_timer_problem`). The early return must also
-        // require health, or `pond schedule start` no-ops on the exact state
-        // it exists to repair.
+        // An enabled timer with unchanged units can still be dead, so the
+        // early return must also require health (`systemd_timer_problem`).
         let needs_repair = systemd_timer_show()
             .as_deref()
             .and_then(systemd_timer_problem)
@@ -864,14 +834,11 @@ mod unix {
                 );
             }
         }
-        // `enable --now` issues a start job on a timer that is already active
-        // (`elapsed`), and systemd treats that as a no-op: `timer_start`
-        // asserts TIMER_DEAD/TIMER_FAILED, and daemon-reload coldplug re-enters
-        // ELAPSED verbatim. Starting the *service* is the one action that
-        // re-anchors `OnUnitActiveSec=`, and it covers the stopped and
-        // failed-but-enabled sub-states too, which `timer_trigger_notify`
-        // ignores. `--no-block` so the sync it triggers does not hold this
-        // command open.
+        // `enable --now` cannot revive a dead timer - a start job on an
+        // active (`elapsed`) unit is a no-op and `timer_trigger_notify`
+        // ignores dead/failed; only a fresh service activation re-anchors
+        // `OnUnitActiveSec=`. `--no-block` keeps the triggered sync from
+        // holding this command open.
         if needs_repair {
             let output = Command::new("systemctl")
                 .args(["--user", "start", "--no-block", "pond-sync.service"])
