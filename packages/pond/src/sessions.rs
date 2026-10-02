@@ -1113,7 +1113,7 @@ impl Store {
     ///      row per session, sequentially. A session whose `source_agent` or
     ///      `project` disagrees is rewritten to the STORED values and still
     ///      written, so its new messages land; the disagreement is counted in
-    ///      `relabeled_sessions` and logged with both values.
+    ///      `relabeled_sessions` (spec.md#wire-ingest-relabel) and logged with both values.
     ///   2. Deduplicates in-batch at the substream level: when two substreams
     ///      in the same batch share a `session_id` (Claude Code's subagent
     ///      files reuse their parent's id), the first occurrence wins and its
@@ -5609,8 +5609,9 @@ pub fn init_embedding_dim(dim: usize) {
     EMBEDDING_DIM_RUNTIME.get_or_init(|| dim);
 }
 
-/// Initial-`CREATE` write params for the namespace-mediated path. The
-/// substrate seam stamps in `session`, `mode`, and `store_params`.
+/// Initial-`CREATE` write params for the namespace-mediated path
+/// (spec.md#lance-table-creation-stable-row-ids).
+/// The substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond copy --to <file>`
 /// snapshots plus deferred Lance tags (spec.md#session-durable-copy).
 /// `skip_auto_cleanup` suppresses the per-commit hook so cleanup stays

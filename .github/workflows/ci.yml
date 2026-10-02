@@ -130,7 +130,7 @@ jobs:
       # multi-commit push would under-select, and the fix is MOON_BASE.
       - run: >
           moon ci
-          repo:check-changelog
+          repo:check-changelog repo:check-spec-refs
           pond:check-package pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test

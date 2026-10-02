@@ -5,7 +5,8 @@
 //! HTTP exposes `POST /v1/search`, `POST /v1/get-session`, `POST /v1/get-message`,
 //! `POST /v1/ingest`, and the unstable `POST /v1/x/sql` (read-only SQL, JSON
 //! rows). MCP exposes `pond_search` / `pond_get_session` / `pond_get_message`
-//! plus `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only.
+//! plus `pond_sql` (read-only SQL); ingest stays HTTP-only and CLI-only
+//! (spec.md#mcp-read-only-heal-exception).
 
 use std::sync::{
     Arc,

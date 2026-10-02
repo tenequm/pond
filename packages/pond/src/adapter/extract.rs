@@ -11,8 +11,9 @@
 //! sentinel ("unknown", "function", "") through any combination of trait
 //! methods, conversions, or struct literals - the seal is module-private.
 //!
-//! Transport-agnostic by design: `Source` is a tiny trait that adapter
-//! authors implement for their own row type, regardless of how the row
+//! Transport-agnostic by design (spec.md#adapter-transport-agnostic-seam):
+//! `Source` is a tiny trait that adapter authors
+//! implement for their own row type, regardless of how the row
 //! arrived (JSONL file, HTTP response body, WebSocket frame, queue
 //! payload, database row). pond ships `impl Source for serde_json::Value`
 //! for JSON-flavored adapters; the trait carries no transport assumptions.

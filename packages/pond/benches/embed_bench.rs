@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
         |_| {},
     )
     .await?;
-    // spec.md#fold-on-write: ingest_adapter already folded FTS + scalars.
+    // spec.md#lance-index-maintenance: ingest folds no indexes; reads flat-scan the unindexed tail.
     let ingest_elapsed = ingest_start.elapsed();
     let (sessions, messages, parts) = store.row_counts().await?;
 

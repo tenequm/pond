@@ -48,6 +48,18 @@ tasks:
     toolchains: 'system'
     inputs: ['CHANGELOG.md', 'ops/scripts/check-changelog-headers.sh']
 
+  check-spec-refs:
+    command: 'bash ops/scripts/check-spec-refs.sh'
+    toolchains: 'system'
+    inputs:
+      - 'docs/spec.md'
+      - 'packages/pond/src/**/*'
+      - 'packages/pond/tests/**/*'
+      - '!packages/pond/tests/fixtures/**/*'
+      - 'packages/pond/benches/**/*'
+      - 'packages/pond/SKILL.md'
+      - 'ops/scripts/check-spec-refs.sh'
+
   # The release gate, both halves in one target: perf (CLI probes + gate
   # benches + map-vs-scan equivalence against the live remote store, ~30 min of
   # S3 wall-clock) and memory (one mem_bench scenario per process, ~40 min on

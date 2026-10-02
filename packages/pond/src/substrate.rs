@@ -1101,7 +1101,8 @@ fn derived_target_rows(stats: &[FragmentStat]) -> usize {
         .clamp(1, u128::from(MAX_TARGET_ROWS_PER_FRAGMENT))) as usize
 }
 
-/// Name the first reason an optional compaction task cannot make progress.
+/// Name the first reason an optional compaction task cannot make progress
+/// (spec.md#lance-compaction-filter).
 /// Deletion materialization always passes because removing tombstones is useful.
 fn task_veto_reason(
     stats: &[FragmentStat],
@@ -3475,13 +3476,14 @@ async fn optimize_table_compact(
     Ok(())
 }
 
-/// Always `Reencode`, never binary copy: binary copy concatenates the input
-/// pages, so every tiny per-sync append survives as its own page, and lance 12
+/// Always `Reencode`, never binary copy (spec.md#lance-compaction-filter):
+/// binary copy concatenates the input pages, so every tiny per-sync append survives as its own page, and lance 12
 /// reads each page's metadata on every take of a projected column (#285: a
 /// 20k-row `sessions` fragment with 2,057 pages/column cost 11,300 GETs per
 /// one-row take, 15 after a re-encode). The cost lands on full-table rewrites
 /// (write_bench A/B: `messages` ~2.3x slower, `sessions` faster, sync-sized
-/// rounds unchanged - docs/benchmarks/results.md). `parts` never binary-copied anyway: lance refuses it for blob columns.
+/// rounds unchanged - docs/benchmarks/results.md). `parts` never binary-copied anyway: lance refuses it for blob
+/// columns.
 fn compaction_options(target_rows_per_fragment: usize) -> CompactionOptions {
     CompactionOptions {
         target_rows_per_fragment,
@@ -5162,8 +5164,9 @@ async fn scan_verify_version(
 /// Self-heal a crash-damaged local table: walk `_versions/` head-down to the
 /// newest fully readable version, quarantine the unreadable manifests above it
 /// (atomic rename to `*.manifest.corrupt`, never delete), then retry the normal
-/// open once. Lossless for pond: source histories are truth and the next
-/// `pond sync` re-ingests the aborted commit (spec.md#local-store-self-heal).
+/// open once. The next `pond sync` re-ingests the aborted commit's rows from
+/// sources that still hold them; a rotated source cannot resupply its rows
+/// (spec.md#local-store-self-heal).
 /// When nothing is quarantinable, returns the original error enriched (Layer 3).
 async fn heal_local_dataset(
     table_uri: &str,
@@ -5311,7 +5314,7 @@ async fn heal_local_dataset(
     // Loud one-line notice: warns render on CLI stderr by default (main.rs
     // init_tracing defaults to WARN level).
     tracing::warn!(
-        "pond self-healed local table {table_name}: quarantined {} unreadable manifest(s) ({}) to {VERSIONS_DIR_NAME}/*.corrupt and rolled back to version {landed_version}. The interrupted commit's rows are reconstructed on the next `pond sync` from source histories.",
+        "pond self-healed local table {table_name}: quarantined {} unreadable manifest(s) ({}) to {VERSIONS_DIR_NAME}/*.corrupt and rolled back to version {landed_version}. Rows from sources that still hold them re-ingest on the next `pond sync`; a rotated source cannot resupply its rows.",
         quarantined.len(),
         quarantined.join(", "),
     );
@@ -5413,7 +5416,8 @@ fn classify_schema(
 /// Open-time schema reconciliation: a store missing this build's known
 /// nullable columns is backfilled IN PLACE via `Dataset::add_columns` - the
 /// values derive from data already stored, so no re-ingest is ever required
-/// (spec.md#session-durable-copy: a rotated source cannot supply rows again).
+/// (spec.md#session-durable-copy: a rotated source cannot supply rows again;
+/// spec.md#session-additive-schema-backfill).
 /// Concurrent openers race benignly: `add_columns` commits through OCC, a
 /// losing writer sees a conflict, re-checks out latest, and finds the columns
 /// present.

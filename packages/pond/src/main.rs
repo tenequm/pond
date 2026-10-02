@@ -6148,7 +6148,7 @@ fn unzip_archive(source: &Path, dest: &Path) -> anyhow::Result<()> {
 
 /// Resolve which (adapter, path) pairs `pond sync` should drive in this run.
 /// Read-only over config - enabling an adapter is `pond adapters` / `pond init`,
-/// never a side effect of sync (spec.md#cli-verbs).
+/// never a side effect of sync (spec.md#cli-sync).
 ///
 /// Precedence:
 /// 1. `--path <dir>` with `<adapter>` set: one-off run, no config writes.
@@ -6187,7 +6187,7 @@ fn resolve_sync_adapters(
             bail!("unknown adapter {name:?}; known: {}", known.join(", "));
         }
         if config.adapters.contains_key(name) {
-            // spec.md#cli-verbs: sync only ingests already-enabled adapters and
+            // spec.md#cli-sync: sync only ingests already-enabled adapters and
             // never enables. resolve_adapters strips `enabled` and refuses a
             // disabled entry, pointing the user at `pond adapters enable`.
             return config.resolve_adapters(Some(name));
@@ -8583,7 +8583,7 @@ mod tests {
         );
 
         // Configured-but-disabled: sync refuses and names the enable verb,
-        // never silently syncing a disabled adapter (spec.md#cli-verbs).
+        // never silently syncing a disabled adapter (spec.md#cli-sync).
         let disabled =
             Config::load_str("[adapters.claude-code]\nenabled = false\npath = \"/tmp/cc\"\n")
                 .expect("disabled config");
