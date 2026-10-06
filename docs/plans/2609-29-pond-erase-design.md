@@ -1,6 +1,6 @@
 # pond erase: design (#45)
 
-Status: design, revision 2. This revision answers two independent external reviews (gpt-6-astra and claude-fable-5). Both concluded "not implementable as written, fixable within the locked decisions"; the section "Review resolution" maps every finding to where it is addressed or disputed. Ten decisions are locked: the original seven plus three that came out of the reviews (8-10). No decision is open. The remaining open items are the verification items V1-V10 in the test plan. Tracks [#45](https://github.com/tenequm/pond/issues/45). The brief is the "PR 2" section of `docs/plans/2609-29-devin-315-fixes-and-erase.md`. The existing contract is spec 5.4 `session-append-only-exception` plus the 7.8 `pond erase` bullet.
+Status: design, revision 2. This revision answers two independent external reviews (gpt-6-astra and claude-fable-5). Both concluded "not implementable as written, fixable within the locked decisions"; the section "Review resolution" maps every finding to where it is addressed or disputed. Ten decisions are locked: the original seven plus three that came out of the reviews (8-10). No decision is open. The remaining open items are the verification items V1-V10 in the test plan. Tracks [#45](https://github.com/tenequm/pond/issues/45). The existing contract is spec 5.4 `session-append-only-exception` plus the 7.8 `pond erase` bullet.
 
 ## Goal
 
