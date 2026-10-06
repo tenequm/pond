@@ -4,7 +4,7 @@ version = "0.1.0"
 # Floor for: agent focus moves clients, the plugin-pane PWD fix, and a plugin
 # registry that survives client-only updates.
 min_herdr_version = "0.9.1"
-description = "Search and read every agent session from your pond store - all harnesses, all machines."
+description = "Search, read and resume every agent session from your pond store - all harnesses, all machines."
 platforms = ["macos", "linux"]
 
 [[actions]]
@@ -12,6 +12,12 @@ id = "desk"
 title = "pond: session desk"
 contexts = ["pane", "workspace"]
 command = ["bin/herdr-pond", "open"]
+
+[[actions]]
+id = "park"
+title = "pond: park this agent"
+contexts = ["pane"]
+command = ["bin/herdr-pond", "park"]
 
 # The title becomes the pane label, which `open` uses as the dedupe key.
 [[panes]]

@@ -86,6 +86,16 @@ impl AdapterFactory for CodexCliFactory {
         path.exists().then(|| json!({ "path": path }))
     }
 
+    /// Restored paths carry the `sessions/` segment, so they root one level up
+    /// - only from a source that is that `sessions` directory.
+    fn native_restore_root(&self, source_path: &Path) -> Option<PathBuf> {
+        source_path
+            .ends_with("sessions")
+            .then(|| source_path.parent())
+            .flatten()
+            .map(Path::to_path_buf)
+    }
+
     fn serialize(
         &self,
         session: &crate::sessions::SessionWithMessages,

@@ -1,8 +1,9 @@
-//! Every herdr CLI call (`pane list`, `agent focus`, `plugin pane open|focus`,
-//! `notification show`) and the plugin runtime env.
+//! Every herdr CLI call (`pane list|close`, `tab create`, `agent focus|start`,
+//! `plugin pane open|focus`, `notification show`) and the plugin runtime env.
 
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -20,6 +21,10 @@ const DESK_ENTRYPOINT: &str = "desk";
 const DESK_LABEL: &str = "pond desk";
 /// herdr answers in milliseconds; a hung CLI must not hang a hook or the desk.
 const CALL_DEADLINE: Duration = Duration::from_secs(3);
+/// How long `agent start` waits for the agent to be ready; the CLI call gets a
+/// little longer, so herdr's own timeout always answers first.
+const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_START_DEADLINE: Duration = Duration::from_secs(AGENT_READY_TIMEOUT.as_secs() + 5);
 const CALL_POLL: Duration = Duration::from_millis(5);
 
 /// A plugin-runtime path herdr sets for every plugin process.
@@ -47,6 +52,19 @@ pub(crate) fn context_project() -> Option<String> {
     project_from_context(&std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?)
 }
 
+/// The pane an action was invoked on.
+pub(crate) fn context_pane() -> Option<String> {
+    #[derive(Deserialize)]
+    struct Context {
+        focused_pane_id: Option<String>,
+    }
+    let json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+    serde_json::from_str::<Context>(&json)
+        .ok()?
+        .focused_pane_id
+        .filter(|id| !id.is_empty())
+}
+
 fn project_from_context(json: &str) -> Option<String> {
     #[derive(Deserialize)]
     struct Context {
@@ -63,10 +81,13 @@ fn project_from_context(json: &str) -> Option<String> {
 /// Spawns `command` so it holds no herdr command slot: herdr reads a plugin
 /// command's stdout/stderr to EOF before releasing its slot, so every stdio
 /// end goes to /dev/null or `log`. The child calls [`detach`] itself - a
-/// pre-exec `setsid` would need `unsafe`.
+/// pre-exec `setsid` would need `unsafe` - so it starts in its own process
+/// group: the desk spawns it as its pane closes, and the pane's teardown
+/// signals the desk's group before the child has detached.
 pub(crate) fn spawn_detached(mut command: Command, log: &Path) -> anyhow::Result<()> {
     log_stdio(&mut command, log)
         .with_context(|| format!("opening {}", log.display()))?
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawning {:?}", command.get_program()))?;
     Ok(())
@@ -105,6 +126,10 @@ pub(crate) struct Pane {
     pub pane_id: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
 }
@@ -211,6 +236,56 @@ impl Herdr {
 
     pub(crate) fn agent_focus(&self, pane_id: &str) -> anyhow::Result<()> {
         self.call(&["agent", "focus", pane_id]).map(drop)
+    }
+
+    pub(crate) fn pane_close(&self, pane_id: &str) -> anyhow::Result<()> {
+        self.call(&["pane", "close", pane_id]).map(drop)
+    }
+
+    pub(crate) fn tab_create(
+        &self,
+        workspace: Option<&str>,
+        cwd: &str,
+        label: &str,
+    ) -> anyhow::Result<String> {
+        let mut args = vec!["tab", "create", "--cwd", cwd, "--label", label, "--focus"];
+        if let Some(workspace) = workspace {
+            args.extend(["--workspace", workspace]);
+        }
+        let result = self.call(&args)?;
+        result["root_pane"]["pane_id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("herdr tab create: no root pane in the response")
+    }
+
+    pub(crate) fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        agent_args: &[String],
+    ) -> anyhow::Result<()> {
+        let timeout = AGENT_READY_TIMEOUT.as_millis().to_string();
+        let mut args = vec![
+            "agent",
+            "start",
+            name,
+            "--kind",
+            kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+            &timeout,
+            "--",
+        ];
+        args.extend(agent_args.iter().map(String::as_str));
+        Self {
+            deadline: AGENT_START_DEADLINE,
+            ..self.clone()
+        }
+        .call(&args)
+        .map(drop)
     }
 
     pub(crate) fn notify(&self, title: &str, body: &str) -> anyhow::Result<()> {
@@ -405,6 +480,37 @@ esac"#,
             &format!("cat '{}'", sandbox.path("panes.json").display()),
         );
         assert_eq!(Herdr::new(bin).pane_list(None).unwrap().len(), 2000);
+    }
+
+    /// The desk spawns its launch leg as its pane closes; a leg sharing the
+    /// desk's process group dies in that teardown before it can detach.
+    #[test]
+    fn a_detached_leg_runs_in_its_own_process_group() {
+        let sandbox = Sandbox::new();
+        let pid_file = sandbox.path("pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("echo $$ > '{}'; exec sleep 5", pid_file.display()));
+        spawn_detached(command, &sandbox.path("log")).unwrap();
+        let started = Instant::now();
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break nix::unistd::Pid::from_raw(pid);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the leg never ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let group = nix::unistd::getpgid(Some(pid)).unwrap();
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        assert_eq!(group, pid, "the leg leads its own group");
+        assert_ne!(group, nix::unistd::getpgid(None).unwrap());
     }
 
     #[test]

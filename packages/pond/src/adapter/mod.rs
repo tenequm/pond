@@ -105,6 +105,13 @@ pub trait AdapterFactory: Send + Sync {
         None
     }
 
+    /// The root this adapter's restored relative paths resolve against when
+    /// its source lives at `source_path` - what `pond resume --out-dir native`
+    /// writes under. `None` when the client has no such location.
+    fn native_restore_root(&self, _source_path: &Path) -> Option<PathBuf> {
+        None
+    }
+
     /// Restore one canonical session into this adapter's native file layout.
     fn serialize(
         &self,

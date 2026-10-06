@@ -168,12 +168,13 @@ pub(crate) struct DeskContext {
     pub state_dir: Option<PathBuf>,
 }
 
-/// How the desk leaves: the caller runs the jump only after the terminal has
-/// been restored.
+/// How the desk leaves: the caller runs the jump or the launch only after the
+/// terminal has been restored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeskExit {
     Quit,
     Jump { pane_id: String },
+    Launch(crate::launch::Launch),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

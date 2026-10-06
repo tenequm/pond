@@ -273,6 +273,96 @@ async fn native_resume_writes_a_pi_session_file_for_the_whole_lineage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn native_resolves_the_clients_own_directory_and_reports_the_project() {
+    let sandbox = Sandbox::with_pi_corpus().await;
+    let sessions = sandbox.temp.path().join("home/.pi/agent/sessions");
+    std::fs::create_dir_all(&sessions).expect("a pi install");
+    let args = [
+        PI_SESSION,
+        "--to",
+        "pi-coding-agent",
+        "--out-dir",
+        "native",
+        "--format",
+        "json",
+    ];
+
+    let (code, doc) = sandbox.resume_json(&args);
+    assert_eq!(code, 0, "{doc}");
+    assert!(doc["project"].is_string(), "{doc}");
+    for file in files_of(&doc, PI_SESSION) {
+        assert!(Path::new(&file).starts_with(&sessions), "{file}");
+    }
+
+    let (again, refusal) = sandbox.resume_json(&args);
+    assert_eq!(again, 3, "{refusal}");
+    assert_eq!(refusal["project"], doc["project"]);
+
+    let (code, missing) = sandbox.resume_json(&[
+        PI_SESSION,
+        "--to",
+        "codex-cli",
+        "--out-dir",
+        "native",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code, 2, "{missing}");
+    assert_eq!(missing["error"], "no_native_dir");
+    assert!(
+        missing["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--out-dir")),
+        "the document names the fix: {missing}"
+    );
+
+    // A configured source wins over the probe, and must be the client's own
+    // existing `sessions` directory: a missing one, or a parent of it, would
+    // grow a tree no client reads.
+    let config = sandbox.temp.path().join("config/pond/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    for path in [
+        sandbox.temp.path().join("gone/sessions"),
+        sandbox.temp.path().join("home/.pi/agent"),
+    ] {
+        std::fs::write(
+            &config,
+            format!(
+                "[adapters.pi-coding-agent]\npath = {:?}\n",
+                path.display().to_string()
+            ),
+        )
+        .unwrap();
+        let (code, refused) = sandbox.resume_json(&args);
+        assert_eq!(code, 2, "{path:?}: {refused}");
+        assert_eq!(refused["error"], "no_native_dir");
+    }
+    let claude_home = sandbox.temp.path().join("home/.claude");
+    std::fs::create_dir_all(&claude_home).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[adapters.claude-code]\npath = {:?}\n",
+            claude_home.display().to_string()
+        ),
+    )
+    .unwrap();
+    let (code, refused) = sandbox.resume_json(&[
+        PI_SESSION,
+        "--to",
+        "claude-code",
+        "--out-dir",
+        "native",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        code, 2,
+        "only claude's own projects dir is its root: {refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resuming_twice_is_refused_and_names_what_is_already_there() {
     let sandbox = Sandbox::with_pi_corpus().await;
     let out_dir = sandbox.out_dir();

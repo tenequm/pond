@@ -24,10 +24,10 @@ use crate::serve::{Endpoint, Origin, ServeDir};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// A fresh path under the temp dir: short, since a socket path is capped
-/// near 100 bytes.
+/// A fresh path under `/tmp`, not `$TMPDIR`: a socket path is capped near 100
+/// bytes, and macOS's per-user `$TMPDIR` alone takes half of that.
 fn temp_path(kind: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    PathBuf::from("/tmp").join(format!(
         "herdr-pond-{kind}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)

@@ -1,5 +1,7 @@
-//! herdr plugin for pond: sync-on-idle and a read-only session desk. Design:
-//! `docs/plans/2609-24-herdr-pond-v1-desk-plan.md`.
+//! herdr plugin for pond: sync-on-idle, a session desk that resumes, forks and
+//! hands off any stored session, and park. Design:
+//! `docs/plans/2609-24-herdr-pond-v1-desk-plan.md`, then
+//! `docs/plans/2610-05-herdr-pond-v2-resume-fork-handoff-park.md`.
 //!
 //! The desk draws with ratatui over crossterm directly - pond's CLI output
 //! stack rule covers the pond binary, not this crate. `unsafe_code` is denied,
@@ -13,6 +15,7 @@ mod desk;
 mod fake_pond;
 mod herdr;
 mod hook;
+mod launch;
 mod serve;
 mod types;
 
@@ -24,7 +27,8 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::types::{DeskContext, DeskExit};
 
-const USAGE: &str = "usage: herdr-pond open|tui|hook [--worker <adapter>]|serve-daemon [--owner]";
+const USAGE: &str = "usage: herdr-pond open|tui|hook [--worker <adapter>]|serve-daemon [--owner]\
+                     |launch <session-id> <adapter> [--fork|--hand-off]|park [--worker <pane> <adapter>]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -36,6 +40,12 @@ fn main() -> ExitCode {
         "tui" => desk_main(),
         "hook" => hook::run(rest),
         "serve-daemon" => daemon::run(rest),
+        "launch" => launch::run(rest),
+        "park" => match rest {
+            [] => launch::park(),
+            [flag, worker @ ..] if flag == "--worker" => launch::park_worker(worker),
+            _ => Err(anyhow::anyhow!(USAGE)),
+        },
         _ => Err(anyhow::anyhow!(USAGE)),
     };
     match result {
@@ -71,8 +81,8 @@ fn shutdown_signal() -> std::io::Result<impl Future<Output = &'static str>> {
     })
 }
 
-/// Runs the desk, then performs a jump only after it has restored the
-/// terminal. The api (and any fallback serve it owns) is dropped when
+/// Runs the desk, then performs a jump or hands off a launch only after it has
+/// restored the terminal. The api (and any fallback serve it owns) is dropped when
 /// `desk::run` returns, before herdr's CLI runs.
 fn desk_main() -> anyhow::Result<()> {
     let context = DeskContext {
@@ -86,5 +96,6 @@ fn desk_main() -> anyhow::Result<()> {
     match desk::run(api, context)? {
         DeskExit::Quit => Ok(()),
         DeskExit::Jump { pane_id } => herdr::Herdr::from_env().agent_focus(&pane_id),
+        DeskExit::Launch(launch) => launch::spawn(&launch),
     }
 }

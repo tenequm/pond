@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::cache::{Known, SavedListing, Snapshot};
 use super::ui;
+use crate::launch::{self, Launch, Mode};
 use crate::types::{
     ApiError, Cursor, DeskContext, DeskExit, LISTING_ROWS, ListingScope, LiveAgent, PAGE_ROWS,
     SearchRequest, SearchResponse, SessionHost, SessionRow, SessionStart, SessionStats,
@@ -215,6 +216,14 @@ pub(super) struct Search {
     pub(super) response: Option<SearchResponse>,
 }
 
+/// The hand-off target picker: every other client the desk can start.
+#[derive(Debug)]
+pub(super) struct Handoff {
+    session_id: String,
+    pub(super) targets: Vec<&'static str>,
+    pub(super) state: ListState,
+}
+
 /// The transcript, wrapped once per load or resize so a frame only slices it.
 #[derive(Debug)]
 pub(super) struct Pager {
@@ -302,6 +311,7 @@ pub(super) struct App {
     pub(super) preview_open: bool,
     pub(super) previews: HashMap<String, Vec<TranscriptMessage>>,
     pub(super) pager: Option<Pager>,
+    pub(super) handoff: Option<Handoff>,
     pub(super) toast: Option<String>,
     pub(super) fatal: Option<String>,
     pub(super) spinner: usize,
@@ -338,6 +348,7 @@ impl App {
             preview_open: false,
             previews: HashMap::new(),
             pager: None,
+            handoff: None,
             toast: None,
             fatal: None,
             spinner: 0,
@@ -606,6 +617,9 @@ impl App {
                 _ => Vec::new(),
             };
         }
+        if self.handoff.is_some() {
+            return self.on_handoff_key(key);
+        }
         if self.pager.is_some() {
             return self.on_pager_key(key);
         }
@@ -648,6 +662,9 @@ impl App {
             KeyCode::Char('p') => self.toggle_scope(true),
             KeyCode::Char('t') => self.toggle_scope(false),
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('o') => self.act(Mode::Resume),
+            KeyCode::Char('f') => self.act(Mode::Fork),
+            KeyCode::Char('h') => self.act(Mode::HandOff),
             _ => Vec::new(),
         }
     }
@@ -707,6 +724,9 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace | KeyCode::Left => {
                 return self.close_pager();
             }
+            KeyCode::Char('o') => return self.act(Mode::Resume),
+            KeyCode::Char('f') => return self.act(Mode::Fork),
+            KeyCode::Char('h') => return self.act(Mode::HandOff),
             KeyCode::Down | KeyCode::Char('j') => 1,
             KeyCode::Up | KeyCode::Char('k') => -1,
             KeyCode::PageDown | KeyCode::Char(' ') => page,
@@ -927,6 +947,105 @@ impl App {
         let mut effects = self.hydrate_visible();
         effects.extend(self.load_more());
         effects
+    }
+
+    /// The session `o`/`f`/`h` act on - the pager's while it is open, since a
+    /// refresh can move the list selection under it - and its client.
+    fn acted_session(&self) -> Option<(String, String)> {
+        let id = match &self.pager {
+            Some(pager) => pager.session_id.clone(),
+            None => self.selected_id()?.to_owned(),
+        };
+        let searched = self
+            .search
+            .as_ref()
+            .and_then(|search| search.response.as_ref())
+            .into_iter()
+            .flat_map(|response| &response.sessions)
+            .map(|session| (&session.session_id, &session.source_agent));
+        let listed = self
+            .listing()
+            .into_iter()
+            .flatten()
+            .map(|row| (&row.session_id, &row.source_agent));
+        let agent = searched
+            .chain(listed)
+            .find(|(found, _)| **found == id)?
+            .1
+            .clone();
+        Some((id, agent))
+    }
+
+    /// `o` on a live row jumps to it, as enter does, and `h` first asks for a
+    /// target; a launch leaves the desk so it runs after the terminal is
+    /// restored.
+    fn act(&mut self, mode: Mode) -> Vec<Effect> {
+        let Some((session_id, source_agent)) = self.acted_session() else {
+            return Vec::new();
+        };
+        if mode == Mode::Resume
+            && let Some(agent) = self.live_agent(&session_id)
+        {
+            return vec![Effect::Exit(DeskExit::Jump {
+                pane_id: agent.pane_id.clone(),
+            })];
+        }
+        let own = launch::client(&source_agent);
+        if mode == Mode::HandOff {
+            let targets: Vec<&'static str> = launch::CLIENTS
+                .iter()
+                .map(|client| client.adapter)
+                .filter(|adapter| own.is_none_or(|own| own.adapter != *adapter))
+                .collect();
+            self.handoff = Some(Handoff {
+                session_id,
+                targets,
+                state: ListState::default().with_selected(Some(0)),
+            });
+            return Vec::new();
+        }
+        let Some(client) = own else {
+            self.toast = Some(format!(
+                "the desk cannot start {source_agent} sessions - h hands one off to a client it can"
+            ));
+            return Vec::new();
+        };
+        vec![Effect::Exit(DeskExit::Launch(Launch {
+            session_id,
+            adapter: client.adapter.to_owned(),
+            mode,
+        }))]
+    }
+
+    fn on_handoff_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(handoff) = &mut self.handoff else {
+            return Vec::new();
+        };
+        let selected = handoff.state.selected().unwrap_or(0);
+        let last = handoff.targets.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.handoff = None,
+            KeyCode::Down | KeyCode::Char('j') => {
+                handoff.state.select(Some((selected + 1).min(last)));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                handoff.state.select(Some(selected.saturating_sub(1)));
+            }
+            KeyCode::Enter => {
+                let Some(handoff) = self.handoff.take() else {
+                    return Vec::new();
+                };
+                if let Some(target) = handoff.targets.get(selected) {
+                    return vec![Effect::Exit(DeskExit::Launch(Launch {
+                        session_id: handoff.session_id,
+                        adapter: (*target).to_owned(),
+                        mode: Mode::HandOff,
+                    }))];
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
     }
 
     fn close_pager(&mut self) -> Vec<Effect> {
@@ -2079,6 +2198,90 @@ mod tests {
         assert!(screen_text.contains(ui::PAGER_FOOTER), "{screen_text}");
         press(&mut app, &api, KeyCode::Char('q'));
         assert!(app.pager.is_none());
+    }
+
+    fn launched(id: &str, adapter: &str, mode: Mode) -> Option<DeskExit> {
+        Some(DeskExit::Launch(Launch {
+            session_id: id.to_owned(),
+            adapter: adapter.to_owned(),
+            mode,
+        }))
+    }
+
+    #[test]
+    fn o_f_and_h_launch_the_selected_session() {
+        let api = MockApi::golden();
+        let mut app = opened(&api, 100, 12);
+        let live = Some(DeskExit::Jump {
+            pane_id: "p7".to_owned(),
+        });
+        assert_eq!(press(&mut app, &api, KeyCode::Char('o')), live);
+        assert_eq!(
+            press(&mut app, &api, KeyCode::Char('f')),
+            launched("s-live", "claude-code", Mode::Fork)
+        );
+        press(&mut app, &api, KeyCode::Down);
+        assert_eq!(
+            press(&mut app, &api, KeyCode::Char('o')),
+            launched("s-old", "codex-cli", Mode::Resume)
+        );
+
+        assert_eq!(press(&mut app, &api, KeyCode::Char('h')), None);
+        assert_eq!(
+            app.handoff.as_ref().unwrap().targets,
+            ["claude-code", "pi-coding-agent"]
+        );
+        assert!(screen(&mut app).contains("hand off to"));
+        press(&mut app, &api, KeyCode::Esc);
+        assert!(app.handoff.is_none());
+        press(&mut app, &api, KeyCode::Char('h'));
+        press(&mut app, &api, KeyCode::Down);
+        assert_eq!(
+            press(&mut app, &api, KeyCode::Enter),
+            launched("s-old", "pi-coding-agent", Mode::HandOff)
+        );
+
+        assert_eq!(press(&mut app, &api, KeyCode::Enter), None);
+        assert!(app.pager.is_some());
+        assert_eq!(
+            press(&mut app, &api, KeyCode::Char('f')),
+            launched("s-old", "codex-cli", Mode::Fork)
+        );
+    }
+
+    /// A refresh landing while the transcript is open can move the list
+    /// selection; the keys still act on the session being read.
+    #[test]
+    fn pager_keys_act_on_the_session_being_read() {
+        let api = MockApi::golden();
+        let mut app = opened(&api, 100, 12);
+        press(&mut app, &api, KeyCode::Down);
+        press(&mut app, &api, KeyCode::Enter);
+        assert_eq!(app.pager.as_ref().unwrap().session_id, "s-old");
+        app.listing_state.select(Some(0));
+        assert_eq!(
+            press(&mut app, &api, KeyCode::Char('f')),
+            launched("s-old", "codex-cli", Mode::Fork)
+        );
+    }
+
+    #[test]
+    fn a_client_the_desk_cannot_start_toasts_and_hands_off() {
+        let api = MockApi {
+            sessions: vec![SessionRow {
+                source_agent: "openclaw".to_owned(),
+                ..row("s-claw")
+            }],
+            ..MockApi::golden()
+        };
+        let mut app = opened(&api, 100, 12);
+        assert_eq!(press(&mut app, &api, KeyCode::Char('o')), None);
+        assert!(app.toast.as_deref().unwrap().contains("openclaw"));
+        press(&mut app, &api, KeyCode::Char('h'));
+        assert_eq!(
+            app.handoff.as_ref().unwrap().targets.len(),
+            launch::CLIENTS.len()
+        );
     }
 
     #[test]

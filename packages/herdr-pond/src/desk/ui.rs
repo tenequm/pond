@@ -7,8 +7,8 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Clear, HighlightSpacing, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -33,6 +33,7 @@ const COUNT: usize = 7;
 /// Below this body width the preview stacks under the list instead of beside it.
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 100;
 const TOAST_MAX_WIDTH: u16 = 60;
+const HANDOFF_MAX_WIDTH: u16 = 40;
 /// A toast covers the rows it reports on, so a long one ends in an ellipsis.
 const TOAST_MAX_LINES: usize = 3;
 /// The preview wraps on every frame, so one huge message must not reach it whole.
@@ -112,9 +113,34 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     } else {
         render_desk(frame, app);
     }
+    if let Some(handoff) = &mut app.handoff {
+        render_handoff(frame, &handoff.targets, &mut handoff.state);
+    }
     if let Some(toast) = &app.toast {
         render_toast(frame, toast);
     }
+}
+
+fn render_handoff(frame: &mut Frame, targets: &[&str], state: &mut ListState) {
+    let area = frame.area();
+    let width = area.width.min(HANDOFF_MAX_WIDTH);
+    let height = u16::try_from(targets.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
+    let picker = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let list = List::new(targets.iter().copied())
+        .block(Block::bordered().title(" hand off to - enter / esc "))
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(Style::new().reversed());
+    frame.render_widget(Clear, picker);
+    frame.render_stateful_widget(list, picker, state);
 }
 
 fn render_fatal(frame: &mut Frame, message: &str) {
@@ -425,11 +451,13 @@ fn footer(app: &App) -> Line<'static> {
         "enter done  esc clear  up/down select".to_owned()
     } else if app.search.is_some() {
         format!(
-            "/ edit  esc back  enter open  space preview  p project/everything  \
-             t {LISTING_WINDOW_DAYS} days/any  q quit"
+            "/ edit  esc back  enter open  o resume  f fork  h hand off  space preview  \
+             p project/everything  t {LISTING_WINDOW_DAYS} days/any  q quit"
         )
     } else {
-        "/ search  enter open  space preview  p projects  t time  r refresh  q quit".to_owned()
+        "/ search  enter open  o resume  f fork  h hand off  space preview  p projects  t time  \
+         r refresh  q quit"
+            .to_owned()
     };
     let mut spans = Vec::new();
     if app.spinner_visible() {
@@ -491,7 +519,7 @@ fn render_pager(frame: &mut Frame, app: &App) {
         Paragraph::new(Line::from(vec![
             Span::raw(PAGER_FOOTER).dim(),
             Span::raw(format!(
-                " | {status} | line {}/{} | q back",
+                " | {status} | line {}/{} | o resume  f fork  h hand off  q back",
                 (pager.offset + 1).min(pager.lines.len()),
                 pager.lines.len()
             )),

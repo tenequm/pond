@@ -215,8 +215,16 @@ async fn stop_orphan(orphan: &Endpoint, timing: &Timing) -> Result<(), String> {
         ));
     }
     for signal in [Signal::SIGTERM, Signal::SIGKILL] {
-        if !still_serving(orphan) {
-            return Ok(());
+        // Every signal needs a fresh identification: a pid the orphan freed
+        // during the last grace can already belong to another process.
+        match settled_reading(pid, &orphan.socket, timing).await {
+            Reading::Serving => {}
+            Reading::Gone => return Ok(()),
+            Reading::Unknown => {
+                return Err(format!(
+                    "cannot read pid {pid}'s command line to confirm it before {signal}"
+                ));
+            }
         }
         match kill(pid, signal) {
             Ok(()) => {}
@@ -225,13 +233,53 @@ async fn stop_orphan(orphan: &Endpoint, timing: &Timing) -> Result<(), String> {
         }
         let deadline = Instant::now() + timing.grace;
         while Instant::now() < deadline {
-            if !still_serving(orphan) {
+            if reading(pid, &orphan.socket) == Reading::Gone {
                 return Ok(());
             }
             tokio::time::sleep(timing.tick).await;
         }
     }
     Err(format!("pid {pid} survived SIGKILL"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    Serving,
+    /// Exited, a zombie, or reused by another program.
+    Gone,
+    /// `ps` failed, or printed only `(name)` because it could not read the
+    /// arguments - common under load on macOS.
+    Unknown,
+}
+
+fn reading(pid: Pid, socket: &Path) -> Reading {
+    if kill(pid, None) == Err(Errno::ESRCH) {
+        return Reading::Gone;
+    }
+    let Some(line) = command_line(pid) else {
+        return Reading::Unknown;
+    };
+    let line = line.trim();
+    if names_socket(line, socket) {
+        Reading::Serving
+    } else if line.starts_with('(') && line.ends_with(')') {
+        Reading::Unknown
+    } else {
+        Reading::Gone
+    }
+}
+
+/// Re-reads an `Unknown` for up to one grace, so a transient `ps` failure
+/// neither passes for an exit nor authorises a signal.
+async fn settled_reading(pid: Pid, socket: &Path, timing: &Timing) -> Reading {
+    let deadline = Instant::now() + timing.grace;
+    loop {
+        let now = reading(pid, socket);
+        if now != Reading::Unknown || Instant::now() >= deadline {
+            return now;
+        }
+        tokio::time::sleep(timing.tick).await;
+    }
 }
 
 fn record_pid(record: &Endpoint) -> Option<Pid> {
@@ -250,31 +298,33 @@ fn still_serving(record: &Endpoint) -> bool {
 }
 
 /// Whether `pid`'s command line serves `socket`, so a pid the record got
-/// wrong is never signalled.
+/// wrong, or one whose command line cannot be read, is never signalled.
 fn serves_at(pid: Pid, socket: &Path) -> bool {
-    names_socket(&command_line(pid), socket)
+    command_line(pid).is_some_and(|line| names_socket(&line, socket))
 }
 
-/// `pid`'s arguments joined by spaces; empty for a gone or zombie process.
+/// `pid`'s arguments joined by spaces; empty for a gone or zombie process,
+/// `None` when `/proc` cannot be read for another reason.
 #[cfg(target_os = "linux")]
-fn command_line(pid: Pid) -> String {
-    std::fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
-        |_| String::new(),
-        |argv| {
+fn command_line(pid: Pid) -> Option<String> {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(argv) => Some(
             argv.strip_suffix(b"\0")
                 .unwrap_or(&argv)
                 .split(|byte| *byte == 0)
                 .map(String::from_utf8_lossy)
                 .collect::<Vec<_>>()
-                .join(" ")
-        },
-    )
+                .join(" "),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
+    }
 }
 
-/// `pid`'s arguments as `ps` prints them; empty for a gone process or a `ps`
-/// that does not answer within [`PS_DEADLINE`].
+/// `pid`'s arguments as `ps` prints them, empty for a gone process; `None`
+/// when `ps` cannot run or does not answer within [`PS_DEADLINE`].
 #[cfg(not(target_os = "linux"))]
-fn command_line(pid: Pid) -> String {
+fn command_line(pid: Pid) -> Option<String> {
     let child = Command::new("ps")
         .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
         .stdin(std::process::Stdio::null())
@@ -282,21 +332,21 @@ fn command_line(pid: Pid) -> String {
         .stderr(std::process::Stdio::null())
         .spawn();
     let Ok(mut child) = child else {
-        return String::new();
+        return None;
     };
     let deadline = Instant::now() + PS_DEADLINE;
     while matches!(child.try_wait(), Ok(None)) {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return String::new();
+            return None;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     child
         .wait_with_output()
+        .ok()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -823,10 +873,33 @@ sleep 30; :"#
         assert!(!names_socket(&bare, socket), "not a --socket argument");
     }
 
+    /// A pid freed during the grace and reused by another program must not be
+    /// signalled: only a line naming the socket reads as the serve.
+    #[test]
+    fn only_a_command_line_naming_the_socket_reads_as_serving() {
+        let socket = Path::new("/tmp/herdr-pond-reading.sock");
+        let mut ours = Command::new("/bin/sh")
+            .args(["-c", "sleep 5; :", "sh", "--socket"])
+            .arg(socket)
+            .spawn()
+            .unwrap();
+        let mut other = Command::new("sleep").arg("5").spawn().unwrap();
+        let pid = |child: &std::process::Child| Pid::from_raw(i32::try_from(child.id()).unwrap());
+        let (ours_reading, other_reading) =
+            (reading(pid(&ours), socket), reading(pid(&other), socket));
+        for child in [&mut ours, &mut other] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(ours_reading, Reading::Serving);
+        assert_eq!(other_reading, Reading::Gone);
+        assert_eq!(reading(pid(&other), socket), Reading::Gone, "a reaped pid");
+    }
+
     #[test]
     fn this_process_has_a_command_line() {
         let pid = Pid::from_raw(i32::try_from(std::process::id()).unwrap());
-        assert!(!command_line(pid).is_empty());
+        assert!(!command_line(pid).unwrap_or_default().is_empty());
     }
 
     /// Still opening its store, an orphan holds the lock without answering.

@@ -9,7 +9,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
@@ -85,11 +85,21 @@ fn idle_adapter(event_json: &str) -> Option<&'static str> {
     if !matches!(data.agent_status.as_deref(), Some("idle" | "done")) {
         return None;
     }
-    let agent = data.agent?;
+    adapter_for(&data.agent?)
+}
+
+pub(crate) fn adapter_for(agent: &str) -> Option<&'static str> {
     ADAPTERS
         .iter()
         .find(|(name, _)| *name == agent)
         .map(|(_, adapter)| *adapter)
+}
+
+pub(crate) fn agent_for(adapter: &str) -> Option<&'static str> {
+    ADAPTERS
+        .iter()
+        .find(|(_, name)| *name == adapter)
+        .map(|(agent, _)| *agent)
 }
 
 fn pending_path(state_dir: &Path, adapter: &str) -> PathBuf {
@@ -161,12 +171,15 @@ fn work(adapter: &str, state_dir: &Path, pond: &Path, coalesce: Duration) -> any
 }
 
 /// Without `--no-wait`: a busy store lock makes this sync wait its turn
-/// instead of exiting "skipped" and silently dropping the idle event.
+/// instead of exiting "skipped" - which would drop an idle event, or let park
+/// close a pane whose session was never stored.
+pub(crate) fn sync_status(adapter: &str, pond: &Path, log: &Path) -> std::io::Result<ExitStatus> {
+    log_stdio(Command::new(pond).args(["sync", adapter, "-q"]), log).and_then(Command::status)
+}
+
 fn sync(adapter: &str, pond: &Path, log: &Path) {
     let started = Instant::now();
-    let status =
-        log_stdio(Command::new(pond).args(["sync", adapter, "-q"]), log).and_then(Command::status);
-    let outcome = match status {
+    let outcome = match sync_status(adapter, pond, log) {
         Ok(status) => status.to_string(),
         Err(error) => format!("cannot run {}: {error}", pond.display()),
     };
