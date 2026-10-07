@@ -1659,6 +1659,12 @@ pub fn is_commit_conflict(error: &anyhow::Error) -> bool {
     })
 }
 
+pub(crate) fn is_index_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<lance::Error>()
+        .is_some_and(|err| matches!(err, lance::Error::IndexNotFound { .. }))
+}
+
 /// A local commit on Windows is a hard-link-then-delete (`RenameCommitHandler`),
 /// and either half fails while a scanner or sibling reader holds the staging
 /// manifest - transient, and the retry converges. Narrow on purpose: a real
@@ -1678,7 +1684,7 @@ fn is_transient_sharing_violation(error: &anyhow::Error) -> bool {
 
 /// True when `retry_lance` exhausted retries against an OCC conflict and
 /// attached `ConflictExhausted` to the chain head.
-fn is_conflict_exhausted(error: &anyhow::Error) -> bool {
+pub(crate) fn is_conflict_exhausted(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ConflictExhausted>())
 }
 
@@ -1981,27 +1987,31 @@ struct DatasetSet {
 #[derive(Debug)]
 struct CachedDataset {
     dataset: Dataset,
-    last_refresh: Instant,
+    /// `None` forces a refresh on the next [`Self::latest`].
+    last_refresh: Option<Instant>,
     refresh_after: Duration,
 }
 impl CachedDataset {
     fn new(dataset: Dataset, refresh_after: Duration) -> Self {
         Self {
             dataset,
-            last_refresh: Instant::now(),
+            last_refresh: Some(Instant::now()),
             refresh_after,
         }
     }
     async fn latest(&mut self) -> Result<Dataset> {
-        if self.last_refresh.elapsed() >= self.refresh_after {
+        if self
+            .last_refresh
+            .is_none_or(|at| at.elapsed() >= self.refresh_after)
+        {
             self.dataset.checkout_latest().await?;
-            self.last_refresh = Instant::now();
+            self.last_refresh = Some(Instant::now());
         }
         Ok(self.dataset.clone())
     }
     fn replace(&mut self, dataset: Dataset) {
         self.dataset = dataset;
-        self.last_refresh = Instant::now();
+        self.last_refresh = Some(Instant::now());
     }
 }
 
@@ -2352,7 +2362,7 @@ impl Handle {
         Fut: std::future::Future<Output = Result<(Dataset, P)>>,
         R: Fn(&anyhow::Error) -> bool,
     {
-        self.retry_lance_filtered(table.label(), should_retry, || {
+        self.retry_lance_filtered(table, should_retry, || {
             let execute = &execute;
             async move {
                 let mut cached = self.cached(table).await?.lock().await;
@@ -2618,7 +2628,7 @@ impl Handle {
             return PhaseOutcome::Noop;
         }
         let result = self
-            .retry_lance(table.label(), || async {
+            .retry_lance(table, || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
                 let did_work =
@@ -2642,7 +2652,7 @@ impl Handle {
         policy: &MaintenancePolicy,
     ) -> PhaseOutcome {
         let result = self
-            .retry_lance(table.label(), || async {
+            .retry_lance(table, || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
                 optimize_table_compact(&mut dataset, table, progress, policy).await?;
@@ -2691,7 +2701,7 @@ impl Handle {
             let mut rewritten = 0;
             for fragment_id in fragment_ids {
                 let did_rewrite = self
-                    .retry_lance(table.label(), || async {
+                    .retry_lance(table, || async {
                         let mut guard = self.cached(table).await?.lock().await;
                         let mut dataset = guard.latest().await?;
                         let did_rewrite = reencode_fragment(&mut dataset, fragment_id).await?;
@@ -2814,7 +2824,7 @@ impl Handle {
         );
         let started = Instant::now();
         let result = self
-            .retry_lance(table.label(), || async {
+            .retry_lance(table, || async {
                 let mut guard = self.cached(table).await?.lock().await;
                 let mut dataset = guard.latest().await?;
                 rebuild_index(&mut dataset, intent, progress, table).await?;
@@ -2835,19 +2845,22 @@ impl Handle {
 
     /// Lance `cleanup_old_versions` for one table: reclaim files no manifest
     /// within the retention window references. No compaction and no new commit -
-    /// it only deletes superseded files, so no OCC retry is needed.
+    /// it only deletes superseded files, so a retry is idempotent.
     pub async fn cleanup_table_versions(
         &self,
         table: Table,
         older_than: chrono::Duration,
     ) -> Result<()> {
-        let mut guard = self.cached(table).await?.lock().await;
-        let dataset = guard.latest().await?;
-        dataset
-            .cleanup_old_versions(older_than, Some(false), Some(false))
-            .await
-            .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
-        Ok(())
+        self.retry_lance(table, || async {
+            let mut guard = self.cached(table).await?.lock().await;
+            let dataset = guard.latest().await?;
+            dataset
+                .cleanup_old_versions(older_than, Some(false), Some(false))
+                .await
+                .with_context(|| format!("cleanup_old_versions failed for {}", table.label()))?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn index_status(
@@ -3060,20 +3073,27 @@ impl Handle {
         Ok(None)
     }
 
-    /// Drop the named index. Used by the `pond optimize --force-embed` model-swap path
-    /// to retire an IVF_SQ whose centroids belong to the old distance
-    /// space, before the next write re-bootstraps it over the new model's
-    /// vectors. Errors when the index does not exist; callers may swallow
-    /// that.
+    /// Drop the named index: `pond optimize --drop-index`, the `--full` orphan
+    /// heal, and the model swap retiring an IVF_SQ whose centroids belong to the
+    /// old distance space. Errors with `IndexNotFound` when the index does not
+    /// exist; callers decide whether that is a failure.
     pub(crate) async fn drop_index(&self, table: Table, name: &str) -> Result<()> {
-        let mut guard = self.cached(table).await?.lock().await;
-        let mut dataset = guard.latest().await?;
-        dataset
-            .drop_index(name)
-            .await
-            .with_context(|| format!("drop_index({name}) failed for {}", table.label()))?;
-        guard.replace(dataset);
-        Ok(())
+        // An absent index stays absent, so retrying it only burns the backoff.
+        self.retry_lance_filtered(
+            table,
+            |error| !is_index_not_found(error),
+            || async {
+                let mut guard = self.cached(table).await?.lock().await;
+                let mut dataset = guard.latest().await?;
+                dataset
+                    .drop_index(name)
+                    .await
+                    .with_context(|| format!("drop_index({name}) failed for {}", table.label()))?;
+                guard.replace(dataset);
+                Ok(())
+            },
+        )
+        .await
     }
 
     /// Resolve each table's stored location through the namespace catalog
@@ -3259,13 +3279,13 @@ impl Handle {
         })
         .await
     }
-    async fn retry_lance<T, Fut, Op>(&self, label: &str, operation: Op) -> Result<T>
+    async fn retry_lance<T, Fut, Op>(&self, table: Table, operation: Op) -> Result<T>
     where
         Fut: std::future::Future<Output = Result<T>>,
         Op: FnMut() -> Fut,
     {
         // Default: retry every transient fault (spec.md#lance-retry-jitter).
-        self.retry_lance_filtered(label, |_| true, operation).await
+        self.retry_lance_filtered(table, |_| true, operation).await
     }
 
     /// Like [`Self::retry_lance`] but `should_retry` gates which errors are
@@ -3279,7 +3299,7 @@ impl Handle {
     /// idempotent recovery (spec.md#lance-deterministic-pk).
     async fn retry_lance_filtered<T, Fut, Op, R>(
         &self,
-        label: &str,
+        table: Table,
         should_retry: R,
         mut operation: Op,
     ) -> Result<T>
@@ -3288,45 +3308,61 @@ impl Handle {
         Op: FnMut() -> Fut,
         R: Fn(&anyhow::Error) -> bool,
     {
+        let label = table.label();
         let mut attempt = 0u8;
         loop {
             attempt = attempt.saturating_add(1);
-            match operation().await {
+            let error = match operation().await {
                 Ok(value) => return Ok(value),
-                Err(error) if attempt < self.retry.attempts && should_retry(&error) => {
-                    let backoff = self.backoff(attempt);
-                    // `{:#}` walks anyhow's cause chain inline; `%error` (Display)
-                    // drops everything below the top-level message.
-                    let error_chain = format!("{error:#}");
-                    tracing::warn!(
-                        label,
-                        attempt,
-                        ?backoff,
-                        error = %error_chain,
-                        "retrying Lance operation"
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-                Err(error) => {
-                    let error_chain = format!("{error:#}");
-                    tracing::warn!(
-                        label,
-                        attempt,
-                        error = %error_chain,
-                        "Lance operation exhausted retries"
-                    );
-                    // spec.md#protocol: surface OCC failures as a typed `conflict`
-                    // rather than the generic `storage_unavailable` bucket. The
-                    // chain root is a `lance::Error` (commit-conflict family) when
-                    // pond's retry layer exhausted because the manifest could not
-                    // be advanced; everything else (timeouts, IAM, disk) stays
-                    // `storage_unavailable`.
-                    if is_commit_conflict(&error) {
-                        return Err(error.context(ConflictExhausted { attempts: attempt }));
-                    }
-                    return Err(error);
-                }
+                Err(error) => error,
+            };
+            // A failed attempt can leave the snapshot behind another host's commit
+            // or its own (spec.md#lance-handle-freshness); an unopened lazy table
+            // has none, and opening it here could fail and replace this error.
+            let cached = match table {
+                Table::Sessions => self.datasets.sessions.get(),
+                Table::Messages => Some(&self.datasets.messages),
+                Table::Parts => self.datasets.parts.get(),
+            };
+            if let Some(cached) = cached {
+                cached.lock().await.last_refresh = None;
             }
+            // `{:#}` walks anyhow's cause chain inline; `%error` (Display)
+            // drops everything below the top-level message.
+            let error_chain = format!("{error:#}");
+            let retryable = should_retry(&error);
+            if attempt < self.retry.attempts && retryable {
+                let backoff = self.backoff(attempt);
+                tracing::warn!(
+                    label,
+                    attempt,
+                    ?backoff,
+                    error = %error_chain,
+                    "retrying Lance operation"
+                );
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            // A filtered-out error was never retried, so it is not an exhausted
+            // retry; the caller reports it.
+            if retryable {
+                tracing::warn!(
+                    label,
+                    attempt,
+                    error = %error_chain,
+                    "Lance operation exhausted retries"
+                );
+            }
+            // spec.md#protocol: surface OCC failures as a typed `conflict`
+            // rather than the generic `storage_unavailable` bucket. The
+            // chain root is a `lance::Error` (commit-conflict family) when
+            // pond's retry layer exhausted because the manifest could not
+            // be advanced; everything else (timeouts, IAM, disk) stays
+            // `storage_unavailable`.
+            if is_commit_conflict(&error) {
+                return Err(error.context(ConflictExhausted { attempts: attempt }));
+            }
+            return Err(error);
         }
     }
     fn backoff(&self, attempt: u8) -> Duration {

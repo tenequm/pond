@@ -25,12 +25,12 @@ Options:
           One-shot orphan cleanup: drop a single named index from whichever table owns it. Used after renaming an intent (the old name is orphaned in the manifest until dropped). Tries every table in turn; errors when no table has an index by that name
 
       --reencode <TABLE>
-          One-time layout repair: rewrite every fragment of one table through the re-encoding writer, collapsing the tiny pages older pond compactions left behind (each one costs a GET on every point read). Rewrites the whole table (a re-run starts over); old files go at the next version cleanup. Pause scheduled syncs first: on `messages`, date-filtered searches fail until the run finishes
+          One-time layout repair: rewrite every fragment of one table through the re-encoding writer, collapsing the tiny pages older pond compactions left behind (each one costs a GET on every point read). Rewrites the whole table (a re-run starts over); old files go at the next version cleanup. On `messages`, date-filtered searches fail until the run finishes
           
           [possible values: sessions, messages]
 
       --full
-          Heal everything the diagnosis finds, costs printed first: drop orphaned indexes, re-encode legacy-layout fragments, re-embed after a model swap, rebuild piled-up indexes, then the normal embed + fold. Idempotent: a re-run heals only what is still found. Rewrites grow the store until version cleanup reclaims the old files
+          Heal everything the diagnosis finds, costs printed first: drop orphaned indexes, re-encode legacy-layout fragments, re-embed after a model swap, rebuild piled-up indexes, then the normal embed + fold. Idempotent: a re-run heals only what is still found. Rewrites grow the store until version cleanup reclaims the old files, and while `messages` is re-encoded, date-filtered searches fail
 
   -h, --help
           Print help (see a summary with '-h')

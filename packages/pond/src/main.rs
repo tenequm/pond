@@ -1004,15 +1004,16 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
         /// the re-encoding writer, collapsing the tiny pages older pond
         /// compactions left behind (each one costs a GET on every point read).
         /// Rewrites the whole table (a re-run starts over); old files go at the
-        /// next version cleanup. Pause scheduled syncs first: on `messages`,
-        /// date-filtered searches fail until the run finishes.
+        /// next version cleanup. On `messages`, date-filtered searches fail
+        /// until the run finishes.
         #[arg(long, value_enum, value_name = "TABLE", conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index"])]
         reencode: Option<ReencodeTable>,
         /// Heal everything the diagnosis finds, costs printed first: drop
         /// orphaned indexes, re-encode legacy-layout fragments, re-embed after
         /// a model swap, rebuild piled-up indexes, then the normal embed + fold.
         /// Idempotent: a re-run heals only what is still found. Rewrites grow
-        /// the store until version cleanup reclaims the old files.
+        /// the store until version cleanup reclaims the old files, and while
+        /// `messages` is re-encoded, date-filtered searches fail.
         #[arg(long, conflicts_with_all = ["only", "skip", "force_embed", "rebuild", "drop_index", "reencode"])]
         full: bool,
     },
@@ -1681,15 +1682,6 @@ async fn run() -> anyhow::Result<()> {
                 } else {
                     output("optimize --full: healing")?;
                     render_findings(&findings, false)?;
-                    if crate::schedule::status_snapshot().active {
-                        output(&pond::output::paint(
-                            "warn      a sync schedule is active on this host, and syncs committing \
-                             during these heals are untested - Ctrl-C now (safe, each rewrite \
-                             commits per fragment), run `pond schedule stop` on every host syncing \
-                             this store, re-run, then `pond schedule start`",
-                            pond::output::yellow(),
-                        ))?;
-                    }
                 }
                 let outcome = run_full_optimize(&store, &policy, &findings).await?;
                 if outcome.any_indices_failed() {
@@ -6852,7 +6844,7 @@ async fn run_full_optimize(
     for finding in findings {
         if let MaintenanceFinding::OrphanIndex { table, index } = finding
             && store
-                .drop_orphan_index(*table, index)
+                .drop_index_if_present(*table, index)
                 .await
                 .with_context(|| format!("drop_index({index}) failed"))?
         {

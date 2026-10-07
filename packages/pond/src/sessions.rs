@@ -3705,7 +3705,19 @@ impl Store {
                     matched = true;
                     self.handle
                         .rebuild_index(table, intent, progress.as_ref())
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            // A rebuild commits once after its whole build, so a
+                            // sync's fold or compaction meanwhile can win every attempt.
+                            if crate::substrate::is_conflict_exhausted(&error) {
+                                error.context(format!(
+                                    "{} rebuild lost every commit to concurrent syncs; on every host using this store note its interval (`pond schedule status`) and pause syncing (`pond schedule stop`, and any `pond serve --with-sync`), re-run this command, then `pond schedule start --every <that interval>`",
+                                    intent.name
+                                ))
+                            } else {
+                                error
+                            }
+                        })?;
                 }
             }
         }
@@ -3730,18 +3742,12 @@ impl Store {
         self.handle.drop_index(owner, name).await
     }
 
-    /// Drop an index `diagnose` found orphaned on `table`. Returns `false` when
-    /// it is already gone (another host healed it since the diagnosis).
-    pub async fn drop_orphan_index(&self, table: Table, name: &str) -> Result<bool> {
+    /// Drop an index on `table`. Returns `false` when it is already gone (e.g.
+    /// another host healed the orphan `diagnose` found).
+    pub async fn drop_index_if_present(&self, table: Table, name: &str) -> Result<bool> {
         match self.handle.drop_index(table, name).await {
             Ok(()) => Ok(true),
-            Err(error)
-                if error
-                    .downcast_ref::<lance::Error>()
-                    .is_some_and(|err| matches!(err, lance::Error::IndexNotFound { .. })) =>
-            {
-                Ok(false)
-            }
+            Err(error) if crate::substrate::is_index_not_found(&error) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -3772,7 +3778,13 @@ impl Store {
         let reencoded = self
             .handle
             .reencode_fragments(table, fragment_ids, progress.as_ref())
-            .await;
+            .await
+            .with_context(|| {
+                format!(
+                    "{} re-encode stopped; fragments already rewritten are kept, and `pond optimize --full` rewrites only the ones still in the legacy layout",
+                    table.as_str()
+                )
+            });
         let policy = pond_index_intents();
         let Some((_, intents)) = policy.all().into_iter().find(|(owner, _)| *owner == table) else {
             return reencoded;
@@ -3883,21 +3895,9 @@ impl Store {
     /// --force-embed` before re-bootstrapping under a different model. Silent
     /// when the index does not exist.
     pub async fn drop_vector_index(&self) -> Result<()> {
-        match self
-            .handle
-            .drop_index(Table::Messages, MESSAGES_VECTOR_INDEX)
+        self.drop_index_if_present(Table::Messages, MESSAGES_VECTOR_INDEX)
             .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let msg = error.to_string();
-                if msg.contains("not found") || msg.contains("does not exist") {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            }
-        }
+            .map(drop)
     }
 
     /// On-disk byte totals per dataset, sized through Lance's object store
@@ -8391,6 +8391,54 @@ mod tests {
         Ok(())
     }
 
+    /// #305: syncs commit while `pond optimize --full` re-encodes, unseen by the
+    /// healer's handle because `shared-memory://` takes the object-store
+    /// freshness window.
+    #[tokio::test]
+    async fn reencode_commits_through_concurrent_writers() -> anyhow::Result<()> {
+        let url = Url::parse("shared-memory://pond-test-reencode-concurrent/")?;
+        let healer = Store::open(&url).await?;
+        ingest_events(&healer, conversational_events("s-0", 4)).await?;
+        ingest_events(&healer, conversational_events("s-1", 4)).await?;
+        let fragments = healer.handle.fragment_ids(Table::Messages).await?;
+        let syncer = Store::open(&url).await?;
+
+        // An append touches no rewritten fragment: the rewrite rebases over it.
+        ingest_events(&syncer, conversational_events("s-new", 3)).await?;
+        assert_eq!(
+            healer
+                .reencode_fragments(Table::Messages, vec![fragments[0]], None)
+                .await?,
+            1
+        );
+
+        // An update to the fragment being rewritten conflicts; the retry must
+        // re-read past it rather than lose to it again until retries run out.
+        let key = MessageKey {
+            session_id: "s-1".to_owned(),
+            message_id: "msg-0".to_owned(),
+        };
+        syncer.write_embeddings(&embedded(&[key])).await?;
+        assert_eq!(
+            healer
+                .reencode_fragments(Table::Messages, vec![fragments[1]], None)
+                .await?,
+            1
+        );
+
+        let messages = syncer.handle.dataset(Table::Messages).await?;
+        assert_eq!(messages.count_rows(None).await?, 4 + 4 + 3);
+        assert_eq!(
+            messages
+                .count_rows(Some("embedding_model IS NOT NULL".to_owned()))
+                .await?,
+            1,
+            "the concurrent update survives the rewrite"
+        );
+        assert!(syncer.get_session("s-new").await?.is_some());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn file_part_blob_v2_round_trips_through_get() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -9443,6 +9491,8 @@ mod tests {
         );
         assert_eq!(store.stale_embedding_count().await?, keys.len());
 
+        store.drop_vector_index().await?;
+        // Absent, as on any store under the activation threshold: still a no-op.
         store.drop_vector_index().await?;
         let mut pending = Vec::new();
         let stream = store.pending_or_stale_messages();
