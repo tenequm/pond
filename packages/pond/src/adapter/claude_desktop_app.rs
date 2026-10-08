@@ -48,9 +48,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
-    config_path, empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id, compact_json, config_path, empty_options,
     extract::{
         Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
     },
@@ -75,6 +75,15 @@ pub struct ClaudeDesktopAppFactory;
 impl AdapterFactory for ClaudeDesktopAppFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Conversations record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::None,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -238,6 +247,10 @@ impl Adapter for ClaudeDesktopAppAdapter {
             // when the oracle has entries - a first ingest has nothing to compare.
             let mut survivors = Vec::with_capacity(files.len());
             for file in files {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &file.session_id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if !oracle.is_empty() {
                     let audit = file.audit_path.clone();
                     let last_ts =

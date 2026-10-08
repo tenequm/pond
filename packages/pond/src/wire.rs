@@ -790,6 +790,10 @@ pub enum IngestStatus {
     Inserted,
     /// PK existed; `merge_insert` matched it (no-op per spec.md#adapter-integrity-additive-sync).
     Matched,
+    /// Withheld, not failed: the session is erased from this store
+    /// (spec.md#session-append-only-exception). Counts as neither accepted nor
+    /// rejected.
+    Denylisted,
     /// Per-row failure: validation or storage error. See `error` field.
     Error,
 }

@@ -138,8 +138,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, expand_home,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text,
     jsonl::{parse_bounded, peek_first_line, peek_last_mapped},
@@ -175,6 +176,17 @@ pub struct OpenClawFactory;
 impl AdapterFactory for OpenClawFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // File/archive-era sessions record no spawn edge and DB-era ones resolve only
+    // single-generation keys; compaction successors and checkpoint forks come through the
+    // header path.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Partial,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -317,6 +329,10 @@ impl Adapter for OpenClawAdapter {
 
             let mut survivors = Vec::with_capacity(entries.len());
             for entry in entries {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, entry.source.session_id()) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if crate::adapter::is_session_fresh(oracle, entry.source.session_id(), entry.source_ts) {
                     yield Ok(AdapterYield::Skipped {
                         session_id: Some(entry.source.session_id().to_owned()),

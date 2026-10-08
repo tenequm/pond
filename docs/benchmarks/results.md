@@ -700,3 +700,45 @@ rounds total (12)        2521     2360    -6% (noise)
 ```
 
 Re-encoding costs messages compaction ~2.3x on the full-base rewrite, which lands once per compaction of a table, not per sync: the sync-like rounds are unchanged. Sessions compacts faster re-encoded (binary copy reads every input file's footer first). The payoff is on the read side, measured on the live-store lab copy in the campaign doc: a one-row `sessions` take went from 11,300 GETs / ~21 s to 15 GETs / ~0.8 s.
+
+## bench-gate + targeted A/B: erase plumbing (#45 part 1, #323)
+
+### 2026-09-30 - mac-m1max (Darwin-arm64), real S3 store, main 5d41f89 vs feat/erase-plumbing 4b85b4f
+
+Gate rows (`moon run repo:bench -- --only perf`, back to back, old side first; the last two `perf-gate` rows in `baseline.jsonl`; `5d41f89-dirty` = two untracked plan docs, code identical to main):
+
+```
+metric                  old      new      delta
+rowmap_cold_ms        11898   145318    +1121%
+get_message_s           5.7     14.8     +160%
+search_s               29.0     62.8     +117%
+get_session_sid_s      32.3     10.1      -69%
+write_ms_per_commit   567.8   1053.2      +85%
+write_rows_per_s        881      475      -46%
+write_copy_noop_ms      758     1309      +73%
+write_copy_delta_ms    1462     2440      +67%
+write_fold_ms          4498     6146      +37%
+```
+
+Per-query S3 IO was flat (search 176 -> 181 req, get_message 26 -> 27), so the wall-clock deltas were suspect. The CLI probes read the shared `~/.cache/pond`, whose newest chain was a PONDRMM5 chain the brew v0.19.3 launchd sync (every 300 s) had built a few versions behind HEAD, so neither side's one-shot reads could use it, and that sync kept committing through both runs.
+
+Targeted A/B: each binary had its own `XDG_CACHE_HOME` / `XDG_CONFIG_HOME` / `XDG_STATE_HOME`, and its chain was warmed and held at HEAD by a read-only `pond serve`. Runs alternated old/new; medians are shown. Write benches ran on scratch `benchw-*` stores only.
+
+```
+metric                   old      new     n     verdict
+get_message_s           7.43     6.39   22     noise
+search_s                6.77     7.18   22     noise (new slower in 7/12 pairs)
+get_session_s           6.63     6.44   10     noise
+rowmap_cold (ops)   12.3/14.6  21.9/13.4  2     noise; the gate's 145 s did not reproduce
+write_ms_per_commit      646      654   16     noise (append path unchanged by the diff)
+write_rows_per_s         775      765   16     noise
+write_copy_noop_ms       692      653    6     noise
+write_copy_delta_ms      806      699    6     noise
+write_fold_ms           3688     4176    6     noise, low confidence (optimize path untouched)
+```
+
+Verdict: no regression. Cross-process chain reuse was confirmed at runtime: CLI reads kept their `.rmm` chain mapped (lsof sampling), and a restarted new-binary `pond serve` reopened its base and appended only a small delta (prewarm 5.0 s vs 56 s cold).
+
+The one real cost is the documented one. The first new-binary sync or serve prewarm on a host holding a PONDRMM5 chain purges it and rebuilds in full (13-22 s build, 56 s whole prewarm today). An old and a new binary sharing one cache dir keep purging each other's chain until the old one is upgraded.
+
+Gate caveat (pre-existing, not from this diff): the CLI probes (`benches/gate.rs`, `cache_home = None`) depend on the operator's shared cache and any running sync schedule. A single gate row on a host with a live launchd sync does not bracket read latency.

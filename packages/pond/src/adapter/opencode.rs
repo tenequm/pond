@@ -47,9 +47,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
-    config_path,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id, compact_json, config_path,
     extract::{Extracted, extract_str, json_or_string},
     jsonl::{RECORD_CAP, parse_bounded},
     part_id, part_ordinal, raw_record, source_options,
@@ -66,6 +66,16 @@ pub struct OpencodeFactory;
 impl AdapterFactory for OpencodeFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Only task-spawned children carry `parentID`, recorded in both eras; tree-era ones keep the
+    // root brand, so only DB-era spawns carry the `/`-subpath brand. Forks record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -223,6 +233,10 @@ impl Adapter for OpencodeAdapter {
 
             let mut survivors = Vec::with_capacity(entries.len());
             for entry in entries {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, entry.source.session_id()) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if crate::adapter::is_session_fresh(oracle, entry.source.session_id(), entry.source_ts) {
                     yield Ok(AdapterYield::Skipped {
                         session_id: Some(entry.source.session_id().to_owned()),
