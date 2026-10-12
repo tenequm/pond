@@ -9,7 +9,8 @@ serve as the test fixtures for the v1 adapter implementations (see
 Snapshot date: 2026-05-13 (claude_code subagent sample added 2026-05-20;
 claude_code nested workflow-subagent sample added 2026-06-04; opencode
 `opencode.db` SQLite fixture generated 2026-07-14 from opencode 1.17.15;
-synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
+opencode V2 `v2/opencode.db` captured 2026-10-12 from opencode 1.19.0 and
+2.0.27; synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
 transcripts captured 2026-08-24 from letta-code 0.30.30; grok-build sessions
 captured 2026-08-24 from grok-build 1.0.5; agy conversations captured
 2026-09-10 from agy 1.2.0 and its ACP server; devin session stores
@@ -878,6 +879,102 @@ the DB, so completeness requires reading the DB PLUS the stale tree.
   the real worktree cwd was deleted), and every `message.data` / `part.data`
   blob passes `json_valid`.
 
+#### opencode V2 (`v2/opencode.db`)
+
+OpenCode 2 (v2.0.0+) keeps the same `opencode.db` but writes sessions to new
+tables, `session_v2` (typed columns, plus `fork_session_id` / `fork_boundary`)
+and `session_message` (`id`, `session_id`, `type`, `seq`, `time_created`,
+`time_updated`, `data`; the record is `{...data, id, type}`), and on first
+start migrates every V1 session into them while leaving the V1
+`session` / `message` / `part` tables in place. Format archaeology, the
+migration and the dedup rule for sessions present in both live in
+`docs/adapters/opencode.md`.
+
+- Layout: `adapter/opencode/v2/opencode.db`, a single SQLite file (WAL
+  checkpointed into a rollback-journal `.db`, no `-wal`/`-shm` sidecars,
+  384 KiB) standing for the OpenCode data dir. It sits in its own directory so
+  the DB-era fixture one level up stays a V1-only store.
+- Provenance: sandboxed self-capture on 2026-10-12 under the neutral base
+  `/tmp/oc2-fixture` (macOS resolves it to `/private/tmp/oc2-fixture`), project
+  cwd `/tmp/oc2-fixture/project`. First opencode 1.19.0
+  (`/opt/homebrew/bin/opencode`) created 3 V1 sessions: plain text, a `read`
+  tool call, and a `-f README.md` attachment (which 1.x records as a file part
+  plus synthetic text parts). Then opencode v2.0.27 (npm
+  `@opencode/cli-darwin-arm64@2.0.27`, once with `--standalone`, then through a
+  sandboxed `opencode service`) migrated them and wrote the V2 sessions; the
+  "ops session" was driven through the HTTP API (`opencode api`). Models via
+  OpenRouter: `anthropic/claude-haiku-4.5`, `anthropic/claude-haiku-5.5`,
+  `deepseek/deepseek-r1-0528`. The API key came from the environment only;
+  nothing was written to disk, and the `account` / `account_state` /
+  `control_account` / `credential` / `workspace` tables are empty.
+- Census (all counts from `sqlite3` against the committed file):
+  - V1 tables: 3 sessions, 7 messages (3 user, 4 assistant), 18 parts
+    (8 `text`, 4 `step-start`, 4 `step-finish`, 1 `tool`, 1 `file`). All 3 are
+    also in `session_v2` (migrated); the V2 fixture has no V1-only session -
+    that path is covered by the DB-era fixture one level up.
+  - `session_v2`: 12 sessions = 3 migrated + 9 V2-only. `session_message`:
+    66 rows = 22 `assistant`, 15 `user`, 14 `idle` (13 `succeeded`, 1
+    `failed`), 4 `synthetic`, 3 `agent-switched`, 3 `model-switched`, 2
+    `system`, 1 `skill`, 1 `shell`, 1 `compaction`. Of those, 9 are
+    migration-derived (id equal to, or sharing the 16-char prefix of, a V1
+    message id of the same session: 4 assistant, 3 user, 1 synthetic, 1
+    system) and 57 are native V2 rows.
+  - Assistant content in the 57 native rows: 15 `text`, 6 `reasoning`, 7
+    `tool` (5 `completed`, 2 `error`).
+  - Migrated, untouched after migration: `ses_ece45fa45ffewtiD8DSPLj3P62`
+    plain text (2 rows, both kept V1 ids) and `ses_ece45e791ffekNVGH2hsZMQvl5`
+    read tool (4 rows: 3 kept ids + the legacy-tool `system` notice
+    `msg_131ba23ec001TKOqvkoEn1JeVb`, prefix-sharing with the last V1
+    assistant).
+  - Migrated and continued in V2 (the mixed case):
+    `ses_ece44e9c1ffeJWYCR23BcS31lX` - 9 rows: 3 derived (the `user` row with
+    the `[Attachment unavailable after migration: ...]` placeholder, its
+    `synthetic` split `msg_131bb1661001TtVuWkGzyg3n04`, the kept assistant)
+    and 6 native (`agent-switched`, `model-switched` to haiku-5.5, `user`, 2
+    `assistant` - reasoning plus a `read`, then the answer - and `idle`).
+    Its `session_v2.title` is `Unknown` while V1 keeps
+    `New session - 2026-10-12T20:08:26.942Z`.
+  - V2-only (row counts in parentheses): `ses_ece44ba32ffevzFy2aZZD3h7TM`
+    tools (4: a `read` `completed` and a `read` of the missing `MISSING.md` in
+    `error`); `ses_ece4258e2ffeuQTOZ9xsBIYqJO` failed run (2: `user` with the
+    text file inlined as a `<file>` block, `idle` `failed` with
+    `provider.no-route` for the unavailable `high` variant);
+    `ses_ece40409affezvqxNOKCv7GG6X` deepseek-r1 reasoning (3);
+    `ses_ece40075dffeI0ePA71fWuHkif` image (3: `user.files[]` with an inline
+    base64 4x4 PNG); `ses_ece3f3948ffeZRbXkWy49E784Y` haiku-5.5 `high`
+    variant thinking (3); `ses_ece3f2e9affezCws7GfDhhKVSE` subagent parent (4:
+    a `subagent` tool call) with child `ses_ece3f27c0ffeXmTUqsOvLDGlbM` (4:
+    `parent_id` set, `agent = general`, a `read`);
+    `ses_ece3c826dffeLR2B3sqhOHBVYG` ops session (19: `skill`, background
+    `shell` `ls`, 3 `synthetic` - the shell completion, a harness note with a
+    `description`, and a plan-mode `<system-reminder>` - 2 `agent-switched`, 1
+    `model-switched`, a manual `compaction` `completed`, 4 `assistant`, 2
+    `user`, 4 `idle`); `ses_ece3c3812ffeMp6n6hGikNUmC3` fork of the tools
+    session (9: `fork_boundary` `{"type":"through","messageID":
+    "msg_131bb5340001PD3DzEht2R4zp9"}`, the parent's 4 rows copied as
+    `msg_131c3c7ee001Iint9OtHjcegT8_<seq>`, then a `model-switched`, an
+    instructions `system` notice, `user`, `assistant`, `idle`).
+  - Per-session rows sum to the total: 2 + 4 + 9 (migrated) + 4 + 2 + 3 + 3 +
+    3 + 4 + 4 + 19 + 9 (V2-only) = 66.
+  - Out-of-order insert, kept as captured: in the ops session the assistant at
+    `seq` 21 has a `data.time.created` older than the rows at `seq` 14, 18 and
+    20 (`seq` is assigned at insert, `time.created` when the message began).
+  - Siblings: `kv` holds only `migration.v1-v2` = `{"phase":"completed"}`;
+    `event` is empty (the migration clears it); `event_sequence` 12,
+    `instruction_state` 10, `instruction_blob` 5, `project` 3 (the project
+    cwd, `global` `/`, and the sandbox home `/private/tmp/oc2-fixture/home`),
+    `worktree` 1, `project_directory` 1; `session_pending`, `session_inbox`,
+    `todo`, `permission`, `session_share` are empty.
+- Removed rows: the `kv` row `models-dev:catalog` (a multi-MB models.dev
+  catalog cache, not session data) was deleted, then the WAL was checkpointed
+  and the file VACUUMed. No row was doctored; every value is as opencode wrote
+  it.
+- Secret hygiene: the `sqlite3 .dump` was swept with `gitleaks` and
+  `trufflehog` - zero findings; no username and no `/Users/...` path appears
+  (every path is under `/private/tmp/oc2-fixture`); every
+  `session_message.data`, `message.data` and `part.data` blob passes
+  `json_valid`, and `PRAGMA integrity_check` is `ok`.
+
 ### pi (pi-coding-agent CLI)
 
 - Source path: `~/.pi/agent/sessions/<encoded-cwd>/<timestamp>_<ulid>.jsonl`
@@ -1054,6 +1151,20 @@ Update as gaps are closed.
   interactive/TUI session, or a newer opencode that surfaces a compact CLI
   command. The child-session lineage path itself (`parent_id`,
   `source_agent`) IS covered by the `task`-tool child session.
+
+- **opencode V2 shapes absent from `v2/opencode.db`.** No unfinished tool
+  item (`streaming` / `running`), no `running` or `failed` `compaction`, no
+  `location-switched` row, no `idle` with outcome `interrupted`, no fork with
+  a `before` boundary, no reverted session (revert deletes rows), no session
+  imported from an earlier `opencode-next.db`, and no Windows capture.
+  Unfinished tool items and an unknown message type are covered by a
+  hand-built record in a unit test (`v2_unfinished_and_unknown_records_land_without_synthesis`),
+  and a session repeated across DB files by copying this fixture in-test.
+  Unknown and uncaptured types still flow through the adapter as rule-3
+  carriers, so the untested surface is their type-specific mapping
+  (`docs/adapters/opencode.md` rows 5-7: results, provenance,
+  `parent_message_id`). Close with an interrupted run, a forced compaction
+  failure, a location switch, and a fork taken before a message.
 
 Closed gaps (kept here briefly for history):
 

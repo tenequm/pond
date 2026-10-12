@@ -264,7 +264,7 @@ One adapter per harness, in `pond adapters` discovery order; `Reads` is the path
 | `claude-desktop-app` | Claude Desktop / Cowork local agent sessions | 2026-05-13 |
 | `claude-ai-export` | claude.ai data-export archive (manual `--path`) | 2026-06-04 |
 | `codex-cli` | OpenAI Codex CLI, `~/.codex/sessions` | 2026-09-01 |
-| `opencode` | opencode, `~/.local/share/opencode` (SQLite DB + legacy tree) | 2026-07-14 |
+| `opencode` | opencode, `~/.local/share/opencode` (`opencode.db`: the 1.x tables and the OpenCode 2 `session_v2` store, plus the legacy JSON tree) | 2026-10-12 |
 | `openclaw` | openclaw, `~/.openclaw` | 2026-05-13 |
 | `nanoclaw` | nanoclaw, `~/nanoclaw` (the install root holding `data/v2-sessions`) | 2026-05-14 |
 | `hermes` | Hermes Agent, `~/.hermes` (`state.db` per profile) | 2026-07-23 |

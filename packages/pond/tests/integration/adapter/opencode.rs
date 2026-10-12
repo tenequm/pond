@@ -29,6 +29,7 @@ use tempfile::TempDir;
 use super::{Conformance, RoundTrip, path_config};
 
 const FIXTURE_ROOT: &str = "tests/fixtures/adapter/opencode";
+const V2_FIXTURE_ROOT: &str = "tests/fixtures/adapter/opencode/v2";
 
 fn conformance() -> Conformance<'static> {
     Conformance {
@@ -45,9 +46,44 @@ fn conformance() -> Conformance<'static> {
                           native_restore_emits_import_shape_from_tree in \
                           src/adapter/opencode.rs (CI), plus the opt-in \
                           native_restore_is_value_equal_to_real_db_corpus below",
+            downgraded: &[],
         },
         config: path_config,
     }
+}
+
+/// The OpenCode 2 data dir: one DB holding V1 sessions the V1->V2 migration
+/// copied forward plus sessions OpenCode 2 created (`v2/opencode.db`).
+fn v2_conformance() -> Conformance<'static> {
+    Conformance {
+        fixture_root: Path::new(V2_FIXTURE_ROOT),
+        // 3 migrated + 9 V2-only sessions, each landing once.
+        expected_sessions: 12,
+        round_trip: RoundTrip::ExternalImport {
+            verified_by: "v2_native_restore_replays_the_transfer_shape in \
+                          src/adapter/opencode.rs (CI), plus the opt-in \
+                          native_restore_is_value_equal_to_real_db_corpus below",
+            // Migrated by OpenCode 2, then continued there: its V1 and V2
+            // records fit no single import shape, so it is served foreign.
+            downgraded: &["ses_ece44e9c1ffeJWYCR23BcS31lX"],
+        },
+        ..conformance()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_fixture_ingest_counts_and_is_searchable() -> anyhow::Result<()> {
+    v2_conformance().assert_ingest_counts_and_searchable().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_fixture_second_sync_skips_every_unchanged_session() -> anyhow::Result<()> {
+    v2_conformance().assert_resync_is_noop().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_fixture_native_restore_serves_import_envelopes() -> anyhow::Result<()> {
+    v2_conformance().assert_round_trip().await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -91,16 +127,15 @@ async fn native_restore_is_value_equal_to_real_db_corpus() -> anyhow::Result<()>
     let mut checked_messages = 0usize;
     let mut checked_parts = 0usize;
     let mut tolerated_truncations = 0usize;
+    let mut mixed_downgraded = 0usize;
 
     for db_path in db_paths(&data_dir)? {
         let conn = rusqlite::Connection::open_with_flags(
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
-        let session_ids: Vec<String> = conn
-            .prepare("SELECT id FROM session ORDER BY id")?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+        let session_ids = table_ids(&conn, "session")?;
+        let v2_ids: BTreeSet<String> = table_ids(&conn, "session_v2")?.into_iter().collect();
 
         for session_id in &session_ids {
             let db_messages = rows_json(
@@ -133,6 +168,12 @@ async fn native_restore_is_value_equal_to_real_db_corpus() -> anyhow::Result<()>
                 "{session_id}: unexpected restore path {}",
                 file.relative_path.display()
             );
+            // A migrated session that kept going in OpenCode 2 mixes V1 and V2
+            // records, which no single import shape holds: an honest downgrade.
+            if file.actual_fidelity == RestoreFidelity::Foreign && v2_ids.contains(session_id) {
+                mixed_downgraded += 1;
+                continue;
+            }
             anyhow::ensure!(
                 file.actual_fidelity == RestoreFidelity::Native,
                 "{session_id}: native restore downgraded to foreign"
@@ -219,15 +260,95 @@ async fn native_restore_is_value_equal_to_real_db_corpus() -> anyhow::Result<()>
             }
             checked_sessions += 1;
         }
+
+        let v1_ids: BTreeSet<&String> = session_ids.iter().collect();
+        for session_id in v2_ids.iter().filter(|id| !v1_ids.contains(id)) {
+            let rows = v2_records(&conn, session_id)?;
+            let Some(session) = store.get_session(session_id).await? else {
+                anyhow::ensure!(
+                    rows.is_empty(),
+                    "{session_id}: has {} V2 rows but is missing from the store",
+                    rows.len()
+                );
+                skipped_empty += 1;
+                continue;
+            };
+            let files = OpencodeFactory.serialize(&session, RestoreFidelity::Native)?;
+            anyhow::ensure!(
+                files.len() == 1 && files[0].actual_fidelity == RestoreFidelity::Native,
+                "{session_id}: V2 session must restore natively as one file"
+            );
+            let envelope: Value = serde_json::from_slice(&files[0].bytes)?;
+            let messages = envelope["messages"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{session_id}: envelope has no messages array"))?;
+            anyhow::ensure!(
+                messages.len() == rows.len(),
+                "{session_id}: {} restored V2 records vs {} rows",
+                messages.len(),
+                rows.len()
+            );
+            for (restored, source) in messages.iter().zip(&rows) {
+                anyhow::ensure!(
+                    value_equal(restored, source, &mut tolerated_truncations),
+                    "{session_id}/{}: V2 record differs from DB",
+                    source["id"]
+                );
+                checked_messages += 1;
+            }
+            checked_sessions += 1;
+        }
     }
 
     anyhow::ensure!(checked_sessions > 0, "no DB sessions found to check");
     println!(
-        "restore oracle: {checked_sessions} sessions ({skipped_empty} empty skipped), \
+        "restore oracle: {checked_sessions} sessions ({skipped_empty} empty skipped, \
+         {mixed_downgraded} migrated-and-continued downgraded to foreign), \
          {checked_messages} messages, {checked_parts} parts value-equal to the source DB \
          ({tolerated_truncations} truncation sentinels tolerated)"
     );
     Ok(())
+}
+
+/// Every `id` in `table`, or none when the DB has no such table (a fresh
+/// OpenCode 2 DB has no V1 tables, an OpenCode 1 DB no V2 ones).
+fn table_ids(conn: &rusqlite::Connection, table: &str) -> anyhow::Result<Vec<String>> {
+    let exists = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+        .exists([table])?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    Ok(conn
+        .prepare(&format!("SELECT id FROM {table} ORDER BY id"))?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// A V2 session's `session_message` rows as the `{...data, id, type}` records
+/// OpenCode's transfer shape carries, in `seq` order.
+fn v2_records(conn: &rusqlite::Connection, session_id: &str) -> anyhow::Result<Vec<Value>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (id, kind, data) = row?;
+        let mut value: Value = serde_json::from_str(&data)?;
+        if let Value::Object(map) = &mut value {
+            map.insert("id".to_owned(), Value::String(id));
+            map.insert("type".to_owned(), Value::String(kind));
+        }
+        records.push(value);
+    }
+    Ok(records)
 }
 
 fn db_paths(data_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {

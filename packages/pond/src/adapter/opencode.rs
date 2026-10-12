@@ -18,6 +18,16 @@
 //! time-sortable, so id order is creation order), emitting `Session -> Message
 //! -> Parts` per session.
 //!
+//! OpenCode 2 writes the same DB through a second pair of tables:
+//! `session_v2` (typed columns) and `session_message` (one row per typed
+//! message, its parts inlined in `data`, ordered by `seq`). Its startup
+//! migration copies every V1 session into them and leaves the V1 tables in
+//! place, so one DB can hold V1-only, V2-only and migrated sessions. A migrated
+//! session keeps its V1 rows (the originals, and what earlier pond versions
+//! already stored, spec.md#adapter-integrity-additive-sync) and gains only the
+//! V2 rows written after the migration; the migration's own lossy copies are
+//! not re-ingested. docs/adapters/opencode.md is the decision record.
+//!
 //! opencode fuses a tool call and its result into one `tool` part on the
 //! assistant message. Canonical keeps the two apart (a `tool_result` on an
 //! assistant message is a category error, spec.md#model-part-provenance), so the
@@ -321,19 +331,25 @@ impl SessionSource {
     }
 }
 
-/// A DB session located by the light enumeration SELECT: just the DB it lives in
-/// and its id. The full `session` row is fetched by primary key at read time so
-/// the freshness gate never materializes a row it may skip.
+/// A DB session located by the light enumeration SELECT: the DB it lives in, its
+/// id, and which table generation carries it. The full session row is fetched by
+/// primary key at read time so the freshness gate never materializes a row it
+/// may skip.
 struct DbLight {
     db_path: PathBuf,
     session_id: String,
+    store: DbStore,
 }
 
-/// A session read from a DB: the canonical `Session` (built from the row
-/// columns) plus the DB path needed to re-open for the body read.
-struct DbSessionHead {
-    db_path: PathBuf,
-    session: Session,
+/// Which session tables of one DB carry a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbStore {
+    /// `session`/`message`/`part` only (OpenCode 1, or never migrated).
+    V1,
+    /// `session_v2`/`session_message` only (created by OpenCode 2).
+    V2,
+    /// Both: an OpenCode 1 session the V1->V2 migration copied forward.
+    Migrated,
 }
 
 /// The enumerated (and optionally peeked) session set, plus the once-resolved
@@ -342,7 +358,8 @@ struct DbSessionHead {
 struct Peeked {
     tree_base: PathBuf,
     entries: Vec<HeadEntry>,
-    /// Tree sessions whose id a DB already carries (DB wins); counted, not read.
+    /// Sessions an earlier source already carries (`opencode.db` over another
+    /// DB, any DB over the tree); counted, not read.
     duplicates: usize,
     errors: Vec<AdapterError>,
 }
@@ -369,6 +386,7 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Peeked {
     // DB side: light `(db_path, session_id)` per session, resilient per source.
     let mut db_entries: Vec<DbLight> = Vec::new();
     let mut db_ids: HashSet<String> = HashSet::new();
+    let mut duplicates = 0usize;
     let paths = match db_paths(root) {
         Ok(paths) => paths,
         Err(error) => {
@@ -380,11 +398,19 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Peeked {
     for db_path in paths {
         match db_session_ids(&mut conns, &db_path) {
             Ok(ids) => {
-                for id in ids {
-                    db_ids.insert(id.clone());
+                for (id, store) in ids {
+                    // OpenCode 2's migration imports a pre-release
+                    // `opencode-next.db` into `opencode.db`, so the same session
+                    // can sit in two DBs; the first DB (`opencode.db` leads)
+                    // wins and the rest count as superseded.
+                    if !db_ids.insert(id.clone()) {
+                        duplicates += 1;
+                        continue;
+                    }
                     db_entries.push(DbLight {
                         db_path: db_path.clone(),
                         session_id: id,
+                        store,
                     });
                 }
             }
@@ -401,7 +427,6 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Peeked {
 
     // Tree side: list session files and dedup against the DB ids.
     let mut tree_entries: Vec<SessionFile> = Vec::new();
-    let mut duplicates = 0usize;
     match collect_session_files(&tree_base) {
         Ok(files) => {
             for file in files {
@@ -426,9 +451,7 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Peeked {
     for light in db_entries {
         let source_ts = if peek {
             match connection(&mut conns, &light.db_path) {
-                Ok(conn) => {
-                    db_session_watermark(conn, &light.db_path, &light.session_id).unwrap_or(None)
-                }
+                Ok(conn) => db_store_watermark(conn, &light).unwrap_or(None),
                 Err(_) => None,
             }
         } else {
@@ -512,8 +535,41 @@ fn read_db_survivor(
         Ok(conn) => conn,
         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
     };
-    match fetch_db_session_head(conn, &light.db_path, &light.session_id) {
-        Ok(Some(head)) => read_db_session(conn, head, tx),
+    let head = match light.store {
+        DbStore::V1 | DbStore::Migrated => {
+            fetch_db_session_head(conn, &light.db_path, &light.session_id)
+        }
+        DbStore::V2 => fetch_v2_session_head(conn, &light.db_path, &light.session_id),
+    };
+    match head {
+        Ok(Some(head)) => {
+            let session_id = head.id.clone();
+            let anchor = head.created_at;
+            emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(head))));
+            match light.store {
+                DbStore::V1 => read_db_session(conn, &light.db_path, &session_id, anchor, tx),
+                DbStore::V2 => {
+                    read_v2_messages(conn, &light.db_path, &session_id, anchor, None, tx)
+                }
+                DbStore::Migrated => {
+                    if !read_db_session(conn, &light.db_path, &session_id, anchor, tx) {
+                        return false;
+                    }
+                    let migrated = match v1_message_instants(conn, &light.db_path, &session_id) {
+                        Ok(instants) => instants,
+                        Err(error) => return tx.blocking_send(Err(error)).is_ok(),
+                    };
+                    read_v2_messages(
+                        conn,
+                        &light.db_path,
+                        &session_id,
+                        anchor,
+                        Some(&migrated),
+                        tx,
+                    )
+                }
+            }
+        }
         Ok(None) => {
             let error = AdapterError::schema(
                 NAME,
@@ -823,7 +879,10 @@ fn list_files_sorted(
 /// excluded by the `.db` extension filter). A missing root is "no DB", not an
 /// error - the adapter may be pointed at a bare legacy tree.
 fn db_paths(root: &Path) -> Result<Vec<PathBuf>, AdapterError> {
-    list_files_sorted(root, "db", |name| name.starts_with("opencode"))
+    let mut paths = list_files_sorted(root, "db", |name| name.starts_with("opencode"))?;
+    // The live DB leads, so it wins a session id another DB repeats.
+    paths.sort_by_key(|path| path.file_name() != Some(std::ffi::OsStr::new("opencode.db")));
+    Ok(paths)
 }
 
 /// Test-only direct open (the non-test path opens through [`connection`]).
@@ -847,32 +906,67 @@ fn connection<'a>(
     sqlite::connection(NAME, conns, path)
 }
 
-/// Every session id in one DB, ordered by id for deterministic ingest. Uses the
-/// shared connection cache so enumeration and the per-session peeks share a
-/// single open per DB.
+/// Every session id in one DB with the table generation(s) carrying it, ordered
+/// by id for deterministic ingest. Each generation's table is read only when it
+/// exists: a fresh OpenCode 2 install has no V1 tables, an OpenCode 1 DB has no
+/// V2 ones. Uses the shared connection cache so enumeration and the per-session
+/// peeks share a single open per DB.
 fn db_session_ids(
     conns: &mut HashMap<PathBuf, Connection>,
     db_path: &Path,
-) -> Result<Vec<String>, AdapterError> {
+) -> Result<Vec<(String, DbStore)>, AdapterError> {
     let conn = connection(conns, db_path)?;
-    let mut stmt = conn
-        .prepare_cached("SELECT id FROM session ORDER BY id")
-        .map_err(|error| db_error(db_path, "prepare session ids", &error))?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| db_error(db_path, "query session ids", &error))?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| db_error(db_path, "read session id", &error))
+    let v1 = table_ids(conn, db_path, "session")?;
+    let v2 = table_ids(conn, db_path, "session_v2")?;
+    let v2_set: HashSet<&str> = v2.iter().map(String::as_str).collect();
+    let v1_set: HashSet<&str> = v1.iter().map(String::as_str).collect();
+    let mut ids: Vec<(String, DbStore)> = v1
+        .iter()
+        .map(|id| {
+            let store = if v2_set.contains(id.as_str()) {
+                DbStore::Migrated
+            } else {
+                DbStore::V1
+            };
+            (id.clone(), store)
+        })
+        .chain(
+            v2.iter()
+                .filter(|id| !v1_set.contains(id.as_str()))
+                .map(|id| (id.clone(), DbStore::V2)),
+        )
+        .collect();
+    ids.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(ids)
 }
 
-/// Fetch one `session` row by primary key and map it to a [`DbSessionHead`].
+/// Every `id` in `table`, or none when the DB has no such table.
+fn table_ids(conn: &Connection, db_path: &Path, table: &str) -> Result<Vec<String>, AdapterError> {
+    let exists = conn
+        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .and_then(|mut stmt| stmt.exists([table]))
+        .map_err(|error| db_error(db_path, &format!("probe {table} table"), &error))?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare_cached(&format!("SELECT id FROM {table}"))
+        .map_err(|error| db_error(db_path, &format!("prepare {table} ids"), &error))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| db_error(db_path, &format!("query {table} ids"), &error))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| db_error(db_path, &format!("read {table} id"), &error))
+}
+
+/// Fetch one `session` row by primary key and map it to a canonical [`Session`].
 /// `Ok(None)` when no row matches (the session vanished between enumeration and
 /// read - our separate statements share no snapshot).
 fn fetch_db_session_head(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
-) -> Result<Option<DbSessionHead>, AdapterError> {
+) -> Result<Option<Session>, AdapterError> {
     let mut stmt = conn
         .prepare_cached(&format!(
             "SELECT {SESSION_COLUMNS} FROM session WHERE id = ?1"
@@ -888,7 +982,7 @@ fn fetch_db_session_head(
 /// Map one reconstructed `SessionInfo` to a canonical [`Session`]. Reusing
 /// [`session_from_value`] threads `directory` through the sealed `Extracted` path
 /// and derives `created_at` from the row `time.created`.
-fn db_session_head(db_path: &Path, info: &Value) -> Result<DbSessionHead, AdapterError> {
+fn db_session_head(db_path: &Path, info: &Value) -> Result<Session, AdapterError> {
     let mut session = session_from_value(info, db_path)?;
     // spec.md#model-no-synthesis: a subagent session (`parentID` set) is labeled
     // `opencode/<agent>` so children leave default search, matching claude-code; a
@@ -903,10 +997,7 @@ fn db_session_head(db_path: &Path, info: &Value) -> Result<DbSessionHead, Adapte
             None => format!("{NAME}/subagent"),
         };
     }
-    Ok(DbSessionHead {
-        db_path: db_path.to_path_buf(),
-        session,
-    })
+    Ok(session)
 }
 
 /// Rebuild the `fromRow` `SessionInfo` JSON from a `session` row by NAME
@@ -1105,17 +1196,11 @@ fn fetch_records(
 /// the consumer dropped the receiver.
 fn read_db_session(
     conn: &Connection,
-    head: DbSessionHead,
+    db_path: &Path,
+    session_id: &str,
+    session_anchor: DateTime<Utc>,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
-    let db_path = head.db_path.clone();
-    let session_id = head.session.id.clone();
-    let session_anchor = head.session.created_at;
-    emit!(
-        tx,
-        Ok(AdapterYield::Event(IngestEvent::Session(head.session)))
-    );
-
     // No `ORDER BY id` in SQL: no index ends in bare `id`, so an SQL sort forces a
     // transient temp b-tree over the full rows (~2x memory), and chunked keyset
     // pagination would be O(N^2) re-sorts. The accepted bound is O(one session)
@@ -1123,9 +1208,9 @@ fn read_db_session(
     // verified no `COLLATE` on `id`).
     let mut messages = match fetch_records(
         conn,
-        &db_path,
+        db_path,
         "SELECT id, data FROM message WHERE session_id = ?1",
-        &session_id,
+        session_id,
         "message",
     ) {
         Ok(rows) => rows,
@@ -1150,8 +1235,8 @@ fn read_db_session(
         let message_value = match reconstruct_record(
             &message.data,
             [("id", json!(message_id)), ("sessionID", json!(session_id))],
-            &db_path,
-            &session_id,
+            db_path,
+            session_id,
             &message_id,
         ) {
             Ok(value) => value,
@@ -1165,7 +1250,7 @@ fn read_db_session(
         // (message_id, id) index (verified via EXPLAIN QUERY PLAN), no temp b-tree.
         let part_rows = match fetch_records(
             conn,
-            &db_path,
+            db_path,
             "SELECT id, data FROM part WHERE message_id = ?1 ORDER BY id",
             &message_id,
             "part",
@@ -1185,15 +1270,15 @@ fn read_db_session(
                     ("sessionID", json!(session_id)),
                     ("messageID", json!(message_id)),
                 ],
-                &db_path,
-                &session_id,
+                db_path,
+                session_id,
                 &part.id,
             ) {
                 Ok(value) => parts.push(value),
                 Err(error) => emit!(tx, Err(error)),
             }
         }
-        match build_message_events(&session_id, &message_value, &parts, default_ts) {
+        match build_message_events(session_id, &message_value, &parts, default_ts) {
             Ok(events) => {
                 for event in events {
                     emit!(tx, Ok(AdapterYield::Event(event)));
@@ -1225,6 +1310,540 @@ fn reconstruct_record(
         }
     }
     Ok(value)
+}
+
+/// An OpenCode id is a prefix plus 12 hex chars of `(ms timestamp, counter)`, so
+/// its first 16 chars name one creation instant. The V1->V2 migration keeps each
+/// V1 message id and gives the rows it splits off or appends (`syntheticID`) the
+/// source id's 16-char prefix plus a hash suffix, so a V2 row sharing a V1
+/// message's instant is a migration copy, never post-migration activity.
+const ID_INSTANT_LEN: usize = 16;
+
+fn id_instant(id: &str) -> &str {
+    id.get(..ID_INSTANT_LEN).unwrap_or(id)
+}
+
+/// The creation instants of a session's V1 messages: the migration-copy test
+/// for its V2 rows (see [`ID_INSTANT_LEN`]).
+fn v1_message_instants(
+    conn: &Connection,
+    db_path: &Path,
+    session_id: &str,
+) -> Result<HashSet<String>, AdapterError> {
+    let mut stmt = conn
+        .prepare_cached("SELECT id FROM message WHERE session_id = ?1")
+        .map_err(|error| db_error(db_path, "prepare migrated message ids", &error))?;
+    let rows = stmt
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .map_err(|error| db_error(db_path, "query migrated message ids", &error))?;
+    let mut instants = HashSet::new();
+    for id in rows {
+        let id = id.map_err(|error| db_error(db_path, "read migrated message id", &error))?;
+        instants.insert(id_instant(&id).to_owned());
+    }
+    Ok(instants)
+}
+
+/// Freshness watermark for one DB session, by the tables carrying it. A migrated
+/// session's newest record is either its V1 tail or its newest post-migration V2
+/// row, so it takes the max of both.
+fn db_store_watermark(conn: &Connection, light: &DbLight) -> Result<Option<i64>, AdapterError> {
+    let (db_path, session_id) = (light.db_path.as_path(), light.session_id.as_str());
+    match light.store {
+        DbStore::V1 => db_session_watermark(conn, db_path, session_id),
+        DbStore::V2 => v2_session_watermark(conn, db_path, session_id, None),
+        DbStore::Migrated => {
+            let migrated = v1_message_instants(conn, db_path, session_id)?;
+            let v1 = db_session_watermark(conn, db_path, session_id)?;
+            let v2 = v2_session_watermark(conn, db_path, session_id, Some(&migrated))?;
+            Ok(v1.max(v2))
+        }
+    }
+}
+
+/// Freshness watermark for the V2 rows of a session (micros): the newest row by
+/// `seq`, its `data.time.created` raised by its tool items' result timestamps -
+/// exactly the timestamps [`build_v2_message_events`] stamps on what it emits.
+/// A newest row that is a migration copy contributes nothing (it is never
+/// ingested, and its `time.created` is the migration-stamped V1 column). `None`
+/// = no usable V2 row, a safe re-read when nothing else bounds it.
+fn v2_session_watermark(
+    conn: &Connection,
+    db_path: &Path,
+    session_id: &str,
+    migrated: Option<&HashSet<String>>,
+) -> Result<Option<i64>, AdapterError> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, data FROM session_message WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+        )
+        .map_err(|error| db_error(db_path, "prepare newest v2 message", &error))?;
+    let newest = stmt
+        .query_row([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()
+        .map_err(|error| db_error(db_path, "query newest v2 message", &error))?;
+    let Some((id, data)) = newest else {
+        return Ok(None);
+    };
+    if migrated.is_some_and(|instants| instants.contains(id_instant(&id))) {
+        return Ok(None);
+    }
+    let Ok(message) = serde_json::from_str::<Value>(&data) else {
+        return Ok(None);
+    };
+    let Some(created) = millis_at(&message, &["time", "created"]) else {
+        return Ok(None);
+    };
+    let newest = v2_tool_items(&message)
+        .filter_map(tool_result_time)
+        .fold(created, DateTime::max);
+    Ok(Some(newest.timestamp_micros()))
+}
+
+/// The `session_v2` columns read as JSON text (drizzle `mode: "json"`); every
+/// other text column is a plain string.
+const V2_JSON_COLUMNS: &[&str] = &[
+    "fork_boundary",
+    "summary_diffs",
+    "metadata",
+    "revert",
+    "permission",
+    "model",
+];
+
+/// Fetch one `session_v2` row by primary key. The row is captured whole (`SELECT
+/// *`, keyed by column name, null columns omitted) rather than through a fixed
+/// column list: OpenCode 2 still adds session columns release to release, and a
+/// lossless capture must not depend on pond knowing each one.
+fn fetch_v2_session_head(
+    conn: &Connection,
+    db_path: &Path,
+    session_id: &str,
+) -> Result<Option<Session>, AdapterError> {
+    let mut stmt = conn
+        .prepare_cached("SELECT * FROM session_v2 WHERE id = ?1")
+        .map_err(|error| db_error(db_path, "prepare v2 session by id", &error))?;
+    let row = stmt
+        .query_row([session_id], v2_row_value)
+        .optional()
+        .map_err(|error| db_error(db_path, "query v2 session by id", &error))?;
+    row.map(|row| {
+        let location = record_location(db_path, session_id, session_id);
+        let row = parse_bounded(NAME, compact_json(&row).as_bytes(), || location.clone())?;
+        session_from_v2_row(&row, &location)
+    })
+    .transpose()
+}
+
+fn v2_row_value(row: &rusqlite::Row) -> rusqlite::Result<Value> {
+    use rusqlite::types::ValueRef;
+    let mut map = serde_json::Map::new();
+    for (index, name) in row.as_ref().column_names().into_iter().enumerate() {
+        let value = match row.get_ref(index)? {
+            ValueRef::Null => continue,
+            ValueRef::Integer(value) => json!(value),
+            ValueRef::Real(value) => json!(value),
+            ValueRef::Text(bytes) => {
+                let text = String::from_utf8_lossy(bytes);
+                if V2_JSON_COLUMNS.contains(&name) {
+                    json_or_string(&text)
+                } else {
+                    json!(text)
+                }
+            }
+            ValueRef::Blob(bytes) => json!(bytes),
+        };
+        map.insert(name.to_owned(), value);
+    }
+    Ok(Value::Object(map))
+}
+
+/// Map a captured `session_v2` row to a canonical [`Session`]. Lineage: a spawned
+/// child carries `parent_id`; a fork carries `fork_session_id` and a boundary
+/// whose `through` message is its cut-point in the parent. A `before` boundary
+/// names the first message NOT copied, so its cut-point is not recorded
+/// (spec.md#model-no-synthesis).
+fn session_from_v2_row(row: &Value, location: &str) -> Result<Session, AdapterError> {
+    let schema =
+        |message: &str| AdapterError::schema(NAME, location.to_owned(), message.to_owned());
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| schema("session_v2 row missing `id`"))?
+        .to_owned();
+    let created_at = millis_at(row, &["time_created"])
+        .ok_or_else(|| schema("session_v2 row missing `time_created`"))?;
+    // spec.md#model-project-non-empty: `directory` is a NOT NULL column.
+    let project = extract_str(row, "directory")
+        .ok_or_else(|| schema("session_v2 row missing `directory`"))?;
+    let parent = row.get("parent_id").and_then(Value::as_str);
+    let fork = row.get("fork_session_id").and_then(Value::as_str);
+    let parent_message_id = fork
+        .and(row.get("fork_boundary"))
+        .filter(|boundary| boundary.get("type").and_then(Value::as_str) == Some("through"))
+        .and_then(|boundary| boundary.get("messageID"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    // A spawned child is labeled like a DB-era V1 child (`opencode/<agent>`); a
+    // fork is a continuation, not a subagent, and keeps the bare brand.
+    let source_agent = match (parent, row.get("agent").and_then(Value::as_str)) {
+        (Some(_), Some(agent)) => format!("{NAME}/{agent}"),
+        (Some(_), None) => format!("{NAME}/subagent"),
+        (None, _) => NAME.to_owned(),
+    };
+    let mut options = opencode_raw(row);
+    mark_source(&mut options, "store", json!(V2_STORE));
+    Ok(Session {
+        id,
+        parent_session_id: parent.or(fork).map(ToOwned::to_owned),
+        parent_message_id,
+        source_agent,
+        created_at,
+        project,
+        options,
+    })
+}
+
+/// `options.source.store` on a session read from `session_v2`: native restore
+/// keys the OpenCode 2 transfer shape off it.
+const V2_STORE: &str = "session_v2";
+
+/// Add a side field next to `options.source.raw_record` (the documented
+/// extension point of [`source_options`]).
+fn mark_source(options: &mut ProviderOptions, key: &str, value: Value) {
+    if let Some(Value::Object(source)) = options.get_mut("source") {
+        source.insert(key.to_owned(), value);
+    }
+}
+
+/// Read one session's `session_message` rows in `seq` order (streamed off the
+/// unique `(session_id, seq)` index) and emit each as canonical events. With
+/// `migrated`, rows whose id shares a V1 message's creation instant are the
+/// migration's copies of records already read from the V1 tables and are
+/// skipped. Returns `false` when the consumer dropped the receiver.
+fn read_v2_messages(
+    conn: &Connection,
+    db_path: &Path,
+    session_id: &str,
+    session_anchor: DateTime<Utc>,
+    migrated: Option<&HashSet<String>>,
+    tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
+) -> bool {
+    let rows = (|| -> rusqlite::Result<Vec<(String, String, i64, String)>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, seq, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        rows.collect()
+    })();
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            emit!(tx, Err(db_error(db_path, "read v2 messages", &error)));
+            return true;
+        }
+    };
+    for (id, kind, seq, data) in rows {
+        if migrated.is_some_and(|instants| instants.contains(id_instant(&id))) {
+            continue;
+        }
+        let record = match reconstruct_record(
+            &data,
+            [("id", json!(id)), ("type", json!(kind))],
+            db_path,
+            session_id,
+            &id,
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                emit!(tx, Err(error));
+                continue;
+            }
+        };
+        for event in build_v2_message_events(session_id, &id, &record, seq, session_anchor) {
+            emit!(tx, Ok(AdapterYield::Event(event)));
+        }
+    }
+    true
+}
+
+/// The `tool` items of an assistant record's `content`.
+fn v2_tool_items(record: &Value) -> impl Iterator<Item = &Value> {
+    record
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("tool"))
+}
+
+/// When a settled tool item's result landed: `time.completed`, else `time.ran`,
+/// else its own `time.created`. `None` for an unfinished call (no result).
+fn tool_result_time(item: &Value) -> Option<DateTime<Utc>> {
+    let status = item.pointer("/state/status").and_then(Value::as_str);
+    if !matches!(status, Some("completed" | "error")) {
+        return None;
+    }
+    millis_at(item, &["time", "completed"])
+        .or_else(|| millis_at(item, &["time", "ran"]))
+        .or_else(|| millis_at(item, &["time", "created"]))
+}
+
+/// One `session_message` record (`{...data, id, type}`, the `SessionMessage.Info`
+/// encoding) as canonical events. Each type takes the conversational slot
+/// OpenCode itself sends it in (`to-llm-message.ts`); the whole record rides in
+/// the message's `options.source.raw_record`, with its `seq` beside it, so the
+/// Parts below are projections and carry no record of their own.
+fn build_v2_message_events(
+    session_id: &str,
+    message_id: &str,
+    record: &Value,
+    seq: i64,
+    session_anchor: DateTime<Utc>,
+) -> Vec<IngestEvent> {
+    let timestamp = millis_at(record, &["time", "created"]).unwrap_or(session_anchor);
+    let mut options = opencode_raw(record);
+    mark_source(&mut options, "seq", json!(seq));
+    let user = |options| Message::User {
+        id: message_id.to_owned(),
+        session_id: session_id.to_owned(),
+        timestamp,
+        options,
+    };
+    let carrier = |options, content| Message::System {
+        id: message_id.to_owned(),
+        session_id: session_id.to_owned(),
+        timestamp,
+        content,
+        options,
+    };
+    let mut parts = V2Parts::new(session_id, message_id);
+    let message = match record.get("type").and_then(Value::as_str) {
+        Some("user") => {
+            for skill in record
+                .get("skills")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                parts.text(Provenance::Injected, skill, "text");
+            }
+            if record
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+            {
+                parts.text(Provenance::Conversational, record, "text");
+            }
+            for file in record
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                parts.file(file);
+            }
+            user(options)
+        }
+        Some("synthetic" | "skill") => {
+            parts.text(Provenance::Injected, record, "text");
+            user(options)
+        }
+        // The user typed the command; its output is runtime-produced.
+        Some("shell") => {
+            parts.text(Provenance::Conversational, record, "command");
+            if let Some(output) = record.get("output") {
+                parts.text(Provenance::Injected, output, "output");
+            }
+            user(options)
+        }
+        Some("compaction") if record.get("summary").is_some() => {
+            parts.text(Provenance::Injected, record, "summary");
+            if record
+                .get("recent")
+                .and_then(Value::as_str)
+                .is_some_and(|recent| !recent.is_empty())
+            {
+                parts.text(Provenance::Injected, record, "recent");
+            }
+            user(options)
+        }
+        Some("system") => carrier(options, extract_str(record, "text")),
+        Some("assistant") => {
+            let mut results = Vec::new();
+            for item in record
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") => parts.text(Provenance::Conversational, item, "text"),
+                    Some("reasoning") => parts.push(
+                        Provenance::Conversational,
+                        PartKind::Reasoning {
+                            text: extract_str(item, "text"),
+                        },
+                    ),
+                    Some("tool") => {
+                        if let Some(result) = parts.tool(item, timestamp) {
+                            results.push(result);
+                        }
+                    }
+                    // An unknown content kind still lands, verbatim in the
+                    // message's raw record; its slot is an injected marker.
+                    _ => parts.push(Provenance::Injected, PartKind::Text { text: None }),
+                }
+            }
+            let mut events = vec![IngestEvent::Message(Message::Assistant {
+                id: message_id.to_owned(),
+                session_id: session_id.to_owned(),
+                timestamp,
+                options,
+            })];
+            events.extend(parts.parts.into_iter().map(IngestEvent::Part));
+            for ToolSplit { message, result } in results {
+                events.push(IngestEvent::Message(message));
+                events.push(IngestEvent::Part(result));
+            }
+            return events;
+        }
+        // idle, agent/model/location switches, a failed compaction, and any type
+        // newer than this adapter: spec placement rule 3, an empty carrier.
+        _ => carrier(options, None),
+    };
+    let mut events = vec![IngestEvent::Message(message)];
+    events.extend(parts.parts.into_iter().map(IngestEvent::Part));
+    events
+}
+
+/// Accumulates the Parts projected out of one V2 record, numbering them in
+/// emission order.
+struct V2Parts<'a> {
+    session_id: &'a str,
+    message_id: &'a str,
+    parts: Vec<Part>,
+}
+
+impl<'a> V2Parts<'a> {
+    fn new(session_id: &'a str, message_id: &'a str) -> Self {
+        Self {
+            session_id,
+            message_id,
+            parts: Vec::new(),
+        }
+    }
+
+    fn next_id(&self) -> (String, i32) {
+        let ordinal = self.parts.len();
+        (part_id(self.message_id, ordinal), part_ordinal(ordinal))
+    }
+
+    fn push(&mut self, provenance: Provenance, kind: PartKind) {
+        let (id, ordinal) = self.next_id();
+        self.parts.push(Part {
+            session_id: self.session_id.to_owned(),
+            id,
+            message_id: self.message_id.to_owned(),
+            ordinal,
+            provenance,
+            options: ProviderOptions::new(),
+            kind,
+        });
+    }
+
+    fn text(&mut self, provenance: Provenance, source: &Value, key: &str) {
+        self.push(
+            provenance,
+            PartKind::Text {
+                text: extract_str(source, key),
+            },
+        );
+    }
+
+    /// A prompt attachment: inline base64 `data` when present, else its `uri`.
+    fn file(&mut self, file: &Value) {
+        let data = match (
+            file.get("data").and_then(Value::as_str),
+            file.pointer("/source/uri").and_then(Value::as_str),
+        ) {
+            (Some(data), _) if !data.is_empty() => FileData::String(data.to_owned()),
+            (_, Some(uri)) => FileData::Url(uri.to_owned()),
+            _ => FileData::String(compact_json(file)),
+        };
+        self.push(
+            Provenance::Conversational,
+            PartKind::File {
+                media_type: file
+                    .get("mime")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                file_name: file
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                data,
+            },
+        );
+    }
+
+    /// A `tool` content item: the ToolCall on the assistant message, plus - once
+    /// the call settled (`completed`/`error`) - the synthetic `Tool` message and
+    /// ToolResult it splits into. An unfinished call (`streaming`/`running`) has
+    /// no result yet, and none is invented (spec.md#model-no-synthesis).
+    fn tool(&mut self, item: &Value, message_ts: DateTime<Utc>) -> Option<ToolSplit> {
+        let (id, _) = self.next_id();
+        let call_id = extract_str(item, "id");
+        let name = extract_str(item, "name");
+        let state = item.get("state");
+        let status = state
+            .and_then(|state| state.get("status"))
+            .and_then(Value::as_str);
+        self.push(
+            Provenance::Conversational,
+            PartKind::ToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                params: state
+                    .and_then(|state| state.get("input"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                provider_executed: item.get("executed").and_then(Value::as_bool) == Some(true),
+            },
+        );
+        let result_ts = tool_result_time(item)?.max(message_ts);
+        let result = match status {
+            Some("error") => state.and_then(|state| state.get("error")),
+            _ => state.and_then(|state| state.get("content")),
+        };
+        let tool_message_id = format!("{id}/result");
+        Some(ToolSplit {
+            message: Message::Tool {
+                id: tool_message_id.clone(),
+                session_id: self.session_id.to_owned(),
+                timestamp: result_ts,
+                options: synthetic_options(),
+            },
+            result: Part {
+                session_id: self.session_id.to_owned(),
+                id: part_id(&tool_message_id, 0),
+                message_id: tool_message_id,
+                ordinal: 0,
+                provenance: Provenance::Injected,
+                options: synthetic_options(),
+                kind: PartKind::ToolResult {
+                    call_id,
+                    name,
+                    is_failure: status == Some("error"),
+                    result: result.cloned().unwrap_or(Value::Null),
+                },
+            },
+        })
+    }
 }
 
 fn record_location(db_path: &Path, session_id: &str, record_id: &str) -> String {
@@ -1593,6 +2212,9 @@ fn serialize_native(
     let Some(session_raw) = raw_record(&session.session.options) else {
         return serialize_foreign(session);
     };
+    if session_store(&session.session.options) == Some(V2_STORE) {
+        return serialize_native_v2(session, &session_raw);
+    }
 
     // Deterministic order: timestamp, then id (peers use the shared comparator).
     let mut ordered = session.messages.clone();
@@ -1602,6 +2224,11 @@ fn serialize_native(
     for message in &ordered {
         if is_synthetic(message.message.options()) {
             continue;
+        }
+        // A migrated session that kept going in OpenCode 2 holds V2 records
+        // after its V1 ones; no single import shape carries both generations.
+        if message_seq(message.message.options()).is_some() {
+            return serialize_foreign(session);
         }
         // A non-synthetic message with no stored `raw_record` cannot be replayed
         // natively; downgrade the whole session to foreign (the same fallback the
@@ -1627,6 +2254,120 @@ fn serialize_native(
         messages,
         RestoreFidelity::Native,
     )
+}
+
+fn session_store(options: &ProviderOptions) -> Option<&str> {
+    options.get("source")?.get("store")?.as_str()
+}
+
+fn message_seq(options: &ProviderOptions) -> Option<i64> {
+    options.get("source")?.get("seq")?.as_i64()
+}
+
+/// Native restore of a session read from `session_v2`: the OpenCode 2 transfer
+/// shape `opencode session import` reads (`SessionTransfer.Data`,
+/// `{ info: Session.Info, messages: SessionMessage.Info[] }`). `info` is
+/// OpenCode's own `fromRow` projection of the stored row; `messages` replays
+/// each stored record in source `seq` order, skipping the synthetic tool-result
+/// carriers the split added.
+fn serialize_native_v2(
+    session: &crate::sessions::SessionWithMessages,
+    row: &Value,
+) -> Result<Vec<RestoredFile>, AdapterError> {
+    let mut records = Vec::with_capacity(session.messages.len());
+    for message in &session.messages {
+        if is_synthetic(message.message.options()) {
+            continue;
+        }
+        let (Some(raw), Some(seq)) = (
+            raw_record(message.message.options()),
+            message_seq(message.message.options()),
+        ) else {
+            return serialize_foreign(session);
+        };
+        records.push((seq, raw));
+    }
+    records.sort_by_key(|(seq, _)| *seq);
+    let messages = records.into_iter().map(|(_, raw)| raw).collect();
+    import_file(
+        &session.session.id,
+        v2_session_info(row),
+        messages,
+        RestoreFidelity::Native,
+    )
+}
+
+/// OpenCode's `fromRow` (`packages/core/src/session/info.ts`) over a captured
+/// `session_v2` row: the `Session.Info` its export writes and its import reads.
+fn v2_session_info(row: &Value) -> Value {
+    let column = |name: &str| row.get(name).filter(|value| !value.is_null());
+    let mut info = serde_json::Map::new();
+    let mut set = |key: &str, value: Option<Value>| {
+        if let Some(value) = value {
+            info.insert(key.to_owned(), value);
+        }
+    };
+    set("id", column("id").cloned());
+    set("projectID", column("project_id").cloned());
+    set("title", column("title").cloned());
+    set("parentID", column("parent_id").cloned());
+    if let (Some(session_id), Some(boundary)) = (column("fork_session_id"), column("fork_boundary"))
+    {
+        set(
+            "fork",
+            Some(json!({ "sessionID": session_id, "boundary": boundary })),
+        );
+    }
+    set("agent", column("agent").cloned());
+    set(
+        "model",
+        column("model").map(|model| {
+            let mut model = model.clone();
+            if let Value::Object(map) = &mut model {
+                // fromRow defaults an unrecorded variant the same way.
+                map.entry("variant").or_insert_with(|| json!("default"));
+            }
+            model
+        }),
+    );
+    set("cost", column("cost").cloned());
+    let token = |name: &str| column(name).cloned().unwrap_or(Value::Null);
+    set(
+        "tokens",
+        Some(json!({
+            "input": token("tokens_input"),
+            "output": token("tokens_output"),
+            "reasoning": token("tokens_reasoning"),
+            "cache": { "read": token("tokens_cache_read"), "write": token("tokens_cache_write") },
+        })),
+    );
+    let mut location = serde_json::Map::new();
+    if let Some(directory) = column("directory") {
+        location.insert("directory".to_owned(), directory.clone());
+    }
+    if let Some(workspace) = column("workspace_id") {
+        location.insert("workspaceID".to_owned(), workspace.clone());
+    }
+    set("location", Some(Value::Object(location)));
+    set("subpath", column("path").cloned());
+    set("metadata", column("metadata").cloned());
+    set("permissions", column("permission").cloned());
+    set("revert", column("revert").cloned());
+    set("outcome", column("idle_outcome").cloned());
+    let mut time = serde_json::Map::new();
+    for (key, name) in [
+        ("created", "time_created"),
+        ("updated", "time_updated"),
+        ("idle", "time_idle"),
+        ("viewed", "time_viewed"),
+        ("archived", "time_archived"),
+    ] {
+        if let Some(value) = column(name) {
+            time.insert(key.to_owned(), value.clone());
+        }
+    }
+    set("time", Some(Value::Object(time)));
+    Value::Object(info)
 }
 
 fn serialize_foreign(
@@ -3270,6 +4011,551 @@ mod tests {
                 "synthetic": false,
             }),
         )?;
+        Ok(())
+    }
+
+    // Facts about the committed OpenCode 2 fixture (`v2/opencode.db`): three
+    // OpenCode 1 sessions the V1->V2 migration copied forward, plus nine created
+    // by OpenCode 2.0.27.
+    const V2_SESSION_COUNT: usize = 12;
+    const V2_MIGRATED_CONTINUED: &str = "ses_ece44e9c1ffeJWYCR23BcS31lX";
+    const V2_MIGRATED_SPLIT_COPY: &str = "msg_131bb1661001TtVuWkGzyg3n04";
+    const V2_POST_MIGRATION_USER: &str = "msg_131c0e706001jV7Smy0gYSlb2L";
+    const V2_MIGRATED_WITH_NOTICE: &str = "ses_ece45e791ffekNVGH2hsZMQvl5";
+    const V2_LEGACY_TOOL_NOTICE: &str = "msg_131ba23ec001TKOqvkoEn1JeVb";
+    const V2_MIGRATED_UNTOUCHED: &str = "ses_ece45fa45ffewtiD8DSPLj3P62";
+    const V2_TOOLS_SESSION: &str = "ses_ece44ba32ffevzFy2aZZD3h7TM";
+    const V2_CHILD: &str = "ses_ece3f27c0ffeXmTUqsOvLDGlbM";
+    const V2_CHILD_PARENT: &str = "ses_ece3f2e9affezCws7GfDhhKVSE";
+    const V2_FORK: &str = "ses_ece3c3812ffeMp6n6hGikNUmC3";
+    const V2_FORK_THROUGH: &str = "msg_131bb5340001PD3DzEht2R4zp9";
+    const V2_OPS_SESSION: &str = "ses_ece3c826dffeLR2B3sqhOHBVYG";
+
+    fn v2_db_fixture() -> PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/opencode/v2/opencode.db")
+    }
+
+    fn v2_data_dir(temp: &std::path::Path) -> anyhow::Result<PathBuf> {
+        let dir = temp.join("data");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::copy(v2_db_fixture(), dir.join("opencode.db"))?;
+        Ok(dir)
+    }
+
+    async fn ingest_v2(
+        temp: &std::path::Path,
+    ) -> anyhow::Result<(Store, PathBuf, crate::handlers::IngestSummary)> {
+        let data = v2_data_dir(temp)?;
+        let store = Store::open_local(temp.join("store")).await?;
+        let summary = ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+        Ok((store, data, summary))
+    }
+
+    fn v2_type(message: &crate::sessions::MessageWithParts) -> Option<String> {
+        raw_record(message.message.options()).and_then(|raw| {
+            raw.get("type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+    }
+
+    fn texts(message: &crate::sessions::MessageWithParts) -> Vec<(Provenance, String)> {
+        message
+            .parts
+            .iter()
+            .filter_map(|part| match &part.kind {
+                PartKind::Text { text } => Some((
+                    part.provenance,
+                    text.as_deref()
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every session of a DB holding both table generations lands once: V1-only
+    /// none here, nine V2-only, three migrated. A migrated session keeps its V1
+    /// message and part rows, gains the V2 rows written after the migration, and
+    /// never re-ingests the migration's own copies (the split-off synthetic row,
+    /// the trailing legacy-tool notice).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_fixture_merges_both_table_generations() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _, summary) = ingest_v2(temp.path()).await?;
+        assert_eq!(summary.dropped_events, 0, "{summary:?}");
+        assert_eq!(summary.dropped_sessions, 0, "{summary:?}");
+        assert_eq!(store.session_ids().await?.len(), V2_SESSION_COUNT);
+
+        let continued = store
+            .get_session(V2_MIGRATED_CONTINUED)
+            .await?
+            .expect("migrated session ingests");
+        let ids: Vec<&str> = continued.messages.iter().map(|m| m.message.id()).collect();
+        assert!(
+            ids.contains(&V2_POST_MIGRATION_USER),
+            "post-migration turn lands"
+        );
+        assert!(
+            !ids.contains(&V2_MIGRATED_SPLIT_COPY),
+            "the migration's split-off copy of a V1 record is not re-ingested",
+        );
+        assert!(
+            continued
+                .messages
+                .iter()
+                .flat_map(|m| &m.parts)
+                .any(|part| part.id.starts_with("prt_")),
+            "migrated history keeps its V1 part rows",
+        );
+        assert!(
+            raw_record(&continued.session.options)
+                .is_some_and(|raw| raw.get("projectID").is_some()),
+            "a migrated session keeps its V1 head",
+        );
+
+        let noticed = store
+            .get_session(V2_MIGRATED_WITH_NOTICE)
+            .await?
+            .expect("migrated session ingests");
+        assert!(
+            noticed
+                .messages
+                .iter()
+                .all(|m| m.message.id() != V2_LEGACY_TOOL_NOTICE),
+            "the migration's appended legacy-tool notice is a copy, not activity",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_lineage_covers_spawned_children_and_forks() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _, _) = ingest_v2(temp.path()).await?;
+
+        let child = store.get_session(V2_CHILD).await?.expect("child ingests");
+        assert_eq!(
+            child.session.parent_session_id.as_deref(),
+            Some(V2_CHILD_PARENT)
+        );
+        assert_eq!(child.session.parent_message_id, None);
+        assert_eq!(child.session.source_agent, "opencode/general");
+
+        let fork = store.get_session(V2_FORK).await?.expect("fork ingests");
+        assert_eq!(
+            fork.session.parent_session_id.as_deref(),
+            Some(V2_TOOLS_SESSION)
+        );
+        assert_eq!(
+            fork.session.parent_message_id.as_deref(),
+            Some(V2_FORK_THROUGH),
+            "a `through` boundary is the fork's cut-point",
+        );
+        assert_eq!(
+            fork.session.source_agent, "opencode",
+            "a fork is not a subagent"
+        );
+        Ok(())
+    }
+
+    /// Each V2 message type takes the conversational slot OpenCode sends it in,
+    /// with injected content marked; markers are empty system carriers. Every V2
+    /// message carries its whole record and `seq`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_message_types_land_in_their_model_slots() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _, _) = ingest_v2(temp.path()).await?;
+        let ops = store
+            .get_session(V2_OPS_SESSION)
+            .await?
+            .expect("ops session ingests");
+        let by_type = |kind: &str| {
+            ops.messages
+                .iter()
+                .filter(|m| v2_type(m).as_deref() == Some(kind))
+                .collect::<Vec<_>>()
+        };
+        let one = |kind: &str| {
+            let found = by_type(kind);
+            assert!(!found.is_empty(), "fixture has a {kind} row");
+            found[0]
+        };
+        for message in &ops.messages {
+            if !is_synthetic(message.message.options()) {
+                assert!(
+                    message_seq(message.message.options()).is_some(),
+                    "V2 message {} carries its seq",
+                    message.message.id(),
+                );
+            }
+        }
+
+        let skill = one("skill");
+        assert_eq!(skill.message.role(), crate::wire::Role::User);
+        assert!(matches!(
+            texts(skill).as_slice(),
+            [(Provenance::Injected, _)]
+        ));
+
+        let shell = one("shell");
+        assert_eq!(shell.message.role(), crate::wire::Role::User);
+        assert_eq!(
+            texts(shell),
+            vec![
+                (Provenance::Conversational, "ls".to_owned()),
+                (Provenance::Injected, "README.md\ndot.png\n".to_owned()),
+            ],
+        );
+
+        for synthetic in by_type("synthetic") {
+            assert_eq!(synthetic.message.role(), crate::wire::Role::User);
+            assert!(
+                texts(synthetic)
+                    .iter()
+                    .all(|(p, _)| *p == Provenance::Injected)
+            );
+        }
+
+        let compaction = one("compaction");
+        assert_eq!(compaction.message.role(), crate::wire::Role::User);
+        assert!(
+            texts(compaction)
+                .iter()
+                .all(|(p, _)| *p == Provenance::Injected)
+        );
+
+        for kind in ["idle", "agent-switched", "model-switched"] {
+            let marker = one(kind);
+            assert!(
+                matches!(&marker.message, Message::System { content: None, .. }),
+                "{kind} is an empty carrier",
+            );
+            assert!(marker.parts.is_empty());
+        }
+
+        let prompt = one("user");
+        assert!(matches!(
+            texts(prompt).as_slice(),
+            [(Provenance::Conversational, text)] if text.contains("Say hi")
+        ));
+        Ok(())
+    }
+
+    /// A V2 tool item becomes a ToolCall plus a split-off result carrier; a failed
+    /// call's result is its error and is flagged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_tool_items_split_into_call_and_result() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _, _) = ingest_v2(temp.path()).await?;
+        let session = store
+            .get_session(V2_TOOLS_SESSION)
+            .await?
+            .expect("tools session ingests");
+        let calls: Vec<String> = session
+            .messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|part| match &part.kind {
+                PartKind::ToolCall { call_id, .. } => call_id.as_deref().cloned(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "two read calls");
+        let results: Vec<(String, bool, Value)> = session
+            .messages
+            .iter()
+            .flat_map(|m| &m.parts)
+            .filter_map(|part| match &part.kind {
+                PartKind::ToolResult {
+                    call_id,
+                    is_failure,
+                    result,
+                    ..
+                } => Some((call_id.as_deref().cloned()?, *is_failure, result.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2, "each settled call has a result");
+        for (call_id, _, _) in &results {
+            assert!(
+                calls.contains(call_id),
+                "result {call_id} correlates to a call"
+            );
+        }
+        let failed: Vec<_> = results.iter().filter(|(_, failure, _)| *failure).collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].2["type"], "tool.execution");
+        assert!(
+            results
+                .iter()
+                .any(|(_, failure, result)| !failure && result[0]["text"].is_string()),
+            "a completed call's result is its content",
+        );
+        Ok(())
+    }
+
+    /// An unfinished call (`streaming`/`running`) has no result yet, so none is
+    /// invented; an unknown content kind and an unknown message type still land.
+    #[test]
+    fn v2_unfinished_and_unknown_records_land_without_synthesis() {
+        let anchor = DateTime::from_timestamp_millis(1).expect("valid");
+        let assistant = json!({
+            "id": "msg_a", "type": "assistant", "time": { "created": 1000 },
+            "content": [
+                { "type": "tool", "id": "call_s", "name": "bash",
+                  "state": { "status": "streaming", "input": "{\"comm" }, "time": { "created": 1001 } },
+                { "type": "tool", "id": "call_r", "name": "bash",
+                  "state": { "status": "running", "input": { "command": "ls" }, "metadata": {} },
+                  "time": { "created": 1002, "ran": 1003 } },
+                { "type": "future-kind", "data": 1 },
+            ],
+        });
+        let events = build_v2_message_events("ses_x", "msg_a", &assistant, 7, anchor);
+        let messages = events
+            .iter()
+            .filter(|event| matches!(event, IngestEvent::Message(_)))
+            .count();
+        assert_eq!(messages, 1, "no result carrier for an unfinished call");
+        let parts: Vec<&Part> = events
+            .iter()
+            .filter_map(|event| match event {
+                IngestEvent::Part(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(&parts[0].kind, PartKind::ToolCall { params, .. } if params == "{\"comm"));
+        assert!(matches!(&parts[2].kind, PartKind::Text { text: None }));
+
+        let future = json!({ "id": "msg_f", "type": "teleported", "time": { "created": 5 } });
+        let events = build_v2_message_events("ses_x", "msg_f", &future, 8, anchor);
+        assert!(matches!(
+            events.as_slice(),
+            [IngestEvent::Message(Message::System { content: None, options, .. })]
+                if raw_record(options).is_some_and(|raw| raw["type"] == "teleported")
+        ));
+    }
+
+    /// Native restore of a V2 session is OpenCode 2's transfer shape: `info` is
+    /// `fromRow` of its row and `messages` are its `session_message` records
+    /// (`{...data, id, type}`) in `seq` order. A migrated session that continued
+    /// in V2 cannot be one import shape and downgrades to foreign; an untouched
+    /// migrated one restores natively in the V1 envelope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_native_restore_replays_the_transfer_shape() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, data, _) = ingest_v2(temp.path()).await?;
+        let conn = open_db(&data.join("opencode.db"))?;
+        let v1_ids: HashSet<String> = conn
+            .prepare("SELECT id FROM session")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut native_v2 = 0usize;
+        for session_id in store.session_ids().await? {
+            let session = store.get_session(&session_id).await?.expect("round-trips");
+            if v1_ids.contains(&session_id) {
+                continue;
+            }
+            let body = serialize_native_body(&session);
+            native_v2 += 1;
+            let expected: Vec<Value> = conn
+                .prepare(
+                    "SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+                )?
+                .query_map([&session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .map(|row| {
+                    let (id, kind, data) = row.expect("row");
+                    let mut value: Value = serde_json::from_str(&data).expect("json");
+                    value["id"] = json!(id);
+                    value["type"] = json!(kind);
+                    crate::adapter::extract::extract_raw_record(&value)
+                })
+                .collect();
+            assert_eq!(
+                body["messages"].as_array().expect("messages"),
+                &expected,
+                "{session_id}: messages replay the session_message records in seq order",
+            );
+            let row = conn.query_row(
+                "SELECT * FROM session_v2 WHERE id = ?1",
+                [&session_id],
+                v2_row_value,
+            )?;
+            assert_eq!(body["info"]["id"], json!(session_id));
+            assert_eq!(body["info"]["projectID"], row["project_id"]);
+            assert_eq!(body["info"]["location"]["directory"], row["directory"]);
+            assert_eq!(body["info"]["time"]["created"], row["time_created"]);
+            assert!(
+                body["info"]["model"]["variant"].is_string(),
+                "fromRow fills variant"
+            );
+            if session_id == V2_FORK {
+                assert_eq!(body["info"]["fork"]["sessionID"], json!(V2_TOOLS_SESSION));
+                assert_eq!(body["info"]["fork"]["boundary"]["type"], "through");
+            }
+        }
+        assert_eq!(native_v2, V2_SESSION_COUNT - v1_ids.len());
+
+        let continued = store
+            .get_session(V2_MIGRATED_CONTINUED)
+            .await?
+            .expect("round-trips");
+        let files = serialize_native(&continued)?;
+        assert_eq!(files[0].actual_fidelity, RestoreFidelity::Foreign);
+
+        let untouched = store
+            .get_session(V2_MIGRATED_UNTOUCHED)
+            .await?
+            .expect("round-trips");
+        let body = serialize_native_body(&untouched);
+        assert!(
+            body["messages"][0]["info"]["role"].is_string(),
+            "V1 envelope"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plan_matches_the_events_gate_v2_source() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        let (first, max_plan) = plan_gate_agreement(&OpencodeAdapter::new(&data)).await?;
+        assert_eq!(first.sessions, V2_SESSION_COUNT);
+        assert_eq!(max_plan.fresh, V2_SESSION_COUNT);
+        Ok(())
+    }
+
+    /// The watermark of a migrated session ignores the migration's copies (whose
+    /// `time.created` is the migration-stamped V1 column) and rises with the first
+    /// post-migration V2 row; a re-read then adds exactly that row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_freshness_tracks_post_migration_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, data, _) = ingest_v2(temp.path()).await?;
+        let db = data.join("opencode.db");
+        let light = |session_id: &str, store| DbLight {
+            db_path: db.clone(),
+            session_id: session_id.to_owned(),
+            store,
+        };
+        {
+            let conn = open_db(&db)?;
+            let notice = light(V2_MIGRATED_WITH_NOTICE, DbStore::Migrated);
+            assert_eq!(
+                db_store_watermark(&conn, &notice)?,
+                db_session_watermark(&conn, &db, V2_MIGRATED_WITH_NOTICE)?,
+                "a migration copy never raises a migrated session's watermark",
+            );
+        }
+
+        let appended_ms: i64 = 1_800_000_000_000;
+        {
+            let conn = Connection::open(&db)?;
+            conn.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+                 VALUES ('msg_zzzzv2fresh00000000000000', ?1, 'user', 1000, ?2, ?2, ?3)",
+                rusqlite::params![
+                    V2_MIGRATED_WITH_NOTICE,
+                    appended_ms,
+                    json!({ "time": { "created": appended_ms }, "text": "fresh v2 turn" }).to_string(),
+                ],
+            )?;
+            let conn = open_db(&db)?;
+            assert_eq!(
+                db_store_watermark(&conn, &light(V2_MIGRATED_WITH_NOTICE, DbStore::Migrated))?,
+                Some(appended_ms * 1_000),
+            );
+        }
+        let before = store
+            .get_session(V2_MIGRATED_WITH_NOTICE)
+            .await?
+            .expect("ingested")
+            .messages
+            .len();
+        let oracle = FixedOracle {
+            session_id: V2_MIGRATED_WITH_NOTICE,
+            watermark_micros: appended_ms * 1_000 - 1,
+        };
+        ingest_adapter(&store, &OpencodeAdapter::new(&data), &oracle, |_| {}).await?;
+        let after = store
+            .get_session(V2_MIGRATED_WITH_NOTICE)
+            .await?
+            .expect("ingested");
+        assert_eq!(
+            after.messages.len(),
+            before + 1,
+            "only the new V2 row is added"
+        );
+        Ok(())
+    }
+
+    /// A session repeated across DBs (a pre-release `opencode-next.db` its
+    /// migration already imported) lands once, from `opencode.db`, and the
+    /// repeats are counted as superseded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_repeated_across_dbs_lands_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        std::fs::copy(v2_db_fixture(), data.join("opencode-next.db"))?;
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let summary = ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+        assert_eq!(store.session_ids().await?.len(), V2_SESSION_COUNT);
+        assert_eq!(summary.skipped_superseded, V2_SESSION_COUNT, "{summary:?}");
+        Ok(())
+    }
+
+    /// A DB with no V1 tables (a fresh OpenCode 2 install) reads every session
+    /// from the V2 tables instead of failing enumeration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_only_db_without_v1_tables_ingests() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        Connection::open(data.join("opencode.db"))?.execute_batch(
+            "PRAGMA foreign_keys = OFF; DROP TABLE part; DROP TABLE message; DROP TABLE session;",
+        )?;
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let summary = ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+        assert_eq!(summary.dropped_events, 0, "{summary:?}");
+        assert_eq!(store.session_ids().await?.len(), V2_SESSION_COUNT);
+        let migrated = store
+            .get_session(V2_MIGRATED_CONTINUED)
+            .await?
+            .expect("ingests from V2 alone");
+        assert!(
+            migrated
+                .messages
+                .iter()
+                .any(|m| m.message.id() == V2_MIGRATED_SPLIT_COPY),
+            "with no V1 rows to prefer, the V2 copies are the only record",
+        );
         Ok(())
     }
 }

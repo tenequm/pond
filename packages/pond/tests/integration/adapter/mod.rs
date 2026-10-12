@@ -63,8 +63,12 @@ pub(crate) enum RoundTrip {
     /// Native restore targets an external import tool, so its output cannot
     /// re-ingest here; deep value-equality against the source lives in the
     /// named adapter-specific test. The harness still asserts the restore face
-    /// serves full-fidelity native output for every fixture session.
-    ExternalImport { verified_by: &'static str },
+    /// serves full-fidelity native output for every fixture session except the
+    /// declared `downgraded` ones (the same contract as `Reingest`'s).
+    ExternalImport {
+        verified_by: &'static str,
+        downgraded: &'static [&'static str],
+    },
     /// `restore_unsupported`: the declared refusal (with a reason naming the
     /// caller's alternative) IS the conformance statement.
     IngestOnly,
@@ -374,15 +378,20 @@ impl Conformance<'_> {
                 );
                 Ok(())
             }
-            RoundTrip::ExternalImport { verified_by } => {
+            RoundTrip::ExternalImport {
+                verified_by,
+                downgraded,
+            } => {
                 anyhow::ensure!(
                     self.factory.restore_unsupported().is_none(),
                     "{brand}: declared a restore face but restore_unsupported refuses",
                 );
                 let (store, _guard) = self.ingest_fixture().await?;
-                for id in store.session_ids().await? {
+                let ids = store.session_ids().await?;
+                let mut downgrades = Vec::new();
+                for id in &ids {
                     let session = store
-                        .get_session(&id)
+                        .get_session(id)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("{brand}: session {id} unreadable"))?;
                     let files = self.factory.serialize(&session, RestoreFidelity::Native)?;
@@ -390,14 +399,26 @@ impl Conformance<'_> {
                         !files.is_empty(),
                         "{brand}: native restore of {id} emitted nothing",
                     );
-                    for file in &files {
-                        anyhow::ensure!(
-                            file.actual_fidelity == RestoreFidelity::Native,
-                            "{brand}: native restore of {id} downgraded to foreign \
-                             (value-equality vs the source is owned by {verified_by})",
-                        );
+                    if files
+                        .iter()
+                        .any(|file| file.actual_fidelity != RestoreFidelity::Native)
+                    {
+                        downgrades.push(id.as_str());
                     }
                 }
+                let mut declared: Vec<&str> = downgraded.to_vec();
+                declared.sort_unstable();
+                downgrades.sort_unstable();
+                anyhow::ensure!(
+                    downgrades == declared,
+                    "{brand}: sessions downgraded to foreign on native restore {downgrades:?}, \
+                     declared {declared:?} (value-equality vs the source is owned by \
+                     {verified_by})",
+                );
+                anyhow::ensure!(
+                    downgrades.len() < ids.len(),
+                    "{brand}: every session downgraded - declare IngestOnly",
+                );
                 Ok(())
             }
             RoundTrip::Reingest { downgraded } => {
