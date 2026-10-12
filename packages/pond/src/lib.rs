@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod config;
 pub mod embed;
+pub mod erase;
 pub mod handlers;
 pub mod memory;
 // Bench/profiling instrumentation only: the module (and with it the

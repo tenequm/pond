@@ -1,0 +1,38 @@
+Lift a session's erase denylist entry on this store.
+
+`--lift` removes this session's denylist entry on this store only, typically one imported by `pond copy` or an archive restore. It deletes no data: the next `pond sync` re-ingests the session if a source still holds it, and a copy from a store that still denylists it re-imports the entry.
+
+Usage: pond erase [OPTIONS] --lift <SESSION_ID>
+
+Arguments:
+  <SESSION_ID>
+          The denylisted session id
+
+Options:
+      --lift
+          Remove the session's denylist entry
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Global options:
+      --storage-path <URL>
+          Storage destination: a local path or remote URL.
+          
+          Accepts a bare path, `~/path`, `file://`, `s3://bucket/prefix`, `s3+https://host/bucket/prefix`, `gs://`, `az://`, or the keyword `local` (the platform default local data dir). Default: `[storage].path` from config, then the platform data dir (`~/.local/share/pond`).
+          
+          [env: POND_STORAGE_PATH]
+
+      --config-file <PATH>
+          Config file to read (default: `~/.config/pond/config.toml`)
+          
+          [env: POND_CONFIG_FILE]
+
+  -v, --verbose...
+          Increase logging verbosity
+
+  -q, --quiet...
+          Decrease logging verbosity
+
+Examples:
+  pond erase --lift 0192d4a8-6f1e-7c3a-9b2d-5e8f7a6b4c3d   let a denylisted session sync again

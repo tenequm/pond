@@ -16,6 +16,7 @@ Commands:
     sync         Make pond current: import, embed, index
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
+    erase        Lift a session's erase denylist entry
 
   Query
     search       Search stored messages

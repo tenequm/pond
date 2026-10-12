@@ -40,8 +40,8 @@ use crate::{
 
 use super::{
     Adapter, AdapterError, AdapterErrorKind, AdapterFactory, AdapterYield, AdapterYieldStream,
-    DiscoverFuture, Env, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
-    SourceWatermark, SyncPlan, compact_json,
+    DiscoverFuture, EdgeFidelity, Env, LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile,
+    SkipOracle, SkipReason, SourceWatermark, SyncPlan, compact_json,
     extract::{Extracted, extract_raw_record, extract_str, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
     sqlite::{self, CHANNEL_CAP, emit},
@@ -73,6 +73,15 @@ pub struct DevinFactory;
 impl AdapterFactory for DevinFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Subagents are branded `devin/subagent`; forks record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {

@@ -22,9 +22,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
-    empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json,
+    config_path, empty_options,
     extract::{
         Extracted, Source, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
     },
@@ -75,6 +75,17 @@ pub struct ClaudeCodeFactory;
 impl AdapterFactory for ClaudeCodeFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Subagent files (`/fork` ones included) link to their parent; a top-level session's
+    // parent is always None, so resume, `--fork-session` and compaction successors are
+    // unlinked.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {

@@ -145,6 +145,9 @@ mod ingest_handler {
         /// source's documented migration contract). Counted in
         /// `skipped_superseded`, never folded into `Empty`.
         Superseded,
+        /// The store has erased this session: skipped undecoded (counted in
+        /// `skipped_erased`) or withheld at ingest (its rows in `denylisted`).
+        Erased,
         /// Transcript is unavailable by the adapter's documented contract.
         Unimportable {
             reason: String,
@@ -287,6 +290,10 @@ mod ingest_handler {
                             summary.skipped_superseded += 1;
                             SyncStatus::Superseded
                         }
+                        SkipReason::Erased => {
+                            summary.skipped_erased += 1;
+                            SyncStatus::Erased
+                        }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += 1;
                             if summary.first_skip_reason.is_none() {
@@ -320,6 +327,10 @@ mod ingest_handler {
                         SkipReason::Superseded => {
                             summary.skipped_superseded += count;
                             SyncStatus::Superseded
+                        }
+                        SkipReason::Erased => {
+                            summary.skipped_erased += count;
+                            SyncStatus::Erased
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += count;
@@ -510,6 +521,7 @@ mod ingest_handler {
             skipped_files = summary.skipped_files as u64,
             skipped_fresh = summary.skipped_fresh as u64,
             skipped_superseded = summary.skipped_superseded as u64,
+            skipped_erased = summary.skipped_erased as u64,
             truncated_values = summary.truncated_values as u64,
             "ingest_adapter complete"
         );
@@ -556,6 +568,10 @@ mod ingest_handler {
             });
             let status = if let Some(reason) = rejection_reason {
                 SyncStatus::Rejected { reason }
+            } else if session_outcome
+                .is_some_and(|outcome| matches!(outcome.status, OutcomeStatus::Denylisted))
+            {
+                SyncStatus::Erased
             } else if done.dropped_events > 0 {
                 SyncStatus::Partial {
                     dropped_events: done.dropped_events,
@@ -610,6 +626,8 @@ mod ingest_handler {
                     match outcome.status {
                         OutcomeStatus::Inserted | OutcomeStatus::Matched => accepted += 1,
                         OutcomeStatus::Error => rejected += 1,
+                        // Withheld on purpose: neither landed nor failed.
+                        OutcomeStatus::Denylisted => {}
                     }
                 }
                 let results = outcomes
@@ -654,6 +672,7 @@ mod ingest_handler {
         let (status, error) = match (outcome.status, outcome.error) {
             (OutcomeStatus::Inserted, _) => (IngestStatus::Inserted, None),
             (OutcomeStatus::Matched, _) => (IngestStatus::Matched, None),
+            (OutcomeStatus::Denylisted, _) => (IngestStatus::Denylisted, None),
             (OutcomeStatus::Error, error) => {
                 let body = error
                     .map(|err| {
@@ -1356,8 +1375,18 @@ mod search_handler {
                 .await
                 .map_err(map_storage)
         };
-        let (candidates, searchable_in_scope) = tokio::try_join!(candidates_fut, scope_fut)?;
+        let erased_fut = async {
+            store
+                .messages_erased_session_ids()
+                .await
+                .map_err(map_storage)
+        };
+        let (mut candidates, searchable_in_scope, erased) =
+            tokio::try_join!(candidates_fut, scope_fut, erased_fut)?;
         stage!("arms+scope joined");
+        // A safety net over an erase's anomaly windows (spec.md#session-append-only-exception),
+        // dropped before the top-`limit` cut so pages and counts stay whole.
+        candidates.retain(|candidate| !erased.contains(&candidate.session_id));
 
         if candidates.is_empty() {
             return Ok(empty_response(searchable_in_scope));
@@ -2795,6 +2824,44 @@ mod get_tests {
             "the rejection teaches the session read: {}",
             error.error.message
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_erased_session_is_withheld_on_the_wire_and_absent_to_restore() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let intent = crate::erase::ErasedIntent {
+            at: Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
+            root: "gone".to_owned(),
+        };
+        store
+            .import_erase_intent(std::future::ready(Ok([intent.entry("gone")].into())))
+            .await?;
+
+        let envelope = super::pond_ingest(
+            &store,
+            IngestRequest {
+                protocol_version: crate::PROTOCOL_VERSION,
+                namespace: Some("local".to_owned()),
+                events: vec![super::IngestEvent::Session(session("gone", "p"))],
+            },
+        )
+        .await;
+        let IngestEnvelope::Success(response) = envelope else {
+            panic!("a denylisted session is not a request failure: {envelope:?}");
+        };
+        assert_eq!((response.accepted, response.rejected), (0, 0));
+        assert_eq!(
+            response.results[0].status,
+            crate::wire::IngestStatus::Denylisted
+        );
+
+        assert!(matches!(
+            super::restore_lineage(&store, "gone").await?,
+            super::Lineage::NotFound
+        ));
         Ok(())
     }
 }

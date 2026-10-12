@@ -73,8 +73,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text, is_session_fresh, jsonl_bytes, part_id, part_ordinal, raw_record,
     source_options,
@@ -188,6 +189,17 @@ impl AdapterFactory for HermesFactory {
         NAME
     }
 
+    // Every parent is recorded verbatim, but a missing parent row or `end_reason` degrades a
+    // continuation to a spawn branded `hermes/subagent` (and the cron override brands branch or
+    // compaction children `hermes/cron`), so the brand does not prove a spawn.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: false,
+        }
+    }
+
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
         Ok(Box::new(HermesAdapter::from_config(config)?))
     }
@@ -271,6 +283,10 @@ impl Adapter for HermesAdapter {
 
             let mut survivors = Vec::with_capacity(entries.len());
             for entry in entries {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &entry.session_id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if is_session_fresh(oracle, &entry.session_id, entry.source_ts) {
                     yield Ok(AdapterYield::Skipped {
                         session_id: Some(entry.session_id),

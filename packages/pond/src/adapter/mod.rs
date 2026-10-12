@@ -93,6 +93,12 @@ pub trait AdapterFactory: Send + Sync {
     /// that need explicit creds) return `None`.
     fn probe_default(&self, env: &Env) -> Option<Value>;
 
+    /// How completely and how exactly this adapter records session lineage.
+    /// Required, not defaulted: erase cascades only over edges an adapter
+    /// vouches for (spec.md#session-append-only-exception), so every adapter
+    /// states its own gaps.
+    fn lineage_fidelity(&self) -> LineageFidelity;
+
     /// `None` when this factory can restore; `Some(reason)` when it is
     /// ingest-only, and the reason names the caller's alternative.
     ///
@@ -111,6 +117,33 @@ pub trait AdapterFactory: Send + Sync {
         session: &SessionWithMessages,
         fidelity: RestoreFidelity,
     ) -> Result<Vec<RestoredFile>, AdapterError>;
+}
+
+/// How much of one edge kind an adapter records as `parent_session_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeFidelity {
+    /// Every edge of this kind the source states is recorded.
+    Complete,
+    /// Some are recorded; sessions linked this way may exist unrecorded.
+    Partial,
+    /// None are recorded.
+    None,
+}
+
+/// An adapter's lineage declaration (see [`AdapterFactory::lineage_fidelity`]).
+/// `spawns` covers spawned children (sub-agents); `continuations` covers
+/// resumes, forks, branches and compaction successors. Both state which edges
+/// the adapter records, whatever brand the child carries: a spawn recorded
+/// under the root brand still counts as a recorded spawn. How a recorded
+/// edge's brand classifies it is `spawn_brand_exact`'s concern alone - it
+/// vouches that a child carrying this adapter's `/`-subpath spawn brand is
+/// always a real spawn, never a misbranded continuation, the one property that
+/// lets an edge cascade without an explicit operator flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineageFidelity {
+    pub spawns: EdgeFidelity,
+    pub continuations: EdgeFidelity,
+    pub spawn_brand_exact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +233,9 @@ pub struct SyncPlan {
     pub sessions: usize,
     pub fresh: usize,
     pub pending: usize,
+    /// Sessions the store has erased: skipped undecoded, counted apart from
+    /// `fresh` because they will never sync again.
+    pub erased: usize,
 }
 
 impl SyncPlan {
@@ -214,7 +250,9 @@ impl SyncPlan {
         let mut plan = Self::default();
         for (session_id, watermark) in heads {
             plan.sessions += 1;
-            if source_in_sync(oracle, session_id, watermark) {
+            if session_id.is_some_and(|id| oracle.is_erased(id)) {
+                plan.erased += 1;
+            } else if source_in_sync(oracle, session_id, watermark) {
                 plan.fresh += 1;
             } else {
                 plan.pending += 1;
@@ -285,8 +323,11 @@ pub type PlanFuture<'a> = std::pin::Pin<
 /// process restart while another process builds that map. `None` makes the
 /// caller re-read.
 ///
-/// The skip is sound because pond and every source are append-only: a session's
-/// max message timestamp only advances as it gains messages. The one residual is
+/// The skip is sound because pond and every source are append-only within a
+/// session: a session's max message timestamp only advances as it gains
+/// messages. Erase, pond's one deletion, removes whole sessions and moves the
+/// erase epoch, which discards every watermark source built before it
+/// (spec.md#session-append-only-exception). The one residual is
 /// two messages sharing the exact micros across a sync boundary (negligible at
 /// sub-second precision, self-healing once any newer message arrives); `pond sync
 /// --verify` (which passes [`NoopOracle`]) is the full-re-read backstop.
@@ -297,6 +338,13 @@ pub trait SkipOracle: Send + Sync {
     /// `NoopOracle`). Lets adapters skip the per-session work needed to read the
     /// source's latest message timestamp. Defaults to `false`.
     fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Whether the store has erased `session_id`
+    /// (spec.md#session-append-only-exception). An optimization only: ingest
+    /// drops an erased session's rows whatever the oracle says.
+    fn is_erased(&self, _session_id: &str) -> bool {
         false
     }
 }
@@ -314,6 +362,17 @@ pub fn is_session_fresh(
         (oracle.session_max_ts(session_id), source_last_ts_micros),
         (Some(stored), Some(source)) if source <= stored
     )
+}
+
+/// The skip an adapter yields, ahead of its freshness gate, for a session the
+/// store has erased: its rows would be dropped at ingest, so decoding them is
+/// waste, and it is reported as erased rather than fresh.
+pub fn erased_skip(oracle: &dyn SkipOracle, session_id: &str) -> Option<AdapterYield> {
+    oracle.is_erased(session_id).then(|| AdapterYield::Skipped {
+        session_id: Some(session_id.to_owned()),
+        project: None,
+        reason: SkipReason::Erased,
+    })
 }
 
 /// `SkipOracle` that always returns `None`. Used by `--verify`, tests, and
@@ -374,6 +433,9 @@ pub enum SkipReason {
     /// supersession is by session id (the source's documented migration
     /// contract). Visible and counted, never folded into `Empty`.
     Superseded,
+    /// The store has erased this session (spec.md#session-append-only-exception),
+    /// so it is skipped undecoded and never syncs again.
+    Erased,
 }
 
 pub type AdapterYieldStream<'a> =
@@ -914,7 +976,87 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{RestoreFidelity, RestoredFile, validate_path_id, write_restored_files};
+    use super::{
+        AdapterYield, EdgeFidelity, NoopOracle, RestoreFidelity, RestoredFile, SkipOracle,
+        SkipReason, SourceWatermark, SyncPlan, erased_skip, is_session_fresh, registry,
+        validate_path_id, write_restored_files,
+    };
+    use crate::erase::ErasedOracle;
+
+    struct Watermarks(std::collections::HashMap<&'static str, i64>);
+
+    impl SkipOracle for Watermarks {
+        fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+            self.0.get(session_id).copied()
+        }
+    }
+
+    fn erased_over(inner: Box<dyn SkipOracle>, erased: &[&str]) -> ErasedOracle {
+        ErasedOracle {
+            inner,
+            erased: erased.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_erased_session_skips_as_erased_not_fresh() {
+        let oracle = erased_over(Box::new(Watermarks([("kept", 10)].into())), &["gone"]);
+        // No watermark and no source signal: an erased id still skips.
+        assert!(matches!(
+            erased_skip(&oracle, "gone"),
+            Some(AdapterYield::Skipped {
+                reason: SkipReason::Erased,
+                ..
+            })
+        ));
+        assert!(!is_session_fresh(&oracle, "gone", None));
+        assert!(erased_skip(&oracle, "kept").is_none());
+        assert!(is_session_fresh(&oracle, "kept", Some(10)));
+        assert!(!is_session_fresh(&oracle, "kept", Some(11)));
+        // The wrapper never makes an empty oracle look populated.
+        assert!(erased_over(Box::new(NoopOracle), &["gone"]).is_empty());
+    }
+
+    #[test]
+    fn sync_plan_counts_erased_sessions_apart_from_fresh() {
+        let oracle = erased_over(
+            Box::new(Watermarks([("kept", 10), ("gone", 10)].into())),
+            &["gone"],
+        );
+        let plan = SyncPlan::from_heads(
+            &oracle,
+            [
+                (Some("kept"), SourceWatermark::At(10)),
+                (Some("gone"), SourceWatermark::At(99)),
+                (Some("new"), SourceWatermark::At(1)),
+            ],
+        );
+        assert_eq!(
+            plan,
+            SyncPlan {
+                sessions: 3,
+                fresh: 1,
+                pending: 1,
+                erased: 1,
+            }
+        );
+    }
+
+    /// Brand exactness vouches for recorded spawn edges, so an adapter that
+    /// records none has nothing to vouch for and claiming it is a declaration
+    /// bug that would let unrecorded lineage look cascade-safe.
+    #[test]
+    fn only_an_adapter_that_records_spawns_vouches_for_their_brand() {
+        assert!(!registry().is_empty());
+        for factory in registry() {
+            let fidelity = factory.lineage_fidelity();
+            assert!(
+                !fidelity.spawn_brand_exact || fidelity.spawns != EdgeFidelity::None,
+                "{} vouches for spawns it never records",
+                factory.name(),
+            );
+        }
+    }
 
     #[test]
     fn validate_path_id_refuses_windows_hostile_segments() {

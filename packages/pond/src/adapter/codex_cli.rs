@@ -49,9 +49,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json, config_path,
-    empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, by_timestamp_then_id, compact_json,
+    config_path, empty_options,
     extract::{
         Extracted, extract_compact_repr, extract_raw_record, extract_self_str, extract_str,
         extract_str_range, json_or_string,
@@ -75,6 +75,15 @@ pub struct CodexCliFactory;
 impl AdapterFactory for CodexCliFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Sessions record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::None,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {

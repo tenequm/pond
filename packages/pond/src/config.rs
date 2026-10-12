@@ -269,13 +269,13 @@ pub const DEFAULT_CONFIG_TOML: &str = "\
 #   fragment count. Default 64; 0 disables task filtering and runs every task
 #   Lance plans.
 # - `cleanup_older_than` is the manifest-retention window for the safe cleanup
-#   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1d`, floor `1h` - it is
+#   pass. Accepts `Ns` / `Nm` / `Nh` / `Nd` (default `1h`, also the floor - it is
 #   what protects in-flight readers). Versions older than this are reclaimed
 #   by Lance's OCC-coordinated GC.
 #
 # [maintenance]
 # compaction_fragment_cap = 64
-# cleanup_older_than = \"1d\"
+# cleanup_older_than = \"1h\"
 
 # Long-running process caps. Both accept either a plain byte count or a
 # humansize-style suffix (\"128 MiB\", \"1 GiB\"). Both are optional - leave
@@ -451,7 +451,7 @@ pub struct MaintenanceConfig {
     #[serde(default)]
     pub compaction_fragment_cap: Option<usize>,
     /// Manifest-retention window for the safe cleanup pass. Accepts
-    /// `Ns`/`Nm`/`Nh`/`Nd` (default `1d`). Versions older than this are
+    /// `Ns`/`Nm`/`Nh`/`Nd` (default `1h`). Versions older than this are
     /// reclaimed by Lance's OCC-coordinated GC (`delete_unverified=false`),
     /// which never races a concurrent writer on any backend.
     #[serde(default)]

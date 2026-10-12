@@ -18,6 +18,8 @@ mod cli_stdout_contract;
 mod copy;
 #[path = "integration/embed.rs"]
 mod embed;
+#[path = "integration/erase.rs"]
+mod erase;
 #[path = "integration/index_fold.rs"]
 mod index_fold;
 #[path = "integration/lance_smoke.rs"]

@@ -31,9 +31,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env, PlanFuture,
-    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, by_timestamp_then_id, config_path,
-    empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark,
+    by_timestamp_then_id, config_path, empty_options,
     extract::{extract_self_str, extract_str},
     extracted_text,
     jsonl::{
@@ -67,6 +67,17 @@ pub struct GrokBuildFactory;
 impl AdapterFactory for GrokBuildFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Forks and worktree sessions carry their parent under the root brand, and subagents link
+    // through the parent-side meta. A `subagent_resume` child is branded `/subagent` but its
+    // parent is the subagent it resumes, so the brand does not prove a spawn.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {

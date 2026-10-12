@@ -73,8 +73,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle,
+    SkipReason, SourceWatermark,
     claude_code::{
         FileState, SubagentDescriptor, claude_peek_watermark, claude_serialize,
         is_workflow_control_file, map_row_events, parse_timestamp, source_project_dir,
@@ -101,6 +102,18 @@ pub struct NanoclawFactory;
 impl AdapterFactory for NanoclawFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Brand exact: `session_from_rows` gives the parent and the `/subagent` brand together, and
+    // only to `subagents/` sidecars (`subagent_descriptor`), while `opencode::reattribute` brands
+    // only children opencode marks spawned. Top-level transcripts, forks and resumes included,
+    // record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {

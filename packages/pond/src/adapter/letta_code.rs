@@ -31,9 +31,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env, PlanFuture,
-    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, by_timestamp_then_id, compact_json,
-    config_path, empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark,
+    by_timestamp_then_id, compact_json, config_path, empty_options,
     extract::{Extracted, extract_bool, extract_self_str, extract_str, json_or_string},
     extracted_text,
     jsonl::{
@@ -68,6 +68,15 @@ pub struct LettaCodeFactory;
 impl AdapterFactory for LettaCodeFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Sessions record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::None,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {

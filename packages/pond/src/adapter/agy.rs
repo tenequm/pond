@@ -35,9 +35,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark, SyncPlan,
-    config_path,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle,
+    SkipReason, SourceWatermark, SyncPlan, config_path,
     extract::{Extracted, extract_self_str, extract_str, extract_value, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
     sqlite::{self, CHANNEL_CAP, emit, has_table},
@@ -132,6 +132,16 @@ pub struct AgyFactory;
 impl AdapterFactory for AgyFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Subagents name their parent in their metadata (`agy/subagent`); forks record parent and
+    // cut point under the root brand.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -231,6 +241,10 @@ impl Adapter for AgyAdapter {
             let mut survivors = Vec::with_capacity(heads.conversations.len());
             let mut fresh = 0usize;
             for (conversation, watermark) in heads.conversations {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &conversation.id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if watermark.is_some_and(|mark| source_in_sync(oracle, Some(&conversation.id), mark)) {
                     fresh += 1;
                     continue;

@@ -35,9 +35,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, compact_json, config_path,
-    empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    compact_json, config_path, empty_options,
     extract::{bound_value, extract_compact_repr, extract_str},
     extracted_text, part_id, part_ordinal, raw_record, source_options,
 };
@@ -56,6 +56,15 @@ pub struct ClaudeAiExportFactory;
 impl AdapterFactory for ClaudeAiExportFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Conversations record no parent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::None,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -149,6 +158,10 @@ impl Adapter for ClaudeAiExportAdapter {
                             .map(ToOwned::to_owned),
                         reason: SkipReason::Empty,
                     });
+                    continue;
+                }
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &session_id) {
+                    yield Ok(skip);
                     continue;
                 }
                 // Skip when the conversation's latest message timestamp is no

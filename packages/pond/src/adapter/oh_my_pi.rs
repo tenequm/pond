@@ -58,8 +58,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, config_path,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, config_path,
     jsonl::{
         BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, jsonl_tree_plan,
         peek_last_line, peek_nth_line,
@@ -107,6 +107,17 @@ pub struct OhMyPiFactory;
 impl AdapterFactory for OhMyPiFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Artifacts-directory children link by path, `/tan` forks among them under the
+    // `oh-my-pi/subagent` brand, so the brand does not prove a spawn. Header `parentSession`
+    // forks are not linked.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Partial,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
