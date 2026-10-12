@@ -1450,18 +1450,20 @@ enum V2Watermark {
 
 /// Freshness watermark for the V2 rows of a session (micros). The stored
 /// watermark is a max timestamp, which only proves completeness when every row
-/// lands with a timestamp above what is already stored. OpenCode breaks that in
-/// two ways, both confined to its open turn - the rows from the last `idle`
-/// marker on (the `(session_id, type, seq)` index finds it), or the whole
-/// session before OpenCode wrote idle markers: a row still being rewritten
-/// (unsettled, deferred by [`read_v2_messages`]), and a row inserted after rows
-/// with a later `time.created` (an assistant is inserted at its first content,
-/// so steering rows can precede it). Either makes the session unknown until the
-/// next `idle` closes the turn; so does a background shell still running
-/// anywhere, since it outlives the turn that started it. Otherwise the
-/// watermark is the max of the timestamps [`build_v2_message_events`] stamps on
-/// the open turn's rows; rows before the marker are settled history the stored
-/// watermark already covers.
+/// lands with a timestamp above what is already stored. An `assistant` or
+/// `compaction` row breaks that: it carries the time its step started, is
+/// rewritten in place until it settles (deferred meanwhile by
+/// [`read_v2_messages`]), and is inserted only at its first content, after any
+/// steering rows - so its settling never raises the watermark. Both are
+/// confined to the open turn, the rows from the last `idle` marker on (the
+/// `(session_id, type, seq)` index finds it; the whole session before OpenCode
+/// wrote idle markers), and the `idle` that closes the turn is newer than all
+/// of it. So an open turn holding such a row, or an unreadable one, makes the
+/// session unknown until that `idle` lands; so does a background shell still
+/// running anywhere, since it outlives its turn. Otherwise the watermark is the
+/// max of the timestamps [`build_v2_message_events`] stamps on the open turn's
+/// rows and on every finished shell's output carrier; rows before the marker
+/// are settled history the stored watermark already covers.
 fn v2_session_watermark(
     conn: &Connection,
     session_id: &str,
@@ -1504,7 +1506,6 @@ fn v2_session_watermark(
         }
         newest = newest.max(millis_at(&record, &["time", "completed"]));
     }
-    let mut created_so_far: Option<DateTime<Utc>> = None;
     for (id, kind, seq, data) in turn {
         if copies.is_some_and(|copies| copies.contains(&id, seq)) {
             continue;
@@ -1515,10 +1516,9 @@ fn v2_session_watermark(
         let Some(created) = millis_at(&record, &["time", "created"]) else {
             return Ok(V2Watermark::Unknown);
         };
-        if !is_settled(&kind, &record) || created_so_far.is_some_and(|before| created < before) {
+        if matches!(kind.as_str(), "assistant" | "compaction") || !is_settled(&kind, &record) {
             return Ok(V2Watermark::Unknown);
         }
-        created_so_far = created_so_far.max(Some(created));
         let emitted = v2_tool_items(&record)
             .filter_map(tool_result_time)
             .fold(created, DateTime::max);
@@ -5100,7 +5100,9 @@ mod tests {
     /// The fixture's ops session, cut right after its seq-21 assistant: that row
     /// was inserted after rows with a later `time.created` (steering while the
     /// step started), so a max-timestamp watermark cannot show it was stored and
-    /// the open turn stays unknown until the next `idle` closes it.
+    /// the open turn stays unknown until the next `idle` closes it. The same
+    /// holds with the assistant inserted in order (seq 13): deferred while it
+    /// ran, its settling raises no timestamp above the steering rows after it.
     #[test]
     fn out_of_order_insert_keeps_the_open_turn_unknown() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -5113,6 +5115,11 @@ mod tests {
         )?;
         let light = v2_light(&db, V2_OPS_SESSION);
         assert_eq!(db_store_watermark(&conn, &light)?, None);
+        conn.execute(
+            "UPDATE session_message SET seq = 13 WHERE session_id = ?1 AND seq = 21",
+            [V2_OPS_SESSION],
+        )?;
+        assert_eq!(db_store_watermark(&conn, &light)?, None, "in order too");
         insert_v2_row(
             &conn,
             "msg_zzzzv2idleaftermath000000",
