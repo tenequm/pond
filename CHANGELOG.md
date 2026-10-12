@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.19.6](https://github.com/tenequm/pond/compare/v0.19.5...v0.19.6) - 2026-10-12
+
+### <!-- 2 -->🐛 Bug Fixes
+- **opencode:** ingest OpenCode 2 sessions from the session_v2 store ([#339](https://github.com/tenequm/pond/pull/339)) ([b5a3f8f](https://github.com/tenequm/pond/commit/b5a3f8f167061ca02007cdfaefd9af0f52d58314))
+  pond now syncs sessions created by OpenCode 2 (`session_v2` store),
+  alongside OpenCode 1 sessions in the same database; sessions OpenCode 2
+  migrated keep their existing history and gain the turns added after the
+  upgrade. No action needed: the next `pond sync` picks them up.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.5...v0.19.6
+
 ## [0.19.5](https://github.com/tenequm/pond/compare/v0.19.4...v0.19.5) - 2026-10-02
 
 ### <!-- 2 -->🐛 Bug Fixes
