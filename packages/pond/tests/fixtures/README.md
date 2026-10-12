@@ -917,8 +917,8 @@ migration and the dedup rule for sessions present in both live in
     `failed`), 4 `synthetic`, 3 `agent-switched`, 3 `model-switched`, 2
     `system`, 1 `skill`, 1 `shell`, 1 `compaction`. Of those, 9 are
     migration copies (a kept V1 message id or its migration `syntheticID`,
-    all with `time_created` before the recorded migration completion: 4
-    assistant, 3 user, 1 synthetic, 1 system) and 57 are native V2 rows.
+    each session's copies forming its `seq` prefix: 4 assistant, 3 user, 1
+    synthetic, 1 system) and 57 are native V2 rows.
   - Assistant content in the 57 native rows: 15 `text`, 6 `reasoning`, 7
     `tool` (5 `completed`, 2 `error`).
   - Migrated, untouched after migration: `ses_ece45fa45ffewtiD8DSPLj3P62`
@@ -1159,9 +1159,11 @@ Update as gaps are closed.
   imported from an earlier `opencode-next.db`, and no Windows capture.
   Unit tests cover these by editing an in-test copy of this fixture or
   hand-building records: unfinished tool items and an unknown message type,
-  a running assistant deferred until its turn closes, a V1 message deleted
-  after the migration, a session repeated across DB files, and a pre-release
-  DB whose V2 heads live in a `session` table.
+  a running assistant deferred until its turn closes, a running background
+  shell behind a later `idle`, the ops session cut right after its
+  out-of-order seq-21 assistant, a V1 message deleted after the migration, a
+  session repeated across DB files, and a pre-release DB whose V2 heads live
+  in a `session` table.
   Unknown and uncaptured types still flow through the adapter as rule-3
   carriers, so the untested surface is their type-specific mapping
   (`docs/adapters/opencode.md` rows 5-7: results, provenance,

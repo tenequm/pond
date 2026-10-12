@@ -1328,23 +1328,21 @@ fn reconstruct_record(
 /// Recognizes the rows OpenCode 2's V1->V2 migration wrote into a migrated
 /// session: copies of records the V1 tables already hold. A copy keeps its V1
 /// message id or carries the migration's deterministic `syntheticID` (the
-/// user/synthetic split, the trailing legacy-tool notice), and every copy takes
-/// its V1 row's `time_created`, so it predates the migration's recorded
-/// completion - which still identifies the copy of a V1 message deleted since
-/// (an OpenCode 1.x revert after a downgrade). Post-migration rows are created
-/// after that instant under fresh ids.
+/// user/synthetic split, the trailing legacy-tool notice). The migration writes
+/// a session's copies as its `seq` prefix (`0..n`, before any live row, which
+/// takes a later `seq`), so every row up to the last recognized copy is one too,
+/// covering a salted id or the copy of a V1 message deleted since. Live rows
+/// are never matched; the one miss is a copy of a V1 TAIL deleted after the
+/// migration (an OpenCode 1.x revert after a downgrade), which re-ingests as a
+/// duplicate of content already stored rather than being lost.
 struct MigrationCopies {
     ids: HashSet<String>,
-    completed_at: Option<i64>,
+    through_seq: Option<i64>,
 }
 
 impl MigrationCopies {
-    fn contains(&self, id: &str, time_created: Option<i64>) -> bool {
-        self.ids.contains(id)
-            || matches!(
-                (self.completed_at, time_created),
-                (Some(completed), Some(created)) if created <= completed
-            )
+    fn contains(&self, id: &str, seq: i64) -> bool {
+        self.ids.contains(id) || self.through_seq.is_some_and(|through| seq <= through)
     }
 }
 
@@ -1353,50 +1351,34 @@ fn migration_copies(
     db_path: &Path,
     session_id: &str,
 ) -> Result<MigrationCopies, AdapterError> {
-    let mut stmt = conn
-        .prepare_cached("SELECT id FROM message WHERE session_id = ?1")
-        .map_err(|error| db_error(db_path, "prepare migrated message ids", &error))?;
-    let rows = stmt
-        .query_map([session_id], |row| row.get::<_, String>(0))
-        .map_err(|error| db_error(db_path, "query migrated message ids", &error))?;
+    let read = |sql: &str, op: &str| -> Result<Vec<(String, Option<i64>)>, AdapterError> {
+        conn.prepare_cached(sql)
+            .and_then(|mut stmt| {
+                stmt.query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()
+            })
+            .map_err(|error| db_error(db_path, op, &error))
+    };
     let mut ids = HashSet::new();
-    for id in rows {
-        let id = id.map_err(|error| db_error(db_path, "read migrated message id", &error))?;
+    for (id, _) in read(
+        "SELECT id, NULL FROM message WHERE session_id = ?1",
+        "read migrated message ids",
+    )? {
         // The notice derives from the last projected row, itself possibly a split.
         let split = synthetic_id(&id);
         ids.insert(synthetic_id(&split));
         ids.insert(split);
         ids.insert(id);
     }
-    Ok(MigrationCopies {
-        ids,
-        completed_at: migration_completed_at(conn, db_path)?,
-    })
-}
-
-/// When the V1->V2 migration finished: the `time_updated` of its `kv` state row
-/// once that row reads `{"phase":"completed"}`.
-fn migration_completed_at(conn: &Connection, db_path: &Path) -> Result<Option<i64>, AdapterError> {
-    if !table_exists(conn, db_path, "kv")? {
-        return Ok(None);
-    }
-    let state = conn
-        .prepare_cached("SELECT value, time_updated FROM kv WHERE key = 'migration.v1-v2'")
-        .and_then(|mut stmt| {
-            stmt.query_row([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .optional()
-        })
-        .map_err(|error| db_error(db_path, "read migration state", &error))?;
-    Ok(state.and_then(|(value, updated)| {
-        let completed = serde_json::from_str::<Value>(&value)
-            .ok()?
-            .get("phase")?
-            .as_str()?
-            == "completed";
-        completed.then_some(updated)
-    }))
+    let through_seq = read(
+        "SELECT id, seq FROM session_message WHERE session_id = ?1",
+        "read migrated v2 ids",
+    )?
+    .into_iter()
+    .filter(|(id, _)| ids.contains(id))
+    .filter_map(|(_, seq)| seq)
+    .max();
+    Ok(MigrationCopies { ids, through_seq })
 }
 
 /// OpenCode's `syntheticID` (`v1-migration.bun.ts`) at salt 0: the source id's
@@ -1462,53 +1444,81 @@ enum V2Watermark {
     /// No V2 row this adapter emits (none yet, or only migration copies).
     Empty,
     At(i64),
-    /// The open turn holds an unsettled or unreadable row: re-read.
+    /// Completeness cannot be shown from timestamps: re-read.
     Unknown,
 }
 
-/// Freshness watermark for the V2 rows of a session (micros), read from its open
-/// turn: the rows from the last `idle` marker on (the `(session_id, type, seq)`
-/// index finds it), or the whole session before OpenCode wrote idle markers.
-/// Settled rows contribute exactly the timestamps [`build_v2_message_events`]
-/// stamps; an unsettled one makes the session unknown, so it is re-read every
-/// sync until the turn closes and [`read_v2_messages`] stops deferring it. Rows
-/// before the marker are settled history the stored watermark already covers.
+/// Freshness watermark for the V2 rows of a session (micros). The stored
+/// watermark is a max timestamp, which only proves completeness when every row
+/// lands with a timestamp above what is already stored. OpenCode breaks that in
+/// two ways, both confined to its open turn - the rows from the last `idle`
+/// marker on (the `(session_id, type, seq)` index finds it), or the whole
+/// session before OpenCode wrote idle markers: a row still being rewritten
+/// (unsettled, deferred by [`read_v2_messages`]), and a row inserted after rows
+/// with a later `time.created` (an assistant is inserted at its first content,
+/// so steering rows can precede it). Either makes the session unknown until the
+/// next `idle` closes the turn; so does a background shell still running
+/// anywhere, since it outlives the turn that started it. Otherwise the
+/// watermark is the max of the timestamps [`build_v2_message_events`] stamps on
+/// the open turn's rows; rows before the marker are settled history the stored
+/// watermark already covers.
 fn v2_session_watermark(
     conn: &Connection,
     session_id: &str,
     copies: Option<&MigrationCopies>,
 ) -> Result<V2Watermark, AdapterError> {
-    let rows = (|| -> rusqlite::Result<Vec<V2Row>> {
+    let rows = (|| -> rusqlite::Result<(Vec<V2Row>, Vec<String>)> {
         let open_turn = conn
             .prepare_cached(
                 "SELECT MAX(seq) FROM session_message WHERE session_id = ?1 AND type = 'idle'",
             )?
             .query_row([session_id], |row| row.get::<_, Option<i64>>(0))?
             .unwrap_or(i64::MIN);
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, type, seq, time_created, data FROM session_message \
-             WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![session_id, open_turn], v2_row)?;
-        rows.collect()
+        let turn = conn
+            .prepare_cached(
+                "SELECT id, type, seq, data FROM session_message \
+                 WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
+            )?
+            .query_map(rusqlite::params![session_id, open_turn], v2_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let shells = conn
+            .prepare_cached(
+                "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'shell'",
+            )?
+            .query_map([session_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((turn, shells))
     })();
-    let Ok(rows) = rows else {
+    let Ok((turn, shells)) = rows else {
         return Ok(V2Watermark::Unknown);
     };
+    // A shell's output carrier is stamped at its end, which can postdate every
+    // later row: those ends join the watermark wherever the shell sits.
     let mut newest: Option<DateTime<Utc>> = None;
-    for (id, kind, _, time_created, data) in rows {
-        if copies.is_some_and(|copies| copies.contains(&id, time_created)) {
+    for data in &shells {
+        let Ok(record) = serde_json::from_str::<Value>(data) else {
+            return Ok(V2Watermark::Unknown);
+        };
+        if !is_settled("shell", &record) {
+            return Ok(V2Watermark::Unknown);
+        }
+        newest = newest.max(millis_at(&record, &["time", "completed"]));
+    }
+    let mut created_so_far: Option<DateTime<Utc>> = None;
+    for (id, kind, seq, data) in turn {
+        if copies.is_some_and(|copies| copies.contains(&id, seq)) {
             continue;
         }
         let Ok(record) = serde_json::from_str::<Value>(&data) else {
             return Ok(V2Watermark::Unknown);
         };
-        if !is_settled(&kind, &record) {
-            return Ok(V2Watermark::Unknown);
-        }
         let Some(created) = millis_at(&record, &["time", "created"]) else {
             return Ok(V2Watermark::Unknown);
         };
+        if !is_settled(&kind, &record) || created_so_far.is_some_and(|before| created < before) {
+            return Ok(V2Watermark::Unknown);
+        }
+        created_so_far = created_so_far.max(Some(created));
         let emitted = v2_tool_items(&record)
             .filter_map(tool_result_time)
             .fold(created, DateTime::max);
@@ -1645,28 +1655,23 @@ fn mark_source(options: &mut ProviderOptions, key: &str, value: Value) {
     }
 }
 
-/// One `session_message` row: id, type, seq, `time_created` column, `data`.
-type V2Row = (String, String, i64, Option<i64>, String);
+/// One `session_message` row: id, type, seq, `data`.
+type V2Row = (String, String, i64, String);
 
 fn v2_row(row: &rusqlite::Row) -> rusqlite::Result<V2Row> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-    ))
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
 }
 
 /// Read one session's `session_message` rows in `seq` order (streamed off the
 /// unique `(session_id, seq)` index) and emit each as canonical events. Skipped:
 /// with `copies`, the migration's copies of records already read from the V1
-/// tables; and any unsettled row of the open turn (after the last `idle`), which
-/// OpenCode is still rewriting in place - stored now, it would freeze half-written
-/// under its final id (spec.md#adapter-integrity-additive-sync), so it waits for
-/// a later sync (the watermark keeps the session unknown until then). An
-/// unsettled row behind a later `idle` belongs to a closed turn (an abandoned
-/// run, a long background shell) and lands as found. Returns `false` when the
+/// tables; and a row OpenCode is still rewriting in place - an unsettled row of
+/// the open turn (after the last `idle`), or a background shell still running
+/// wherever it sits, since it outlives its turn. Stored now, it would freeze
+/// half-written under its final id (spec.md#adapter-integrity-additive-sync), so
+/// it waits for a later sync (the watermark keeps the session unknown until
+/// then). Any other unsettled row sits behind a later `idle` in a turn that
+/// closed without settling it, and lands as found. Returns `false` when the
 /// consumer dropped the receiver.
 fn read_v2_messages(
     conn: &Connection,
@@ -1678,8 +1683,7 @@ fn read_v2_messages(
 ) -> bool {
     let rows = (|| -> rusqlite::Result<Vec<rusqlite::Result<V2Row>>> {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, type, seq, time_created, data FROM session_message \
-             WHERE session_id = ?1 ORDER BY seq",
+            "SELECT id, type, seq, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map([session_id], v2_row)?;
         Ok(rows.collect())
@@ -1699,14 +1703,14 @@ fn read_v2_messages(
         .max()
         .unwrap_or(i64::MIN);
     for row in rows {
-        let (id, kind, seq, time_created, data) = match row {
+        let (id, kind, seq, data) = match row {
             Ok(row) => row,
             Err(error) => {
                 emit!(tx, Err(db_error(db_path, "read v2 message row", &error)));
                 continue;
             }
         };
-        if copies.is_some_and(|copies| copies.contains(&id, time_created)) {
+        if copies.is_some_and(|copies| copies.contains(&id, seq)) {
             continue;
         }
         let record = match reconstruct_record(
@@ -1722,7 +1726,7 @@ fn read_v2_messages(
                 continue;
             }
         };
-        if seq > open_turn && !is_settled(&kind, &record) {
+        if !is_settled(&kind, &record) && (seq > open_turn || kind == "shell") {
             continue;
         }
         for event in build_v2_message_events(session_id, &id, &record, seq, session_anchor) {
@@ -1815,12 +1819,26 @@ fn build_v2_message_events(
             user(options)
         }
         // The user typed the command; its output is runtime-produced.
+        // The user typed the command. A shell finishes in place with no later
+        // row to mark it, so - like a tool result - its output rides a synthetic
+        // carrier stamped when it ended, which is what lets the freshness
+        // watermark see the completion.
         Some("shell") => {
             parts.text(Provenance::Conversational, record, "command");
-            if let Some(output) = record.get("output") {
-                parts.text(Provenance::Injected, output, "output");
+            let mut events = vec![IngestEvent::Message(user(options))];
+            events.extend(parts.parts.into_iter().map(IngestEvent::Part));
+            if let Some(ended) = millis_at(record, &["time", "completed"]) {
+                events.push(IngestEvent::Message(Message::System {
+                    id: format!("{message_id}/output"),
+                    session_id: session_id.to_owned(),
+                    timestamp: ended.max(timestamp),
+                    content: record
+                        .get("output")
+                        .and_then(|output| extract_str(output, "output")),
+                    options: synthetic_options(),
+                }));
             }
-            user(options)
+            return events;
         }
         Some("compaction") if record.get("summary").is_some() => {
             parts.text(Provenance::Injected, record, "summary");
@@ -4416,11 +4434,18 @@ mod tests {
         assert_eq!(shell.message.role(), crate::wire::Role::User);
         assert_eq!(
             texts(shell),
-            vec![
-                (Provenance::Conversational, "ls".to_owned()),
-                (Provenance::Injected, "README.md\ndot.png\n".to_owned()),
-            ],
+            vec![(Provenance::Conversational, "ls".to_owned())]
         );
+        let output = ops
+            .messages
+            .iter()
+            .find(|m| m.message.id() == format!("{}/output", shell.message.id()))
+            .expect("a finished shell's output carrier");
+        assert!(matches!(
+            &output.message,
+            Message::System { content: Some(text), .. } if text.as_str() == "README.md\ndot.png\n"
+        ));
+        assert!(is_synthetic(output.message.options()));
 
         for synthetic in by_type("synthetic") {
             assert_eq!(synthetic.message.role(), crate::wire::Role::User);
@@ -4801,14 +4826,15 @@ mod tests {
     }
 
     /// A V1 message deleted after the migration (an OpenCode 1.x revert after a
-    /// downgrade) leaves its V2 copy behind; the copy still predates the recorded
-    /// migration, so it stays skipped. A post-migration row that happens to share
-    /// a V1 id's 16-char prefix (the prefix wraps every 2^36 ms) is kept.
+    /// downgrade) leaves its V2 copy inside the migration's `seq` prefix, so it
+    /// stays skipped. A live row is kept even when its id shares a V1 id's
+    /// 16-char prefix (it wraps every 2^36 ms) and its `time_created` predates
+    /// the migration's completion (written while other sessions still migrated).
     #[tokio::test(flavor = "multi_thread")]
     async fn migration_copies_are_exact_and_survive_v1_deletes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let data = v2_data_dir(temp.path())?;
-        let deleted_v1 = "msg_131ba23ec001D2OA1U5ijz8c0y";
+        let deleted_v1 = "msg_131ba198c001kCcV4OpDtOChtC";
         let lookalike = "msg_131ba23ec001ZZZZZZZZZZZZZZ";
         {
             let conn = Connection::open(data.join("opencode.db"))?;
@@ -4821,7 +4847,7 @@ mod tests {
                 V2_MIGRATED_WITH_NOTICE,
                 "user",
                 500,
-                1_800_000_000_000,
+                1_700_000_000_000,
                 &json!({ "time": { "created": 1_800_000_000_000i64 }, "text": "after the upgrade" }),
             )?;
         }
@@ -5061,5 +5087,122 @@ mod tests {
             info["revert"],
             json!({ "messageID": "msg_a", "files": [{ "file": "f", "status": "modified", "additions": 1, "deletions": 0, "patch": "p" }] }),
         );
+    }
+
+    fn v2_light(db: &std::path::Path, session_id: &str) -> DbLight {
+        DbLight {
+            db_path: db.to_path_buf(),
+            session_id: session_id.to_owned(),
+            store: DbStore::V2 { head: "session_v2" },
+        }
+    }
+
+    /// The fixture's ops session, cut right after its seq-21 assistant: that row
+    /// was inserted after rows with a later `time.created` (steering while the
+    /// step started), so a max-timestamp watermark cannot show it was stored and
+    /// the open turn stays unknown until the next `idle` closes it.
+    #[test]
+    fn out_of_order_insert_keeps_the_open_turn_unknown() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        let db = data.join("opencode.db");
+        let conn = Connection::open(&db)?;
+        conn.execute(
+            "DELETE FROM session_message WHERE session_id = ?1 AND seq > 21",
+            [V2_OPS_SESSION],
+        )?;
+        let light = v2_light(&db, V2_OPS_SESSION);
+        assert_eq!(db_store_watermark(&conn, &light)?, None);
+        insert_v2_row(
+            &conn,
+            "msg_zzzzv2idleaftermath000000",
+            V2_OPS_SESSION,
+            "idle",
+            22,
+            1_800_000_000_000,
+            &json!({ "time": { "created": 1_800_000_000_000i64 }, "outcome": "succeeded" }),
+        )?;
+        assert_eq!(
+            db_store_watermark(&conn, &light)?,
+            Some(1_800_000_000_000 * 1_000),
+            "a closed turn reads fresh again",
+        );
+        Ok(())
+    }
+
+    /// A background shell outlives the turn that started it: still running behind
+    /// a later `idle`, it is deferred and keeps the session unknown; once it ends
+    /// it lands with its output.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_background_shell_waits_even_behind_idle() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        let db = data.join("opencode.db");
+        let shell_id: String = Connection::open(&db)?.query_row(
+            "SELECT id FROM session_message WHERE session_id = ?1 AND type = 'shell'",
+            [V2_OPS_SESSION],
+            |row| row.get(0),
+        )?;
+        let running = json!({
+            "metadata": { "background": true }, "time": { "created": 1_791_836_259_452i64 },
+            "shellID": "sh_x", "command": "ls", "status": "running",
+        });
+        Connection::open(&db)?.execute(
+            "UPDATE session_message SET data = ?1 WHERE id = ?2",
+            rusqlite::params![running.to_string(), shell_id],
+        )?;
+        assert_eq!(
+            db_store_watermark(&open_db(&db)?, &v2_light(&db, V2_OPS_SESSION))?,
+            None
+        );
+
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let adapter = OpencodeAdapter::new(&data);
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        let mid = store.get_session(V2_OPS_SESSION).await?.expect("ingests");
+        assert!(
+            !message_ids(&mid).contains(&shell_id.as_str()),
+            "the running shell waits"
+        );
+
+        let mut ended = running;
+        ended["status"] = json!("exited");
+        ended["exit"] = json!(0);
+        ended["time"]["completed"] = json!(1_800_000_000_000i64);
+        ended["output"] = json!({ "output": "README.md\n" });
+        Connection::open(&db)?.execute(
+            "UPDATE session_message SET data = ?1 WHERE id = ?2",
+            rusqlite::params![ended.to_string(), shell_id],
+        )?;
+        // The store's own watermarks, as `pond sync` uses them: the shell ended
+        // with no later row, and its end alone must trigger the re-read.
+        let oracle = crate::sessions::RowmapOracle(store.rowmap_snapshot());
+        ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
+        let done = store.get_session(V2_OPS_SESSION).await?.expect("ingests");
+        assert!(
+            message_ids(&done).contains(&shell_id.as_str()),
+            "the ended shell lands"
+        );
+        let output = done
+            .messages
+            .iter()
+            .find(|m| m.message.id() == format!("{shell_id}/output"))
+            .expect("with its output carrier");
+        assert!(matches!(
+            &output.message,
+            Message::System { content: Some(text), .. } if text.as_str() == "README.md\n"
+        ));
+        let summary = ingest_adapter(
+            &store,
+            &adapter,
+            &crate::sessions::RowmapOracle(store.rowmap_snapshot()),
+            |_| {},
+        )
+        .await?;
+        assert_eq!(
+            summary.inserted, 0,
+            "then the session reads fresh: {summary:?}"
+        );
+        Ok(())
     }
 }
