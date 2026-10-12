@@ -342,7 +342,6 @@ struct DbLight {
 }
 
 /// Which session tables of one DB carry a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbStore {
     /// `session`/`message`/`part` only (OpenCode 1, or never migrated).
     V1,
@@ -908,7 +907,7 @@ fn connection<'a>(
 /// A pre-release OpenCode 2 DB (the `opencode-next.db` its migration imports)
 /// keeps V2 heads in a table still named `session`; those sessions are told
 /// apart from V1 ones by having `session_message` rows, which OpenCode 1 never
-/// writes. Uses the shared connection cache so enumeration and the per-session
+/// writes, or - an empty one - by the DB having no V1 `message` table. Uses the shared connection cache so enumeration and the per-session
 /// peeks share a single open per DB.
 fn db_session_ids(
     conns: &mut HashMap<PathBuf, Connection>,
@@ -918,7 +917,9 @@ fn db_session_ids(
     let v1 = table_ids(conn, db_path, "session")?;
     let v2 = table_ids(conn, db_path, "session_v2")?;
     let v2_set: HashSet<&str> = v2.iter().map(String::as_str).collect();
-    let with_v2_body: HashSet<String> = if table_exists(conn, db_path, "session_message")? {
+    let has_v2_body = table_exists(conn, db_path, "session_message")?;
+    let prerelease = has_v2_body && !table_exists(conn, db_path, "message")?;
+    let with_v2_body: HashSet<String> = if has_v2_body {
         conn.prepare_cached("SELECT DISTINCT session_id FROM session_message")
             .and_then(|mut stmt| {
                 stmt.query_map([], |row| row.get::<_, String>(0))?
@@ -934,7 +935,7 @@ fn db_session_ids(
         .map(|id| {
             let store = if v2_set.contains(id.as_str()) {
                 DbStore::Migrated
-            } else if with_v2_body.contains(id) {
+            } else if prerelease || with_v2_body.contains(id) {
                 DbStore::V2 { head: "session" }
             } else {
                 DbStore::V1
@@ -952,8 +953,7 @@ fn db_session_ids(
 }
 
 fn table_exists(conn: &Connection, db_path: &Path, table: &str) -> Result<bool, AdapterError> {
-    conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
-        .and_then(|mut stmt| stmt.exists([table]))
+    sqlite::has_table(conn, table)
         .map_err(|error| db_error(db_path, &format!("probe {table} table"), &error))
 }
 
@@ -1344,6 +1344,14 @@ impl MigrationCopies {
     fn contains(&self, id: &str, seq: i64) -> bool {
         self.ids.contains(id) || self.through_seq.is_some_and(|through| seq <= through)
     }
+
+    /// The first `seq` past the copy prefix. Every exact copy sits at or below
+    /// `through_seq`, so reads start here and never fetch a copy's `data`.
+    fn live_from(copies: Option<&Self>) -> i64 {
+        copies
+            .and_then(|copies| copies.through_seq)
+            .map_or(i64::MIN, |through| through.saturating_add(1))
+    }
 }
 
 fn migration_copies(
@@ -1475,7 +1483,8 @@ fn v2_session_watermark(
                 "SELECT MAX(seq) FROM session_message WHERE session_id = ?1 AND type = 'idle'",
             )?
             .query_row([session_id], |row| row.get::<_, Option<i64>>(0))?
-            .unwrap_or(i64::MIN);
+            .unwrap_or(i64::MIN)
+            .max(MigrationCopies::live_from(copies));
         let turn = conn
             .prepare_cached(
                 "SELECT id, type, seq, data FROM session_message \
@@ -1567,22 +1576,12 @@ fn fetch_v2_session_head(
 }
 
 fn v2_row_value(row: &rusqlite::Row) -> rusqlite::Result<Value> {
-    use rusqlite::types::ValueRef;
     let mut map = serde_json::Map::new();
     for (index, name) in row.as_ref().column_names().into_iter().enumerate() {
-        let value = match row.get_ref(index)? {
-            ValueRef::Null => continue,
-            ValueRef::Integer(value) => json!(value),
-            ValueRef::Real(value) => json!(value),
-            ValueRef::Text(bytes) => {
-                let text = String::from_utf8_lossy(bytes);
-                if V2_JSON_COLUMNS.contains(&name) {
-                    json_or_string(&text)
-                } else {
-                    json!(text)
-                }
-            }
-            ValueRef::Blob(bytes) => json!(bytes),
+        let value = match sqlite::value_json(row.get_ref(index)?) {
+            Value::Null => continue,
+            Value::String(text) if V2_JSON_COLUMNS.contains(&name) => json_or_string(&text),
+            value => value,
         };
         map.insert(name.to_owned(), value);
     }
@@ -1683,9 +1682,13 @@ fn read_v2_messages(
 ) -> bool {
     let rows = (|| -> rusqlite::Result<Vec<rusqlite::Result<V2Row>>> {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, type, seq, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+            "SELECT id, type, seq, data FROM session_message \
+             WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
         )?;
-        let rows = stmt.query_map([session_id], v2_row)?;
+        let rows = stmt.query_map(
+            rusqlite::params![session_id, MigrationCopies::live_from(copies)],
+            v2_row,
+        )?;
         Ok(rows.collect())
     })();
     let rows = match rows {
@@ -1818,7 +1821,6 @@ fn build_v2_message_events(
             parts.text(Provenance::Injected, record, "text");
             user(options)
         }
-        // The user typed the command; its output is runtime-produced.
         // The user typed the command. A shell finishes in place with no later
         // row to mark it, so - like a tool result - its output rides a synthetic
         // carrier stamped when it ended, which is what lets the freshness
@@ -4827,9 +4829,9 @@ mod tests {
 
     /// A V1 message deleted after the migration (an OpenCode 1.x revert after a
     /// downgrade) leaves its V2 copy inside the migration's `seq` prefix, so it
-    /// stays skipped. A live row is kept even when its id shares a V1 id's
-    /// 16-char prefix (it wraps every 2^36 ms) and its `time_created` predates
-    /// the migration's completion (written while other sessions still migrated).
+    /// stays skipped. The live row past the copy prefix is kept, though its id
+    /// shares a V1 id's 16-char prefix and its `time_created` predates the
+    /// migration: both rejected copy rules (docs/adapters/opencode.md) would drop it.
     #[tokio::test(flavor = "multi_thread")]
     async fn migration_copies_are_exact_and_survive_v1_deletes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -4887,6 +4889,7 @@ mod tests {
         let next = data.join("opencode-next.db");
         std::fs::copy(v2_db_fixture(), &next)?;
         let unique = "ses_zzzznextonly000000000000";
+        let empty = "ses_zzzznextempty00000000000";
         {
             let conn = Connection::open(&next)?;
             conn.execute_batch(
@@ -4902,6 +4905,12 @@ mod tests {
                 "UPDATE session_message SET session_id = ?1 WHERE session_id = ?2",
                 [unique, V2_OPS_SESSION],
             )?;
+            conn.execute(
+                "CREATE TEMP TABLE head AS SELECT * FROM session WHERE id = ?1",
+                [unique],
+            )?;
+            conn.execute("UPDATE head SET id = ?1", [empty])?;
+            conn.execute_batch("INSERT INTO session SELECT * FROM head;")?;
         }
         let store = Store::open_local(temp.path().join("store")).await?;
         let summary = ingest_adapter(
@@ -4912,7 +4921,8 @@ mod tests {
         )
         .await?;
         assert_eq!(summary.dropped_events, 0, "{summary:?}");
-        assert_eq!(store.session_ids().await?.len(), V2_SESSION_COUNT + 1);
+        assert_eq!(summary.unreadable_events, 0, "{summary:?}");
+        assert_eq!(store.session_ids().await?.len(), V2_SESSION_COUNT + 2);
         assert_eq!(
             summary.skipped_superseded,
             V2_SESSION_COUNT - 1,
@@ -4929,6 +4939,11 @@ mod tests {
             "with its whole transcript"
         );
         assert_eq!(session_store(&session.session.options), Some("session"));
+        let empty = store
+            .get_session(empty)
+            .await?
+            .expect("empty session lands");
+        assert_eq!(session_store(&empty.session.options), Some("session"));
         assert_eq!(
             serialize_native(&session)?[0].actual_fidelity,
             RestoreFidelity::Native
