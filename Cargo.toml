@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["packages/pond"]
+members = ["packages/pond", "packages/herdr-pond"]
+# Root builds (dist scripts, bare `cargo build/test/clippy`) stay pond-only;
+# herdr-pond is built and gated by name (`-p herdr-pond`, its moon tasks).
+default-members = ["packages/pond"]
 
 # Profiles are honored only at the workspace root, so they live here (not in the
 # member manifest, where cargo ignores them). The crate is packages/pond.
