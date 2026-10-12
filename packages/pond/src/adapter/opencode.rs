@@ -346,8 +346,9 @@ struct DbLight {
 enum DbStore {
     /// `session`/`message`/`part` only (OpenCode 1, or never migrated).
     V1,
-    /// `session_v2`/`session_message` only (created by OpenCode 2).
-    V2,
+    /// A V2 head in `head` (`session_v2`, or `session` in a pre-release
+    /// OpenCode 2 DB) with its body in `session_message`.
+    V2 { head: &'static str },
     /// Both: an OpenCode 1 session the V1->V2 migration copied forward.
     Migrated,
 }
@@ -539,7 +540,9 @@ fn read_db_survivor(
         DbStore::V1 | DbStore::Migrated => {
             fetch_db_session_head(conn, &light.db_path, &light.session_id)
         }
-        DbStore::V2 => fetch_v2_session_head(conn, &light.db_path, &light.session_id),
+        DbStore::V2 { head } => {
+            fetch_v2_session_head(conn, &light.db_path, &light.session_id, head)
+        }
     };
     match head {
         Ok(Some(head)) => {
@@ -548,25 +551,18 @@ fn read_db_survivor(
             emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(head))));
             match light.store {
                 DbStore::V1 => read_db_session(conn, &light.db_path, &session_id, anchor, tx),
-                DbStore::V2 => {
+                DbStore::V2 { .. } => {
                     read_v2_messages(conn, &light.db_path, &session_id, anchor, None, tx)
                 }
                 DbStore::Migrated => {
                     if !read_db_session(conn, &light.db_path, &session_id, anchor, tx) {
                         return false;
                     }
-                    let migrated = match v1_message_instants(conn, &light.db_path, &session_id) {
-                        Ok(instants) => instants,
+                    let copies = match migration_copies(conn, &light.db_path, &session_id) {
+                        Ok(copies) => copies,
                         Err(error) => return tx.blocking_send(Err(error)).is_ok(),
                     };
-                    read_v2_messages(
-                        conn,
-                        &light.db_path,
-                        &session_id,
-                        anchor,
-                        Some(&migrated),
-                        tx,
-                    )
+                    read_v2_messages(conn, &light.db_path, &session_id, anchor, Some(&copies), tx)
                 }
             }
         }
@@ -907,9 +903,12 @@ fn connection<'a>(
 }
 
 /// Every session id in one DB with the table generation(s) carrying it, ordered
-/// by id for deterministic ingest. Each generation's table is read only when it
-/// exists: a fresh OpenCode 2 install has no V1 tables, an OpenCode 1 DB has no
-/// V2 ones. Uses the shared connection cache so enumeration and the per-session
+/// by id for deterministic ingest. Each table is read only when it exists: a
+/// fresh OpenCode 2 install has no V1 tables, an OpenCode 1 DB no `session_v2`.
+/// A pre-release OpenCode 2 DB (the `opencode-next.db` its migration imports)
+/// keeps V2 heads in a table still named `session`; those sessions are told
+/// apart from V1 ones by having `session_message` rows, which OpenCode 1 never
+/// writes. Uses the shared connection cache so enumeration and the per-session
 /// peeks share a single open per DB.
 fn db_session_ids(
     conns: &mut HashMap<PathBuf, Connection>,
@@ -919,12 +918,24 @@ fn db_session_ids(
     let v1 = table_ids(conn, db_path, "session")?;
     let v2 = table_ids(conn, db_path, "session_v2")?;
     let v2_set: HashSet<&str> = v2.iter().map(String::as_str).collect();
+    let with_v2_body: HashSet<String> = if table_exists(conn, db_path, "session_message")? {
+        conn.prepare_cached("SELECT DISTINCT session_id FROM session_message")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<_>>()
+            })
+            .map_err(|error| db_error(db_path, "list v2 message sessions", &error))?
+    } else {
+        HashSet::new()
+    };
     let v1_set: HashSet<&str> = v1.iter().map(String::as_str).collect();
     let mut ids: Vec<(String, DbStore)> = v1
         .iter()
         .map(|id| {
             let store = if v2_set.contains(id.as_str()) {
                 DbStore::Migrated
+            } else if with_v2_body.contains(id) {
+                DbStore::V2 { head: "session" }
             } else {
                 DbStore::V1
             };
@@ -933,20 +944,22 @@ fn db_session_ids(
         .chain(
             v2.iter()
                 .filter(|id| !v1_set.contains(id.as_str()))
-                .map(|id| (id.clone(), DbStore::V2)),
+                .map(|id| (id.clone(), DbStore::V2 { head: "session_v2" })),
         )
         .collect();
     ids.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(ids)
 }
 
+fn table_exists(conn: &Connection, db_path: &Path, table: &str) -> Result<bool, AdapterError> {
+    conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .and_then(|mut stmt| stmt.exists([table]))
+        .map_err(|error| db_error(db_path, &format!("probe {table} table"), &error))
+}
+
 /// Every `id` in `table`, or none when the DB has no such table.
 fn table_ids(conn: &Connection, db_path: &Path, table: &str) -> Result<Vec<String>, AdapterError> {
-    let exists = conn
-        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
-        .and_then(|mut stmt| stmt.exists([table]))
-        .map_err(|error| db_error(db_path, &format!("probe {table} table"), &error))?;
-    if !exists {
+    if !table_exists(conn, db_path, table)? {
         return Ok(Vec::new());
     }
     let mut stmt = conn
@@ -1312,94 +1325,198 @@ fn reconstruct_record(
     Ok(value)
 }
 
-/// An OpenCode id is a prefix plus 12 hex chars of `(ms timestamp, counter)`, so
-/// its first 16 chars name one creation instant. The V1->V2 migration keeps each
-/// V1 message id and gives the rows it splits off or appends (`syntheticID`) the
-/// source id's 16-char prefix plus a hash suffix, so a V2 row sharing a V1
-/// message's instant is a migration copy, never post-migration activity.
-const ID_INSTANT_LEN: usize = 16;
-
-fn id_instant(id: &str) -> &str {
-    id.get(..ID_INSTANT_LEN).unwrap_or(id)
+/// Recognizes the rows OpenCode 2's V1->V2 migration wrote into a migrated
+/// session: copies of records the V1 tables already hold. A copy keeps its V1
+/// message id or carries the migration's deterministic `syntheticID` (the
+/// user/synthetic split, the trailing legacy-tool notice), and every copy takes
+/// its V1 row's `time_created`, so it predates the migration's recorded
+/// completion - which still identifies the copy of a V1 message deleted since
+/// (an OpenCode 1.x revert after a downgrade). Post-migration rows are created
+/// after that instant under fresh ids.
+struct MigrationCopies {
+    ids: HashSet<String>,
+    completed_at: Option<i64>,
 }
 
-/// The creation instants of a session's V1 messages: the migration-copy test
-/// for its V2 rows (see [`ID_INSTANT_LEN`]).
-fn v1_message_instants(
+impl MigrationCopies {
+    fn contains(&self, id: &str, time_created: Option<i64>) -> bool {
+        self.ids.contains(id)
+            || matches!(
+                (self.completed_at, time_created),
+                (Some(completed), Some(created)) if created <= completed
+            )
+    }
+}
+
+fn migration_copies(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
-) -> Result<HashSet<String>, AdapterError> {
+) -> Result<MigrationCopies, AdapterError> {
     let mut stmt = conn
         .prepare_cached("SELECT id FROM message WHERE session_id = ?1")
         .map_err(|error| db_error(db_path, "prepare migrated message ids", &error))?;
     let rows = stmt
         .query_map([session_id], |row| row.get::<_, String>(0))
         .map_err(|error| db_error(db_path, "query migrated message ids", &error))?;
-    let mut instants = HashSet::new();
+    let mut ids = HashSet::new();
     for id in rows {
         let id = id.map_err(|error| db_error(db_path, "read migrated message id", &error))?;
-        instants.insert(id_instant(&id).to_owned());
+        // The notice derives from the last projected row, itself possibly a split.
+        let split = synthetic_id(&id);
+        ids.insert(synthetic_id(&split));
+        ids.insert(split);
+        ids.insert(id);
     }
-    Ok(instants)
+    Ok(MigrationCopies {
+        ids,
+        completed_at: migration_completed_at(conn, db_path)?,
+    })
+}
+
+/// When the V1->V2 migration finished: the `time_updated` of its `kv` state row
+/// once that row reads `{"phase":"completed"}`.
+fn migration_completed_at(conn: &Connection, db_path: &Path) -> Result<Option<i64>, AdapterError> {
+    if !table_exists(conn, db_path, "kv")? {
+        return Ok(None);
+    }
+    let state = conn
+        .prepare_cached("SELECT value, time_updated FROM kv WHERE key = 'migration.v1-v2'")
+        .and_then(|mut stmt| {
+            stmt.query_row([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()
+        })
+        .map_err(|error| db_error(db_path, "read migration state", &error))?;
+    Ok(state.and_then(|(value, updated)| {
+        let completed = serde_json::from_str::<Value>(&value)
+            .ok()?
+            .get("phase")?
+            .as_str()?
+            == "completed";
+        completed.then_some(updated)
+    }))
+}
+
+/// OpenCode's `syntheticID` (`v1-migration.bun.ts`) at salt 0: the source id's
+/// first 16 chars plus 14 base62 digits of `sha256("v1-synthetic:" + source)`.
+/// The salted retry only fires on a collision with an existing id of the session.
+fn synthetic_id(source: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut value = Sha256::digest(format!("v1-synthetic:{source}")).to_vec();
+    let mut suffix = [0u8; 14];
+    for slot in suffix.iter_mut().rev() {
+        // One step of big-endian long division by 62; the remainder is the digit.
+        let mut remainder = 0u32;
+        for byte in &mut value {
+            let acc = (remainder << 8) | u32::from(*byte);
+            *byte = u8::try_from(acc / 62).unwrap_or(u8::MAX);
+            remainder = acc % 62;
+        }
+        *slot = ALPHABET[remainder as usize];
+    }
+    let prefix: String = source.chars().take(16).collect();
+    format!("{prefix}{}", String::from_utf8_lossy(&suffix))
+}
+
+/// Whether OpenCode considers a record finished (`isSettled`, `transfer.ts`):
+/// an assistant once `time.completed` is set, a shell or compaction once it is
+/// no longer `running`. Until then OpenCode rewrites the row in place.
+fn is_settled(kind: &str, record: &Value) -> bool {
+    match kind {
+        "assistant" => record.pointer("/time/completed").is_some(),
+        "shell" | "compaction" => record.get("status").and_then(Value::as_str) != Some("running"),
+        _ => true,
+    }
 }
 
 /// Freshness watermark for one DB session, by the tables carrying it. A migrated
 /// session's newest record is either its V1 tail or its newest post-migration V2
-/// row, so it takes the max of both.
+/// row, so it takes the max of both - unless the V2 side cannot say, which makes
+/// the whole session unknown (a re-read that surfaces the fault).
 fn db_store_watermark(conn: &Connection, light: &DbLight) -> Result<Option<i64>, AdapterError> {
     let (db_path, session_id) = (light.db_path.as_path(), light.session_id.as_str());
     match light.store {
         DbStore::V1 => db_session_watermark(conn, db_path, session_id),
-        DbStore::V2 => v2_session_watermark(conn, db_path, session_id, None),
+        DbStore::V2 { .. } => Ok(match v2_session_watermark(conn, session_id, None)? {
+            V2Watermark::At(ts) => Some(ts),
+            V2Watermark::Empty | V2Watermark::Unknown => None,
+        }),
         DbStore::Migrated => {
-            let migrated = v1_message_instants(conn, db_path, session_id)?;
+            let copies = migration_copies(conn, db_path, session_id)?;
             let v1 = db_session_watermark(conn, db_path, session_id)?;
-            let v2 = v2_session_watermark(conn, db_path, session_id, Some(&migrated))?;
-            Ok(v1.max(v2))
+            Ok(
+                match v2_session_watermark(conn, session_id, Some(&copies))? {
+                    V2Watermark::At(ts) => v1.max(Some(ts)),
+                    V2Watermark::Empty => v1,
+                    V2Watermark::Unknown => None,
+                },
+            )
         }
     }
 }
 
-/// Freshness watermark for the V2 rows of a session (micros): the newest row by
-/// `seq`, its `data.time.created` raised by its tool items' result timestamps -
-/// exactly the timestamps [`build_v2_message_events`] stamps on what it emits.
-/// A newest row that is a migration copy contributes nothing (it is never
-/// ingested, and its `time.created` is the migration-stamped V1 column). `None`
-/// = no usable V2 row, a safe re-read when nothing else bounds it.
+enum V2Watermark {
+    /// No V2 row this adapter emits (none yet, or only migration copies).
+    Empty,
+    At(i64),
+    /// The open turn holds an unsettled or unreadable row: re-read.
+    Unknown,
+}
+
+/// Freshness watermark for the V2 rows of a session (micros), read from its open
+/// turn: the rows from the last `idle` marker on (the `(session_id, type, seq)`
+/// index finds it), or the whole session before OpenCode wrote idle markers.
+/// Settled rows contribute exactly the timestamps [`build_v2_message_events`]
+/// stamps; an unsettled one makes the session unknown, so it is re-read every
+/// sync until the turn closes and [`read_v2_messages`] stops deferring it. Rows
+/// before the marker are settled history the stored watermark already covers.
 fn v2_session_watermark(
     conn: &Connection,
-    db_path: &Path,
     session_id: &str,
-    migrated: Option<&HashSet<String>>,
-) -> Result<Option<i64>, AdapterError> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, data FROM session_message WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
-        )
-        .map_err(|error| db_error(db_path, "prepare newest v2 message", &error))?;
-    let newest = stmt
-        .query_row([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .optional()
-        .map_err(|error| db_error(db_path, "query newest v2 message", &error))?;
-    let Some((id, data)) = newest else {
-        return Ok(None);
+    copies: Option<&MigrationCopies>,
+) -> Result<V2Watermark, AdapterError> {
+    let rows = (|| -> rusqlite::Result<Vec<V2Row>> {
+        let open_turn = conn
+            .prepare_cached(
+                "SELECT MAX(seq) FROM session_message WHERE session_id = ?1 AND type = 'idle'",
+            )?
+            .query_row([session_id], |row| row.get::<_, Option<i64>>(0))?
+            .unwrap_or(i64::MIN);
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, type, seq, time_created, data FROM session_message \
+             WHERE session_id = ?1 AND seq >= ?2 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id, open_turn], v2_row)?;
+        rows.collect()
+    })();
+    let Ok(rows) = rows else {
+        return Ok(V2Watermark::Unknown);
     };
-    if migrated.is_some_and(|instants| instants.contains(id_instant(&id))) {
-        return Ok(None);
+    let mut newest: Option<DateTime<Utc>> = None;
+    for (id, kind, _, time_created, data) in rows {
+        if copies.is_some_and(|copies| copies.contains(&id, time_created)) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(&data) else {
+            return Ok(V2Watermark::Unknown);
+        };
+        if !is_settled(&kind, &record) {
+            return Ok(V2Watermark::Unknown);
+        }
+        let Some(created) = millis_at(&record, &["time", "created"]) else {
+            return Ok(V2Watermark::Unknown);
+        };
+        let emitted = v2_tool_items(&record)
+            .filter_map(tool_result_time)
+            .fold(created, DateTime::max);
+        newest = newest.max(Some(emitted));
     }
-    let Ok(message) = serde_json::from_str::<Value>(&data) else {
-        return Ok(None);
-    };
-    let Some(created) = millis_at(&message, &["time", "created"]) else {
-        return Ok(None);
-    };
-    let newest = v2_tool_items(&message)
-        .filter_map(tool_result_time)
-        .fold(created, DateTime::max);
-    Ok(Some(newest.timestamp_micros()))
+    Ok(newest.map_or(V2Watermark::Empty, |ts| {
+        V2Watermark::At(ts.timestamp_micros())
+    }))
 }
 
 /// The `session_v2` columns read as JSON text (drizzle `mode: "json"`); every
@@ -1413,17 +1530,19 @@ const V2_JSON_COLUMNS: &[&str] = &[
     "model",
 ];
 
-/// Fetch one `session_v2` row by primary key. The row is captured whole (`SELECT
-/// *`, keyed by column name, null columns omitted) rather than through a fixed
-/// column list: OpenCode 2 still adds session columns release to release, and a
-/// lossless capture must not depend on pond knowing each one.
+/// Fetch one V2 session row by primary key from `table` (`session_v2`, or
+/// `session` in a pre-release OpenCode 2 DB). The row is captured whole
+/// (`SELECT *`, keyed by column name, null columns omitted) rather than through a
+/// fixed column list: OpenCode 2 still adds session columns release to release,
+/// and a lossless capture must not depend on pond knowing each one.
 fn fetch_v2_session_head(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
+    table: &'static str,
 ) -> Result<Option<Session>, AdapterError> {
     let mut stmt = conn
-        .prepare_cached("SELECT * FROM session_v2 WHERE id = ?1")
+        .prepare_cached(&format!("SELECT * FROM {table} WHERE id = ?1"))
         .map_err(|error| db_error(db_path, "prepare v2 session by id", &error))?;
     let row = stmt
         .query_row([session_id], v2_row_value)
@@ -1432,7 +1551,7 @@ fn fetch_v2_session_head(
     row.map(|row| {
         let location = record_location(db_path, session_id, session_id);
         let row = parse_bounded(NAME, compact_json(&row).as_bytes(), || location.clone())?;
-        session_from_v2_row(&row, &location)
+        session_from_v2_row(&row, &location, table)
     })
     .transpose()
 }
@@ -1460,26 +1579,37 @@ fn v2_row_value(row: &rusqlite::Row) -> rusqlite::Result<Value> {
     Ok(Value::Object(map))
 }
 
-/// Map a captured `session_v2` row to a canonical [`Session`]. Lineage: a spawned
+/// A text column OpenCode's `fromRow` treats as set: non-null and non-empty.
+fn set_column<'a>(row: &'a Value, name: &str) -> Option<&'a str> {
+    row.get(name)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+/// Map a captured V2 session row to a canonical [`Session`]. Lineage: a spawned
 /// child carries `parent_id`; a fork carries `fork_session_id` and a boundary
 /// whose `through` message is its cut-point in the parent. A `before` boundary
 /// names the first message NOT copied, so its cut-point is not recorded
 /// (spec.md#model-no-synthesis).
-fn session_from_v2_row(row: &Value, location: &str) -> Result<Session, AdapterError> {
+fn session_from_v2_row(
+    row: &Value,
+    location: &str,
+    table: &'static str,
+) -> Result<Session, AdapterError> {
     let schema =
         |message: &str| AdapterError::schema(NAME, location.to_owned(), message.to_owned());
     let id = row
         .get("id")
         .and_then(Value::as_str)
-        .ok_or_else(|| schema("session_v2 row missing `id`"))?
+        .ok_or_else(|| schema("v2 session row missing `id`"))?
         .to_owned();
     let created_at = millis_at(row, &["time_created"])
-        .ok_or_else(|| schema("session_v2 row missing `time_created`"))?;
+        .ok_or_else(|| schema("v2 session row missing `time_created`"))?;
     // spec.md#model-project-non-empty: `directory` is a NOT NULL column.
     let project = extract_str(row, "directory")
-        .ok_or_else(|| schema("session_v2 row missing `directory`"))?;
-    let parent = row.get("parent_id").and_then(Value::as_str);
-    let fork = row.get("fork_session_id").and_then(Value::as_str);
+        .ok_or_else(|| schema("v2 session row missing `directory`"))?;
+    let parent = set_column(row, "parent_id");
+    let fork = set_column(row, "fork_session_id");
     let parent_message_id = fork
         .and(row.get("fork_boundary"))
         .filter(|boundary| boundary.get("type").and_then(Value::as_str) == Some("through"))
@@ -1488,13 +1618,13 @@ fn session_from_v2_row(row: &Value, location: &str) -> Result<Session, AdapterEr
         .map(ToOwned::to_owned);
     // A spawned child is labeled like a DB-era V1 child (`opencode/<agent>`); a
     // fork is a continuation, not a subagent, and keeps the bare brand.
-    let source_agent = match (parent, row.get("agent").and_then(Value::as_str)) {
+    let source_agent = match (parent, set_column(row, "agent")) {
         (Some(_), Some(agent)) => format!("{NAME}/{agent}"),
         (Some(_), None) => format!("{NAME}/subagent"),
         (None, _) => NAME.to_owned(),
     };
     let mut options = opencode_raw(row);
-    mark_source(&mut options, "store", json!(V2_STORE));
+    mark_source(&mut options, "store", json!(table));
     Ok(Session {
         id,
         parent_session_id: parent.or(fork).map(ToOwned::to_owned),
@@ -1506,39 +1636,53 @@ fn session_from_v2_row(row: &Value, location: &str) -> Result<Session, AdapterEr
     })
 }
 
-/// `options.source.store` on a session read from `session_v2`: native restore
-/// keys the OpenCode 2 transfer shape off it.
-const V2_STORE: &str = "session_v2";
-
 /// Add a side field next to `options.source.raw_record` (the documented
-/// extension point of [`source_options`]).
+/// extension point of [`source_options`]). `store` names the table a V2 session
+/// head was read from; native restore keys the OpenCode 2 transfer shape off it.
 fn mark_source(options: &mut ProviderOptions, key: &str, value: Value) {
     if let Some(Value::Object(source)) = options.get_mut("source") {
         source.insert(key.to_owned(), value);
     }
 }
 
+/// One `session_message` row: id, type, seq, `time_created` column, `data`.
+type V2Row = (String, String, i64, Option<i64>, String);
+
+fn v2_row(row: &rusqlite::Row) -> rusqlite::Result<V2Row> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
 /// Read one session's `session_message` rows in `seq` order (streamed off the
-/// unique `(session_id, seq)` index) and emit each as canonical events. With
-/// `migrated`, rows whose id shares a V1 message's creation instant are the
-/// migration's copies of records already read from the V1 tables and are
-/// skipped. Returns `false` when the consumer dropped the receiver.
+/// unique `(session_id, seq)` index) and emit each as canonical events. Skipped:
+/// with `copies`, the migration's copies of records already read from the V1
+/// tables; and any unsettled row of the open turn (after the last `idle`), which
+/// OpenCode is still rewriting in place - stored now, it would freeze half-written
+/// under its final id (spec.md#adapter-integrity-additive-sync), so it waits for
+/// a later sync (the watermark keeps the session unknown until then). An
+/// unsettled row behind a later `idle` belongs to a closed turn (an abandoned
+/// run, a long background shell) and lands as found. Returns `false` when the
+/// consumer dropped the receiver.
 fn read_v2_messages(
     conn: &Connection,
     db_path: &Path,
     session_id: &str,
     session_anchor: DateTime<Utc>,
-    migrated: Option<&HashSet<String>>,
+    copies: Option<&MigrationCopies>,
     tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>,
 ) -> bool {
-    let rows = (|| -> rusqlite::Result<Vec<(String, String, i64, String)>> {
+    let rows = (|| -> rusqlite::Result<Vec<rusqlite::Result<V2Row>>> {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, type, seq, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+            "SELECT id, type, seq, time_created, data FROM session_message \
+             WHERE session_id = ?1 ORDER BY seq",
         )?;
-        let rows = stmt.query_map([session_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?;
-        rows.collect()
+        let rows = stmt.query_map([session_id], v2_row)?;
+        Ok(rows.collect())
     })();
     let rows = match rows {
         Ok(rows) => rows,
@@ -1547,8 +1691,22 @@ fn read_v2_messages(
             return true;
         }
     };
-    for (id, kind, seq, data) in rows {
-        if migrated.is_some_and(|instants| instants.contains(id_instant(&id))) {
+    let open_turn = rows
+        .iter()
+        .flatten()
+        .filter(|(_, kind, ..)| kind == "idle")
+        .map(|(_, _, seq, ..)| *seq)
+        .max()
+        .unwrap_or(i64::MIN);
+    for row in rows {
+        let (id, kind, seq, time_created, data) = match row {
+            Ok(row) => row,
+            Err(error) => {
+                emit!(tx, Err(db_error(db_path, "read v2 message row", &error)));
+                continue;
+            }
+        };
+        if copies.is_some_and(|copies| copies.contains(&id, time_created)) {
             continue;
         }
         let record = match reconstruct_record(
@@ -1564,6 +1722,9 @@ fn read_v2_messages(
                 continue;
             }
         };
+        if seq > open_turn && !is_settled(&kind, &record) {
+            continue;
+        }
         for event in build_v2_message_events(session_id, &id, &record, seq, session_anchor) {
             emit!(tx, Ok(AdapterYield::Event(event)));
         }
@@ -2212,7 +2373,7 @@ fn serialize_native(
     let Some(session_raw) = raw_record(&session.session.options) else {
         return serialize_foreign(session);
     };
-    if session_store(&session.session.options) == Some(V2_STORE) {
+    if session_store(&session.session.options).is_some() {
         return serialize_native_v2(session, &session_raw);
     }
 
@@ -2301,6 +2462,12 @@ fn serialize_native_v2(
 /// `session_v2` row: the `Session.Info` its export writes and its import reads.
 fn v2_session_info(row: &Value) -> Value {
     let column = |name: &str| row.get(name).filter(|value| !value.is_null());
+    // `fromRow` tests these columns for JS truthiness, so `""` and `0` read as unset.
+    let truthy = |name: &str| {
+        column(name).filter(|value| {
+            !matches!(value, Value::String(text) if text.is_empty()) && value.as_f64() != Some(0.0)
+        })
+    };
     let mut info = serde_json::Map::new();
     let mut set = |key: &str, value: Option<Value>| {
         if let Some(value) = value {
@@ -2310,18 +2477,18 @@ fn v2_session_info(row: &Value) -> Value {
     set("id", column("id").cloned());
     set("projectID", column("project_id").cloned());
     set("title", column("title").cloned());
-    set("parentID", column("parent_id").cloned());
-    if let (Some(session_id), Some(boundary)) = (column("fork_session_id"), column("fork_boundary"))
+    set("parentID", truthy("parent_id").cloned());
+    if let (Some(session_id), Some(boundary)) = (truthy("fork_session_id"), truthy("fork_boundary"))
     {
         set(
             "fork",
             Some(json!({ "sessionID": session_id, "boundary": boundary })),
         );
     }
-    set("agent", column("agent").cloned());
+    set("agent", truthy("agent").cloned());
     set(
         "model",
-        column("model").map(|model| {
+        truthy("model").map(|model| {
             let mut model = model.clone();
             if let Value::Object(map) = &mut model {
                 // fromRow defaults an unrecorded variant the same way.
@@ -2349,10 +2516,10 @@ fn v2_session_info(row: &Value) -> Value {
         location.insert("workspaceID".to_owned(), workspace.clone());
     }
     set("location", Some(Value::Object(location)));
-    set("subpath", column("path").cloned());
+    set("subpath", truthy("path").cloned());
     set("metadata", column("metadata").cloned());
     set("permissions", column("permission").cloned());
-    set("revert", column("revert").cloned());
+    set("revert", truthy("revert").map(current_revert));
     set("outcome", column("idle_outcome").cloned());
     let mut time = serde_json::Map::new();
     for (key, name) in [
@@ -2362,12 +2529,51 @@ fn v2_session_info(row: &Value) -> Value {
         ("viewed", "time_viewed"),
         ("archived", "time_archived"),
     ] {
-        if let Some(value) = column(name) {
+        let value = if name == "time_archived" {
+            truthy(name)
+        } else {
+            column(name)
+        };
+        if let Some(value) = value {
             time.insert(key.to_owned(), value.clone());
         }
     }
     set("time", Some(Value::Object(time)));
     Value::Object(info)
+}
+
+/// `PersistedRevert` (`session-revert.ts`): revert state stored before
+/// `FileDiff` became canonical (`files[].path`, `diff`) decodes to the current
+/// shape, which is the only one `Session.Info` accepts.
+fn current_revert(revert: &Value) -> Value {
+    let files = revert.get("files").and_then(Value::as_array);
+    let legacy = revert.get("diff").is_some()
+        || files.is_some_and(|files| files.iter().any(|file| file.get("path").is_some()));
+    if !legacy {
+        return revert.clone();
+    }
+    let mut current = serde_json::Map::new();
+    for key in ["messageID", "partID", "snapshot"] {
+        if let Some(value) = revert.get(key).filter(|value| !value.is_null()) {
+            current.insert(key.to_owned(), value.clone());
+        }
+    }
+    if let Some(files) = files {
+        let files = files
+            .iter()
+            .map(|file| {
+                json!({
+                    "file": file.get("path"),
+                    "status": file.get("status"),
+                    "additions": file.get("additions"),
+                    "deletions": file.get("deletions"),
+                    "patch": file.get("patch"),
+                })
+            })
+            .collect();
+        current.insert("files".to_owned(), Value::Array(files));
+    }
+    Value::Object(current)
 }
 
 fn serialize_foreign(
@@ -4557,5 +4763,303 @@ mod tests {
             "with no V1 rows to prefer, the V2 copies are the only record",
         );
         Ok(())
+    }
+
+    #[test]
+    fn synthetic_id_matches_the_migration() {
+        assert_eq!(
+            synthetic_id("msg_131bb1661001jevwkFX4ZpwQDM"),
+            V2_MIGRATED_SPLIT_COPY,
+            "the user/synthetic split",
+        );
+        assert_eq!(
+            synthetic_id("msg_131ba23ec001D2OA1U5ijz8c0y"),
+            V2_LEGACY_TOOL_NOTICE,
+            "the legacy-tool notice after the last projected row",
+        );
+    }
+
+    fn insert_v2_row(
+        conn: &Connection,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        seq: i64,
+        created_ms: i64,
+        data: &Value,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            rusqlite::params![id, session_id, kind, seq, created_ms, data.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn message_ids(session: &crate::sessions::SessionWithMessages) -> Vec<&str> {
+        session.messages.iter().map(|m| m.message.id()).collect()
+    }
+
+    /// A V1 message deleted after the migration (an OpenCode 1.x revert after a
+    /// downgrade) leaves its V2 copy behind; the copy still predates the recorded
+    /// migration, so it stays skipped. A post-migration row that happens to share
+    /// a V1 id's 16-char prefix (the prefix wraps every 2^36 ms) is kept.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_copies_are_exact_and_survive_v1_deletes() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        let deleted_v1 = "msg_131ba23ec001D2OA1U5ijz8c0y";
+        let lookalike = "msg_131ba23ec001ZZZZZZZZZZZZZZ";
+        {
+            let conn = Connection::open(data.join("opencode.db"))?;
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+            conn.execute("DELETE FROM part WHERE message_id = ?1", [deleted_v1])?;
+            conn.execute("DELETE FROM message WHERE id = ?1", [deleted_v1])?;
+            insert_v2_row(
+                &conn,
+                lookalike,
+                V2_MIGRATED_WITH_NOTICE,
+                "user",
+                500,
+                1_800_000_000_000,
+                &json!({ "time": { "created": 1_800_000_000_000i64 }, "text": "after the upgrade" }),
+            )?;
+        }
+        let store = Store::open_local(temp.path().join("store")).await?;
+        ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+        let session = store
+            .get_session(V2_MIGRATED_WITH_NOTICE)
+            .await?
+            .expect("ingests");
+        let ids = message_ids(&session);
+        assert!(
+            !ids.contains(&deleted_v1),
+            "the deleted V1 message's copy stays skipped"
+        );
+        assert!(!ids.contains(&V2_LEGACY_TOOL_NOTICE));
+        assert!(
+            ids.contains(&lookalike),
+            "a prefix lookalike is real activity"
+        );
+        Ok(())
+    }
+
+    /// A pre-release OpenCode 2 DB keeps V2 heads in a table still named
+    /// `session` (bodies in `session_message`). Its sessions read through the V2
+    /// path; one the live DB already holds is superseded, a unique one lands
+    /// with its transcript.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prerelease_v2_db_reads_heads_from_its_session_table() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        let next = data.join("opencode-next.db");
+        std::fs::copy(v2_db_fixture(), &next)?;
+        let unique = "ses_zzzznextonly000000000000";
+        {
+            let conn = Connection::open(&next)?;
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE part; DROP TABLE message; DROP TABLE session;
+                 ALTER TABLE session_v2 RENAME TO session;",
+            )?;
+            conn.execute(
+                "UPDATE session SET id = ?1 WHERE id = ?2",
+                [unique, V2_OPS_SESSION],
+            )?;
+            conn.execute(
+                "UPDATE session_message SET session_id = ?1 WHERE session_id = ?2",
+                [unique, V2_OPS_SESSION],
+            )?;
+        }
+        let store = Store::open_local(temp.path().join("store")).await?;
+        let summary = ingest_adapter(
+            &store,
+            &OpencodeAdapter::new(&data),
+            &crate::adapter::NoopOracle,
+            |_| {},
+        )
+        .await?;
+        assert_eq!(summary.dropped_events, 0, "{summary:?}");
+        assert_eq!(store.session_ids().await?.len(), V2_SESSION_COUNT + 1);
+        assert_eq!(
+            summary.skipped_superseded,
+            V2_SESSION_COUNT - 1,
+            "{summary:?}"
+        );
+        let session = store
+            .get_session(unique)
+            .await?
+            .expect("unique session lands");
+        let ops = store.get_session(V2_OPS_SESSION).await?.expect("ops lands");
+        assert_eq!(
+            session.messages.len(),
+            ops.messages.len(),
+            "with its whole transcript"
+        );
+        assert_eq!(session_store(&session.session.options), Some("session"));
+        assert_eq!(
+            serialize_native(&session)?[0].actual_fidelity,
+            RestoreFidelity::Native
+        );
+        Ok(())
+    }
+
+    /// OpenCode rewrites a running assistant row in place. A sync mid-turn
+    /// defers it (and keeps the session unknown, so it is re-read); once the
+    /// turn closes, the finished row lands with its final content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unsettled_rows_wait_for_the_turn_to_close() -> anyhow::Result<()> {
+        const SESSION: &str = "ses_ece40409affezvqxNOKCv7GG6X";
+        const ASSISTANT: &str = "msg_zzzzv2streaming0000000000";
+        let temp = TempDir::new()?;
+        let (store, data, _) = ingest_v2(temp.path()).await?;
+        let db = data.join("opencode.db");
+        let adapter = OpencodeAdapter::new(&data);
+        let started: i64 = 1_800_000_000_000;
+        let assistant = |text: &str, completed: Option<i64>| {
+            let mut time = json!({ "created": started + 1 });
+            if let Some(completed) = completed {
+                time["completed"] = json!(completed);
+            }
+            json!({
+                "time": time, "agent": "build",
+                "model": { "id": "m", "providerID": "p" },
+                "content": [{ "type": "text", "text": text }],
+            })
+        };
+        {
+            let conn = Connection::open(&db)?;
+            insert_v2_row(
+                &conn,
+                "msg_zzzzv2prompt0000000000000",
+                SESSION,
+                "user",
+                100,
+                started,
+                &json!({ "time": { "created": started }, "text": "next question" }),
+            )?;
+            insert_v2_row(
+                &conn,
+                ASSISTANT,
+                SESSION,
+                "assistant",
+                101,
+                started + 1,
+                &assistant("par", None),
+            )?;
+        }
+        let light = DbLight {
+            db_path: db.clone(),
+            session_id: SESSION.to_owned(),
+            store: DbStore::V2 { head: "session_v2" },
+        };
+        assert_eq!(
+            db_store_watermark(&open_db(&db)?, &light)?,
+            None,
+            "open turn: unknown"
+        );
+
+        let fresh_everywhere = FixedOracle {
+            session_id: SESSION,
+            watermark_micros: i64::MAX,
+        };
+        ingest_adapter(&store, &adapter, &fresh_everywhere, |_| {}).await?;
+        let mid = store.get_session(SESSION).await?.expect("ingested");
+        assert!(message_ids(&mid).contains(&"msg_zzzzv2prompt0000000000000"));
+        assert!(
+            !message_ids(&mid).contains(&ASSISTANT),
+            "the running row is deferred"
+        );
+
+        {
+            let conn = Connection::open(&db)?;
+            conn.execute(
+                "UPDATE session_message SET data = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    assistant("final answer", Some(started + 5)).to_string(),
+                    ASSISTANT
+                ],
+            )?;
+            insert_v2_row(
+                &conn,
+                "msg_zzzzv2idle000000000000000",
+                SESSION,
+                "idle",
+                102,
+                started + 6,
+                &json!({ "time": { "created": started + 6 }, "outcome": "succeeded" }),
+            )?;
+        }
+        let oracle = FixedOracle {
+            session_id: SESSION,
+            watermark_micros: started * 1_000,
+        };
+        ingest_adapter(&store, &adapter, &oracle, |_| {}).await?;
+        let done = store.get_session(SESSION).await?.expect("ingested");
+        let finished = done
+            .messages
+            .iter()
+            .find(|m| m.message.id() == ASSISTANT)
+            .expect("the settled row lands");
+        assert_eq!(
+            texts(finished),
+            vec![(Provenance::Conversational, "final answer".to_owned())],
+        );
+        Ok(())
+    }
+
+    /// An unreadable newest V2 row makes a migrated session unknown even though
+    /// its V1 side alone would read as fresh, so the next sync surfaces it.
+    #[test]
+    fn unreadable_v2_tail_makes_a_migrated_session_unknown() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let data = v2_data_dir(temp.path())?;
+        let db = data.join("opencode.db");
+        Connection::open(&db)?.execute(
+            "UPDATE session_message SET data = '{not json' WHERE id = ?1",
+            [V2_POST_MIGRATION_USER],
+        )?;
+        // The marker after it would otherwise close the turn before it.
+        Connection::open(&db)?.execute(
+            "DELETE FROM session_message WHERE session_id = ?1 AND type = 'idle'",
+            [V2_MIGRATED_CONTINUED],
+        )?;
+        let light = DbLight {
+            db_path: db.clone(),
+            session_id: V2_MIGRATED_CONTINUED.to_owned(),
+            store: DbStore::Migrated,
+        };
+        assert_eq!(db_store_watermark(&open_db(&db)?, &light)?, None);
+        Ok(())
+    }
+
+    /// `info` follows OpenCode's `fromRow`: falsy columns read as unset, and a
+    /// legacy revert decodes to the current shape.
+    #[test]
+    fn v2_session_info_follows_from_row() {
+        let info = v2_session_info(&json!({
+            "id": "ses_a", "project_id": "p", "directory": "/w", "title": "",
+            "parent_id": "", "agent": "", "path": "", "time_archived": 0,
+            "time_created": 1, "time_updated": 2, "cost": 0.5,
+            "tokens_input": 1, "tokens_output": 2, "tokens_reasoning": 0,
+            "tokens_cache_read": 0, "tokens_cache_write": 0,
+            "revert": { "messageID": "msg_a", "diff": "d",
+                        "files": [{ "path": "f", "status": "modified", "additions": 1, "deletions": 0, "patch": "p" }] },
+        }));
+        assert_eq!(info["title"], "", "title uses `??`, so an empty one stays");
+        for key in ["parentID", "agent", "subpath"] {
+            assert!(info.get(key).is_none(), "{key} is unset when empty");
+        }
+        assert!(info["time"].get("archived").is_none());
+        assert_eq!(
+            info["revert"],
+            json!({ "messageID": "msg_a", "files": [{ "file": "f", "status": "modified", "additions": 1, "deletions": 0, "patch": "p" }] }),
+        );
     }
 }

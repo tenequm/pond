@@ -916,15 +916,15 @@ migration and the dedup rule for sessions present in both live in
     66 rows = 22 `assistant`, 15 `user`, 14 `idle` (13 `succeeded`, 1
     `failed`), 4 `synthetic`, 3 `agent-switched`, 3 `model-switched`, 2
     `system`, 1 `skill`, 1 `shell`, 1 `compaction`. Of those, 9 are
-    migration-derived (id equal to, or sharing the 16-char prefix of, a V1
-    message id of the same session: 4 assistant, 3 user, 1 synthetic, 1
-    system) and 57 are native V2 rows.
+    migration copies (a kept V1 message id or its migration `syntheticID`,
+    all with `time_created` before the recorded migration completion: 4
+    assistant, 3 user, 1 synthetic, 1 system) and 57 are native V2 rows.
   - Assistant content in the 57 native rows: 15 `text`, 6 `reasoning`, 7
     `tool` (5 `completed`, 2 `error`).
   - Migrated, untouched after migration: `ses_ece45fa45ffewtiD8DSPLj3P62`
     plain text (2 rows, both kept V1 ids) and `ses_ece45e791ffekNVGH2hsZMQvl5`
     read tool (4 rows: 3 kept ids + the legacy-tool `system` notice
-    `msg_131ba23ec001TKOqvkoEn1JeVb`, prefix-sharing with the last V1
+    `msg_131ba23ec001TKOqvkoEn1JeVb` = `syntheticID` of the last V1
     assistant).
   - Migrated and continued in V2 (the mixed case):
     `ses_ece44e9c1ffeJWYCR23BcS31lX` - 9 rows: 3 derived (the `user` row with
@@ -1157,9 +1157,11 @@ Update as gaps are closed.
   `location-switched` row, no `idle` with outcome `interrupted`, no fork with
   a `before` boundary, no reverted session (revert deletes rows), no session
   imported from an earlier `opencode-next.db`, and no Windows capture.
-  Unfinished tool items and an unknown message type are covered by a
-  hand-built record in a unit test (`v2_unfinished_and_unknown_records_land_without_synthesis`),
-  and a session repeated across DB files by copying this fixture in-test.
+  Unit tests cover these by editing an in-test copy of this fixture or
+  hand-building records: unfinished tool items and an unknown message type,
+  a running assistant deferred until its turn closes, a V1 message deleted
+  after the migration, a session repeated across DB files, and a pre-release
+  DB whose V2 heads live in a `session` table.
   Unknown and uncaptured types still flow through the adapter as rule-3
   carriers, so the untested surface is their type-specific mapping
   (`docs/adapters/opencode.md` rows 5-7: results, provenance,
