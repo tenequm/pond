@@ -2058,7 +2058,7 @@ Examples (4 patterns the agent should recognize):
 
         use std::sync::Arc;
 
-        use rmcp::model::{ErrorCode as JsonRpcErrorCode, Tool};
+        use rmcp::model::Tool;
 
         use super::*;
         use crate::wire::{ErrorBody, ErrorCode};
