@@ -53,6 +53,9 @@ env:
   # jobs that don't run moon.
   MOON_REMOTE_HOST: ${{ secrets.BAZEL_REMOTE_AUTH != '' && 'grpcs://bazel-remote.cascade.fyi:443' || '' }}
   BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
+  # .moon/workspace.yml turns the local CAS + shared worktree cache on for
+  # developer machines; env overrides the file, keeping the experiment off CI.
+  MOON_EXPERIMENT_CAS_OUTPUTS_CACHE: 'false'
 
 jobs:
   build-and-test-linux:

@@ -43,3 +43,15 @@ remote:
   cache:
     instanceName: 'pond'
     compression: 'zstd'
+
+# Every worktree of a clone (treehouse slots, agent lanes, the main checkout)
+# shares one result store in the main checkout's .moon/cache, so a task that
+# passed in one replays as `cached` in any other at identical inputs. Both are
+# required: the shared store is the local CAS. CI opts out (workflow env in
+# ci.yml) - one checkout per runner gains nothing, and the experiment stays
+# off the release path. Nothing prunes the store; run a plain `moon clean`.
+experiments:
+  casOutputsCache: true
+
+cache:
+  unstable_sharedWorktreeCache: true
