@@ -273,9 +273,9 @@ tempfile = "3.25"
 tokio = { version = "1.52", features = ["test-util"] }
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
 tower = { version = "0.5", features = ["util"] }
-# 0.14, not 0.13: lance-io v8 pulls opendal 0.57, whose opendal-core needs the
-# md-5 0.11.0 release; s3s 0.13 pins md-5 =0.11.0-rc.5, which blocks resolution.
-# Coupled to the lance v8 bump - keep in lockstep.
+# 0.14, not 0.13: lance-io pulls opendal (0.59 at lance 13), whose opendal-core
+# needs the md-5 0.11.0 release; s3s 0.13 pins md-5 =0.11.0-rc.5, which blocks
+# resolution. Coupled to the lance pins - keep in lockstep.
 s3s = "0.14"
 s3s-fs = "0.14"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
