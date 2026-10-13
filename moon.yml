@@ -206,6 +206,9 @@ tasks:
       # ad-hoc otherwise so local and fork builds still get a loadable arm64
       # binary. Gatekeeper denies unnotarized Developer ID outright, so the
       # cert path is only ever taken by CI, which pairs it with notarization.
+      # The identifier is pinned because a bare Mach-O has no bundle ID to
+      # default to: rcodesign would keep the linker's `pond-<cargo hash>`, which
+      # changes every release and breaks firewall and privacy rules keyed on it.
       if [ -n "${APPLE_P12_BASE64:-}" ]; then
         creds="$(mktemp -d)"
         printf '%s' "$APPLE_P12_BASE64" | base64 -d > "$creds/id.p12"
@@ -213,10 +216,13 @@ tasks:
         rcodesign --config-file /dev/null sign \
           --p12-file "$creds/id.p12" --p12-password-file "$creds/id.pass" \
           --code-signature-flags runtime \
+          --binary-identifier com.github.tenequm.pond \
           target/dist/pond-aarch64-apple-darwin
         rm -rf "$creds"
       else
-        rcodesign --config-file /dev/null sign target/dist/pond-aarch64-apple-darwin
+        rcodesign --config-file /dev/null sign \
+          --binary-identifier com.github.tenequm.pond \
+          target/dist/pond-aarch64-apple-darwin
       fi
       cp "$TD/aarch64-unknown-linux-gnu/dist/pond" target/dist/pond-aarch64-unknown-linux-gnu
       cp "$TD/x86_64-unknown-linux-gnu/dist/pond" target/dist/pond-x86_64-unknown-linux-gnu

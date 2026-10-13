@@ -695,10 +695,12 @@ jobs:
           # Gatekeeper cannot be asked directly: `spctl --assess --type exec`
           # rejects ANY bare CLI binary ("does not seem to be an app"), even a
           # correctly notarized one. Assert the two properties notarization
-          # actually requires instead.
+          # actually requires instead, plus the pinned identifier that firewall
+          # and privacy rules key on (#353).
           codesign -dvvv ./pond 2>&1 | tee sig.txt
           grep -q 'Authority=Developer ID Application' sig.txt
           grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)' sig.txt
+          grep -qx 'Identifier=com.github.tenequm.pond' sig.txt
 
       - name: Notarize with Apple
         if: needs.dist-build-unix.outputs.signed == 'true'
