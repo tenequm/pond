@@ -192,7 +192,7 @@ runs:
     #
     # Its post step is `success() || failure()`, so a red run still saves, which
     # matters because Windows iteration means a test failing after a long compile.
-    - uses: kunobi-ninja/kache-action@d71ab254aa8c20bdfa2dc38856611f5e78678cc6 # main @ 2026-09-14
+    - uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # main @ 2026-10-03
       with:
         s3-bucket: ttq
         s3-endpoint: https://nbg1.your-objectstorage.com
@@ -210,9 +210,9 @@ runs:
         # Bumped in lockstep with the dist-build-unix pin and the k-tag in the
         # prefixes, never alone. kache strips the remote env from daemons it
         # spawns, which is harmless here because the daemon reads KACHE_CONFIG.
-        # 0.27.0 moved the key schema 31 -> 32, so no 0.22 entry matches and
-        # the k34 prefixes start cold on purpose.
-        version: v0.28.1
+        # 1.1.0 corrected the build-script and native keys without moving
+        # CACHE_KEY_VERSION, so the k35 prefixes start cold on purpose.
+        version: v1.1.1
         manifest-key: ${{ inputs.manifest-key }}
         # Above kache's 5%-of-disk default because the cap MUST stay above the
         # remote prefix, while still leaving room for target/ and CARGO_HOME.
@@ -257,8 +257,9 @@ runs:
         $ErrorActionPreference = 'Stop'
         $stats = kache stats 2>&1
         $stats
-        $line = $stats | Select-String -Pattern '^Remote:\s+(\S+)' | Select-Object -First 1
-        if (-not $line) { throw "kache stats printed no Remote: line" }
+        # 1.x prints an indented `  Remote   <url>` row; 0.x printed `Remote: <url>`.
+        $line = $stats | Select-String -Pattern '^\s*Remote:?\s+(\S+://\S+)' | Select-Object -First 1
+        if (-not $line) { throw "kache stats printed no Remote row with a URL" }
         $remote = $line.Matches[0].Groups[1].Value
         if ($remote -notmatch "^s3://.+/$([regex]::Escape($env:KACHE_PREFIX_EXPECTED))$") {
           throw "kache resolved its remote to '$remote', expected an s3 remote ending in '$($env:KACHE_PREFIX_EXPECTED)' - the config at $env:KACHE_CONFIG did not load as intended"
