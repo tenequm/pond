@@ -347,10 +347,8 @@ enum RowmapEnsure {
     Contended,
 }
 
-/// The rowmap build `flock`, released explicitly on drop rather than on close.
-/// The lock belongs to the open file description, so a subprocess spawned while
-/// it is held inherits a duplicate and would keep it held until that child
-/// execs - a phantom contention that leaves the next build installing no map.
+/// Unlocked explicitly on drop: a subprocess spawned while it is held inherits
+/// the open file description and would hold the flock until it execs.
 struct RowmapBuildLock(std::fs::File);
 
 impl RowmapBuildLock {
@@ -8805,8 +8803,8 @@ mod tests {
     }
 
     fn hold_rowmap_lock(store: &Store, cache: &Path) -> anyhow::Result<RowmapBuildLock> {
-        Ok(RowmapBuildLock::try_acquire(cache, &store.store_key())?
-            .expect("the rowmap build lock is free"))
+        RowmapBuildLock::try_acquire(cache, &store.store_key())?
+            .context("rowmap build lock already held")
     }
 
     /// Same as [`store_with_messages`] but tests optimize with a custom
@@ -10575,50 +10573,22 @@ mod tests {
         Ok(())
     }
 
-    /// A subprocess spawned while the build lock is held inherits its open file
-    /// description; without the explicit unlock on drop, the next acquire sees
-    /// that child's copy as a live holder. Spawn-count asserted so a machine
-    /// where `/bin/sh` never runs cannot pass without opening the window.
+    /// A cloned descriptor shares the open file description exactly as a forked
+    /// child's inherited copy does, so this needs no real subprocess or timing.
     #[cfg(unix)]
     #[test]
-    fn rowmap_build_lock_frees_on_drop_while_subprocesses_spawn() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawned = Arc::new(AtomicUsize::new(0));
-        let spawner = {
-            let stop = Arc::clone(&stop);
-            let spawned = Arc::clone(&spawned);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if std::process::Command::new("/bin/sh")
-                        .args(["-c", ":"])
-                        .status()
-                        .is_ok()
-                    {
-                        spawned.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            })
-        };
-
-        let dir = TempDir::new().unwrap();
-        // Each acquire is dropped at the end of its round, so every round after
-        // the first proves the previous round's drop released the lock.
-        let leaked_round = (0..2_000).find(|_| {
-            RowmapBuildLock::try_acquire(dir.path(), "k")
-                .unwrap()
-                .is_none()
-        });
-
-        stop.store(true, Ordering::Relaxed);
-        spawner.join().unwrap();
-        assert_eq!(
-            leaked_round, None,
+    fn rowmap_build_lock_frees_on_drop_while_an_inherited_descriptor_is_alive() -> anyhow::Result<()>
+    {
+        let dir = TempDir::new()?;
+        let lock = RowmapBuildLock::try_acquire(dir.path(), "k")?.context("fresh lock")?;
+        let inherited = lock.0.try_clone()?;
+        assert!(RowmapBuildLock::try_acquire(dir.path(), "k")?.is_none());
+        drop(lock);
+        assert!(
+            RowmapBuildLock::try_acquire(dir.path(), "k")?.is_some(),
             "an inherited descriptor kept the build lock held after drop"
         );
-        assert!(
-            spawned.load(Ordering::Relaxed) > 0,
-            "no subprocess ever spawned - this test proved nothing",
-        );
+        drop(inherited);
+        Ok(())
     }
 }
