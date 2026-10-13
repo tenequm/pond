@@ -145,7 +145,7 @@ tasks:
   # target dir and dist/ lands at the root where publish-release reads it.
   # Inline on purpose: a file would be hashed by content just the same, and
   # moon substitutes its own `$` tokens ($target, $os, $arch, $time, ...) in a
-  # script - never name a shell variable after one.
+  # script, matched as a prefix - never start a shell variable's name with one.
   build-dist:
     script: |
       set -euo pipefail
@@ -274,7 +274,7 @@ tasks:
     options:
       cache: true
       outputStyle: stream
-      # Not $SHELL: on a dev Mac that is zsh.
+      # moon falls back to sh when bash is not on PATH; this script needs bash.
       unixShell: 'bash'
 
   # The shipped msvc zip, built natively on a Windows runner. A moon task rather
@@ -338,6 +338,6 @@ tasks:
     options:
       cache: true
       outputStyle: stream
-      # Must be pwsh, not moon's resolved default `powershell` (Windows
-      # PowerShell 5.1): $PSNativeCommandUseErrorActionPreference needs 7.3+.
+      # Pinned so a host without pwsh fails instead of falling back to Windows
+      # PowerShell 5.1, which ignores $PSNativeCommandUseErrorActionPreference.
       windowsShell: 'pwsh'

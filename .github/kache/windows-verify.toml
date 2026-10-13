@@ -27,7 +27,7 @@
 # conditional PUT rejects the standard quoted `If-Match` with 412, so every
 # manifest merge after the first write failed there and prefetch went stale.
 #
-# Every key below exists unchanged through 1.1.1
+# Every key below except `pull_request_prefix` (1.x only) exists unchanged through 1.1.1
 # (RemoteFileConfig). Full reasoning: docs/plans/2608-24-ci-caching-architecture.md.
 [cache.remote]
 type = "s3"

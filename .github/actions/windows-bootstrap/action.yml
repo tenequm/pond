@@ -234,13 +234,13 @@ runs:
     # a bad config file makes CI red rather than slow: the wrapper calls
     # Config::load() on every rustc invocation, so a TOML typo or a rejected
     # prefix would otherwise kill 1454 compiles one at a time instead of once
-    # here. A config gate, not a connectivity gate - the `Remote:` line is
+    # here. A config gate, not a connectivity gate - the `Remote` row is
     # resolved from the config without the bucket having to answer. Expect an
     # auto-start line: `kache stats` starts a daemon if none is reachable, which
     # is harmless here.
     #
     # The exit code is NOT the gate. Measured against 0.9.0: a config whose TOML
-    # does not parse makes `kache stats` print `Remote: not configured` and exit
+    # does not parse makes `kache stats` print a `Remote` of not configured and exit
     # 0, which is precisely the silent local-only run this arrangement exists to
     # prevent. So the assertion is on the line itself.
     - name: Verify the kache config loads
@@ -251,8 +251,8 @@ runs:
         $ErrorActionPreference = 'Stop'
         $stats = kache stats 2>&1
         $stats
-        # 1.x prints an indented `  Remote   <url>` row; 0.x printed `Remote: <url>`.
-        $line = $stats | Select-String -Pattern '^\s*Remote:?\s+(\S+://\S+)' | Select-Object -First 1
+        # kache 1.x prints an indented `  Remote   <url>` row.
+        $line = $stats | Select-String -Pattern '^\s*Remote\s+(\S+://\S+)' | Select-Object -First 1
         if (-not $line) { throw "kache stats printed no Remote row with a URL" }
         $remote = $line.Matches[0].Groups[1].Value
         if ($remote -notmatch "^s3://.+/$([regex]::Escape($env:KACHE_PREFIX_EXPECTED))$") {

@@ -352,8 +352,8 @@ jobs:
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
-      # --output-style stream: two primary targets otherwise buffer to exit, so
-      # a cold build logged nothing but moon's heartbeat for over an hour.
+      # --output-style stream: in CI moon buffers a task with no outputStyle to
+      # its exit, so a cold build logged nothing but moon's heartbeat for an hour.
       - name: Test
         run: moon run pond:lint-msvc pond:test-msvc --output-style stream
 
@@ -362,8 +362,8 @@ jobs:
       # enough: its "Prefetch: 0/N" line counts plan entries, not downloads
       # (kunobi-ninja/kache#618), so it reads as a total miss on a run that hit
       # 99.7%. `kache stats` carries the honest
-      # `Hit rate: X% (local/prefetch/remote/dup/miss)` split plus the `Remote:`
-      # and `Daemon:` lines that say which prefix actually served the run, and
+      # `Hit rate` split (local/prefetch/remote/dup/miss) plus the `Remote` and
+      # `Daemon` rows that say which prefix actually served the run, and
       # the daemon log is the only place a remote timeout is recorded.
       #
       # NOT `kache daemon log`: at v0.14.2 its Windows branch shells out to
