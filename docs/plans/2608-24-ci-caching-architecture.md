@@ -1,6 +1,6 @@
 # CI caching architecture: fast, robust, and settled once
 
-Date: 2026-08-24. Owner: tenequm. Status: both rounds landed on the PR branch and measured (results recorded under each round below); round two's cold run 32768577584 and warm-confirm run 32777363790 both passed - the Windows gate is at 9m 6s moon time warm, from 17.8-19.5 min. Remaining: merge #176.
+Date: 2026-08-24. Owner: tenequm. Update 2026-10-13 (PR #348, merged as df16abe): kache 1.1.1, prefixes k35, `pull_request_prefix` for windows-verify, both Windows legs moved to Cloudflare R2 `pond-kache` (Hetzner rejects kache's quoted `If-Match`, so manifests never updated), background `sync --pull --all` removed. Measured on R2: warm Windows job 9m57s (Hetzner 11m55s), prefetch 17.4 MB/s (Hetzner 6.9 MB/s), manifest saves; old Windows prefixes deleted from `ttq`. Original status: both rounds landed on the PR branch and measured (results recorded under each round below); round two's cold run 32768577584 and warm-confirm run 32777363790 both passed - the Windows gate is at 9m 6s moon time warm, from 17.8-19.5 min. Remaining: merge #176.
 
 Delivery: both rounds land in ONE pull request from `ci/kache-caching`, one commit per round. A round's first CI run on that PR - forced through the `force_build` dispatch input wherever a number will be read - is the acceptance gate for the next round's commit. Nothing is squashed or reordered: the commit boundaries are what make a single round revertible.
 
