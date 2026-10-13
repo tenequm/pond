@@ -194,9 +194,11 @@ runs:
     # matters because Windows iteration means a test failing after a long compile.
     - uses: kunobi-ninja/kache-action@1a33fb2ff51be23eb9e87abeae6edb65be78f71c # main @ 2026-10-03
       with:
-        s3-bucket: ttq
-        s3-endpoint: https://nbg1.your-objectstorage.com
-        s3-region: nbg1
+        # Cloudflare R2, matching .github/kache/windows-*.toml (see
+        # windows-verify.toml for why not Hetzner).
+        s3-bucket: pond-kache
+        s3-endpoint: https://3db7dd8ff22ae68593205855d8bc0b25.r2.cloudflarestorage.com
+        s3-region: auto
         # Per caller (see the s3-prefix input). Asserted equal to the config
         # file's `prefix` by the step above.
         s3-prefix: ${{ inputs.s3-prefix }}
@@ -214,19 +216,11 @@ runs:
         # CACHE_KEY_VERSION, so the k35 prefixes start cold on purpose.
         version: v1.1.1
         manifest-key: ${{ inputs.manifest-key }}
-        # Above kache's 5%-of-disk default because the cap MUST stay above the
-        # remote prefix, while still leaving room for target/ and CARGO_HOME.
-        # `sync --pull --all` materializes the whole prefix locally, and a
-        # cap under it makes the store evict mid-run - measured 2026-08-26 at a
-        # 27.5 GiB prefix against the old 20GiB cap (138%), 13 failed transfers
-        # and demand re-fetches during the build. D: holds ~147 GB total.
-        #
-        # Rotation is what keeps the prefix under the cap: rotate when it passes
-        # about twice the working set (1538 artifacts / 45 s on 2026-08-24 grew
-        # to 1925 / 156 s by 2026-08-26 - entry count lags the byte growth, and
-        # by 2026-09 the pull was ~650 s). The warm pull no longer times itself
-        # now that it runs detached, so read the size off `kache stats` in the
-        # diagnostics step instead.
+        # Above kache's 5%-of-disk default: the cap MUST stay above the working
+        # set the manifest prefetch materializes, or the store evicts mid-run
+        # (measured 2026-08-26: 13 failed transfers under a 20GiB cap), while
+        # still leaving room for target/ and CARGO_HOME. D: holds ~147 GB total.
+        # Read the store size off `kache stats` in the diagnostics step.
         max-size: 40GiB
         # ~3 min of link time on unchanged sources; the trade is unresolved
         # .pdb paths on a restored harness. Revert this line alone if job time
@@ -264,45 +258,3 @@ runs:
         if ($remote -notmatch "^s3://.+/$([regex]::Escape($env:KACHE_PREFIX_EXPECTED))$") {
           throw "kache resolved its remote to '$remote', expected an s3 remote ending in '$($env:KACHE_PREFIX_EXPECTED)' - the config at $env:KACHE_CONFIG did not load as intended"
         }
-
-    # The warm pull moves the whole remote prefix (27.5 GiB / ~156 s measured
-    # 2026-08-26, ~650 s by 2026-09), and it used to run to completion BEFORE
-    # the build step started. That was the single largest cost on this leg: on
-    # every run where moon then served the msvc tasks from its remote cache -
-    # every doc-, CI- and plugin-only diff, and every merge push whose PR had
-    # already compiled, 9 of 31 pulling runs measured - cargo never started and
-    # the whole pull was waste.
-    #
-    # It is now started DETACHED and never waited on. A background process
-    # survives the end of its step on the Windows runner, so it keeps filling
-    # the store while the caller's build step runs:
-    #   - moon replays  -> the job finishes in ~30 s and the pull is discarded
-    #     with the runner. The ~650 s is simply gone.
-    #   - real compile  -> the bulk pull overlaps cargo instead of preceding
-    #     it, and anything it has not reached yet is demand-fetched by the
-    #     wrapper exactly as it would be on a cold store.
-    #
-    # This replaces a path-regex step that guessed whether the diff touched the
-    # msvc tasks' inputs. The guess deliberately over-matched, so it kept the
-    # pull far more often than needed; backgrounding removes the need to guess
-    # at all. The alternative the plan also allows - asking moon itself
-    # (`moon query affected`) and skipping on a confirmed replay - is strictly
-    # more accurate but still a prediction, and it cannot help the runs that DO
-    # compile. Revisit it if the overlapped demand fetches show up in the
-    # `Hit rate:` line of the kache diagnostics.
-    #
-    # Fail-soft in every direction: --allow-partial because kache exits
-    # non-zero on any failed transfer, output to a log the diagnostics step
-    # tails, and the step itself cannot fail the job - it only starts a
-    # process.
-    - name: Warm the kache store in the background
-      shell: pwsh
-      run: |
-        $log = Join-Path $env:RUNNER_TEMP 'kache-warm.log'
-        "KACHE_WARM_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        $proc = Start-Process -FilePath 'kache' `
-          -ArgumentList 'sync','--pull','--all','--allow-partial' `
-          -RedirectStandardOutput $log `
-          -RedirectStandardError "$log.err" `
-          -PassThru -NoNewWindow
-        "started kache sync --pull --all in the background, pid $($proc.Id), log $log"

@@ -332,8 +332,8 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/windows-bootstrap
         with:
-          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          kache-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          kache-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
           manifest-key: windows-verify
           s3-prefix: kache/pond/windows-verify/k35
           # Test leg only, never dist-build-windows: a restored harness has
@@ -345,11 +345,10 @@ jobs:
       # The round-one `kache pull dry run` step is gone, deliberately: it
       # measured the lock-filtered enumeration (one sequential LIST per lock
       # crate, 126.8 s measured against the shared prefix), and that number did
-      # its job - it sized round two in favor of `--pull --all` on a per-job
-      # prefix. Re-adding it would still buy nothing and cost ~2 min per run.
-      # What the warm pull reports has shrunk since: it is detached now, so the
-      # `Plan:` count reaches the log only if the pull gets that far, and no step
-      # times it. `kache stats` in the diagnostics below is the surviving number.
+      # its job. The bulk `sync --pull --all` it sized is gone too: on R2 the
+      # manifest merges succeed, so kache-action's default manifest prefetch
+      # (`warm: true`) fetches the working set itself. `kache stats` in the
+      # diagnostics below is the number to read.
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
@@ -389,14 +388,6 @@ jobs:
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
-          # windows-bootstrap's warm pull runs detached, so this log is the only
-          # record of whether it finished before the build did - and the only
-          # place a `Plan:` count or a failed transfer is reported.
-          if ($env:KACHE_WARM_LOG -and (Test-Path $env:KACHE_WARM_LOG)) {
-            "--- background warm pull ---"
-            Get-Content -Tail 40 $env:KACHE_WARM_LOG
-            if (Test-Path "$($env:KACHE_WARM_LOG).err") { Get-Content -Tail 40 "$($env:KACHE_WARM_LOG).err" }
-          } else { "no background warm-pull log" }
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
@@ -440,8 +431,8 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/windows-bootstrap
         with:
-          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          kache-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          kache-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
           manifest-key: windows-dist
           s3-prefix: kache/pond/windows-dist/k35
 
@@ -491,14 +482,6 @@ jobs:
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
-          # windows-bootstrap's warm pull runs detached, so this log is the only
-          # record of whether it finished before the build did - and the only
-          # place a `Plan:` count or a failed transfer is reported.
-          if ($env:KACHE_WARM_LOG -and (Test-Path $env:KACHE_WARM_LOG)) {
-            "--- background warm pull ---"
-            Get-Content -Tail 40 $env:KACHE_WARM_LOG
-            if (Test-Path "$($env:KACHE_WARM_LOG).err") { Get-Content -Tail 40 "$($env:KACHE_WARM_LOG).err" }
-          } else { "no background warm-pull log" }
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
