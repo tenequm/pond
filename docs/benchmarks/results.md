@@ -14,6 +14,7 @@ Numbers that have hardened into rules live in CLAUDE.md as prose (the S3 commit-
 - **win-5700x3d** - AMD Ryzen 7 5700X3D (8C/16T), 16 GB, Windows 11 Pro 10.0.26200, NTFS on NVMe SSD.
 - **s3-nbg1** - Hetzner object storage at `nbg1.your-objectstorage.com`, driven from mac-m1max.
 
+- **bl** - Beelink EQ13, Intel N100 (4C/4T), 16 GB, Ubuntu 24.04, ext4 on NVMe. Drives s3-nbg1 over a home link. Its rows carry host `Linux-x86_64`, the same tag as ws-pond-01's, though the hardware is far smaller.
 - **ws-pond-01** - Devboxes sandbox VM, NixOS (Linux 6.18.50), AMD EPYC 16 vCPU, 62 GB, ext4 on virtio SSD. Drives s3-nbg1 from Nuremberg-adjacent network rather than over a home link, which is why its S3 numbers are not comparable to mac-m1max's.
 
 The 2026-09-10 bench-gate row is the first Linux entry in this file. Before it, on 2026-08-17, every recorded session mentioning a benchmark was searched for output carrying a Linux path or target triple and none existed. CI still does not run benches.
@@ -204,6 +205,71 @@ sys	2m42.220s
 ```
 
 39m22s against 113m56s: first import is 2.89x faster with embeddings off (the new default). The gap is the inline embedding cost the old binary always paid; a new-enabled leg would land near the old number.
+
+## bench-gate: Lance 12 -> 13 upgrade (#342)
+
+Store digest `5fcd5e32b8dd` (the live s3-nbg1 store), both sides read-only against it; write benches ran on scratch stores beside it. The Lance 12 side is a full gate (perf + mem ci) on **bl** at `8b6ec39` (2026-10-13T07:08Z). The Lance 13 side is the perf half on **mac-m1max** at `b4965d0` (2026-10-13T10:08:59Z): a Lance 13 run on bl was stopped mid-build (the N100 needs ~1.5 h of compile per side), so the pair spans two hosts.
+
+That decides what compares. The io-trace iops are S3 request counts per warm query - a function of the store and the code, not the host - so they compare across the pair. Wall-clock fields do not (different CPU, different network path to nbg1); same-host latency is the hyperfine A/B further down. `8b6ec39` is main plus the `store_probe` component; `b4965d0` adds only the Lance 13 pins.
+
+Lineage note: the bl rows carry host `Linux-x86_64`, the same tag as the ws-pond-01 rows before them, so the delta printer pairs bl against ws-pond-01. Those deltas are hardware, not Lance: bl's mem rows read peak heap 9-60% below ws-pond-01's (`f35c084`, Lance 12 too) and peak RSS 4-29% below, on the same Lance version - fewer cores, less concurrent readahead. The Lance 13 row is the first `Darwin-arm64` row.
+
+### 2026-10-13 - s3-nbg1, io-trace iops (cross-host comparable)
+
+```
+metric                lance 12 (bl)  lance 13 (mac)   delta
+fts_iops                         36              14    -61%
+vector_iops                      92              90     -2%
+get_message_iops                 27              16    -41%
+search_iops                     185             155    -16%
+store_probe_iops                119               1    -99%
+equivalence                      OK              OK
+```
+
+`store_probe` is the rowmap store probe every one-shot read pays (#310): one `message_store_probe` call, 119 GETs on Lance 12 against 1 on Lance 13. That is lance#9344 pruning the unfiltered `scan(id) LIMIT 3` to the leading fragment(s) from manifest live-row counts, on the real store rather than the fixture.
+
+### 2026-10-13 - s3-nbg1, gate wall-clock fields (NOT cross-host comparable, recorded for each host's own lineage)
+
+```
+metric                  lance 12 (bl)  lance 13 (mac)
+get_session_sid_s                 4.7             5.0
+get_session_mid_s                 7.7             5.0
+get_message_s                     8.5            18.4
+search_s                          9.3             5.1
+search_dated_s                    5.3             4.5
+sql_count_s                       1.4             3.6
+open_store_ms                     956            1186
+row_counts_ms                    1105             932
+rowmap_cold_ms                  17074           27181
+rowmap_warm_ms                   1425             338
+write_copy_ms                    5946            3284
+write_ms_per_commit             599.8           399.0
+write_index_build_ms            27793           14797
+write_fold_ms                    2864            7556
+```
+
+### 2026-10-13 - mac-m1max -> S3 copy of the live store, hyperfine A/B (same host, both binaries)
+
+Released 0.19.5 (Lance 12; read paths identical to main) vs the `b4965d0` release build, one-shot CLI reads (each run pays process start, store open and the rowmap probe), against a server-side `s5cmd` copy of the live store (17.3 GiB / 610 objects; 22.6k sessions, 4.88M messages, 3.05M parts). Two hyperfine passes, the second in reverse order, 6 runs per side per pass; medians over all 12. RSS is peak resident.
+
+```
+probe          L12 med s L13 med s   delta  L12 RSS MB  L13 RSS MB  n   fails
+get_session         5.97      4.74    -21%          81          92  12/12 0
+get_message        17.17     20.38    +19%         227         233  12/12 0
+search              9.38     10.64    +13%         279         176  12/12 0
+search_dated       18.52     17.00     -8%         433         346  12/12 0
+sql_count           1.85      1.72     -7%          57          63  12/12 0
+```
+
+Inconclusive on latency: the same binary drifts 30-40% between passes (Lance 12 get-message pass medians 15.4 s / 20.2 s), so nothing under ~20% resolves. Peak RSS on the search paths is consistently lower on Lance 13 (search -37%, search_dated -20%), get-session +13%.
+
+### 2026-10-13 - #310 probe fixture (local TempDir + shared-memory, Lance 13 at `b4965d0`)
+
+`docs/plans/2610-13-lance13-probe-measure.patch` applied for the run and reverted: 128 fragments / 2560 messages, stable row ids. The probe plans 1 fragment, 4 GETs / 4,510 B (appends only) and 5 GETs / 5,208 B (with deletions), identical results - the same numbers the spike recorded on #310 for Lance 13 (Lance 12: 128 fragments planned, 88-355 GETs).
+
+### 2026-10-13 - S3 copy of the live store, cross-version read/write parity
+
+Same copy as the A/B, sandboxed HOME/XDG per binary. 9 read probes (counts, per-agent, roles, a `json_extract` predicate, FTS search, date-scoped search, get-session, get-message, status) byte-identical between Lance 12 and Lance 13 on the untouched copy. Then Lance 13 `sync` (+1 session, +59 messages, 56 s) and `optimize` (40 s); Lance 12 reads that state cleanly, then runs its own `sync` (18 s) and `optimize` (92 s) on top; Lance 13 re-reads the result identically to Lance 12 on 8/9 probes, the ninth (`status`) differing only by a live session file that grew between the two runs.
 
 ## bench-gate: Lance 8 -> 10 upgrade (#145)
 
