@@ -2870,11 +2870,11 @@ impl Store {
     pub async fn message_store_probe(&self) -> Result<MessageStoreProbe> {
         let dataset = self.handle.dataset(Table::Messages).await?;
         let row_count = dataset.count_rows(None).await?;
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
-        scanner.with_row_id();
-        scanner.project(&["id"])?;
-        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
-        let mut stream = scanner.try_into_stream().await?;
+        let mut stream = self
+            .message_store_probe_scanner()
+            .await?
+            .try_into_stream()
+            .await?;
         let mut oldest_messages = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
@@ -2889,6 +2889,16 @@ impl Store {
             row_count,
             oldest_messages,
         })
+    }
+
+    /// The probe's own scanner, shared with the #310 regression test so the plan
+    /// it asserts is the one the probe runs.
+    async fn message_store_probe_scanner(&self) -> Result<lance::dataset::scanner::Scanner> {
+        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        scanner.with_row_id();
+        scanner.project(&["id"])?;
+        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        Ok(scanner)
     }
 
     /// Scan the hydration columns with row ids into a `Vec`, the input to
@@ -10477,6 +10487,74 @@ mod tests {
         // Empty input is the documented zero-path.
         let empty = store.session_message_counts(&[]).await?;
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    /// #310: the rowmap store probe (`scan(id) LIMIT 3` with row ids) runs
+    /// before every one-shot read and must plan only the leading fragment.
+    /// Lance 12 planned every fragment of a stable-row-id table and read-ahead
+    /// fanned out from there (~120 GETs per call on a real store); lance#9344
+    /// prunes by manifest live-row counts, deletions included.
+    #[tokio::test]
+    async fn message_store_probe_plans_only_the_leading_fragment() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        for index in 0..8 {
+            let session = synthetic_session(&format!("s{index}"));
+            store
+                .upsert_sessions(std::slice::from_ref(&session))
+                .await?;
+            let messages: Vec<Message> = (0..4)
+                .map(|m| Message::User {
+                    id: format!("s{index}-m{m}"),
+                    session_id: session.id.clone(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                })
+                .collect();
+            let writes: Vec<MessageWrite<'_>> = messages
+                .iter()
+                .map(|message| MessageWrite {
+                    message,
+                    parts: &[],
+                    search_text: Some("probe"),
+                })
+                .collect();
+            store.upsert_messages(&session, &writes).await?;
+        }
+        let fragments = store
+            .handle
+            .dataset(Table::Messages)
+            .await?
+            .get_fragments()
+            .len();
+        assert_eq!(
+            fragments, 8,
+            "one fragment per commit, so the pruning is observable"
+        );
+
+        let plan = store
+            .message_store_probe_scanner()
+            .await?
+            .explain_plan(true)
+            .await?;
+        assert!(plan.contains("num_fragments=1"), "{plan}");
+
+        let mut messages = store.handle.dataset(Table::Messages).await?;
+        messages.delete("id = 's0-m1'").await?;
+        let plan = store
+            .message_store_probe_scanner()
+            .await?
+            .explain_plan(true)
+            .await?;
+        assert!(plan.contains("num_fragments=1"), "{plan}");
+        let probe = store.message_store_probe().await?;
+        let oldest: Vec<&str> = probe
+            .oldest_messages
+            .iter()
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(oldest, ["s0-m0", "s0-m2", "s0-m3"]);
         Ok(())
     }
 }
