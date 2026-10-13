@@ -37,3 +37,8 @@ region = "nbg1"
 # schema number: k35 is kache 1.1, whose corrected build-script and native keys
 # miss k34's entries even though CACHE_KEY_VERSION is still 32.
 prefix = "kache/pond/windows-verify/k35"
+# Pull request jobs only (kache 1.x): they read `prefix` first, then this one,
+# and write only here, so a labeled PR's next push reuses what its last push
+# compiled. Trusted pushes never read it. Shared by every PR and never expired;
+# it rotates with `prefix`, k-tag included.
+pull_request_prefix = "kache/pond/windows-verify-pr/k35"
