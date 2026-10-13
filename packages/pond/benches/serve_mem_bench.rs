@@ -1033,6 +1033,7 @@ async fn main() -> Result<()> {
             &cfg,
         )
         .await;
+        store.message_store_probe().await?;
         io_trace::take(); // discard warm IO
 
         let labels = [
@@ -1041,9 +1042,10 @@ async fn main() -> Result<()> {
             "vector_search",
             "pond_get_message",
             "pond_search",
+            "store_probe",
         ];
-        let mut iops: [Vec<u128>; 5] = Default::default();
-        let mut rbytes: [Vec<u128>; 5] = Default::default();
+        let mut iops: [Vec<u128>; 6] = Default::default();
+        let mut rbytes: [Vec<u128>; 6] = Default::default();
         #[cfg(feature = "io-trace")]
         let mut hist: std::collections::BTreeMap<String, (u64, u64)> =
             std::collections::BTreeMap::new();
@@ -1114,6 +1116,10 @@ async fn main() -> Result<()> {
                 )
                 .await;
             });
+            // The rowmap store probe every one-shot read pays before trusting
+            // its cached rowmap (#310): data pages are never cached, so it stays
+            // a real GET cost even on a warm process.
+            meas!(5, store.message_store_probe().await?);
         }
 
         println!("\n=== S3 IO per warm query (component isolated) ===");
