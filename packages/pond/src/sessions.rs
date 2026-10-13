@@ -6778,9 +6778,10 @@ fn primary_field(name: &str, data_type: DataType, nullable: bool) -> Field {
     )
 }
 
-// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`): Lance 12
-// rejects legacy blob columns at `data_storage_version >= 2.2`, so
-// `write_params_for_create` must stay pinned to 2.1. Blob v2's `Struct<data,
+// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`): at
+// `data_storage_version >= 2.2` Lance 13 silently promotes legacy blob columns
+// to Blob v2 (Lance 12 rejected them), so `write_params_for_create` must stay
+// pinned to 2.1. Blob v2's `Struct<data,
 // uri>` extension at v7.0.0-beta.16 trips a `compact_files` bug: the AllBinary
 // blob_handling path leaves the field as a 2-child struct but
 // `BlobV2StructuralEncoder` allocated only one column_info, so the decoder's
