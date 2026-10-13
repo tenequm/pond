@@ -30,7 +30,9 @@ TD="${CARGO_TARGET_DIR:-target}"
 # any daemon kache spawns for itself both resolve it from a file they can
 # re-read. The old stub named no bucket and leaned on the job's KACHE_S3_*
 # env, which kache strips from a daemon spawn. Push on EXIT, not after
-# success: crates compiled before a failure still warm the retry.
+# success: crates compiled before a failure still warm the retry. The push
+# covers only workspace crates; the daemon uploads the dependencies, and
+# `daemon stop` gives its queue up to 30 s to drain before the pod goes away.
 # --all: one paginated LIST of the per-job prefix instead of one LIST
 # per Cargo.lock crate (~833 serial LISTs, 89 s measured from a laptop,
 # worse from a runner). Safe only because the prefix holds exactly this
@@ -40,7 +42,7 @@ TD="${CARGO_TARGET_DIR:-target}"
 # broken one.
 export RUSTC_WRAPPER=kache
 kache sync --pull --all --allow-partial
-trap 'kache sync --push || true' EXIT
+trap 'kache sync --push || true; kache daemon stop || true' EXIT
 
 # Cargo unifies features across all targets in one invocation, leaking
 # cfg-gated deps across platforms, so macOS builds alone: it pulls
