@@ -23,6 +23,10 @@ stdenv.mkDerivation {
 
   sourceRoot = ".";
 
+  # Stripping the signed darwin binary replaces its Developer ID signature
+  # with an ad-hoc one, which drops the team and the pinned identifier.
+  dontStrip = hostPlatform.isDarwin;
+
   # Prebuilt glibc ELF won't run on NixOS until its interpreter and RPATH
   # are rewritten to Nix-store paths; darwin Mach-O needs no patching.
   nativeBuildInputs = [ installShellFiles ] ++ lib.optionals hostPlatform.isLinux [ autoPatchelfHook ];

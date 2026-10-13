@@ -216,12 +216,12 @@ tasks:
         rcodesign --config-file /dev/null sign \
           --p12-file "$creds/id.p12" --p12-password-file "$creds/id.pass" \
           --code-signature-flags runtime \
-          --binary-identifier com.github.tenequm.pond \
+          --binary-identifier io.github.tenequm.pond \
           target/dist/pond-aarch64-apple-darwin
         rm -rf "$creds"
       else
         rcodesign --config-file /dev/null sign \
-          --binary-identifier com.github.tenequm.pond \
+          --binary-identifier io.github.tenequm.pond \
           target/dist/pond-aarch64-apple-darwin
       fi
       cp "$TD/aarch64-unknown-linux-gnu/dist/pond" target/dist/pond-aarch64-unknown-linux-gnu

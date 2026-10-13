@@ -686,6 +686,10 @@ jobs:
           # clap_complete, so the assertion killed the release it was gating.
           ./pond completions zsh > completions.zsh
           grep -q '_pond' completions.zsh
+          # Both signing paths pin the identifier that firewall and privacy
+          # rules key on (#353), so check it whether or not the cert was present.
+          codesign -dvvv ./pond > ident.txt 2>&1
+          grep -Fqx 'Identifier=io.github.tenequm.pond' ident.txt
 
       - name: Verify code signature
         if: needs.dist-build-unix.outputs.signed == 'true'
@@ -695,12 +699,12 @@ jobs:
           # Gatekeeper cannot be asked directly: `spctl --assess --type exec`
           # rejects ANY bare CLI binary ("does not seem to be an app"), even a
           # correctly notarized one. Assert the two properties notarization
-          # actually requires instead, plus the pinned identifier that firewall
-          # and privacy rules key on (#353).
+          # actually requires instead, and the team the designated requirement
+          # pins alongside the identifier.
           codesign -dvvv ./pond 2>&1 | tee sig.txt
           grep -q 'Authority=Developer ID Application' sig.txt
           grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)' sig.txt
-          grep -qx 'Identifier=com.github.tenequm.pond' sig.txt
+          grep -Fqx 'TeamIdentifier=4L9YA7S99L' sig.txt
 
       - name: Notarize with Apple
         if: needs.dist-build-unix.outputs.signed == 'true'
