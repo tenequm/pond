@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.20.0](https://github.com/tenequm/pond/compare/v0.19.6...v0.20.0) - 2026-10-13
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] upgrade Lance to 13.0.0 ([#346](https://github.com/tenequm/pond/pull/346)) ([371d178](https://github.com/tenequm/pond/commit/371d17870744ba0e911111dda3036379f7d20a67))
+  Pond now runs on Lance 13.0.0 (from 12.0.0). The on-disk format is
+  unchanged (file version 2.1 stays pinned) and Lance 12 builds keep
+  reading stores Lance 13 writes, so mixed-version hosts on one store are
+  safe. No migration or action is needed.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **mcp:** serve classic requests after a discover probe (rmcp 3.5.1) ([#350](https://github.com/tenequm/pond/pull/350)) ([a8ae5e9](https://github.com/tenequm/pond/commit/a8ae5e938904f64a73b7d530223277ef602da655))
+  `pond mcp` no longer loses its tools when Claude Code's discovery probe
+  and its `initialize` fallback both reach a slow-starting server, which
+  showed pond as connected with "tools fetch failed" until a manual
+  reconnect. No action needed.
+- **maintenance:** refresh the cached handle before retrying a Lance write ([#337](https://github.com/tenequm/pond/pull/337)) ([dff025f](https://github.com/tenequm/pond/commit/dff025ff37059e47129c01867fe407ada9da0443))
+  `pond optimize --full` and `--reencode` can now run while syncs keep
+  going: a write that loses a commit race refreshes before it retries
+  instead of failing. `--force-embed` and the `--full` model-swap heal
+  work again on stores under 100k embedded rows.
+
+### <!-- 6 -->🧹 Chores
+- **rowmap:** guard the #310 probe's single-fragment plan ([#349](https://github.com/tenequm/pond/pull/349)) ([0d29eb5](https://github.com/tenequm/pond/commit/0d29eb55761dedf862be6cdfbfd84d6fc4f59413))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.6...v0.20.0
+
 ## [0.19.6](https://github.com/tenequm/pond/compare/v0.19.5...v0.19.6) - 2026-10-12
 
 ### <!-- 2 -->🐛 Bug Fixes

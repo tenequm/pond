@@ -2,7 +2,7 @@
 # which names this file). Same shape and same reasoning as
 # .github/kache/windows-verify.toml - see that file's header, or
 # docs/plans/2608-24-ci-caching-architecture.md, for why the remote lives in a
-# file and the credentials do not.
+# file and the credentials do not, and why both Windows legs are on R2.
 #
 # A separate file rather than a shared one because each build shape carries
 # its own prefix: nothing is shared across these two anyway (the dist leg
@@ -14,9 +14,9 @@
 # action, and the bootstrap asserts it.
 [cache.remote]
 type = "s3"
-bucket = "ttq"
-endpoint = "https://nbg1.your-objectstorage.com"
-region = "nbg1"
+bucket = "pond-kache"
+endpoint = "https://3db7dd8ff22ae68593205855d8bc0b25.r2.cloudflarestorage.com"
+region = "auto"
 # Per-job and schema-tagged, same reasoning as windows-verify.toml. A freshly
 # rotated prefix starts empty and the first release build into it is the cold
 # one (~76 min).
@@ -28,4 +28,4 @@ region = "nbg1"
 # cannot override it. A `force_build` workflow_dispatch therefore compiles for
 # real, pulls, and uploads NOTHING - it warms the runner it ran on and nobody
 # else. Rotate together with a change that lands on main.
-prefix = "kache/pond/windows-dist/k34"
+prefix = "kache/pond/windows-dist/k35"

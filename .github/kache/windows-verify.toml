@@ -20,20 +20,30 @@
 # KACHE_NAMESPACE and KACHE_MANIFEST_KEY stay in env (the last two have no file
 # form at all), and `[cache] ignore_env` is never set here because it would
 # silence exactly those. Credentials stay in env too - KACHE_S3_ACCESS_KEY and
-# KACHE_S3_SECRET_KEY come from repository secrets and never enter a file.
+# KACHE_S3_SECRET_KEY come from the KACHE_R2_* repository secrets and never
+# enter a file.
 #
-# Every key below exists unchanged through 0.28.1
+# Cloudflare R2, not the Hetzner bucket the Linux dist leg uses: Hetzner's
+# conditional PUT rejects the standard quoted `If-Match` with 412, so every
+# manifest merge after the first write failed there and prefetch went stale.
+#
+# Every key below except `pull_request_prefix` (1.x only) exists unchanged through 1.1.1
 # (RemoteFileConfig). Full reasoning: docs/plans/2608-24-ci-caching-architecture.md.
 [cache.remote]
 type = "s3"
-bucket = "ttq"
-endpoint = "https://nbg1.your-objectstorage.com"
-region = "nbg1"
+bucket = "pond-kache"
+endpoint = "https://3db7dd8ff22ae68593205855d8bc0b25.r2.cloudflarestorage.com"
+region = "auto"
 # Per-job and schema-tagged: nothing is shared across build shapes anyway (the
 # rustc flags differ per unit), the bootstrap's bulk `--pull --all` pulls the
 # whole prefix so the prefix must hold only this job's artifacts, and the tag
 # keeps a rotation a sibling directory instead of a subtree - rotation IS the
-# remote GC. k34 = key schema 32 (kache's CACHE_KEY_VERSION since 0.27.0); the
-# tag only moves forward, so it sits above k33, the schema-31 prefix that one
-# manual GC rotation had already moved past the schema number.
-prefix = "kache/pond/windows-verify/k34"
+# remote GC. The tag only moves forward and tracks kache upgrades, not the
+# schema number: k35 is kache 1.1, whose corrected build-script and native keys
+# miss k34's entries even though CACHE_KEY_VERSION is still 32.
+prefix = "kache/pond/windows-verify/k35"
+# Pull request jobs only (kache 1.x): they read `prefix` first, then this one,
+# and write only here, so a labeled PR's next push reuses what its last push
+# compiled. Trusted pushes never read it. Shared by every PR and never expired;
+# it rotates with `prefix`, k-tag included.
+pull_request_prefix = "kache/pond/windows-verify-pr/k35"

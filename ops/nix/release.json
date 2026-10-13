@@ -1,8 +1,8 @@
 {
-  "version": "0.19.6",
+  "version": "0.20.0",
   "hashes": {
-    "x86_64-linux": "2378896f8af7141d51eb1515c4493c67cb7cda20031b1a0c6ea4551a179281c6",
-    "aarch64-linux": "79473baf07bc82d3ae213a07e8f29b77af9be6d37a2db2dfb1a1ab2fea2a1d6b",
-    "aarch64-darwin": "b0cc7672b59ee4979f2c7d0afa7b1fd532a376df951cdbcc5d8acd5b66bfcabe"
+    "x86_64-linux": "ae44a55419720389c2a6d725d39c1805ea0b98938b2960874b6ff5a00facdad0",
+    "aarch64-linux": "212bdf44197c2d6b9e1e72edc80922d649bd944c40db0b6efa7284477a95428f",
+    "aarch64-darwin": "83d0b46e60b4a130c096f1525976b966d1c657d6e210fee59f4744edfe64f0f3"
   }
 }

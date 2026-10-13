@@ -53,6 +53,9 @@ env:
   # jobs that don't run moon.
   MOON_REMOTE_HOST: ${{ secrets.BAZEL_REMOTE_AUTH != '' && 'grpcs://bazel-remote.cascade.fyi:443' || '' }}
   BAZEL_REMOTE_AUTH: ${{ secrets.BAZEL_REMOTE_AUTH }}
+  # .moon/workspace.yml turns the local CAS + shared worktree cache on for
+  # developer machines; env overrides the file, keeping the experiment off CI.
+  MOON_EXPERIMENT_CAS_OUTPUTS_CACHE: 'false'
 
 jobs:
   build-and-test-linux:
@@ -287,7 +290,17 @@ jobs:
     # the artifact cache cold and every later PR rebuilds Lance from scratch.
     # PRs still replay docs/CI-only diffs from main's own stored hashes.
     env:
-      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # A force_build dispatch reads nothing and writes nothing: `off`, not
+      # MOON_FORCE, which switches moon to write mode and would let a dispatch
+      # on any ref upload hashes main later replays (moon crates/cache/src/cache_engine.rs).
+      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || (inputs.force_build && 'off' || 'read') }}
+      # Skips build.rs's Windows manifest on this leg only: kache refuses to cache
+      # a link carrying /MANIFESTINPUT. dist-build-windows still embeds it.
+      POND_SKIP_EMBED_MANIFEST: '1'
+      # Records which key groups changed on a miss, for `kache explain` below. A
+      # fresh runner has no earlier local build, so explain can only compare the
+      # prefetched entries' target/profile/features, not input groups.
+      KACHE_EXPLAIN_MISS: '1'
       # On-demand cache warmer: a main push whose head commit message carries
       # '[force-build]' compiles for real even on a moon hash hit - the way to
       # repopulate a cold kache prefix without waiting for an input-changing
@@ -319,10 +332,10 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/windows-bootstrap
         with:
-          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          kache-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          kache-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
           manifest-key: windows-verify
-          s3-prefix: kache/pond/windows-verify/k34
+          s3-prefix: kache/pond/windows-verify/k35
           # Test leg only, never dist-build-windows: a restored harness has
           # unresolved .pdb paths, so a failing test gets a weaker backtrace.
           # Worth ~3 min of link time here; not worth it on the leg whose
@@ -332,39 +345,25 @@ jobs:
       # The round-one `kache pull dry run` step is gone, deliberately: it
       # measured the lock-filtered enumeration (one sequential LIST per lock
       # crate, 126.8 s measured against the shared prefix), and that number did
-      # its job - it sized round two in favor of `--pull --all` on a per-job
-      # prefix. Re-adding it would still buy nothing and cost ~2 min per run.
-      # What the warm pull reports has shrunk since: it is detached now, so the
-      # `Plan:` count reaches the log only if the pull gets that far, and no step
-      # times it. `kache stats` in the diagnostics below is the surviving number.
-
-      # moon replays the hash main already stored when a diff touches none of a
-      # task's declared inputs, which is every CI-only change - so a run whose
-      # kache numbers will be read has to defeat it deliberately.
-      #
-      # The value must be the literal `true`. MOON_FORCE is not a presence
-      # check: it is the clap env binding for `--force` (`moon run --help`:
-      # `[env: MOON_FORCE=]`), so moon parses it as the flag's value and rejects
-      # anything outside true/false with `error: invalid value '1' for
-      # '--force'`. Written only when asked, so the variable is simply absent on
-      # an ordinary run.
-      - name: Force a real compile
-        if: inputs.force_build
-        shell: pwsh
-        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      # its job. The bulk `sync --pull --all` it sized is gone too: on R2 the
+      # manifest merges succeed, so kache-action's default manifest prefetch
+      # (`warm: true`) fetches the working set itself. `kache stats` in the
+      # diagnostics below is the number to read.
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
+      # --output-style stream: in CI moon buffers a task with no outputStyle to
+      # its exit, so a cold build logged nothing but moon's heartbeat for an hour.
       - name: Test
-        run: moon run pond:lint-msvc pond:test-msvc
+        run: moon run pond:lint-msvc pond:test-msvc --output-style stream
 
       # Permanent diagnostics - this is how a cache regression shows up in the
       # log instead of in stopwatch comparisons. The action's own summary is not
       # enough: its "Prefetch: 0/N" line counts plan entries, not downloads
       # (kunobi-ninja/kache#618), so it reads as a total miss on a run that hit
       # 99.7%. `kache stats` carries the honest
-      # `Hit rate: X% (local/prefetch/remote/dup/miss)` split plus the `Remote:`
-      # and `Daemon:` lines that say which prefix actually served the run, and
+      # `Hit rate` split (local/prefetch/remote/dup/miss) plus the `Remote` and
+      # `Daemon` rows that say which prefix actually served the run, and
       # the daemon log is the only place a remote timeout is recorded.
       #
       # NOT `kache daemon log`: at v0.14.2 its Windows branch shells out to
@@ -383,17 +382,12 @@ jobs:
         timeout-minutes: 2
         run: |
           kache stats
+          # The crates that missed on a same-commit re-run.
+          kache explain pond
+          kache explain integration
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
-          # windows-bootstrap's warm pull runs detached, so this log is the only
-          # record of whether it finished before the build did - and the only
-          # place a `Plan:` count or a failed transfer is reported.
-          if ($env:KACHE_WARM_LOG -and (Test-Path $env:KACHE_WARM_LOG)) {
-            "--- background warm pull ---"
-            Get-Content -Tail 40 $env:KACHE_WARM_LOG
-            if (Test-Path "$($env:KACHE_WARM_LOG).err") { Get-Content -Tail 40 "$($env:KACHE_WARM_LOG).err" }
-          } else { "no background warm-pull log" }
 
   # The shipped msvc zip. Release-gated rather than per-PR: it produces an
   # artifact nobody consumes outside a release, and it is the only thing in the
@@ -422,7 +416,8 @@ jobs:
     # write moon's remote cache, so a release push compiles for real inside
     # kache's write window instead of replaying a dispatch-stored hash.
     env:
-      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # Same rules as build-and-test-windows, force_build `off` included.
+      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || (inputs.force_build && 'off' || 'read') }}
       # Same '[force-build]' warmer as build-and-test-windows.
       MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     steps:
@@ -436,20 +431,10 @@ jobs:
           fetch-depth: 0
       - uses: ./.github/actions/windows-bootstrap
         with:
-          kache-access-key-id: ${{ secrets.KACHE_S3_ACCESS_KEY }}
-          kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
+          kache-access-key-id: ${{ secrets.KACHE_R2_ACCESS_KEY_ID }}
+          kache-secret-access-key: ${{ secrets.KACHE_R2_SECRET_ACCESS_KEY }}
           manifest-key: windows-dist
-          s3-prefix: kache/pond/windows-dist/k34
-
-      # Same reasoning as the sibling job: without this, moon serves the stored
-      # hash and nothing is actually compiled or measured. Same `true`-not-`1`
-      # constraint too. This still cannot prewarm the prefix - kache forces the
-      # remote read-only outside a protected-branch push (src/policy.rs) - so a
-      # rotated prefix is warmed by the next push to main, not by a dispatch.
-      - name: Force a real compile
-        if: inputs.force_build
-        shell: pwsh
-        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+          s3-prefix: kache/pond/windows-dist/k35
 
       # Build + smoke + package, as a moon task so the leg gets the same
       # task-level remote cache every other build has. `--profile dist`, not
@@ -497,14 +482,6 @@ jobs:
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
-          # windows-bootstrap's warm pull runs detached, so this log is the only
-          # record of whether it finished before the build did - and the only
-          # place a `Plan:` count or a failed transfer is reported.
-          if ($env:KACHE_WARM_LOG -and (Test-Path $env:KACHE_WARM_LOG)) {
-            "--- background warm pull ---"
-            Get-Content -Tail 40 $env:KACHE_WARM_LOG
-            if (Test-Path "$($env:KACHE_WARM_LOG).err") { Get-Content -Tail 40 "$($env:KACHE_WARM_LOG).err" }
-          } else { "no background warm-pull log" }
 
   # Maintain the release PR, and report ONLY whether a release is pending.
   # Detection is the tag check - release-plz's own first gate is "skip a package
@@ -580,7 +557,7 @@ jobs:
       KACHE_S3_REGION: nbg1
       KACHE_S3_BUCKET: ttq
       KACHE_S3_ENDPOINT: https://nbg1.your-objectstorage.com
-      KACHE_S3_PREFIX: kache/pond/linux-dist/k34
+      KACHE_S3_PREFIX: kache/pond/linux-dist/k35
       # Local store on the PVC so pods start warm and sync only moves
       # deltas; cap it well below the 100Gi shared PVC.
       KACHE_CACHE_DIR: /ci-cache/kache
@@ -592,7 +569,7 @@ jobs:
 
       # kache is not in the flake devShell (a per-machine tool, and a repo pin
       # that disagreed with developers' own daemons), so this job - the only
-      # Linux consumer, through RUSTC_WRAPPER in ops/scripts/build-dist.sh -
+      # Linux consumer, through RUSTC_WRAPPER in the repo:build-dist script -
       # installs its own pinned copy. Deliberately not kunobi-ninja/kache-action
       # as on Windows: that action exports its own RUSTC_WRAPPER, KACHE_CACHE_DIR,
       # manifest/namespace and daemon lifecycle, all of which would change how
@@ -605,13 +582,13 @@ jobs:
       # the k-tag in the S3 prefixes, never alone.
       - name: Install kache
         env:
-          KACHE_RELEASE: 0.28.1
+          KACHE_RELEASE: 1.1.1
         run: |
           set -euo pipefail
           arch=$(uname -m)
           case "$arch" in
-            x86_64) sha256=68635a9f92ce5015a2c48c98b968d1b3707b6dbee0ca725e51d1671c9346f38f ;;
-            aarch64) sha256=b2110805eb24afe9b408e5b9a1e3d0584b7fdd0b79fe8cbe548ab29fbaf50176 ;;
+            x86_64) sha256=2ef097121b87ed7a24f9b40fbf5d3799837b4c2ac75391d2264ea5cc6c38b3d7 ;;
+            aarch64) sha256=3c2e82f42092123a937004aa1a3b5efa766c39b071eedce2de9e9b51fbe91b08 ;;
             *) echo "no pinned kache for $arch" >&2; exit 1 ;;
           esac
           asset="kache-$arch-unknown-linux-musl.tar.gz"
@@ -709,6 +686,10 @@ jobs:
           # clap_complete, so the assertion killed the release it was gating.
           ./pond completions zsh > completions.zsh
           grep -q '_pond' completions.zsh
+          # Both signing paths pin the identifier that firewall and privacy
+          # rules key on (#353), so check it whether or not the cert was present.
+          codesign -dvvv ./pond > ident.txt 2>&1
+          grep -Fqx 'Identifier=io.github.tenequm.pond' ident.txt
 
       - name: Verify code signature
         if: needs.dist-build-unix.outputs.signed == 'true'
@@ -718,10 +699,12 @@ jobs:
           # Gatekeeper cannot be asked directly: `spctl --assess --type exec`
           # rejects ANY bare CLI binary ("does not seem to be an app"), even a
           # correctly notarized one. Assert the two properties notarization
-          # actually requires instead.
+          # actually requires instead, and the team the designated requirement
+          # pins alongside the identifier.
           codesign -dvvv ./pond 2>&1 | tee sig.txt
           grep -q 'Authority=Developer ID Application' sig.txt
           grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)' sig.txt
+          grep -Fqx 'TeamIdentifier=4L9YA7S99L' sig.txt
 
       - name: Notarize with Apple
         if: needs.dist-build-unix.outputs.signed == 'true'
@@ -808,7 +791,7 @@ jobs:
       # cannot change or poison anything. Listed in AGENTS.md with the repo's
       # other unguarded copies of that pin.
       - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
-        with: { moon-version: '2.5.5', cache: false }
+        with: { moon-version: '2.6.1', cache: false }
 
       # Same pinned action as release-prep. RUSTUP_TOOLCHAIN outranks
       # rust-toolchain.toml, so rustup does not install pond's pin just to run
