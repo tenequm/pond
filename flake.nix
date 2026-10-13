@@ -66,7 +66,7 @@
         cargoZigbuild = "0.23.4";
         rcodesign = "0.29.0";
         macosSdk = "15.5";
-        moon = "2.5.5";
+        moon = "2.6.1";
         protoc = "36.1";
         uv = "0.12.13";
         node = "24.21.0";
@@ -80,15 +80,15 @@
         moon = {
           x86_64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-x86_64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-85cFeiLIj/nksopKL78B2Z9Nmk815aQmNCVan1Ccy9Y=";
+            hash = "sha256-zxV877+egJbU4OIgG1bs/K+xn4xUoe0925CuXUap2pw=";
           };
           aarch64-linux = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-unknown-linux-gnu.tar.xz";
-            hash = "sha256-OdVeiHdGdxgdGvNWbEzNKZTNLZ2BmfzzDcLW3vwFrHg=";
+            hash = "sha256-E+bhaASWqyJeGwM2C2Cz3zYWQX5x0lc98oeVtKZRL5E=";
           };
           aarch64-darwin = {
             url = "https://github.com/moonrepo/moon/releases/download/v${v.moon}/moon_cli-aarch64-apple-darwin.tar.xz";
-            hash = "sha256-yQljcRtwYJ2jmMG+juNrTPL2FnxexT9IbYvZuqVupXg=";
+            hash = "sha256-KSLOcCd8xvN1AQb6nr0eJe2JDsjNukVwFI/4cBpb6lM=";
           };
         };
         protoc = {

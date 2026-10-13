@@ -355,8 +355,10 @@ jobs:
 
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
+      # --output-style stream: two primary targets otherwise buffer to exit, so
+      # a cold build logged nothing but moon's heartbeat for over an hour.
       - name: Test
-        run: moon run pond:lint-msvc pond:test-msvc
+        run: moon run pond:lint-msvc pond:test-msvc --output-style stream
 
       # Permanent diagnostics - this is how a cache regression shows up in the
       # log instead of in stopwatch comparisons. The action's own summary is not
@@ -808,7 +810,7 @@ jobs:
       # cannot change or poison anything. Listed in AGENTS.md with the repo's
       # other unguarded copies of that pin.
       - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
-        with: { moon-version: '2.5.5', cache: false }
+        with: { moon-version: '2.6.1', cache: false }
 
       # Same pinned action as release-prep. RUSTUP_TOOLCHAIN outranks
       # rust-toolchain.toml, so rustup does not install pond's pin just to run
