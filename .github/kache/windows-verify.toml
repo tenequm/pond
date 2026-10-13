@@ -6,15 +6,16 @@
 # which is why "file for the remote, env for the secrets" is the shape that
 # survives the next bump.
 #
-# Selected by the KACHE_CONFIG that .github/actions/windows-bootstrap exports
-# before the kache-action step; discovery is KACHE_CONFIG > nearest .kache.toml
-# > XDG at both 0.9.0 and 0.14.2 (src/config.rs, resolve_config_path). NOT a
-# repo-root .kache.toml: that is found by every contributor running kache as
-# RUSTC_WRAPPER anywhere inside a checkout and silently points them at a bucket
-# they have no credentials for.
+# Selected by the job's KACHE_CONFIG in ci.yml; discovery is KACHE_CONFIG >
+# nearest .kache.toml > XDG at both 0.9.0 and 0.14.2 (src/config.rs,
+# resolve_config_path). NOT a repo-root .kache.toml: that is found by every
+# contributor running kache as RUSTC_WRAPPER anywhere inside a checkout and
+# silently points them at a bucket they have no credentials for. The only
+# place the prefix is written: the `Start kache` step fails the job unless the
+# daemon resolved it from here.
 #
-# `prefix` MUST equal the s3-prefix the bootstrap hands kache-action; the
-# bootstrap asserts it and fails the job otherwise.
+# An input of pond:lint-msvc and pond:test-msvc, so rotating the k-tag makes
+# the leg compile into the new prefix instead of replaying moon's cache.
 #
 # [cache.remote] and nothing else. The store size, the prefetch caps,
 # KACHE_NAMESPACE and KACHE_MANIFEST_KEY stay in env (the last two have no file
@@ -35,10 +36,8 @@ bucket = "pond-kache"
 endpoint = "https://3db7dd8ff22ae68593205855d8bc0b25.r2.cloudflarestorage.com"
 region = "auto"
 # Per-job and schema-tagged: nothing is shared across build shapes anyway (the
-# rustc flags differ per unit), the bootstrap's bulk `--pull --all` pulls the
-# whole prefix so the prefix must hold only this job's artifacts, and the tag
-# keeps a rotation a sibling directory instead of a subtree - rotation IS the
-# remote GC. The tag only moves forward and tracks kache upgrades, not the
+# rustc flags differ per unit), and the tag keeps a rotation a sibling
+# directory instead of a subtree - rotation IS the remote GC. The tag only moves forward and tracks kache upgrades, not the
 # schema number: k35 is kache 1.1, whose corrected build-script and native keys
 # miss k34's entries even though CACHE_KEY_VERSION is still 32.
 prefix = "kache/pond/windows-verify/k35"

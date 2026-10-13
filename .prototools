@@ -1,0 +1,17 @@
+# The moon and protoc pins for every machine: flake.nix reads both into the
+# devShell's toolVersions, and runners without the flake (the Windows legs,
+# publish-release) install them from here through moonrepo/setup-toolchain.
+# One copy, because moon refuses a remote cache written by another moon
+# version, and a protoc skew would build two different binaries from one commit.
+# Plain `name = "x.y"` lines above any table: setup-toolchain decides by text
+# whether proto or the action installs moon, and stops at the first table.
+moon = "2.6.1"
+protoc = "36.1"
+
+# protoc is a community TOML plugin, pinned to a commit: the registry entry
+# points at the plugin repo's moving main branch.
+[plugins.tools]
+protoc = "https://raw.githubusercontent.com/b4nst/proto-plugins/b93fa985e51e3ba4ddf465099f330a7eb06700f0/toml/protoc.toml"
+
+[settings]
+telemetry = false

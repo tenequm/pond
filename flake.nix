@@ -49,25 +49,26 @@
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
       # Every tool version in one place, in plain `name = "x.y.z";` form on
-      # purpose: a reader without Nix can extract it by text, which is how the
-      # Windows leg will read these once it stops carrying its own copies.
-      # The flake-check job keeps that text form honest today - it
-      # fails when the literals and `nix eval --json .#lib.toolVersions`
-      # disagree. Rust is not repeated here - it is read from
-      # rust-toolchain.toml, which stays the single Rust pin.
+      # purpose: a reader without Nix can extract it by text. The flake-check
+      # job keeps that text form honest - it fails when the literals and
+      # `nix eval --json .#lib.toolVersions` disagree. Rust is not repeated
+      # here - it is read from rust-toolchain.toml, which stays the single Rust
+      # pin - and neither are moon and protoc: .prototools is their single pin,
+      # because the runners without this flake install them from it.
       #
       # The three that come from nixpkgs-toolchain (zig, cargoZigbuild,
       # rcodesign) are asserted against the package's own `version` below,
       # so a nixpkgs bump that moves one fails evaluation instead of making
       # this table lie.
+      prototools = builtins.fromTOML (builtins.readFile ./.prototools);
       toolVersions = {
         rust = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml)).toolchain.channel;
         zig = "0.16.0";
         cargoZigbuild = "0.23.4";
         rcodesign = "0.29.0";
         macosSdk = "15.5";
-        moon = "2.6.1";
-        protoc = "36.1";
+        moon = prototools.moon;
+        protoc = prototools.protoc;
         uv = "0.12.13";
         node = "24.21.0";
         npm = "11.19.1";
@@ -215,8 +216,8 @@
           };
 
           # nixpkgs' protobuf is deliberately not used: protoc's exact version
-          # is a pin windows-bootstrap mirrors by hand, and nixpkgs' would
-          # float with the input instead of staying that pin.
+          # is the .prototools pin the Windows legs install too, and nixpkgs'
+          # would float with the input instead of staying that pin.
           protoc = prebuilt {
             pname = "protoc";
             version = v.protoc;

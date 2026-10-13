@@ -31,6 +31,13 @@
 # and once locally. uv is pinned in the flake devShell instead, and hermes-pond
 # runs on the system toolchain. Versionless `unstable_python`/`unstable_uv` is
 # untested - revisit together, when those plugins leave `unstable_`.
+#
+# `proto` is moon 2.6.1's own default (PROTO_CLI_VERSION), written out because
+# moonrepo/setup-toolchain reads it from here and otherwise installs the latest
+# proto on the runners that take moon and protoc from .prototools.
+proto:
+  version: '0.62.2'
+
 javascript: {}
 
 node:

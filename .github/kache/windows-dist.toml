@@ -9,9 +9,8 @@
 # inherits the dist profile's thin LTO and cgu=1, so the rustc flags differ per
 # unit and the keys never collide).
 #
-# Selected by the KACHE_CONFIG that .github/actions/windows-bootstrap exports
-# before the kache-action step; `prefix` MUST equal the s3-prefix it hands the
-# action, and the bootstrap asserts it.
+# Selected by dist-build-windows's KACHE_CONFIG in ci.yml, and an input of
+# repo:build-dist-msvc so a k-tag rotation rebuilds into the new prefix.
 [cache.remote]
 type = "s3"
 bucket = "pond-kache"

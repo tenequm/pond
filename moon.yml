@@ -38,7 +38,7 @@ fileGroups:
   # runner's own system is stale, so no cache entry is written under an outdated
   # id; flake-check covers the other two systems. Not in `sources`:
   # the msvc tasks share that group and never enter the flake - they take
-  # windows-bootstrap, where their pins live, instead.
+  # .prototools and their kache remote file instead.
   nixToolchain:
     - 'ops/toolchain-id.json'
 
@@ -334,11 +334,16 @@ tasks:
       New-Item -ItemType Directory -Force -Path dist | Out-Null
       Compress-Archive -Path stage\pond.exe,stage\pondw.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
       Remove-Item -Recurse -Force stage
+    # Same NASM opt-in as pond:test-msvc, for the same reasons.
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: '1'
     inputs:
       - '@group(sources)'
-      # This leg's toolchain pins (moon, protoc, kache) live in the action, not
-      # the flake.
-      - '.github/actions/windows-bootstrap/action.yml'
+      # This leg never enters the flake: protoc's pin, and the kache remote whose
+      # k-tag a cache-key-changing kache bump rotates, so the rotation itself
+      # rebuilds into the new prefix (same as pond:test-msvc).
+      - '.prototools'
+      - '.github/kache/windows-dist.toml'
     outputs:
       - 'dist/pond-x86_64-pc-windows-msvc.zip'
     options:

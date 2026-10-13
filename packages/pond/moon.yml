@@ -31,9 +31,15 @@ fileGroups:
     - 'benches/**/*'
   # The devShell's derivation path per system - see the same group in the root
   # moon.yml. Linux/macOS tasks only; the msvc tasks never enter the flake and
-  # take windows-bootstrap instead.
+  # take msvcToolchain instead.
   nixToolchain:
     - '/ops/toolchain-id.json'
+  # The msvc tasks' toolchain: protoc's pin, and the kache remote whose k-tag a
+  # cache-key-changing kache bump rotates - so the rotation itself makes the
+  # Windows leg compile into the new prefix instead of replaying a hash.
+  msvcToolchain:
+    - '/.prototools'
+    - '/.github/kache/windows-verify.toml'
 
 tasks:
   format:
@@ -54,14 +60,22 @@ tasks:
   # folds the host triple into the hash as well.
   # Same OS-fingerprint reasoning as test-msvc: `lint` runs on Linux and never
   # sees a cfg(windows) block, so Windows-only code was ungated until this task.
+  #
+  # AWS_LC_SYS_PREBUILT_NASM: the windows-2025 image ships no NASM, aws-lc-sys's
+  # only extra Windows x86-64 prerequisite, and its CI-verified prebuilt objects
+  # avoid a release-critical dependency on community.chocolatey.org, which
+  # rate-limits GitHub Actions IPs. It only forgoes assembly size reduction
+  # under opt-level s/z, which no pond profile uses.
   lint-msvc:
     command: 'cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --features windows-launcher -- -D warnings'
-    inputs: ['@group(sources)', '@group(tests)', '/.github/actions/windows-bootstrap/action.yml']
+    env: { AWS_LC_SYS_PREBUILT_NASM: '1' }
+    inputs: ['@group(sources)', '@group(tests)', '@group(msvcToolchain)']
   test-msvc:
     # windows-launcher so pondw.exe is compiled here on every PR; the job that
     # builds it for the zip is release-gated, too late to learn it is broken.
     command: 'cargo test --locked --target x86_64-pc-windows-msvc --features windows-launcher'
-    inputs: ['@group(sources)', '@group(tests)', '/.github/actions/windows-bootstrap/action.yml']
+    env: { AWS_LC_SYS_PREBUILT_NASM: '1' }
+    inputs: ['@group(sources)', '@group(tests)', '@group(msvcToolchain)']
   # Cheap packaging gate: `cargo package --list` must contain every file the
   # code embeds via include_str!/include_bytes! (a full verify build is skipped
   # at publish time - publish_no_verify in .github/release-plz.toml). The script
