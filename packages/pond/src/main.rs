@@ -1167,11 +1167,13 @@ enum OutputFormat {
     Json,
 }
 
-/// Lance's DataFusion `FairSpillPool` defaults to 100 MiB total
-/// (`lance-datafusion::exec::DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION`), which
-/// the multi-consumer fair-share splits below the working set of BTree
-/// `SortExec` over ~2M-row tables and crashes `create_index` with
-/// `ExternalSorterMerge` reservation failures. Lance offers no programmatic
+/// Lance's DataFusion `FairSpillPool` defaults to 150 MiB per partition
+/// (`lance-datafusion::exec::DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION`) - one
+/// partition through lance 12, every available core since lance 13 - while an
+/// explicit `LANCE_MEM_POOL_SIZE` is the total. The multi-consumer fair-share
+/// split the lance 12 default below the working set of BTree `SortExec` over
+/// ~2M-row tables and crashed `create_index` with `ExternalSorterMerge`
+/// reservation failures. Lance offers no programmatic
 /// `MemoryPool` injection in 7.0.0; the env var is the only lever, and the
 /// session-context cache resolves it at first use, so setting it here (before
 /// any Lance call) is sufficient.

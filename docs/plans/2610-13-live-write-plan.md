@@ -85,9 +85,12 @@ default cadence is chosen from that sweep, not assumed.
 
 Dominant known component: the unbounded `message_store_probe` (unfiltered
 `scan(id) LIMIT 3`), which runs on the sync oracle, cursor persistence, and rowmap
-extension (#310). Expected largely fixed by lance 13's #9344 (V2 LIMIT/OFFSET
-scans pruned by manifest live-row counts) - #342 tracks the pin; a probe-local
-first-fragment bound remains the fallback if a measured residual remains.
+extension (#310). MEASURED FIXED by lance 13's #9344 (2026-10-13, isolated
+13-pin build, 128-fragment fixture, local + shared-memory stores): fragments
+planned 128 -> 1, probe GETs 88-355 -> 4-5 deterministic, ~4.5 KB read,
+identical probe results, deletions included. #342 tracks the pin; the
+probe-local first-fragment fallback is dropped - no pond-side bound needed on
+this evidence. Numbers on #310, compile findings on #342.
 
 ## 4. Ordering (deliberate, posted on #43)
 

@@ -2942,12 +2942,9 @@ impl Store {
     /// rowmap build validates against the exact snapshot it labels.
     async fn message_store_probe_on(dataset: &Dataset) -> Result<MessageStoreProbe> {
         let row_count = dataset.count_rows(None).await?;
-        let mut scanner = dataset.scan();
-        scanner.prefilter(true);
-        scanner.with_row_id();
-        scanner.project(&["id"])?;
-        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
-        let mut stream = scanner.try_into_stream().await?;
+        let mut stream = Self::message_store_probe_scanner(dataset)?
+            .try_into_stream()
+            .await?;
         let mut oldest_messages = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
@@ -2962,6 +2959,17 @@ impl Store {
             row_count,
             oldest_messages,
         })
+    }
+
+    /// The probe's own scanner, shared with the #310 regression test so the plan
+    /// it asserts is the one the probe runs.
+    fn message_store_probe_scanner(dataset: &Dataset) -> Result<lance::dataset::scanner::Scanner> {
+        let mut scanner = dataset.scan();
+        scanner.prefilter(true);
+        scanner.with_row_id();
+        scanner.project(&["id"])?;
+        scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
+        Ok(scanner)
     }
 
     /// Scan the hydration columns with row ids into a `Vec`, the input to
@@ -6879,16 +6887,12 @@ fn primary_field(name: &str, data_type: DataType, nullable: bool) -> Field {
     )
 }
 
-// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`): Lance 12
-// rejects legacy blob columns at `data_storage_version >= 2.2`, so
-// `write_params_for_create` must stay pinned to 2.1. Blob v2's `Struct<data,
-// uri>` extension at v7.0.0-beta.16 trips a `compact_files` bug: the AllBinary
-// blob_handling path leaves the field as a 2-child struct but
-// `BlobV2StructuralEncoder` allocated only one column_info, so the decoder's
-// second `expect_next()` fires `"there were more fields in the schema than
-// provided column indices / infos"`; legacy blob writes `BlobLayout` pages,
-// which compact handles correctly (covered by Lance's own
-// `test_compact_blob_columns`).
+// Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`), which is why
+// `write_params_for_create` pins file format 2.1: at >= 2.2 Lance 13 silently
+// stores this column as Blob v2 (`Struct<data, uri>`), a shape pond's parts
+// read/write paths and `.pond` archives do not expect, and the first 2.2 write
+// sets the sticky mixed-versions manifest flag that Lance 11 readers refuse.
+// The move to Blob v2 is the deferred item in spec.md section 9.
 fn legacy_blob_field(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::LargeBinary, nullable).with_metadata(
         [(lance_arrow::BLOB_META_KEY.to_owned(), "true".to_owned())]
@@ -10753,6 +10757,72 @@ mod tests {
         // Empty input is the documented zero-path.
         let empty = store.session_message_counts(&[]).await?;
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    /// #310: the rowmap store probe (`scan(id) LIMIT 3` with row ids) runs
+    /// before every one-shot read and must plan only the leading fragment.
+    /// Lance 12 planned every fragment of a stable-row-id table and read-ahead
+    /// fanned out from there (~120 GETs per call on a real store); lance#9344
+    /// prunes by manifest live-row counts, deletions included.
+    #[tokio::test]
+    async fn message_store_probe_plans_only_the_leading_fragment() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        for index in 0..8 {
+            let session = synthetic_session(&format!("s{index}"));
+            store
+                .upsert_sessions(std::slice::from_ref(&session))
+                .await?;
+            let messages: Vec<Message> = (0..4)
+                .map(|m| Message::User {
+                    id: format!("s{index}-m{m}"),
+                    session_id: session.id.clone(),
+                    timestamp: Utc::now(),
+                    options: ProviderOptions::new(),
+                })
+                .collect();
+            let writes: Vec<MessageWrite<'_>> = messages
+                .iter()
+                .map(|message| MessageWrite {
+                    message,
+                    parts: &[],
+                    search_text: Some("probe"),
+                })
+                .collect();
+            store.upsert_messages(&session, &writes).await?;
+        }
+        let fragments = store
+            .handle
+            .dataset(Table::Messages)
+            .await?
+            .get_fragments()
+            .len();
+        assert_eq!(
+            fragments, 8,
+            "one fragment per commit, so the pruning is observable"
+        );
+
+        let plan =
+            Store::message_store_probe_scanner(&store.handle.dataset(Table::Messages).await?)?
+                .explain_plan(true)
+                .await?;
+        assert!(plan.contains("num_fragments=1"), "{plan}");
+
+        let mut messages = store.handle.dataset(Table::Messages).await?;
+        messages.delete("id = 's0-m1'").await?;
+        let plan =
+            Store::message_store_probe_scanner(&store.handle.dataset(Table::Messages).await?)?
+                .explain_plan(true)
+                .await?;
+        assert!(plan.contains("num_fragments=1"), "{plan}");
+        let probe = store.message_store_probe().await?;
+        let oldest: Vec<&str> = probe
+            .oldest_messages
+            .iter()
+            .map(|(_, id)| id.as_str())
+            .collect();
+        assert_eq!(oldest, ["s0-m0", "s0-m2", "s0-m3"]);
         Ok(())
     }
 }

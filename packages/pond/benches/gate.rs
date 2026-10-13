@@ -941,6 +941,7 @@ async fn perf_gate(
     set("vector_iops", column(&serve, "vector_search"));
     set("get_message_iops", column(&serve, "pond_get_message"));
     set("search_iops", column(&serve, "pond_search"));
+    set("store_probe_iops", column(&serve, "store_probe"));
     set("open_store_ms", millis(&ops, "open store (manifests)"));
     set("row_counts_ms", millis(&ops, "row_counts"));
     set("rowmap_cold_ms", millis(&ops, "ensure_rowmap COLD"));

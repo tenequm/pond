@@ -762,16 +762,16 @@ pub mod mcp {
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         handler::server::{router::tool::ToolRouter, wrapper::Parameters},
         model::{
-            CacheScope, CallToolResult, ClientJsonRpcMessage, ClientRequest, ContentBlock,
-            ErrorCode as JsonRpcErrorCode, GetMeta, Implementation, ListResourceTemplatesResult,
-            ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
-            ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-            Resource, ResourceContents, ServerCapabilities, ServerConfig, ServerJsonRpcMessage,
+            CacheScope, CallToolResult, ContentBlock, ErrorCode as JsonRpcErrorCode,
+            Implementation, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+            MetaObject, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
+            ReadResourceResponse, ReadResourceResult, Resource, ResourceContents,
+            ServerCapabilities, ServerConfig,
         },
         schemars,
         service::RequestContext,
         tool, tool_handler, tool_router,
-        transport::{Transport, async_rw::AsyncRwTransport, stdio},
+        transport::{async_rw::AsyncRwTransport, stdio},
     };
     use serde::Deserialize;
     use uuid::Uuid;
@@ -1951,85 +1951,11 @@ Examples (4 patterns the agent should recognize):
         W: tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let service = PondMcp::new(state)
-            .serve(RecoverableOpener {
-                inner: AsyncRwTransport::new_server(read, write),
-                opened: false,
-            })
+            .serve(AsyncRwTransport::new_server(read, write))
             .await
             .context("failed to start stdio MCP server")?;
         service.waiting().await.context("stdio MCP server error")?;
         Ok(())
-    }
-
-    /// rmcp answers a first request lacking complete 2026-07-28 `_meta` with
-    /// `-32602` and then ends the connection, so the client never reaches its
-    /// `initialize` fallback; this answers it the same way and keeps reading.
-    /// Drop it once rust-sdk#1248 ships
-    /// (<https://github.com/modelcontextprotocol/rust-sdk/pull/1248>).
-    struct RecoverableOpener<T> {
-        inner: T,
-        opened: bool,
-    }
-
-    impl<T: Transport<RoleServer>> Transport<RoleServer> for RecoverableOpener<T> {
-        type Error = T::Error;
-
-        fn send(
-            &mut self,
-            item: ServerJsonRpcMessage,
-        ) -> impl Future<Output = Result<(), T::Error>> + Send + 'static {
-            self.inner.send(item)
-        }
-
-        async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
-            loop {
-                let message = self.inner.receive().await?;
-                if self.opened {
-                    return Some(message);
-                }
-                let rejection = match &message {
-                    ClientJsonRpcMessage::Request(request) => match &request.request {
-                        ClientRequest::PingRequest(_) => return Some(message),
-                        ClientRequest::InitializeRequest(_) => None,
-                        other => {
-                            let missing = other
-                                .get_meta()
-                                .missing_required_keys(&ProtocolVersion::V_2026_07_28);
-                            (!missing.is_empty()).then(|| {
-                                ServerJsonRpcMessage::error(
-                                    ErrorData::invalid_params(
-                                        format!(
-                                            "request _meta is missing or has malformed \
-                                             required fields: {}",
-                                            missing.join(", ")
-                                        ),
-                                        None,
-                                    ),
-                                    Some(request.id.clone()),
-                                )
-                            })
-                        }
-                    },
-                    _ => None,
-                };
-                match rejection {
-                    Some(rejection) => {
-                        if let Err(error) = self.inner.send(rejection).await {
-                            tracing::error!(%error, "failed to send pre-init metadata error");
-                            return None;
-                        }
-                    }
-                    None => {
-                        self.opened = true;
-                        return Some(message);
-                    }
-                }
-            }
-        }
-
-        fn close(&mut self) -> impl Future<Output = Result<(), T::Error>> + Send {
-            self.inner.close()
-        }
     }
 
     /// Build an MCP tool result from a rendered transcript. Deliberately text
@@ -2132,7 +2058,7 @@ Examples (4 patterns the agent should recognize):
 
         use std::sync::Arc;
 
-        use rmcp::model::{ErrorCode as JsonRpcErrorCode, Tool};
+        use rmcp::model::Tool;
 
         use super::*;
         use crate::wire::{ErrorBody, ErrorCode};
@@ -2171,63 +2097,100 @@ Examples (4 patterns the agent should recognize):
         /// connection, at a classic version or at 2026-07-28 itself.
         #[tokio::test]
         async fn malformed_opener_leaves_initialize_fallback_open() -> anyhow::Result<()> {
+            for version in ["2025-06-18", "2026-07-28"] {
+                let replies = exchange(&[
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+                    }),
+                    initialize_frame(2, version),
+                    serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+                    }),
+                ])
+                .await?;
+                assert_eq!(
+                    replies[&1]["error"]["code"],
+                    JsonRpcErrorCode::INVALID_PARAMS.0,
+                    "{version}"
+                );
+                assert!(
+                    replies[&2]["result"]["protocolVersion"].is_string(),
+                    "{version}"
+                );
+                assert!(has_tools(&replies[&3]), "{version}");
+            }
+            Ok(())
+        }
+
+        /// Claude Code probes with `server/discover` and, when the reply is
+        /// slow (a store open still in flight), falls back to `initialize`
+        /// before it lands; both arrive and the classic session must hold.
+        #[tokio::test]
+        async fn discover_probe_then_initialize_serves_classic_requests() -> anyhow::Result<()> {
+            let replies = exchange(&[
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+                    "params": {"_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "0"},
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }}
+                }),
+                initialize_frame(2, "2025-11-25"),
+                serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+                }),
+            ])
+            .await?;
+            assert!(replies[&1]["result"]["supportedVersions"].is_array());
+            assert_eq!(replies[&2]["result"]["protocolVersion"], "2025-11-25");
+            assert!(has_tools(&replies[&3]), "{}", replies[&3]);
+            Ok(())
+        }
+
+        fn initialize_frame(id: u64, version: &str) -> serde_json::Value {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": {},
+                    "clientInfo": {"name": "probe", "version": "0"}
+                }
+            })
+        }
+
+        fn has_tools(reply: &serde_json::Value) -> bool {
+            reply["result"]["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty())
+        }
+
+        /// Write `frames` back to back, as a client that does not wait between
+        /// requests would, and collect one reply per request keyed by id.
+        async fn exchange(
+            frames: &[serde_json::Value],
+        ) -> anyhow::Result<std::collections::HashMap<u64, serde_json::Value>> {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                for version in ["2025-06-18", "2026-07-28"] {
-                    let temp = tempfile::TempDir::new()?;
-                    let (client_io, server_task) = spawn_server(&temp).await?;
-                    let (read, mut write) = tokio::io::split(client_io);
-                    let mut lines = BufReader::new(read).lines();
-                    let mut send = async |frame: serde_json::Value| {
-                        write.write_all(format!("{frame}\n").as_bytes()).await
-                    };
-                    let mut recv = async || -> anyhow::Result<serde_json::Value> {
-                        let line = lines.next_line().await?.context("server hung up")?;
-                        Ok(serde_json::from_str(&line)?)
-                    };
-                    send(serde_json::json!({
-                        "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
-                    }))
-                    .await?;
-                    let rejected = recv().await?;
-                    assert_eq!(rejected["id"], 1, "{version}");
-                    assert_eq!(
-                        rejected["error"]["code"],
-                        JsonRpcErrorCode::INVALID_PARAMS.0,
-                        "{version}"
-                    );
-                    send(serde_json::json!({
-                        "jsonrpc": "2.0", "id": 2, "method": "initialize",
-                        "params": {
-                            "protocolVersion": version,
-                            "capabilities": {},
-                            "clientInfo": {"name": "probe", "version": "0"}
-                        }
-                    }))
-                    .await?;
-                    assert!(
-                        recv().await?["result"]["protocolVersion"].is_string(),
-                        "{version}"
-                    );
-                    send(serde_json::json!({
-                        "jsonrpc": "2.0", "method": "notifications/initialized"
-                    }))
-                    .await?;
-                    send(serde_json::json!({
-                        "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
-                    }))
-                    .await?;
-                    assert!(
-                        recv().await?["result"]["tools"]
-                            .as_array()
-                            .is_some_and(|tools| !tools.is_empty()),
-                        "{version}"
-                    );
-                    drop((lines, write));
-                    server_task.await??;
+                let temp = tempfile::TempDir::new()?;
+                let (client_io, server_task) = spawn_server(&temp).await?;
+                let (read, mut write) = tokio::io::split(client_io);
+                for frame in frames {
+                    write.write_all(format!("{frame}\n").as_bytes()).await?;
                 }
-                anyhow::Ok(())
+                let mut lines = BufReader::new(read).lines();
+                let mut replies = std::collections::HashMap::new();
+                for _ in frames.iter().filter(|frame| frame.get("id").is_some()) {
+                    let line = lines.next_line().await?.context("server hung up")?;
+                    let reply: serde_json::Value = serde_json::from_str(&line)?;
+                    replies.insert(reply["id"].as_u64().context("reply without id")?, reply);
+                }
+                drop((lines, write));
+                server_task.await??;
+                anyhow::Ok(replies)
             })
             .await?
         }

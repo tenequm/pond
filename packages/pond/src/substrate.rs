@@ -1138,9 +1138,9 @@ fn task_veto_reason(
         }
     }
 
-    // Match the writer's own count: lance 12 picks `max(1, floor(surviving_rows
+    // Match the writer's own count: lance 12+ picks `max(1, floor(surviving_rows
     // / target))` outputs and spreads rows EVENLY across them, so each reaches
-    // the target (lance-12.0.0 optimize.rs:2499-2528). Lance 11's fixed
+    // the target (lance-13.0.0 optimize.rs:2585-2614). Lance 11's fixed
     // `max_rows_per_file = target` stranded a tail instead - one output per
     // input, a shrink the byte prediction had promised, and the same task
     // re-planned every sync (#288, ~80 GiB/day for a 4.5 GiB table). The floor
@@ -1348,7 +1348,7 @@ impl IndexParamsKind {
     /// True for families whose search results are row *addresses*
     /// (`fragment_id << 32 | offset`) emitted straight from the persisted
     /// payload - named after Lance's `ScalarIndex::results_are_row_addresses`.
-    /// Lance 12 has three such families: ZoneMap, BloomFilter and FM-Index; pond
+    /// Lance 13 has three such families: ZoneMap, BloomFilter and FM-Index; pond
     /// ships only the ZoneMap. Fragment ids die at compaction, so these indexes go
     /// stale when covered fragments are rewritten; row-id-domain families
     /// survive rewrites via stable row ids.
@@ -3387,7 +3387,7 @@ impl Handle {
 ///
 /// spec.md#lance-index-maintenance mandates FRI on by default, but lance
 /// rejects `defer_index_remap=true` on stable-row-id datasets
-/// (`optimize.rs:738`): they never remap, so there is nothing to defer - we
+/// (`optimize.rs:823`): they never remap, so there is nothing to defer - we
 /// only lose the documented concurrency-with-index-build benefit.
 async fn optimize_table_compact(
     dataset: &mut Dataset,
@@ -3873,7 +3873,7 @@ async fn optimize_table_indices(
 /// intent name.
 ///
 /// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// skips the remapper entirely (lance-12 `optimize.rs` `needs_remapping`) and
+/// skips the remapper entirely (lance-13 `optimize.rs` `needs_remapping`) and
 /// only rewrites each covered index's `fragment_bitmap` to the new fragment
 /// ids (lance-table `transaction/index_maintenance.rs`
 /// `recalculate_fragment_bitmap`). A rewrite of covered

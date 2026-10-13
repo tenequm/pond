@@ -1,0 +1,148 @@
+diff --git a/packages/pond/src/sessions.rs b/packages/pond/src/sessions.rs
+index 97c49ab..7de4cc3 100644
+--- a/packages/pond/src/sessions.rs
++++ b/packages/pond/src/sessions.rs
+@@ -10434,3 +10434,143 @@ mod tests {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod lance13_probe_measure {
++    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
++    use super::*;
++    use tempfile::TempDir;
++
++    fn session(id: &str) -> Session {
++        Session {
++            id: id.to_owned(),
++            parent_session_id: None,
++            parent_message_id: None,
++            source_agent: "claude-code".to_owned(),
++            created_at: Utc::now(),
++            project: crate::adapter::Extracted::from_test_value("/tmp/pond".to_owned()),
++            options: ProviderOptions::new(),
++        }
++    }
++
++    fn message(session_id: &str, id: &str) -> Message {
++        Message::User {
++            id: id.to_owned(),
++            session_id: session_id.to_owned(),
++            timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
++            options: ProviderOptions::new(),
++        }
++    }
++
++    async fn write_session(store: &Store, index: usize, msgs: usize, text: &str) -> Result<()> {
++        let s = session(&format!("s{index:04}"));
++        store.upsert_sessions(std::slice::from_ref(&s)).await?;
++        let owned: Vec<Message> = (0..msgs)
++            .map(|m| message(&s.id, &format!("s{index:04}-m{m:03}")))
++            .collect();
++        let writes: Vec<MessageWrite<'_>> = owned
++            .iter()
++            .map(|message| MessageWrite {
++                message,
++                parts: &[],
++                search_text: Some(text),
++            })
++            .collect();
++        store.upsert_messages(&s, &writes).await
++    }
++
++    fn frag_files(stats: &lance_io::utils::tracking_store::IoStats) -> (usize, usize, u64) {
++        let mut files = HashSet::new();
++        let mut data_reads = 0usize;
++        let mut data_bytes = 0u64;
++        for request in &stats.requests {
++            let path = request.path.to_string();
++            if path.contains("messages") && path.contains("/data/") {
++                files.insert(path);
++                data_reads += 1;
++                data_bytes += request
++                    .range
++                    .as_ref()
++                    .map_or(0, |range| (range.end - range.start) as u64);
++            }
++        }
++        (files.len(), data_reads, data_bytes)
++    }
++
++    async fn measure(url: &Url, label: &str) -> Result<MessageStoreProbe> {
++        let store = Store::open(url).await?;
++        let dataset = store.handle.dataset(Table::Messages).await?;
++        let frags = dataset.get_fragments();
++        let deleted = frags
++            .iter()
++            .filter(|f| f.metadata().deletion_file.is_some())
++            .count();
++        println!(
++            "[{label}] messages fragments={} with_deletions={} stable_row_ids={} version={}",
++            frags.len(),
++            deleted,
++            dataset.manifest().uses_stable_row_ids(),
++            dataset.version().version
++        );
++        let _ = crate::substrate::io_trace::take();
++        let probe = store.message_store_probe().await?;
++        let stats = crate::substrate::io_trace::take().unwrap();
++        let (files, data_reads, data_bytes) = frag_files(&stats);
++        println!(
++            "[{label}] probe (cold store) io: read_iops={} read_bytes={} | messages data files touched={} data reads={} data bytes={}",
++            stats.read_iops, stats.read_bytes, files, data_reads, data_bytes
++        );
++        println!(
++            "[{label}] probe result: row_count={} oldest={:?}",
++            probe.row_count, probe.oldest_messages
++        );
++        drop(store);
++
++        for with_row_id in [true, false] {
++            let store = Store::open(url).await?;
++            let mut scanner = store.handle.scanner(Table::Messages, None).await?;
++            if with_row_id {
++                scanner.with_row_id();
++            }
++            scanner.project(&["id"])?;
++            scanner.limit(Some(Store::ROWMAP_PROBE_ROWS), None)?;
++            let _ = crate::substrate::io_trace::take();
++            let plan = scanner.analyze_plan().await?;
++            let stats = crate::substrate::io_trace::take().unwrap();
++            let (files, data_reads, data_bytes) = frag_files(&stats);
++            println!(
++                "[{label}] analyze_plan with_row_id={with_row_id} (cold store): io read_iops={} read_bytes={} | data files touched={} data reads={} data bytes={}\n{plan}",
++                stats.read_iops, stats.read_bytes, files, data_reads, data_bytes
++            );
++        }
++        Ok(probe)
++    }
++
++    async fn run(url: &Url, tag: &str) -> Result<()> {
++        let text = "lorem ipsum dolor sit amet ".repeat(80);
++        {
++            let store = Store::open(url).await?;
++            for index in 0..128 {
++                write_session(&store, index, 20, &text).await?;
++            }
++        }
++        let a = measure(url, &format!("{tag}/appends-only")).await?;
++        {
++            let store = Store::open(url).await?;
++            let mut dataset = store.handle.dataset(Table::Messages).await?;
++            dataset.delete("id = 's0000-m001' OR id = 's0050-m005' OR id LIKE 's0001-%'").await?;
++        }
++        let b = measure(url, &format!("{tag}/with-deletions")).await?;
++        println!("RESULT {tag} appends={:?}\nRESULT {tag} deletions={:?}", (a.row_count, &a.oldest_messages), (b.row_count, &b.oldest_messages));
++        Ok(())
++    }
++
++    #[tokio::test(flavor = "multi_thread")]
++    async fn probe_fragment_pruning() -> Result<()> {
++        crate::substrate::io_trace::enable();
++        let temp = TempDir::new()?;
++        run(&config::url_for_path(temp.path())?, "local").await?;
++        run(&Url::parse("shared-memory://pond-lance13-probe/")?, "memory").await?;
++        Ok(())
++    }
++}
