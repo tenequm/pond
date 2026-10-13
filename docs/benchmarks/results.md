@@ -208,45 +208,81 @@ sys	2m42.220s
 
 ## bench-gate: Lance 12 -> 13 upgrade (#342)
 
-Store digest `5fcd5e32b8dd` (the live s3-nbg1 store), both sides read-only against it; write benches ran on scratch stores beside it. The Lance 12 side is a full gate (perf + mem ci) on **bl** at `8b6ec39` (2026-10-13T07:08Z). The Lance 13 side is the perf half on **mac-m1max** at `b4965d0` (2026-10-13T10:08:59Z): a Lance 13 run on bl was stopped mid-build (the N100 needs ~1.5 h of compile per side), so the pair spans two hosts.
+Store digest `5fcd5e32b8dd` (the live s3-nbg1 store), read-only. Write benches ran on scratch stores beside it. The primary pair is **same-host on mac-m1max**: a full gate (perf + mem `ci`) at `8b6ec39` (Lance 12; main plus the `store_probe` io-trace component) and at `b4965d0` (Lance 13; only the pins differ). The Lance 12 perf half ran at 2026-10-13T11:22:13Z, the Lance 13 one at 2026-10-13T10:08:59Z. There is also a third, unpaired row: a full Lance 12 gate on **bl** at 2026-10-13T07:08:32Z. Its Lance 13 partner was stopped mid-build, because the N100 needs about 1.5 h of compile per side.
 
-That decides what compares. The io-trace iops are S3 request counts per warm query - a function of the store and the code, not the host - so they compare across the pair. Wall-clock fields do not (different CPU, different network path to nbg1); same-host latency is the hyperfine A/B further down. `8b6ec39` is main plus the `store_probe` component; `b4965d0` adds only the Lance 13 pins.
+Lineage note: the bl rows carry host `Linux-x86_64`, the same tag as the ws-pond-01 rows before them, so the delta printer pairs bl against ws-pond-01. Those deltas reflect hardware, not Lance. bl's mem rows read peak heap 9-60% below ws-pond-01's (`f35c084`, also Lance 12) and peak RSS 4-29% below, on the same Lance version. The bl perf row's io-trace request counts (`store_probe` 119, `fts` 36, `get_message` 27, `search` 185) agree with the Mac Lance 12 row, as request counts should across hosts.
 
-Lineage note: the bl rows carry host `Linux-x86_64`, the same tag as the ws-pond-01 rows before them, so the delta printer pairs bl against ws-pond-01. Those deltas are hardware, not Lance: bl's mem rows read peak heap 9-60% below ws-pond-01's (`f35c084`, Lance 12 too) and peak RSS 4-29% below, on the same Lance version - fewer cores, less concurrent readahead. The Lance 13 row is the first `Darwin-arm64` row.
-
-### 2026-10-13 - s3-nbg1, io-trace iops (cross-host comparable)
+### 2026-10-13 - mac-m1max -> s3-nbg1, perf-gate pair (same host)
 
 ```
-metric                lance 12 (bl)  lance 13 (mac)   delta
-fts_iops                         36              14    -61%
-vector_iops                      92              90     -2%
-get_message_iops                 27              16    -41%
-search_iops                     185             155    -16%
-store_probe_iops                119               1    -99%
-equivalence                      OK              OK
+metric                  lance 12  lance 13   delta
+get_session_sid_s           11.0       5.0    -55%
+get_session_mid_s            8.2       5.0    -39%
+get_message_s                9.3      18.4    +98%
+search_s                     7.8       5.1    -35%
+search_dated_s               9.0       4.5    -50%
+sql_count_s                  1.9       3.6    +89%
+fts_iops                      36        14    -61%
+vector_iops                   96        90     -6%
+get_message_iops              39        16    -59%
+search_iops                  211       155    -27%
+store_probe_iops             121         1    -99%
+open_store_ms               1351      1186    -12%
+row_counts_ms                801       932    +16%
+rowmap_cold_ms             29499     27181     -8%
+rowmap_warm_ms              1587       338    -79%
+write_copy_ms               3451      3284     -5%
+write_copy_merge_ms          634       552    -13%
+write_copy_noop_ms           597       557     -7%
+write_copy_delta_ms          562       537     -4%
+write_ms_per_commit        590.0     399.0    -32%
+write_rows_per_s             847      1253    +48%
+write_index_build_ms       14741     14797     +0%
+write_fold_ms               3311      7556   +128%
+equivalence                   OK        OK
 ```
 
-`store_probe` is the rowmap store probe every one-shot read pays (#310): one `message_store_probe` call, 119 GETs on Lance 12 against 1 on Lance 13. That is lance#9344 pruning the unfiltered `scan(id) LIMIT 3` to the leading fragment(s) from manifest live-row counts, on the real store rather than the fixture.
+The io-trace request counts are deterministic for a given store and code, and they drop everywhere. `store_probe` is #310's rowmap store probe, one `message_store_probe` call: 121 GETs / ~84 MB per call on Lance 12, and 1 GET / ~3 KB on Lance 13. That is lance#9344 pruning the unfiltered `scan(id) LIMIT 3` to the leading fragment from manifest live-row counts. Warm `pond_get_message` reads 0.9 MB instead of 4.7 MB at p50.
 
-### 2026-10-13 - s3-nbg1, gate wall-clock fields (NOT cross-host comparable, recorded for each host's own lineage)
+The wall-clock fields are one sample each, so a single row cannot bracket them. Two of them were checked with targeted A/Bs, below:
+- `get_message_s` (9.3 -> 18.4) reversed under a 20-run interleaved A/B.
+- `write_fold_ms` (3,311 -> 7,556) was flat under a 4-pair interleaved A/B.
+
+### 2026-10-13 - mac-m1max, mem gate pair (`ci` profile, median of 3 runs each)
 
 ```
-metric                  lance 12 (bl)  lance 13 (mac)
-get_session_sid_s                 4.7             5.0
-get_session_mid_s                 7.7             5.0
-get_message_s                     8.5            18.4
-search_s                          9.3             5.1
-search_dated_s                    5.3             4.5
-sql_count_s                       1.4             3.6
-open_store_ms                     956            1186
-row_counts_ms                    1105             932
-rowmap_cold_ms                  17074           27181
-rowmap_warm_ms                   1425             338
-write_copy_ms                    5946            3284
-write_ms_per_commit             599.8           399.0
-write_index_build_ms            27793           14797
-write_fold_ms                    2864            7556
+scenario                           heap MiB 12     13   delta  rss MiB 12     13   delta
+sync-noop-local                           24.9   24.8     -0%        75.3   75.2     -0%
+sync-incremental                          24.9   24.8     -1%        97.5   99.1     +2%
+rowmap-build-cold                         24.9   24.9     +0%        74.4   75.1     +1%
+mcp-query-growth                          11.9   19.2    +61%       113.1  121.7     +8%
+ingest-large-session                     106.1  106.1     -0%       195.8  197.2     +1%
+search-query-latency                       6.9    6.8     -1%        91.1   98.6     +8%
+ingest-throughput                         22.4   22.4     -0%        99.3  103.4     +4%
+serve-sync-retention                      24.9   24.8     -1%        79.8   79.0     -1%
+sync-under-contention                      4.4    0.6    -87%        90.0   90.9     +1%
+rowmap-build-cold-partial-embed           11.2   11.2     -1%       214.7  225.1     +5%
 ```
+
+Flat on 8 of 10 scenarios. `mcp-query-growth` peak heap rises consistently: per-run 12.0 / 11.9 / 11.9 MiB on Lance 12 against 16.3 / 19.2 / 19.4 on Lance 13. RSS is +8%, the retained heap after the run is 5% lower, and the growth slope drops from 18 to 5 B/iter, so this is a bigger transient peak inside each query, not retention. Same class as #300 (Lance 12's row-id readahead, which 13 leaves unchanged); a plausible source is 13's batched page reads (lance#9379/#9473, 8 MiB request batches), not verified. It is past the gate's 20% threshold on a gated scenario, but nothing gates in CI (`bench-check` is not wired into any workflow). `sync-under-contention` (record-only) reads a flat 0.6 MiB on every Lance 13 run; whether the scenario still exercises the same path on 13 has not been checked. `scan_fallbacks` stays 0.
+
+### 2026-10-13 - mac-m1max -> s3-nbg1, cold one-shot `pond get-message` A/B (live store)
+
+Released 0.19.5 (Lance 12; same read path as main) against the `b4965d0` release build. Two hyperfine passes, the second in reverse order, 5 runs per side per pass (one warmup). Medians over all 10: Lance 12 6.29 s, Lance 13 5.14 s (-18%). Peak memory was 580-587 MiB on Lance 12 and 498 MiB on Lance 13. The gate's single `get_message_s` sample (26.0 / 18.4 s on Lance 13) was a cold one-off.
+
+### 2026-10-13 - mac-m1max -> s3-nbg1 scratch, `write_bench --profile-optimize` fold A/B
+
+`--sessions 500 --messages 5 --grown 2`, the gate's write corpus. The release bench binaries were snapshotted per side, and 4 pairs ran interleaved (12/13, 13/12, ...), each on its own scratch prefix. Medians:
+
+```
+step                       lance 12   lance 13   delta
+fold round total (ms)          3380       3438     +2%
+  messages cleanup (ms)        1305       1522    +17%
+  messages index-append (ms)   1645       1590     -3%
+round 0 total (ms)             4760       4512     -5%
+```
+
+`write_fold_ms` does not regress. Version cleanup costs about 200 ms more per call, consistently, in all 4 pairs: every Lance 13 run is above every Lance 12 run. Lance 13's cleanup issues the same or fewer requests on a no-delete pass (lance#9414 made deletes concurrent and dropped the per-manifest HEADs), so the cause is unidentified. It is immaterial at `pond sync`'s every-8th-version cleanup gate.
 
 ### 2026-10-13 - mac-m1max -> S3 copy of the live store, hyperfine A/B (same host, both binaries)
 
