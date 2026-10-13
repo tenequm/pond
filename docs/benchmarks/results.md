@@ -210,7 +210,7 @@ sys	2m42.220s
 
 Store digest `5fcd5e32b8dd` (the live s3-nbg1 store), read-only. Write benches ran on scratch stores beside it. The primary pair is **same-host on mac-m1max**: a full gate (perf + mem `ci`) at `8b6ec39` (Lance 12; main plus the `store_probe` io-trace component) and at `b4965d0` (Lance 13; only the pins differ). The Lance 12 perf half ran at 2026-10-13T11:22:13Z, the Lance 13 one at 2026-10-13T10:08:59Z. There is also a third, unpaired row: a full Lance 12 gate on **bl** at 2026-10-13T07:08:32Z. Its Lance 13 partner was stopped mid-build, because the N100 needs about 1.5 h of compile per side.
 
-Lineage note: the bl rows carry host `Linux-x86_64`, the same tag as the ws-pond-01 rows before them, so the delta printer pairs bl against ws-pond-01. Those deltas reflect hardware, not Lance. bl's mem rows read peak heap 9-60% below ws-pond-01's (`f35c084`, also Lance 12) and peak RSS 4-29% below, on the same Lance version. The bl perf row's io-trace request counts (`store_probe` 119, `fts` 36, `get_message` 27, `search` 185) agree with the Mac Lance 12 row, as request counts should across hosts.
+Lineage note: the bl rows carry host `Linux-x86_64`, the same tag as the ws-pond-01 rows before them, so the delta printer pairs bl against ws-pond-01. Those deltas reflect hardware, not Lance. bl's mem rows read peak heap 9-60% below ws-pond-01's (`f35c084`, also Lance 12) and peak RSS 4-29% below, on the same Lance version. The bl perf row's io-trace request counts (`store_probe` 119, `fts` 36, `get_message` 27, `search` 185, `vector` 92) are close to the Mac Lance 12 row's (121 / 36 / 39 / 211 / 96) but not equal: the store digest hashes the URL, not a snapshot, and the live store took about 50 syncs between the two runs, so the counts drift with store state.
 
 ### 2026-10-13 - mac-m1max -> s3-nbg1, perf-gate pair (same host)
 
@@ -242,7 +242,7 @@ write_fold_ms               3311      7556   +128%
 equivalence                   OK        OK
 ```
 
-The io-trace request counts are deterministic for a given store and code, and they drop everywhere. `store_probe` is #310's rowmap store probe, one `message_store_probe` call: 121 GETs / ~84 MB per call on Lance 12, and 1 GET / ~3 KB on Lance 13. That is lance#9344 pruning the unfiltered `scan(id) LIMIT 3` to the leading fragment from manifest live-row counts. Warm `pond_get_message` reads 0.9 MB instead of 4.7 MB at p50.
+The io-trace request counts depend on store state and code, not host speed. The two runs are 74 minutes apart on a live store that syncs every 5 minutes, so small differences are drift. The drops here are far larger than that drift, and they go down everywhere. `store_probe` is #310's rowmap store probe, one `message_store_probe` call: 121 GETs / ~84 MB per call on Lance 12, and 1 GET / ~3 KB on Lance 13. That is lance#9344 pruning the unfiltered `scan(id) LIMIT 3` to the leading fragment from manifest live-row counts. Warm `pond_get_message` reads 0.9 MB instead of 4.7 MB at p50.
 
 The wall-clock fields are one sample each, so a single row cannot bracket them. Two of them were checked with targeted A/Bs, below:
 - `get_message_s` (9.3 -> 18.4) reversed under a 20-run interleaved A/B.
