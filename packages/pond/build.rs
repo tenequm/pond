@@ -8,11 +8,15 @@ use std::error::Error;
 // MAX_PATH-bound; it converts to `\\?\` verbatim paths internally.
 //
 // Gated on CARGO_CFG_WINDOWS (the target), not the host: embed_manifest is a
-// no-op anywhere else.
+// no-op anywhere else. POND_SKIP_EMBED_MANIFEST opts the CI test leg out, since
+// kache cannot cache a link that carries /MANIFESTINPUT; shipped builds embed it.
 fn main() -> Result<(), Box<dyn Error>> {
-    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some()
+        && std::env::var_os("POND_SKIP_EMBED_MANIFEST").is_none()
+    {
         embed_manifest::embed_manifest(embed_manifest::new_manifest("Pond.Pond"))?;
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=POND_SKIP_EMBED_MANIFEST");
     Ok(())
 }

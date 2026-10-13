@@ -287,7 +287,17 @@ jobs:
     # the artifact cache cold and every later PR rebuilds Lance from scratch.
     # PRs still replay docs/CI-only diffs from main's own stored hashes.
     env:
-      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # A force_build dispatch reads nothing and writes nothing: `off`, not
+      # MOON_FORCE, which switches moon to write mode and would let a dispatch
+      # on any ref upload hashes main later replays (moon crates/cache/src/cache_engine.rs).
+      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || (inputs.force_build && 'off' || 'read') }}
+      # Skips build.rs's Windows manifest on this leg only: kache refuses to cache
+      # a link carrying /MANIFESTINPUT. dist-build-windows still embeds it.
+      POND_SKIP_EMBED_MANIFEST: '1'
+      # Records which key groups changed on a miss, for `kache explain` below. A
+      # fresh runner has no earlier local build, so explain can only compare the
+      # prefetched entries' target/profile/features, not input groups.
+      KACHE_EXPLAIN_MISS: '1'
       # On-demand cache warmer: a main push whose head commit message carries
       # '[force-build]' compiles for real even on a moon hash hit - the way to
       # repopulate a cold kache prefix without waiting for an input-changing
@@ -338,21 +348,6 @@ jobs:
       # `Plan:` count reaches the log only if the pull gets that far, and no step
       # times it. `kache stats` in the diagnostics below is the surviving number.
 
-      # moon replays the hash main already stored when a diff touches none of a
-      # task's declared inputs, which is every CI-only change - so a run whose
-      # kache numbers will be read has to defeat it deliberately.
-      #
-      # The value must be the literal `true`. MOON_FORCE is not a presence
-      # check: it is the clap env binding for `--force` (`moon run --help`:
-      # `[env: MOON_FORCE=]`), so moon parses it as the flag's value and rejects
-      # anything outside true/false with `error: invalid value '1' for
-      # '--force'`. Written only when asked, so the variable is simply absent on
-      # an ordinary run.
-      - name: Force a real compile
-        if: inputs.force_build
-        shell: pwsh
-        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
-
       # Full suite, not a subset: DataFusion, axum and rmcp have no Windows CI
       # anywhere upstream, so this is the first place they ever run on Windows.
       # --output-style stream: two primary targets otherwise buffer to exit, so
@@ -385,6 +380,9 @@ jobs:
         timeout-minutes: 2
         run: |
           kache stats
+          # The crates that missed on a same-commit re-run.
+          kache explain pond
+          kache explain integration
           Get-PSDrive C, D | Format-Table -AutoSize
           $log = Join-Path $env:KACHE_RUNTIME_DIR 'daemon.log'
           if (Test-Path $log) { Get-Content -Tail 200 $log } else { "no daemon log at $log" }
@@ -424,7 +422,8 @@ jobs:
     # write moon's remote cache, so a release push compiles for real inside
     # kache's write window instead of replaying a dispatch-stored hash.
     env:
-      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || 'read' }}
+      # Same rules as build-and-test-windows, force_build `off` included.
+      MOON_CACHE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'read-write' || (inputs.force_build && 'off' || 'read') }}
       # Same '[force-build]' warmer as build-and-test-windows.
       MOON_FORCE: ${{ github.event_name == 'push' && contains(github.event.head_commit.message, '[force-build]') }}
     steps:
@@ -442,16 +441,6 @@ jobs:
           kache-secret-access-key: ${{ secrets.KACHE_S3_SECRET_KEY }}
           manifest-key: windows-dist
           s3-prefix: kache/pond/windows-dist/k35
-
-      # Same reasoning as the sibling job: without this, moon serves the stored
-      # hash and nothing is actually compiled or measured. Same `true`-not-`1`
-      # constraint too. This still cannot prewarm the prefix - kache forces the
-      # remote read-only outside a protected-branch push (src/policy.rs) - so a
-      # rotated prefix is warmed by the next push to main, not by a dispatch.
-      - name: Force a real compile
-        if: inputs.force_build
-        shell: pwsh
-        run: '"MOON_FORCE=true" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
 
       # Build + smoke + package, as a moon task so the leg gets the same
       # task-level remote cache every other build has. `--profile dist`, not
@@ -594,7 +583,7 @@ jobs:
 
       # kache is not in the flake devShell (a per-machine tool, and a repo pin
       # that disagreed with developers' own daemons), so this job - the only
-      # Linux consumer, through RUSTC_WRAPPER in ops/scripts/build-dist.sh -
+      # Linux consumer, through RUSTC_WRAPPER in the repo:build-dist script -
       # installs its own pinned copy. Deliberately not kunobi-ninja/kache-action
       # as on Windows: that action exports its own RUSTC_WRAPPER, KACHE_CACHE_DIR,
       # manifest/namespace and daemon lifecycle, all of which would change how
