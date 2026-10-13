@@ -223,9 +223,25 @@ async fn rebuilt_store_rejects_and_replaces_the_old_cursor() {
         String::from_utf8_lossy(&rebuilt.stderr).contains("first sync from this host"),
         "the old cursor must not mark the replacement store fresh",
     );
+    // The deterministic re-ingest matches the deleted store's chain row for
+    // row (the restored-from-backup semantics of `rowmap_matches_store`), so
+    // the rebuilt sync ends with a store-validated map and persists a fresh
+    // cursor; the old cursor was rejected above. The replacement must describe
+    // the REBUILT store: a dry-run plans incrementally off it while the rowmap
+    // build lock is still held.
     assert!(
-        !cursor_path.exists(),
-        "the rejected cursor stays absent until a current rowmap is available",
+        cursor_path.is_file(),
+        "the rebuilt sync persists a cursor for the replacement store",
+    );
+    let preview = sandboxed_pond(&temp)
+        .args(["sync", "--dry-run"])
+        .output()
+        .expect("preview with the replacement cursor");
+    let preview_out = String::from_utf8_lossy(&preview.stdout);
+    assert!(
+        preview.status.success() && preview_out.contains("up to date"),
+        "the replacement cursor must mark the rebuilt store fresh:\n{preview_out}{}",
+        String::from_utf8_lossy(&preview.stderr),
     );
     let store = Store::open_local(temp.path().join("store"))
         .await
