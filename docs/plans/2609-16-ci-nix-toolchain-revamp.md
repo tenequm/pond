@@ -327,8 +327,9 @@ Phase 5 notes, decided while implementing (the plan was silent on each):
   ones included, which never enter the flake. The Rust file groups now take
   `ops/toolchain-id.json`, a committed `lib.toolchainId` = the devShell's
   drvPath per system, so the key moves only when the shell itself does; the msvc
-  tasks take `.github/actions/windows-bootstrap/action.yml`, where their pins
-  live. `flake-check` diffs the file against a fresh evaluation, and the
+  tasks take `.prototools` and their `.github/kache/windows-*.toml` (since
+  2026-10-14; before that the deleted `windows-bootstrap` action, where their
+  pins lived). `flake-check` diffs the file against a fresh evaluation, and the
   devshell action's profile key grew a fourth file (it hashes
   `ops/toolchain-id.json` too) and verifies the committed id for its own system
   before it creates the profile - so a hit implies the check already passed and

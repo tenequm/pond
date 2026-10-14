@@ -1,10 +1,6 @@
-# The moon and protoc pins for every machine: flake.nix reads both into the
-# devShell's toolVersions, and runners without the flake (the Windows legs,
-# publish-release) install them from here through moonrepo/setup-toolchain.
-# One copy, because moon refuses a remote cache written by another moon
-# version, and a protoc skew would build two different binaries from one commit.
-# Plain `name = "x.y"` lines above any table: setup-toolchain decides by text
-# whether proto or the action installs moon, and stops at the first table.
+# The single moon and protoc pin: flake.nix reads it into the devShell, and the
+# runners without the flake install from it through moonrepo/setup-toolchain.
+# Version lines stay above any table, where setup-toolchain scans them as text.
 moon = "2.6.1"
 protoc = "36.1"
 
@@ -15,7 +11,6 @@ protoc = "https://raw.githubusercontent.com/b4nst/proto-plugins/b93fa985e51e3ba4
 
 [settings]
 telemetry = false
-# Without it, a bare `proto install` (setup-toolchain's auto-install) also picks
-# rust up from rust-toolchain.toml and installs it through rustup its own way,
-# which left the Windows toolchain without cargo.exe. Rust stays rustup's.
+# Otherwise a bare `proto install` also installs rust from rust-toolchain.toml,
+# its own way, which left the Windows toolchain without cargo.exe.
 detect-strategy = "only-prototools"
