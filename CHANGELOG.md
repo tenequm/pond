@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.20.1](https://github.com/tenequm/pond/compare/v0.20.0...v0.20.1) - 2026-10-14
+
+### <!-- 2 -->🐛 Bug Fixes
+- **schedule:** keep systemd sync timers recurring ([#352](https://github.com/tenequm/pond/pull/352)) ([a66b2b7](https://github.com/tenequm/pond/commit/a66b2b70c2ba65ada1915b52a3097081026f794a))
+  Systemd sync schedules now keep firing and catch up missed runs after
+  restart, with a stable per-host delay to spread shared-store load.
+  Re-run `pond schedule start --every <interval>` after upgrading. Daily
+  schedules start from 03:00 local time and follow calendar days.
+
+  ---------
+
+
+### <!-- 6 -->🧹 Chores
+- upgrade kache to 1.1.1 and rotate cache prefixes to k35 ([#348](https://github.com/tenequm/pond/pull/348)) ([df16abe](https://github.com/tenequm/pond/commit/df16abea9acb12ad7ddd7773d4eebf19aef83da8))
+  CI-only: kache 1.1.1 with fresh k35 caches and per-PR Windows cache
+  reuse, moon 2.6.1, inlined dist build scripts. No user-facing change.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.20.0...v0.20.1
+
 ## [0.20.0](https://github.com/tenequm/pond/compare/v0.19.6...v0.20.0) - 2026-10-13
 
 ### <!-- 0 -->🛠 Breaking Changes
