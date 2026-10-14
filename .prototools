@@ -15,3 +15,7 @@ protoc = "https://raw.githubusercontent.com/b4nst/proto-plugins/b93fa985e51e3ba4
 
 [settings]
 telemetry = false
+# Without it, a bare `proto install` (setup-toolchain's auto-install) also picks
+# rust up from rust-toolchain.toml and installs it through rustup its own way,
+# which left the Windows toolchain without cargo.exe. Rust stays rustup's.
+detect-strategy = "only-prototools"
