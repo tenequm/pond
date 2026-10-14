@@ -1,16 +1,16 @@
 # The single moon and protoc pin: flake.nix reads it into the devShell, and the
-# runners without the flake install from it through moonrepo/setup-toolchain.
-# Version lines stay above any table, where setup-toolchain scans them as text.
+# jobs without the flake download both releases at these versions. Version
+# lines stay above any table, where those readers scan them as text.
 moon = "2.6.1"
 protoc = "36.1"
 
-# protoc is a community TOML plugin, pinned to a commit: the registry entry
-# points at the plugin repo's moving main branch.
+# For `proto install` on developer machines. protoc is a community TOML plugin,
+# pinned to a commit: the registry entry points at a moving main branch.
 [plugins.tools]
 protoc = "https://raw.githubusercontent.com/b4nst/proto-plugins/b93fa985e51e3ba4ddf465099f330a7eb06700f0/toml/protoc.toml"
 
 [settings]
 telemetry = false
 # Otherwise a bare `proto install` also installs rust from rust-toolchain.toml,
-# its own way, which left the Windows toolchain without cargo.exe.
+# its own way, which leaves the toolchain without cargo.exe on Windows.
 detect-strategy = "only-prototools"

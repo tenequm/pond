@@ -9,8 +9,9 @@
 # inherits the dist profile's thin LTO and cgu=1, so the rustc flags differ per
 # unit and the keys never collide).
 #
-# Selected by dist-build-windows's KACHE_CONFIG in ci.yml, and an input of
-# repo:build-dist-msvc so a k-tag rotation rebuilds into the new prefix.
+# Selected through KACHE_CONFIG, which ci.yml's `Start kache` builds from the
+# job's manifest key, and an input of repo:build-dist-msvc so a k-tag rotation
+# rebuilds into the new prefix.
 [cache.remote]
 type = "s3"
 bucket = "pond-kache"

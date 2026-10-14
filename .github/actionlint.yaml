@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # The in-cluster ARC runner scale set that build-and-test-linux and
+  # dist-build-unix run on.
+  labels: [pond-ci]

@@ -334,14 +334,13 @@ tasks:
       New-Item -ItemType Directory -Force -Path dist | Out-Null
       Compress-Archive -Path stage\pond.exe,stage\pondw.exe,stage\completions -DestinationPath dist\pond-x86_64-pc-windows-msvc.zip -Force
       Remove-Item -Recurse -Force stage
-    # Same NASM opt-in as pond:test-msvc, for the same reasons.
+    # Same NASM opt-in as pond:lint-msvc and pond:test-msvc, for the reasons
+    # given there.
     env:
       AWS_LC_SYS_PREBUILT_NASM: '1'
     inputs:
       - '@group(sources)'
-      # This leg never enters the flake: protoc's pin, and the kache remote whose
-      # k-tag a cache-key-changing kache bump rotates, so the rotation itself
-      # rebuilds into the new prefix (same as pond:test-msvc).
+      # Same as pond's msvcToolchain group, with this leg's own kache remote.
       - '.prototools'
       - '.github/kache/windows-dist.toml'
     outputs:

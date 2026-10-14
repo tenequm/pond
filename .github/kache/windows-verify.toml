@@ -6,7 +6,8 @@
 # which is why "file for the remote, env for the secrets" is the shape that
 # survives the next bump.
 #
-# Selected by the job's KACHE_CONFIG in ci.yml; discovery is KACHE_CONFIG >
+# Selected through KACHE_CONFIG, which ci.yml's `Start kache` builds from the
+# job's manifest key; discovery is KACHE_CONFIG >
 # nearest .kache.toml > XDG at both 0.9.0 and 0.14.2 (src/config.rs,
 # resolve_config_path). NOT a repo-root .kache.toml: that is found by every
 # contributor running kache as RUSTC_WRAPPER anywhere inside a checkout and

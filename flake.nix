@@ -48,10 +48,10 @@
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      # Every tool version in one place, in plain `name = "x.y.z";` form on
-      # purpose: a reader without Nix can extract it by text. The flake-check
-      # job keeps that text form honest - it fails when the literals and
-      # `nix eval --json .#lib.toolVersions` disagree. Rust is not repeated
+      # Every tool version in one place, in plain `name = "x.y.z";` form where
+      # it is defined here: a reader without Nix can extract it by text. The
+      # flake-check job keeps that text form honest - it fails when the literals
+      # and `nix eval --json .#lib.toolVersions` disagree. Rust is not repeated
       # here - it is read from rust-toolchain.toml, which stays the single Rust
       # pin - and neither are moon and protoc: .prototools is their single pin,
       # because the runners without this flake install them from it.
@@ -150,7 +150,7 @@
 
       # The devShell is built from `nixpkgs-toolchain` and must NOT reference
       # `self` or the source tree: CI keys a `nix print-dev-env` profile on the
-      # hash of flake.nix, flake.lock, rust-toolchain.toml and
+      # hash of flake.nix, flake.lock, rust-toolchain.toml, .prototools and
       # ops/toolchain-id.json, moon keys the Rust tasks on its drvPath
       # (`lib.toolchainId`), and a source reference would make every commit a
       # fresh derivation (plan 2609-16 2.2).
