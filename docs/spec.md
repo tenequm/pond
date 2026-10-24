@@ -604,7 +604,7 @@ Identifiers on canonical objects are opaque strings. An adapter decodes any stru
 
 ##### `adapter-integrity-additive-sync`
 
-A write MUST NOT overwrite a row already present under its primary key - matched rows are no-ops. Adapter output is monotone across versions: a newer adapter produces a superset of the rows a prior version produced, except where it corrects a record it had misclassified - it then stops emitting the rows that classification implied, and rows already stored stay untouched. The source is not authoritative against pond's stored copy - a re-parse from a since-corrupted source must not be able to overwrite good data. Changing or removing an already-stored row is a deliberate migration, never a side effect of re-ingest.
+A write MUST NOT overwrite a row already present under its primary key - matched rows are no-ops. Adapter output is monotone across versions: a newer adapter produces a superset of the rows a prior version produced. The source is not authoritative against pond's stored copy - a re-parse from a since-corrupted source must not be able to overwrite good data. Changing or removing an already-stored row is a deliberate migration, never a side effect of re-ingest.
 
 ##### `adapter-integrity-dedup`
 
