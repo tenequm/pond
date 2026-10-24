@@ -849,7 +849,14 @@ fn events_from_row(
         .and_then(Value::as_str)
         .map_or_else(|| format!("{session_id}:{line}"), ToOwned::to_owned);
 
-    if let Some(message_value) = row.get("message") {
+    let raw_type = row.get("type").and_then(Value::as_str);
+    // Only `user` / `assistant` rows are turns. The request journal
+    // (`api-request-blob`, Claude Code >= 2.1.310) also carries a `message`,
+    // but re-copies turn bodies the transcript already holds; mapping it as a
+    // turn doubles the conversation at the session-anchor timestamp.
+    if matches!(raw_type, Some("user" | "assistant"))
+        && let Some(message_value) = row.get("message")
+    {
         return message_events(
             session_id,
             &uuid,
@@ -861,13 +868,11 @@ fn events_from_row(
         );
     }
 
-    // Rows with no `message` field are session-metadata records:
-    // `queue-operation`, `permission-mode`, `last-prompt`, `attachment`,
-    // `progress`, `system`, `custom-title`, etc. We preserve them as
-    // System messages with the row's compact JSON in `content` so a future
-    // exporter could reconstruct the original transcript; the `subtype`
-    // becomes the human label via `options.source.raw_type`.
-    let raw_type = row.get("type").and_then(Value::as_str);
+    // Every other row is a session-metadata record: `queue-operation`,
+    // `permission-mode`, `last-prompt`, `attachment`, `progress`, `system`,
+    // `custom-title`, the `api-request*` journal, etc. We preserve them as
+    // System messages with the whole row in `options.source.raw_record`, so
+    // native restore replays it; `content` carries the `subtype` or `type` label.
     let content = if raw_type == Some("attachment") {
         row.get("attachment")
             .and_then(attachment_content)
@@ -2555,6 +2560,119 @@ mod tests {
         }
         assert!(saw_prompt && saw_notification, "both messages present");
         Ok(())
+    }
+
+    /// The request journal (`api-request`, `api-request-blob`,
+    /// `api-request-shape`) re-copies turn bodies (`api-request-blob` rows carry
+    /// no `uuid` or `timestamp`). Its rows must land as System carriers - never as turns, which
+    /// duplicated the conversation at the session anchor and sorted a reply
+    /// ahead of its prompt (#358) - and still restore natively value-equal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_journal_rows_are_carriers_not_turns() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        let project_dir = corpus.path().join("-tmp-pond-test");
+        std::fs::create_dir_all(&project_dir)?;
+        let session_uuid = "77777777-7777-7777-7777-777777777777";
+        let rows = [
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u-prompt",
+                "sessionId": session_uuid,
+                "cwd": "/tmp/pond-test",
+                "timestamp": "2026-10-24T15:43:55.343Z",
+                "message": {"role": "user", "content": "audit the codebase"},
+            }),
+            serde_json::json!({
+                "type": "api-request-blob",
+                "sessionId": session_uuid,
+                "hash": "761037ed",
+                "message": {"role": "user", "content": [{"type": "text", "text": "audit the codebase"}]},
+            }),
+            serde_json::json!({
+                "type": "api-request-shape",
+                "sessionId": session_uuid,
+                "shapeHash": "92078e67",
+                "timestamp": "2026-10-24T15:43:55.452Z",
+                "shape": {"tools": [{"name": "SubagentHandback"}]},
+            }),
+            serde_json::json!({
+                "type": "api-request",
+                "sessionId": session_uuid,
+                "id": "fde5675b",
+                "timestamp": "2026-10-24T15:43:55.452Z",
+                "tail": ["761037ed"],
+            }),
+            serde_json::json!({
+                "type": "api-request-blob",
+                "sessionId": session_uuid,
+                "hash": "819e8c58",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Now the client."}]},
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "a-reply",
+                "sessionId": session_uuid,
+                "cwd": "/tmp/pond-test",
+                "timestamp": "2026-10-24T15:44:25.446Z",
+                "message": {
+                    "role": "assistant",
+                    "type": "message",
+                    "content": [{"type": "text", "text": "Now the client."}],
+                },
+            }),
+        ];
+        let body: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        std::fs::write(project_dir.join(format!("{session_uuid}.jsonl")), body)?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeCodeAdapter::new(corpus.path());
+        let summary = ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+        assert!(
+            summary.drop_reasons.is_empty(),
+            "{:?}",
+            summary.drop_reasons
+        );
+
+        let session = store
+            .get_session(session_uuid)
+            .await?
+            .expect("session ingests");
+        let journal: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|stored| {
+                stored.message.options()["source"]["raw_type"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("api-request"))
+            })
+            .collect();
+        assert_eq!(journal.len(), 4, "every journal row is carried");
+        for stored in &journal {
+            assert!(
+                matches!(stored.message, Message::System { .. }) && stored.parts.is_empty(),
+                "journal row {} must be a part-less System carrier",
+                stored.message.id(),
+            );
+        }
+        let turns: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|stored| !matches!(stored.message, Message::System { .. }))
+            .map(|stored| stored.message.id())
+            .collect();
+        assert_eq!(
+            turns,
+            ["u-prompt", "a-reply"],
+            "only the transcript's own turns"
+        );
+
+        crate::adapter::test_support::assert_native_restore(
+            &ClaudeCodeFactory,
+            &adapter,
+            corpus.path(),
+        )
+        .await
     }
 
     /// Orphan tool_result with no earlier tool_use in the same file: the
