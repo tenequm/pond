@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.20.2](https://github.com/tenequm/pond/compare/v0.20.1...v0.20.2) - 2026-10-24
+
+### <!-- 2 -->🐛 Bug Fixes
+- **claude-code:** store request-journal rows as carriers, not turns ([#360](https://github.com/tenequm/pond/pull/360)) ([4cbb238](https://github.com/tenequm/pond/commit/4cbb23810c59348c5e347ed57b492e16a9a4aac2))
+  pond no longer stores Claude Code 2.1.310+ request-journal rows as
+  duplicate user/assistant turns, which polluted search and misordered
+  sessions. Sessions ingested earlier keep their duplicates; hosts sharing
+  a store should upgrade together.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.20.1...v0.20.2
+
 ## [0.20.1](https://github.com/tenequm/pond/compare/v0.20.0...v0.20.1) - 2026-10-14
 
 ### <!-- 2 -->🐛 Bug Fixes
