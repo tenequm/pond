@@ -802,3 +802,32 @@ rounds total (12)        2521     2360    -6% (noise)
 ```
 
 Re-encoding costs messages compaction ~2.3x on the full-base rewrite, which lands once per compaction of a table, not per sync: the sync-like rounds are unchanged. Sessions compacts faster re-encoded (binary copy reads every input file's footer first). The payoff is on the read side, measured on the live-store lab copy in the campaign doc: a one-row `sessions` take went from 11,300 GETs / ~21 s to 15 GETs / ~0.8 s.
+
+## get-session read path and claude-code journal ingest A/B (#359, #360)
+
+### 2026-10-24 - pond_get_session reads every session row (#359)
+
+Does dropping the `search_text IS NOT NULL` pushdown from the `session_view` scan (it now reads all of a session's rows to count them and find the final assistant turn) cost anything on a remote store? No: medians move -1.7% to +3.5% in both directions, inside run-to-run noise.
+
+Interleaved CLI one-shots, 10 rounds per case, order alternating each round, after one warm-up each. Old = released 0.20.1 (`3b57817`), new = `2ac76c8`'s read path built at `d0ea140` (release profile). Session `3bf09c91-...` (2,436 source lines) and its subagent `.../agent-ab8c8514ac88aff58` (482 rows), `--limit 20`.
+
+s3-nbg1 from mac-m1max (a local full-corpus sync was running concurrently; interleaving cancels its load out of the old/new comparison):
+
+```
+child-end     old median   4.43s  new median   4.59s  delta  +3.5%  (old min 4.22 max 5.20; new min 4.12 max 5.01)
+parent-end    old median   4.34s  new median   4.27s  delta  -1.7%  (old min 4.05 max 7.16; new min 3.93 max 4.44)
+parent-start  old median   4.65s  new median   4.77s  delta  +2.7%  (old min 4.19 max 5.86; new min 4.29 max 8.76)
+```
+
+A non-interleaved hyperfine pair taken ~25 min apart under different local load showed `parent-start` +28% (4.93 s -> 6.28 s median); the interleaved run above shows that was load, not the change.
+
+### 2026-10-24 - full local claude-code corpus, 0.20.1 vs request-journal fix (#360)
+
+`pond sync claude-code --path <APFS clone of ~/.claude/projects> --format json` into fresh local scratch stores, mac-m1max, 11,029 JSONL files / 11 GiB. The two runs overlapped different build and benchmark load, so wall time is not comparable; row counts are the point.
+
+```
+old (0.20.1):  {"outcome":"ok","sessions_inserted":10963,"messages_inserted":221026,"stored":{"messages":2909567,"sessions":10963},"drop_reasons":{"duplicate_message_id":2563,"part_message_mismatch":2401},"duration_secs":772.687352}
+new (#360):    {"outcome":"ok","sessions_inserted":10963,"messages_inserted":218962,"stored":{"messages":2909567,"sessions":10963},"drop_reasons":{"duplicate_message_id":2563,"part_message_mismatch":2401},"duration_secs":574.513566083}
+```
+
+Message key sets identical (2,909,567 each, 0 only-old, 0 only-new); exactly 5,592 rows differ, all `api-request-blob` (1,454 user + 3,177 assistant + 961 tool -> system); parts 1,598,580 -> 1,586,232.

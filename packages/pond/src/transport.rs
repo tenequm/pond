@@ -805,7 +805,8 @@ source_agent (one source harness, exact-or-subpath: \"openclaw\" also covers \
 Subagents are excluded by default: a root source_agent like \"openclaw\" returns \
 main sessions only, while naming a subpath (e.g. \"claude-code/general-purpose\") \
 reaches those subagent sessions and is the opt-in that disables the default \
-exclusion. Subagents are also reachable via pond_sql (parent_session_id).
+exclusion. Subagents are also reachable from their parent: its pond_get_session \
+footer lists them.
 
 pond_search response: a transcript. The first line states totals \
 (`matched_total` is the message count before `limit` and byte-budget \
@@ -831,12 +832,17 @@ one-line tool refs (`-> name [call_id]` tool call, `<- name [call_id] \
 (ok|failed)` result); full part bodies stay one pond_get_message away. limit \
 defaults to 20; from=start|end picks which end the first page reads from (end \
 = recent tail - the session's final state, e.g. post-compaction recovery). \
-A partial page's header states the span and session total (`messages 1-130 \
-of 234`); pages are bounded by limit and a size budget - page with \
-after_message_id (forward) or before_message_id (backward) using the id a \
-page marker shows. The first page \
-also lists the session's subagents (each stored as its own session) in a \
-footer; pass a listed id back to open it. Not for bulk export - use `pond \
+A partial page's header states the span and the conversational total \
+(`messages 1-130 of 234`); when tool calls, results and harness records add \
+rows the view leaves out it reads `conversational messages 1-130 of 234 (1873 \
+stored in all - ...)`; pages are bounded by limit and a \
+size budget - page with after_message_id (forward) or before_message_id \
+(backward) using the id a page marker shows. The page that reaches the end \
+also names what follows the last conversational message, including the final \
+assistant turn - a subagent's report is often a bare tool call there, one \
+pond_get_message away. The first page also lists the session's subagents (each \
+stored as its own session) in a footer; pass a listed id back with from=end to \
+read its final turn. Not for bulk export - use `pond \
 copy --to <file>`.
 
 pond_get_message: id (a message id - the target renders marked `>` with its \
@@ -1354,8 +1360,10 @@ Examples (4 patterns the agent should recognize):
                            pond_get_session or its message_id to pond_get_message to read \
                            it. Searches conversational text only (tool \
                            calls/results and reasoning are excluded by design - a gap there is \
-                           expected, not a failure) and excludes subagent sessions; reach both \
-                           via pond_sql. Response format details: resource schema://pond.",
+                           expected, not a failure) and excludes subagent sessions; open those from \
+                           the parent's pond_get_session footer. Expand a known message's tool \
+                           bodies with pond_get_message; search across bodies with pond_sql. \
+                           Response format details: resource schema://pond.",
             annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
         )]
         async fn pond_search(
@@ -1642,7 +1650,8 @@ Examples (4 patterns the agent should recognize):
                  value (\"openclaw\", \"claude-code\") returns that harness's main \
                  sessions; subagents are stored as their own sessions and excluded by \
                  default - name a subpath (\"claude-code/general-purpose\") to search \
-                 them, or reach them via pond_sql (parent_session_id). Search covers only \
+                 them, or open them from a parent's pond_get_session footer (from=\"end\" names \
+                 a subagent's final turn). Search covers only \
                  user/assistant conversational text by \
                  design (tool calls/results and reasoning are excluded as low-signal \
                  noise, not a bug) - a zero/weak result is not proof of absence: verify \
@@ -1873,8 +1882,10 @@ Examples (4 patterns the agent should recognize):
         scored hits grouped by session, best session first; pass a hit's session_id to \
         pond_get_session or its message_id to pond_get_message to read it. Searches \
         conversational text only (tool calls/results and reasoning are excluded by design - a \
-        gap there is expected, not a failure) and excludes subagent sessions; reach both via \
-        pond_sql. Response format details: resource schema://pond.";
+        gap there is expected, not a failure) and excludes subagent sessions; open those from the \
+        parent's pond_get_session footer. Expand a known message's tool bodies with \
+        pond_get_message; search across bodies with pond_sql. Response format details: resource \
+        schema://pond.";
 
     /// `mode` property description on an instance with embedding off.
     const MODE_DOC_FTS_ONLY: &str =
