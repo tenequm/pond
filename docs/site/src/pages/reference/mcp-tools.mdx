@@ -30,7 +30,7 @@ Search indexes only conversational text (user and assistant turns). Tool calls, 
 
 Read a whole session as a readable transcript - the tool for analyzing, reviewing, or summarizing a past session: user/assistant text plus one-line tool and file references. Takes one `id`; a message id also works and resolves to its parent session with the page anchored at that message. Page with `limit` (default 20 messages), `from: "start" | "end"` (`end` reads the most recent page first - the session's final state, e.g. recovering context after compaction), and `after_message_id` / `before_message_id` to page onward.
 
-The first page lists the session's subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/reference/cli).
+The header counts the conversational view and, when tool calls, results, and harness records add more, the session's stored total too. The page that reaches the end also names the session's final assistant turn when it has no conversational text - a subagent's report is often one bare tool call - so `pond_get_message` on that id expands it (budget-bounded; `target_parts_remaining` signals a cut). The first page lists the session's subagent sessions in a footer; open one with `from: "end"` to read its final turn. Not for bulk export - that is [`pond copy`](/reference/cli).
 
 ## pond_get_message
 
@@ -38,7 +38,7 @@ Expand one message: its full parts, including tool call and result bodies, plus 
 
 ## pond_sql
 
-The advanced escape hatch: one read-only SQL query (SELECT/WITH only, DataFusion-planned) over the three tables: `sessions`, `messages`, `parts`. Not for finding or reading conversations - that is search and get. It covers what they deliberately don't: exact strings, identifiers, counts, joins, group-bys, tool-call archaeology through `parts.variant_data` (a tool_call body is `{call_id, name, params}` - a Bash command lives at `json_extract(variant_data, '$.params.command')`), and subagent sessions (`parent_session_id`).
+The advanced escape hatch: one read-only SQL query (SELECT/WITH only, DataFusion-planned) over the three tables: `sessions`, `messages`, `parts`. Not for finding or reading conversations - that is search and get. It covers what they deliberately don't: exact strings, identifiers, counts, joins, group-bys, tool-call archaeology through `parts.variant_data` (a tool_call body is `{call_id, name, params}` - a Bash command lives at `json_extract(variant_data, '$.params.command')`), and lineage queries over `parent_session_id`. To read a subagent session, open it from its parent's `pond_get_session` footer instead.
 
 Two useful full-text primitives:
 
