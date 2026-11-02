@@ -2646,25 +2646,19 @@ mod tests {
         assert!(
             matches!(
                 &prompt_parts[1].kind,
-                PartKind::File { media_type: Some(media), data: FileData::String(_), .. }
-                    if media == "application/pdf"
+                PartKind::File { media_type: Some(media), data: FileData::String(data), .. }
+                    if media == "application/pdf" && data == "JVBERi0xLjQK"
             ),
-            "document block must be a file part: {:?}",
+            "document block must be a file part holding the source bytes: {:?}",
             prompt_parts[1].kind,
         );
 
         let fallback_parts = parts_of("a-fallback");
         assert_eq!(fallback_parts.len(), 1);
-        assert_eq!(
-            fallback_parts[0].provenance,
-            crate::wire::Provenance::Injected
-        );
+        assert_eq!(fallback_parts[0].provenance, Provenance::Injected);
 
         let reply_parts = parts_of("a-reply");
-        assert_eq!(
-            reply_parts[0].provenance,
-            crate::wire::Provenance::Conversational
-        );
+        assert_eq!(reply_parts[0].provenance, Provenance::Conversational);
         Ok(())
     }
 
