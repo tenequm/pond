@@ -302,9 +302,10 @@ struct CoworkSession {
     relative_dir: PathBuf,
 }
 
-/// Walk the root for `local_*/audit.jsonl`, pruning hidden directories so the
-/// nested `.claude/` inner loop is never reached. Sorted for deterministic
-/// ingest order. A missing root means "no sessions yet", not an error.
+/// Walk the root for `local_*/audit.jsonl`, pruning hidden directories below
+/// it so the nested `.claude/` inner loop is never reached. Sorted for
+/// deterministic ingest order. A missing root means "no sessions yet", not an
+/// error.
 fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -315,11 +316,13 @@ fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
         // Prune any hidden dir (`.claude`, `.audit-key` is a file). The inner
         // Claude Code loop lives under `.claude/`, so this is the structural
         // guard against double-counting it (spec.md#adapters).
-        !(entry.file_type().is_dir()
+        let hidden_dir = entry.file_type().is_dir()
             && entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with('.')))
+                .is_some_and(|name| name.starts_with('.'));
+        // The root is the source even when it is `.` or dot-named.
+        entry.depth() == 0 || !hidden_dir
     });
     for entry in walker {
         let entry = entry.map_err(|error| io(error.into()))?;
@@ -1409,13 +1412,28 @@ mod tests {
         ));
     }
 
+    /// Hidden dirs are pruned below the root, never the root itself: a
+    /// dot-named source folder (or a relative `.`) is still the source.
+    #[test]
+    fn dot_named_root_is_walked_but_hidden_subdirs_are_not() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".cowork");
+        for dir in ["acct/workspace/local_a", "acct/workspace/.claude/local_b"] {
+            std::fs::create_dir_all(root.join(dir))?;
+            std::fs::write(root.join(dir).join("audit.jsonl"), "")?;
+        }
+        let sessions = collect_sessions(&root)?;
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["local_a"]);
+        Ok(())
+    }
+
     /// A model-switch `fallback` block is harness-written, so it is injected
     /// (kept out of search); `document` (a PDF) and `image` blocks are file parts
     /// carrying the media type from their `source`, not JSON blobs in text parts.
     #[tokio::test(flavor = "multi_thread")]
     async fn fallback_block_is_injected_and_document_block_is_a_file() -> anyhow::Result<()> {
         let corpus = TempDir::new()?;
-        // The walk prunes hidden dirs, root included, and a TempDir is named `.tmp*`.
         let root = corpus.path().join(SESSIONS_SUBDIR);
         let workspace = root.join("acct").join("workspace");
         let session_id = "local_88888888-8888-8888-8888-888888888888";
