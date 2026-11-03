@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.20.3](https://github.com/tenequm/pond/compare/v0.20.2...v0.20.3) - 2026-11-03
+
+### <!-- 2 -->🐛 Bug Fixes
+- **claude-code:** classify fallback blocks as injected and document blocks as files ([#364](https://github.com/tenequm/pond/pull/364)) ([67592c3](https://github.com/tenequm/pond/commit/67592c3d97a907740641443a2f596d66a88a6a53))
+  pond now stores Claude Code model-fallback markers as harness content,
+  so they no longer show up as assistant text in search, stores PDF
+  attachments as files, and records the media type of PDF and image
+  attachments. Sessions ingested earlier keep the old classification.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.20.2...v0.20.3
+
 ## [0.20.2](https://github.com/tenequm/pond/compare/v0.20.1...v0.20.2) - 2026-10-24
 
 ### <!-- 2 -->🐛 Bug Fixes
