@@ -16,8 +16,8 @@
 //!   the inner Claude Code loop the Cowork sandbox runs; `audit.jsonl` already
 //!   represents that conversation, so ingesting the `.claude/projects/**/*.jsonl`
 //!   transcripts under it would double-count the same session. Discovery is
-//!   scoped to `local_*/audit.jsonl` and the walk prunes hidden dirs below the
-//!   root, so this adapter cannot pick up the inner loop. This is why it drives the [`Adapter`]
+//!   scoped to `local_*/audit.jsonl` and the walk prunes hidden dirs, so this
+//!   adapter cannot pick up the inner loop. This is why it drives the [`Adapter`]
 //!   seam directly rather than through `JsonlTree` (whose blanket `*.jsonl` walk
 //!   would find the inner transcripts).
 //!
@@ -300,10 +300,10 @@ struct CoworkSession {
     relative_dir: PathBuf,
 }
 
-/// Walk the root for `local_*/audit.jsonl`, pruning hidden directories below
-/// it so the nested `.claude/` inner loop is never reached. Sorted for
-/// deterministic ingest order. A missing root means "no sessions yet"; an
-/// unreadable one is an error rather than an empty result.
+/// Walk the root for `local_*/audit.jsonl`, pruning hidden directories so the
+/// nested `.claude/` inner loop is never reached. Sorted for deterministic
+/// ingest order. A missing root means "no sessions yet"; an unreadable one is
+/// an error rather than an empty result.
 fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
     let io = |source| AdapterError::io(NAME, root.display().to_string(), source);
     if !root.try_exists().map_err(io)? {
@@ -314,13 +314,11 @@ fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
         // Prune any hidden dir (`.claude`, `.audit-key` is a file). The inner
         // Claude Code loop lives under `.claude/`, so this is the structural
         // guard against double-counting it (spec.md#adapters).
-        let hidden_dir = entry.file_type().is_dir()
+        !(entry.file_type().is_dir()
             && entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with('.'));
-        // The root is the source even when it is `.` or dot-named.
-        entry.depth() == 0 || !hidden_dir
+                .is_some_and(|name| name.starts_with('.')))
     });
     for entry in walker {
         let entry = entry.map_err(|error| io(error.into()))?;
@@ -1245,26 +1243,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn dot_named_root_is_walked_but_hidden_subdirs_are_not() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let root = temp.path().join(".cowork");
-        for dir in ["acct/workspace/local_a", "acct/workspace/.claude/local_b"] {
-            std::fs::create_dir_all(root.join(dir))?;
-            std::fs::write(root.join(dir).join("audit.jsonl"), "")?;
-        }
-        let sessions = collect_sessions(&root)?;
-        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
-        assert_eq!(ids, ["local_a"]);
-        Ok(())
-    }
-
     /// A model-switch `fallback` block is harness-written, so it is injected
     /// (kept out of search); a `document` block (a PDF read) is a file part
     /// carrying the media type from its `source`, not a JSON blob in a text part.
     #[tokio::test(flavor = "multi_thread")]
     async fn fallback_block_is_injected_and_document_block_is_a_file() -> anyhow::Result<()> {
         let corpus = TempDir::new()?;
+        // The walk prunes hidden dirs, root included, and a TempDir is named `.tmp*`.
         let root = corpus.path().join(SESSIONS_SUBDIR);
         let workspace = root.join("acct").join("workspace");
         let session_id = "local_88888888-8888-8888-8888-888888888888";
