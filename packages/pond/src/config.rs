@@ -1536,6 +1536,32 @@ path = [\"/srv/solo\"]
         });
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn is_cwd_relative_rejects_drive_less_windows_paths() {
+        for path in [
+            "\\sessions",
+            "/sessions",
+            "C:sessions",
+            "sessions",
+            "~user\\sessions",
+        ] {
+            assert!(
+                is_cwd_relative(path),
+                "{path} depends on the cwd drive or dir"
+            );
+        }
+        for path in [
+            "C:\\sessions",
+            "C:/sessions",
+            "\\\\host\\share\\s",
+            "~\\sessions",
+            "~/sessions",
+        ] {
+            assert!(!is_cwd_relative(path), "{path} names a fixed location");
+        }
+    }
+
     #[test]
     fn resolve_adapters_accepts_env_var_paths_that_expand_to_absolute() {
         figment::Jail::expect_with(|jail| {
