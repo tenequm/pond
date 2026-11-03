@@ -303,7 +303,8 @@ struct CoworkSession {
 
 /// Walk the root for `local_*/audit.jsonl`, pruning hidden directories so the
 /// nested `.claude/` inner loop is never reached. Sorted for deterministic
-/// ingest order. A missing root means "no sessions yet", not an error.
+/// ingest order. A missing root means "no sessions yet", not an error. The
+/// root itself is never pruned, so a dot-named or relative (`.`) source still walks.
 fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -313,12 +314,14 @@ fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
     let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
         // Prune any hidden dir (`.claude`, `.audit-key` is a file). The inner
         // Claude Code loop lives under `.claude/`, so this is the structural
-        // guard against double-counting it (spec.md#adapters).
-        !(entry.file_type().is_dir()
+        // guard against double-counting it (spec.md#adapters). The root is the
+        // source even when it is `.` or dot-named.
+        let hidden_dir = entry.file_type().is_dir()
             && entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with('.')))
+                .is_some_and(|name| name.starts_with('.'));
+        entry.depth() == 0 || !hidden_dir
     });
     for entry in walker {
         let entry = entry.map_err(|error| io(error.into()))?;
@@ -1229,6 +1232,20 @@ mod tests {
             "the foreign family must be dropped and the rest sorted",
         );
         assert!(roots.iter().all(|root| root.ends_with(SESSIONS_SUBDIR)));
+    }
+
+    #[test]
+    fn dot_named_root_is_walked_but_hidden_subdirs_are_not() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join(".cowork");
+        for dir in ["acct/workspace/local_a", "acct/workspace/.claude/local_b"] {
+            std::fs::create_dir_all(root.join(dir))?;
+            std::fs::write(root.join(dir).join("audit.jsonl"), "")?;
+        }
+        let sessions = collect_sessions(&root)?;
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["local_a"]);
+        Ok(())
     }
 
     /// Probe ORDER, which the single-root tests cannot see: with both layouts
