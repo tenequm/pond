@@ -22,8 +22,8 @@
 //!   would find the inner transcripts).
 //!
 //! The per-line `message` object is the Anthropic Messages shape (the same
-//! content blocks claude-code carries), so the part mapping mirrors that
-//! adapter. Records that are not a `user`/`assistant` turn (`system`, `result`,
+//! content blocks claude-code carries), so it reuses that adapter's part
+//! mapping. Records that are not a `user`/`assistant` turn (`system`, `result`,
 //! `rate_limit_event`, ...) become System carriers: their `subtype`/`type` is
 //! the content and the verbatim row survives in `options.source.raw_record`, so
 //! native restore reproduces the full `audit.jsonl`. `system/permission_*`
@@ -50,14 +50,12 @@ use crate::{
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
-    claude_code::file_part,
-    compact_json, config_path, empty_options,
-    extract::{
-        Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
-    },
+    claude_code::{assistant_part, is_tool_result, text_part, tool_result_part, user_part},
+    compact_json, config_path,
+    extract::{Extracted, Source, bound_value, extract_self_str, extract_str},
     extracted_text,
     jsonl::{RECORD_CAP, peek_last_line},
-    jsonl_bytes, part_id, part_ordinal, raw_record, source_options,
+    jsonl_bytes, raw_record, source_options,
 };
 
 const NAME: &str = "claude-desktop-app";
@@ -696,7 +694,14 @@ fn message_events(
         }
         ("user", Value::Array(items)) => {
             parts.extend(items.iter().enumerate().map(|(ordinal, item)| {
-                user_part(session_id, uuid, ordinal, item, tool_call_names)
+                user_part(
+                    session_id,
+                    uuid,
+                    ordinal,
+                    item,
+                    tool_call_names,
+                    Provenance::Conversational,
+                )
             }));
             Message::User {
                 id: uuid.to_owned(),
@@ -749,166 +754,6 @@ fn message_carrier_event(
     })
 }
 
-fn text_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    text: Option<Extracted<String>>,
-    provenance: Provenance,
-) -> Part {
-    Part {
-        session_id: session_id.to_owned(),
-        id: part_id(message_id, ordinal),
-        message_id: message_id.to_owned(),
-        ordinal: part_ordinal(ordinal),
-        provenance,
-        options: empty_options(),
-        kind: PartKind::Text { text },
-    }
-}
-
-fn user_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    value: &Value,
-    tool_call_names: &HashMap<String, Extracted<String>>,
-) -> Part {
-    match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            extract_str(value, "text"),
-            Provenance::Conversational,
-        ),
-        Some("image" | "file" | "document") => file_part(
-            session_id,
-            message_id,
-            ordinal,
-            value,
-            Provenance::Conversational,
-        ),
-        Some("tool_result") => tool_result_part(
-            session_id,
-            message_id,
-            ordinal,
-            value,
-            None,
-            tool_call_names,
-        ),
-        // Unknown user block: preserve the raw JSON in a Text slot rather than
-        // drop it - a lossless encoding, not a synthesized value.
-        _ => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            Some(extract_compact_repr(value)),
-            Provenance::Conversational,
-        ),
-    }
-}
-
-fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
-    match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            extract_str(value, "text"),
-            Provenance::Conversational,
-        ),
-        Some("thinking") => Part {
-            session_id: session_id.to_owned(),
-            id: part_id(message_id, ordinal),
-            message_id: message_id.to_owned(),
-            ordinal: part_ordinal(ordinal),
-            provenance: Provenance::Conversational,
-            options: signature_options(value),
-            kind: PartKind::Reasoning {
-                text: extract_str(value, "thinking"),
-            },
-        },
-        Some(kind @ ("tool_use" | "server_tool_use")) => Part {
-            session_id: session_id.to_owned(),
-            id: part_id(message_id, ordinal),
-            message_id: message_id.to_owned(),
-            ordinal: part_ordinal(ordinal),
-            provenance: Provenance::Conversational,
-            options: empty_options(),
-            kind: PartKind::ToolCall {
-                call_id: extract_str(value, "id"),
-                name: extract_str(value, "name"),
-                params: value.get("input").cloned().unwrap_or(Value::Null),
-                provider_executed: kind == "server_tool_use",
-            },
-        },
-        Some("image" | "file" | "document") => file_part(
-            session_id,
-            message_id,
-            ordinal,
-            value,
-            Provenance::Conversational,
-        ),
-        // A model-switch marker (`{"from":{"model"},"to":{"model"}}`) rides in
-        // assistant content but is written by the harness, not the model.
-        Some("fallback") => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            Some(extract_compact_repr(value)),
-            Provenance::Injected,
-        ),
-        _ => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            Some(extract_compact_repr(value)),
-            Provenance::Conversational,
-        ),
-    }
-}
-
-fn tool_result_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    value: &Value,
-    source_tool_result: Option<&Value>,
-    tool_call_names: &HashMap<String, Extracted<String>>,
-) -> Part {
-    let call_id = extract_str(value, "tool_use_id");
-    // The name lives on the prior `tool_use`, resolved via the per-session map;
-    // a miss surfaces as `None`, never a sentinel (spec.md#model-no-synthesis).
-    let name = value
-        .str_field("tool_use_id")
-        .and_then(|id| tool_call_names.get(id))
-        .cloned();
-    let result = value
-        .get("content")
-        .cloned()
-        .or_else(|| source_tool_result.cloned())
-        .unwrap_or(Value::Null);
-    Part {
-        session_id: session_id.to_owned(),
-        id: part_id(message_id, ordinal),
-        message_id: message_id.to_owned(),
-        ordinal: part_ordinal(ordinal),
-        // spec.md#model-part-provenance: tool output is runtime-produced.
-        provenance: Provenance::Injected,
-        options: empty_options(),
-        kind: PartKind::ToolResult {
-            call_id,
-            name,
-            is_failure: value
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            result,
-        },
-    }
-}
-
 fn row_options(record: &Value, line: usize) -> ProviderOptions {
     let mut options = source_options(NAME, record);
     if let Some(source) = options.get_mut("source").and_then(Value::as_object_mut) {
@@ -931,18 +776,6 @@ fn assistant_options(record: &Value, message_value: &Value, line: usize) -> Prov
     });
     options.insert("anthropic".to_owned(), anthropic);
     options
-}
-
-fn signature_options(value: &Value) -> ProviderOptions {
-    let mut options = ProviderOptions::new();
-    if let Some(signature) = value.get("signature").and_then(Value::as_str) {
-        options.insert("anthropic".to_owned(), json!({ "signature": signature }));
-    }
-    options
-}
-
-fn is_tool_result(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("tool_result")
 }
 
 fn serialize_session(

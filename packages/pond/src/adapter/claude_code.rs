@@ -934,7 +934,7 @@ fn message_events(
                     ordinal,
                     item,
                     source_tool_result.as_ref(),
-                    state,
+                    &state.tool_call_names,
                 )
             }));
             Message::Tool {
@@ -949,7 +949,14 @@ fn message_events(
             // provenance within a single message (spec.md#model-part-provenance).
             let provenance = user_array_provenance(row, items);
             parts.extend(items.iter().enumerate().map(|(ordinal, item)| {
-                user_part(session_id, uuid, ordinal, item, state, provenance)
+                user_part(
+                    session_id,
+                    uuid,
+                    ordinal,
+                    item,
+                    &state.tool_call_names,
+                    provenance,
+                )
             }));
             Message::User {
                 id: uuid.to_owned(),
@@ -1008,7 +1015,9 @@ fn message_events(
     Ok(events)
 }
 
-fn text_part(
+// The content-block mapping from here through `tool_result_part` is shared
+// with `claude_desktop_app`, whose rows carry the same Anthropic blocks.
+pub(crate) fn text_part(
     session_id: &str,
     message_id: &str,
     ordinal: usize,
@@ -1026,12 +1035,12 @@ fn text_part(
     }
 }
 
-fn user_part(
+pub(crate) fn user_part(
     session_id: &str,
     message_id: &str,
     ordinal: usize,
     value: &Value,
-    state: &FileState,
+    tool_call_names: &HashMap<String, Extracted<String>>,
     provenance: Provenance,
 ) -> Part {
     match value.get("type").and_then(Value::as_str) {
@@ -1045,9 +1054,14 @@ fn user_part(
         Some("image" | "file" | "document") => {
             file_part(session_id, message_id, ordinal, value, provenance)
         }
-        Some("tool_result") => {
-            tool_result_part(session_id, message_id, ordinal, value, None, state)
-        }
+        Some("tool_result") => tool_result_part(
+            session_id,
+            message_id,
+            ordinal,
+            value,
+            None,
+            tool_call_names,
+        ),
         // Unknown user part shapes: preserve the raw JSON in the Text slot
         // rather than dropping. This is not a synthesized value - it's a
         // lossless encoding of structured data the schema doesn't model.
@@ -1061,7 +1075,12 @@ fn user_part(
     }
 }
 
-fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
+pub(crate) fn assistant_part(
+    session_id: &str,
+    message_id: &str,
+    ordinal: usize,
+    value: &Value,
+) -> Part {
     // spec.md#model-part-provenance: assistant content - text, reasoning, tool calls -
     // is model-authored, hence conversational. `tool_result` parts never appear
     // on an assistant message.
@@ -1140,13 +1159,13 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
     }
 }
 
-fn tool_result_part(
+pub(crate) fn tool_result_part(
     session_id: &str,
     message_id: &str,
     ordinal: usize,
     value: &Value,
     source_tool_result: Option<&Value>,
-    state: &FileState,
+    tool_call_names: &HashMap<String, Extracted<String>>,
 ) -> Part {
     let call_id = extract_str(value, "tool_use_id");
     // `tool_result` source rows don't carry the tool name; it's resolved
@@ -1156,7 +1175,7 @@ fn tool_result_part(
     // string).
     let name = value
         .str_field("tool_use_id")
-        .and_then(|id| state.tool_call_names.get(id))
+        .and_then(|id| tool_call_names.get(id))
         .cloned();
     let result = value
         .get("content")
@@ -1184,9 +1203,7 @@ fn tool_result_part(
     }
 }
 
-/// Shared with `claude_desktop_app`, whose rows carry the same Anthropic
-/// content blocks, so the two adapters cannot drift on file mapping.
-pub(crate) fn file_part(
+fn file_part(
     session_id: &str,
     message_id: &str,
     ordinal: usize,
@@ -1287,7 +1304,7 @@ pub(crate) fn parse_timestamp(value: &Value) -> anyhow::Result<DateTime<Utc>> {
         .with_timezone(&Utc))
 }
 
-fn is_tool_result(value: &Value) -> bool {
+pub(crate) fn is_tool_result(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("tool_result")
 }
 
