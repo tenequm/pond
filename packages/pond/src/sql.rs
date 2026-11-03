@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use arrow_json::LineDelimitedWriter;
+use futures::StreamExt;
 use lance::Dataset;
 use lance::datafusion::LanceTableProvider;
 use lance::deps::arrow_array::builder::{
@@ -22,14 +23,20 @@ use lance::deps::arrow_array::builder::{
 };
 use lance::deps::arrow_array::cast::AsArray;
 use lance::deps::arrow_array::types::{
-    ArrowTimestampType, TimestampMicrosecondType, TimestampMillisecondType,
-    TimestampNanosecondType, TimestampSecondType,
+    ArrowDictionaryKeyType, ArrowTimestampType, RunEndIndexType, TimestampMicrosecondType,
+    TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
 };
 use lance::deps::arrow_array::{
-    Array, ArrayRef, GenericStringArray, LargeBinaryArray, OffsetSizeTrait, RecordBatch,
-    StringArray, StringViewArray,
+    Array, ArrayRef, DictionaryArray, GenericStringArray, LargeBinaryArray, OffsetSizeTrait,
+    PrimitiveArray, RecordBatch, RunArray, StringArray, StringViewArray, downcast_dictionary_array,
+    downcast_run_array, make_array,
 };
-use lance::deps::arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
+use lance::deps::arrow_schema::{
+    ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit, UnionMode,
+};
+use lance::deps::datafusion::arrow::array::MutableArrayData;
+use lance::deps::datafusion::arrow::buffer::{Buffer, NullBuffer};
+use lance::deps::datafusion::arrow::datatypes::ArrowNativeType;
 use lance::deps::datafusion::arrow::util::pretty::pretty_format_batches;
 use lance::deps::datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use lance::deps::datafusion::common::ScalarValue;
@@ -43,7 +50,7 @@ use lance::deps::datafusion::logical_expr::{
 };
 use lance::deps::datafusion::logical_expr::{Expr, TableType};
 use lance::deps::datafusion::physical_plan::ExecutionPlan;
-use lance::deps::datafusion::prelude::{SQLOptions, SessionConfig, SessionContext, col};
+use lance::deps::datafusion::prelude::{DataFrame, SQLOptions, SessionConfig, SessionContext, col};
 use lance::deps::datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use lance::deps::datafusion::sql::sqlparser::ast::{SetExpr, Statement as SqlStatement};
 use lance_arrow::SchemaExt;
@@ -313,9 +320,6 @@ pub async fn run(
             .map_err(|error| SqlError::Query(enrich(&format!("SQL error: {error}"))))?;
     }
 
-    // Captured before `collect()` consumes `df`, so an empty result still
-    // renders its column headers.
-    let result_schema = Arc::new(df.schema().as_arrow().clone());
     let started = Instant::now();
     // TODO(#47): substring hunts inside parts.variant_data (json_extract +
     // LIKE full scans) are the dominant real-world cause of this timeout. The
@@ -323,7 +327,7 @@ pub async fn run(
     // search via `contains(variant_data, 'needle')`); until it lands, the
     // message steers agents to predicates the current indexes can serve.
     let timeout = effective_timeout(timeout_secs);
-    let collected = tokio::time::timeout(timeout, df.collect())
+    let gathered = tokio::time::timeout(timeout, gather(df, mode, max_rows, MAX_EXPORT_BYTES))
         .await
         .map_err(|_| {
             SqlError::Query(format!(
@@ -343,48 +347,425 @@ pub async fn run(
                  against parts JOINed to those session_ids; unscoped body scans time out.",
                 timeout.as_secs()
             ))
-        })?
-        .map_err(|error| match is_storage_failure(&error) {
-            true => SqlError::Storage(anyhow!("sql execution failed: {error}")),
-            false => SqlError::Query(enrich(&format!("SQL error: {error}"))),
-        })?;
+        })??;
     let elapsed = started.elapsed();
 
-    let display: Vec<RecordBatch> = if collected.is_empty() {
-        vec![displayable(&RecordBatch::new_empty(result_schema)).map_err(infra)?]
-    } else {
-        collected
-            .into_iter()
-            .map(|batch| displayable(&batch))
-            .collect::<Result<_, _>>()
-            .map_err(infra)?
-    };
-
-    match mode {
-        Mode::Inline => Ok(Outcome::Inline(
-            render_inline(&display, max_rows, elapsed).map_err(infra)?,
+    match gathered {
+        Gathered::Rows { display, .. } if matches!(mode, Mode::Json) => {
+            Ok(Outcome::Json(json_rows(&display, max_rows, elapsed)?))
+        }
+        Gathered::Rows { display, total } => Ok(Outcome::Inline(
+            render_inline(&display, total, max_rows, elapsed).map_err(infra)?,
         )),
-        Mode::Json => Ok(Outcome::Json(json_rows(&display, max_rows, elapsed)?)),
-        Mode::Export(format) => {
-            let rows = display.iter().map(RecordBatch::num_rows).sum();
-            let columns = column_names(&display);
-            let bytes = match format {
-                Format::Parquet => encode_parquet(&display)?,
-                Format::Ndjson => encode_ndjson(&display)?,
-            };
-            if bytes.len() > MAX_EXPORT_BYTES {
-                return Err(SqlError::Query(format!(
-                    "export is {} bytes, over the {MAX_EXPORT_BYTES} byte limit; \
-                     narrow the query or aggregate",
-                    bytes.len()
-                )));
+        Gathered::Export {
+            bytes,
+            format,
+            rows,
+            columns,
+        } => Ok(Outcome::Export {
+            bytes,
+            format,
+            rows,
+            columns,
+        }),
+    }
+}
+
+fn execution_error(error: DataFusionError) -> SqlError {
+    match is_storage_failure(&error) {
+        true => SqlError::Storage(anyhow!("sql execution failed: {error}")),
+        false => SqlError::Query(enrich(&format!("SQL error: {error}"))),
+    }
+}
+
+/// What `run` keeps of a result. The stream is never held whole: the result
+/// buffers sit outside the DataFusion memory pool, so a wide, unlimited result
+/// (a fan-out join over tool bodies) would otherwise grow the process until it
+/// is killed.
+enum Gathered {
+    /// The first rows that can be shown, plus the count of every row.
+    Rows {
+        display: Vec<RecordBatch>,
+        total: usize,
+    },
+    Export {
+        bytes: Vec<u8>,
+        format: Format,
+        rows: usize,
+        columns: Vec<String>,
+    },
+}
+
+async fn gather(
+    df: DataFrame,
+    mode: Mode,
+    max_rows: usize,
+    export_limit: usize,
+) -> Result<Gathered, SqlError> {
+    // Taken before the stream consumes `df`, so an empty result still names
+    // its columns.
+    let empty = displayable(&RecordBatch::new_empty(Arc::new(
+        df.schema().as_arrow().clone(),
+    )))
+    .map_err(infra)?;
+    let mut stream = df.execute_stream().await.map_err(execution_error)?;
+    let Mode::Export(format) = mode else {
+        // One row past the cap keeps JSON's `truncated` exact.
+        let keep = max_rows.saturating_add(1);
+        let mut display = Vec::new();
+        let mut total = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(execution_error)?;
+            if total < keep {
+                let rows = batch.num_rows().min(keep - total);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .map(|array| retained_prefix(array.as_ref(), rows))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(infra)?;
+                let shown = RecordBatch::try_new(batch.schema(), columns).map_err(infra)?;
+                display.push(displayable(&shown).map_err(infra)?);
             }
-            Ok(Outcome::Export {
-                bytes,
-                format,
-                rows,
-                columns,
+            total += batch.num_rows();
+        }
+        if display.is_empty() {
+            display.push(empty);
+        }
+        return Ok(Gathered::Rows { display, total });
+    };
+    let mut encoder = None;
+    let mut columns = Vec::new();
+    let mut rows = 0;
+    while let Some(batch) = stream.next().await {
+        let batch = displayable(&batch.map_err(execution_error)?).map_err(infra)?;
+        let encoder = match &mut encoder {
+            Some(encoder) => encoder,
+            None => {
+                columns = column_names(std::slice::from_ref(&batch));
+                encoder.insert(ExportEncoder::new(format, batch.schema())?)
+            }
+        };
+        encoder.write(&batch, export_limit)?;
+        rows += batch.num_rows();
+        if encoder.size() > export_limit {
+            return Err(over_export_limit(export_limit, rows));
+        }
+    }
+    let encoder = match encoder {
+        Some(encoder) => encoder,
+        None => {
+            columns = column_names(std::slice::from_ref(&empty));
+            let mut encoder = ExportEncoder::new(format, empty.schema())?;
+            encoder.write(&empty, export_limit)?;
+            encoder
+        }
+    };
+    let bytes = encoder.finish()?;
+    if bytes.len() > export_limit {
+        return Err(over_export_limit(export_limit, rows));
+    }
+    Ok(Gathered::Export {
+        bytes,
+        format,
+        rows,
+        columns,
+    })
+}
+
+/// Materialize retained rows, including nested values. `take` alone shares byte
+/// view buffers and whole dictionaries; a slice also shares ordinary buffers.
+fn retained_prefix(array: &dyn Array, rows: usize) -> Result<ArrayRef, ArrowError> {
+    retained_ranges(array, &[(0, rows)])
+}
+
+fn retained_ranges(array: &dyn Array, ranges: &[(usize, usize)]) -> Result<ArrayRef, ArrowError> {
+    let indices = || ranges.iter().flat_map(|&(start, end)| start..end);
+    let len = ranges.iter().map(|&(start, end)| end - start).sum();
+    let data = array.to_data();
+    if data.child_data().is_empty() {
+        let mut selected = MutableArrayData::new(vec![&data], false, len);
+        for &(start, end) in ranges {
+            selected.extend(0, start, end);
+        }
+        let selected = make_array(selected.freeze());
+        return Ok(match selected.data_type() {
+            DataType::Utf8View => Arc::new(selected.as_string_view().gc()),
+            DataType::BinaryView => Arc::new(selected.as_binary_view().gc()),
+            _ => selected,
+        });
+    }
+    let nulls = array
+        .nulls()
+        .map(|_| NullBuffer::from(indices().map(|i| array.is_valid(i)).collect::<Vec<_>>()));
+    let (buffers, children) = match array.data_type() {
+        DataType::Dictionary(_, _) => {
+            return downcast_dictionary_array! {
+                array => retained_dictionary(array, ranges),
+                _ => unreachable!("dictionary key type"),
+            };
+        }
+        DataType::List(_) | DataType::Map(_, _) | DataType::ListView(_) => {
+            return retained_list::<i32>(array, ranges);
+        }
+        DataType::LargeList(_) | DataType::LargeListView(_) => {
+            return retained_list::<i64>(array, ranges);
+        }
+        DataType::Struct(_) => (
+            vec![],
+            array
+                .as_struct()
+                .columns()
+                .iter()
+                .map(|child| retained_ranges(child.as_ref(), ranges).map(|a| a.to_data()))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        DataType::FixedSizeList(_, size) => {
+            let size = *size as usize;
+            let child_ranges: Vec<_> = ranges
+                .iter()
+                .map(|&(start, end)| ((data.offset() + start) * size, (data.offset() + end) * size))
+                .collect();
+            let child = make_array(data.child_data()[0].clone());
+            (
+                vec![],
+                vec![retained_ranges(child.as_ref(), &child_ranges)?.to_data()],
+            )
+        }
+        DataType::Union(fields, mode) => {
+            let union = array.as_union();
+            let types = indices().map(|i| union.type_id(i)).collect::<Vec<_>>();
+            let mut offsets = vec![0i32; len];
+            let children = fields
+                .iter()
+                .map(|(id, _)| {
+                    let mut child_ranges = Vec::new();
+                    for (out, i) in indices().enumerate() {
+                        if *mode == UnionMode::Sparse || union.type_id(i) == id {
+                            offsets[out] = i32::try_from(child_ranges.len()).map_err(|_| {
+                                ArrowError::ComputeError("retained union offset overflow".into())
+                            })?;
+                            let index = union.value_offset(i);
+                            child_ranges.push((index, index + 1));
+                        }
+                    }
+                    retained_ranges(union.child(id).as_ref(), &child_ranges).map(|a| a.to_data())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut buffers = vec![Buffer::from_vec(types)];
+            if *mode == UnionMode::Dense {
+                buffers.push(Buffer::from_vec(offsets));
+            }
+            (buffers, children)
+        }
+        DataType::RunEndEncoded(_, _) => {
+            return downcast_run_array! {
+                array => retained_runs(array, ranges),
+                _ => unreachable!("run end type"),
+            };
+        }
+        _ => {
+            return Err(ArrowError::ComputeError(format!(
+                "cannot retain {}",
+                array.data_type()
+            )));
+        }
+    };
+    Ok(make_array(
+        data.into_builder()
+            .offset(0)
+            .len(len)
+            .nulls(nulls)
+            .buffers(buffers)
+            .child_data(children)
+            .build()?,
+    ))
+}
+
+fn retained_dictionary<K: ArrowDictionaryKeyType>(
+    array: &DictionaryArray<K>,
+    ranges: &[(usize, usize)],
+) -> Result<ArrayRef, ArrowError> {
+    // MutableArrayData rejects a valid dictionary with max_key + 1 values,
+    // even with just one input. Copy/remap keys without that constructor.
+    let mut remap = HashMap::new();
+    let mut values = Vec::new();
+    let keys = ranges
+        .iter()
+        .flat_map(|&(start, end)| start..end)
+        .map(|i| {
+            array.key(i).map(|old| {
+                *remap.entry(old).or_insert_with(|| {
+                    let key = K::Native::usize_as(values.len());
+                    values.push((old, old + 1));
+                    key
+                })
             })
+        })
+        .collect::<PrimitiveArray<K>>();
+    let values = retained_ranges(array.values().as_ref(), &values)?;
+    Ok(Arc::new(DictionaryArray::<K>::try_new(keys, values)?))
+}
+
+fn retained_list<O: OffsetSizeTrait>(
+    array: &dyn Array,
+    ranges: &[(usize, usize)],
+) -> Result<ArrayRef, ArrowError> {
+    let data = array.to_data();
+    let view = matches!(
+        array.data_type(),
+        DataType::ListView(_) | DataType::LargeListView(_)
+    );
+    let source_offsets = data.buffer::<O>(0);
+    let source_sizes = view.then(|| data.buffer::<O>(1));
+    let mut offsets = Vec::new();
+    let mut sizes = Vec::new();
+    let mut child_ranges = Vec::new();
+    let mut next = 0usize;
+    let mut validity = Vec::new();
+    for i in ranges.iter().flat_map(|&(start, end)| start..end) {
+        offsets.push(
+            O::from_usize(next)
+                .ok_or_else(|| ArrowError::ComputeError("retained list offset overflow".into()))?,
+        );
+        let start = source_offsets[i].as_usize();
+        let size = if array.is_null(i) {
+            0
+        } else {
+            source_sizes.map_or_else(
+                || source_offsets[i + 1].as_usize() - start,
+                |s| s[i].as_usize(),
+            )
+        };
+        if size != 0 {
+            child_ranges.push((start, start + size));
+        }
+        sizes.push(O::usize_as(size));
+        next = next
+            .checked_add(size)
+            .ok_or_else(|| ArrowError::ComputeError("retained list length overflow".into()))?;
+        validity.push(array.is_valid(i));
+    }
+    let len = sizes.len();
+    if !view {
+        offsets.push(
+            O::from_usize(next)
+                .ok_or_else(|| ArrowError::ComputeError("retained list offset overflow".into()))?,
+        );
+    }
+    let mut buffers = vec![Buffer::from_vec(offsets)];
+    if view {
+        buffers.push(Buffer::from_vec(sizes));
+    }
+    let child = make_array(data.child_data()[0].clone());
+    let child = retained_ranges(child.as_ref(), &child_ranges)?;
+    Ok(make_array(
+        data.into_builder()
+            .offset(0)
+            .len(len)
+            .nulls(array.nulls().map(|_| NullBuffer::from(validity)))
+            .buffers(buffers)
+            .child_data(vec![child.to_data()])
+            .build()?,
+    ))
+}
+
+fn retained_runs<R: RunEndIndexType>(
+    array: &RunArray<R>,
+    ranges: &[(usize, usize)],
+) -> Result<ArrayRef, ArrowError> {
+    let mut ends = Vec::new();
+    let mut children = Vec::new();
+    for (out, i) in ranges
+        .iter()
+        .flat_map(|&(start, end)| start..end)
+        .enumerate()
+    {
+        let physical = array.get_physical_index(i);
+        ends.push(
+            R::Native::from_usize(out + 1)
+                .ok_or_else(|| ArrowError::ComputeError("retained run end overflow".into()))?,
+        );
+        children.push((physical, physical + 1));
+    }
+    let values = retained_ranges(array.values().as_ref(), &children)?;
+    let ends = PrimitiveArray::<R>::new(ends.into(), None);
+    let data = array
+        .to_data()
+        .into_builder()
+        .offset(0)
+        .len(children.len())
+        .child_data(vec![ends.to_data(), values.to_data()])
+        .build()?;
+    Ok(make_array(data))
+}
+
+fn over_export_limit(limit: usize, rows: usize) -> SqlError {
+    SqlError::Query(format!(
+        "export passed the {limit} byte limit at row {rows}; \
+         narrow the query or aggregate"
+    ))
+}
+
+/// Encodes an export batch by batch, so the byte limit stops the query as soon
+/// as the result outgrows it.
+enum ExportEncoder {
+    Parquet(Box<ArrowWriter<Vec<u8>>>),
+    Ndjson(Vec<u8>),
+}
+
+impl ExportEncoder {
+    fn new(format: Format, schema: SchemaRef) -> Result<Self, SqlError> {
+        Ok(match format {
+            Format::Parquet => Self::Parquet(Box::new(
+                ArrowWriter::try_new(Vec::new(), schema, None)
+                    .map_err(|error| SqlError::Infra(anyhow!("parquet init failed: {error}")))?,
+            )),
+            Format::Ndjson => Self::Ndjson(Vec::new()),
+        })
+    }
+
+    fn write(&mut self, batch: &RecordBatch, limit: usize) -> Result<(), SqlError> {
+        match self {
+            Self::Parquet(writer) => {
+                writer
+                    .write(batch)
+                    .map_err(|error| SqlError::Infra(anyhow!("parquet write failed: {error}")))?;
+                // Estimates trigger a flush, never a byte-limit error. Only
+                // committed bytes and the finished file establish that breach.
+                if writer.in_progress_size() > limit || writer.memory_size() >= MAX_EXPORT_BYTES {
+                    writer.flush().map_err(|error| {
+                        SqlError::Infra(anyhow!("parquet flush failed: {error}"))
+                    })?;
+                }
+                Ok(())
+            }
+            Self::Ndjson(buffer) => {
+                let mut writer = LineDelimitedWriter::new(buffer);
+                writer
+                    .write(batch)
+                    .map_err(|error| SqlError::Infra(anyhow!("ndjson write failed: {error}")))?;
+                writer
+                    .finish()
+                    .map_err(|error| SqlError::Infra(anyhow!("ndjson finish failed: {error}")))
+            }
+        }
+    }
+
+    /// Actual encoded bytes so far; Parquet's buffered size is only an estimate.
+    fn size(&self) -> usize {
+        match self {
+            Self::Parquet(writer) => writer.bytes_written(),
+            Self::Ndjson(buffer) => buffer.len(),
+        }
+    }
+
+    fn finish(self) -> Result<Vec<u8>, SqlError> {
+        match self {
+            Self::Parquet(writer) => (*writer)
+                .into_inner()
+                .map_err(|error| SqlError::Infra(anyhow!("parquet close failed: {error}"))),
+            Self::Ndjson(buffer) => Ok(buffer),
         }
     }
 }
@@ -1293,10 +1674,10 @@ fn bound_cells(batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, ArrowError> 
 
 fn render_inline(
     display: &[RecordBatch],
+    total: usize,
     max_rows: usize,
     elapsed: Duration,
 ) -> Result<String, ArrowError> {
-    let total: usize = display.iter().map(RecordBatch::num_rows).sum();
     let elapsed_ms = elapsed.as_millis();
     if total == 0 {
         // Still render the header so the caller sees the result columns.
@@ -1451,25 +1832,6 @@ fn limit_batches(batches: &[RecordBatch], max_rows: usize) -> Vec<RecordBatch> {
         }
     }
     out
-}
-
-fn encode_parquet(batches: &[RecordBatch]) -> Result<Vec<u8>, SqlError> {
-    let schema = batches
-        .first()
-        .map(RecordBatch::schema)
-        .ok_or_else(|| SqlError::Query("query returned no columns to export".to_owned()))?;
-    let mut buffer = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buffer, schema, None)
-        .map_err(|error| SqlError::Infra(anyhow!("parquet init failed: {error}")))?;
-    for batch in batches {
-        writer
-            .write(batch)
-            .map_err(|error| SqlError::Infra(anyhow!("parquet write failed: {error}")))?;
-    }
-    writer
-        .close()
-        .map_err(|error| SqlError::Infra(anyhow!("parquet close failed: {error}")))?;
-    Ok(buffer)
 }
 
 fn encode_ndjson(batches: &[RecordBatch]) -> Result<Vec<u8>, SqlError> {
@@ -1740,7 +2102,8 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![Some(fat.as_str())]))],
         )
         .expect("single-column batch");
-        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        let out =
+            render_inline(&[batch], 1, 10, Duration::from_millis(1)).expect("render succeeds");
         assert!(
             out.len() < INLINE_BUDGET_BYTES,
             "one fat cell stays within the inline budget: {} bytes",
@@ -1765,7 +2128,8 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![Some(fat.as_str())]))],
         )
         .expect("single-column batch");
-        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        let out =
+            render_inline(&[batch], 1, 10, Duration::from_millis(1)).expect("render succeeds");
         assert!(
             out.contains("é\\ný") && out.contains("[+1003 chars"),
             "char-boundary clip with newline collapse: {out}"
@@ -1780,7 +2144,8 @@ mod tests {
             )]))],
         )
         .expect("single-column batch");
-        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        let out =
+            render_inline(&[batch], 1, 10, Duration::from_millis(1)).expect("render succeeds");
         assert!(!out.contains("chars -"), "cap-sized cell not clipped");
     }
 
@@ -1794,7 +2159,8 @@ mod tests {
             )]))],
         )
         .expect("single-column batch");
-        let out = render_inline(&[batch], 10, Duration::from_millis(1)).expect("render succeeds");
+        let out =
+            render_inline(&[batch], 1, 10, Duration::from_millis(1)).expect("render succeeds");
         assert!(
             out.contains("line one\\nline two\\nline three"),
             "newlines collapse to literal \\n: {out}"
@@ -1923,6 +2289,644 @@ mod tests {
             .expect("query runs");
         assert_eq!(result.columns, ["n"]);
         assert_eq!(result.rows, [serde_json::json!({"n": 1})]);
+    }
+
+    async fn frame(sql: &str) -> DataFrame {
+        build_context()
+            .expect("context builds")
+            .sql(sql)
+            .await
+            .expect("query plans")
+    }
+
+    /// 20,000 rows of 1 KiB: about 20 MiB if a result were held whole.
+    const WIDE: &str = "SELECT value, repeat('x', 1024) AS pad FROM generate_series(1, 20000)";
+
+    #[tokio::test]
+    async fn inline_holds_only_the_rows_it_shows_and_counts_the_rest() {
+        let Gathered::Rows { display, total } =
+            gather(frame(WIDE).await, Mode::Inline, 10, MAX_EXPORT_BYTES)
+                .await
+                .expect("query runs")
+        else {
+            panic!("inline gathers rows");
+        };
+        assert_eq!(total, 20_000, "the footer still counts every row");
+        assert_eq!(display.iter().map(RecordBatch::num_rows).sum::<usize>(), 11);
+        let held: usize = display.iter().map(RecordBatch::get_array_memory_size).sum();
+        assert!(
+            held < 256 * 1024,
+            "only the shown rows stay in memory: {held} bytes"
+        );
+
+        let out = match run(&no_tables(), WIDE, Mode::Inline, 10, None).await {
+            Ok(Outcome::Inline(out)) => out,
+            _ => panic!("inline run renders"),
+        };
+        assert!(out.starts_with("20000 row(s) in "), "{}", &out[..80]);
+        assert!(
+            out.contains("19990 row(s) omitted"),
+            "omitted count survives streaming"
+        );
+    }
+
+    #[test]
+    fn retained_views_dictionaries_and_nested_values_release_unused_storage() {
+        use lance::deps::arrow_array::types::Int32Type;
+        use lance::deps::arrow_array::{DictionaryArray, Int32Array, ListViewArray, StructArray};
+
+        let values: Vec<Option<String>> = (0..20_000)
+            .map(|i| match i {
+                2 => None,
+                0..4 => Some(format!("small retained value {i}")),
+                _ => Some(format!("unique {i}: {}", "x".repeat(1024))),
+            })
+            .collect();
+        let views: ArrayRef = Arc::new(StringViewArray::from_iter(
+            values.iter().map(|value| value.as_deref()),
+        ));
+        let strings: ArrayRef = Arc::new(StringArray::from_iter(
+            values.iter().map(|value| value.as_deref()),
+        ));
+        let keys = Int32Array::from_iter_values(0..values.len() as i32);
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys.clone(), strings)
+                .expect("fixture operation succeeds"),
+        );
+        let view_dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(keys, views.clone())
+                .expect("fixture operation succeeds"),
+        );
+        let lists: ArrayRef = Arc::new(
+            ListViewArray::try_new(
+                Arc::new(Field::new("item", DataType::Utf8View, true)),
+                (0..values.len() as i32).collect::<Vec<_>>().into(),
+                vec![1i32; values.len()].into(),
+                views.clone(),
+                None,
+            )
+            .expect("fixture operation succeeds"),
+        );
+        let nested: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("list", lists.data_type().clone(), true)),
+                lists,
+            ),
+            (
+                Arc::new(Field::new(
+                    "dict",
+                    view_dictionary.data_type().clone(),
+                    true,
+                )),
+                view_dictionary.clone(),
+            ),
+        ]));
+        for (name, array) in [
+            ("views", views),
+            ("dictionary", dictionary),
+            ("view dictionary", view_dictionary),
+            ("nested list view and dictionary", nested),
+        ] {
+            assert!(array.get_array_memory_size() > 10 * 1024 * 1024, "{name}");
+            let retained = retained_prefix(array.as_ref(), 4).expect("fixture operation succeeds");
+            let held = retained.get_array_memory_size();
+            assert!(held < 64 * 1024, "{name} retained {held} bytes");
+            assert_eq!(retained.data_type(), array.data_type(), "{name} schema");
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "v",
+                array.data_type().clone(),
+                true,
+            )]));
+            let before = RecordBatch::try_new(schema.clone(), vec![array.slice(0, 4)])
+                .expect("fixture operation succeeds");
+            let after =
+                RecordBatch::try_new(schema, vec![retained]).expect("fixture operation succeeds");
+            assert_eq!(
+                encode_ndjson(&[before]).expect("fixture operation succeeds"),
+                encode_ndjson(&[after]).expect("fixture operation succeeds"),
+                "{name} values and nulls"
+            );
+        }
+    }
+
+    fn check_compact_slice(
+        array: ArrayRef,
+        offset: usize,
+        rows: usize,
+        backing: Buffer,
+    ) -> ArrayRef {
+        let source = array.slice(offset, array.len() - offset);
+        drop(array);
+        let field = Field::new("value", source.data_type().clone(), true)
+            .with_metadata(HashMap::from([("field-note".into(), "kept".into())]));
+        let schema = Arc::new(Schema::new_with_metadata(
+            vec![field],
+            HashMap::from([("schema-note".into(), "kept".into())]),
+        ));
+        let expected = {
+            let batch = RecordBatch::try_new(schema.clone(), vec![source.slice(0, rows)])
+                .expect("valid source batch");
+            encode_ndjson(&[batch]).expect("source values encode")
+        };
+        let retained = retained_prefix(source.as_ref(), rows).expect("valid prefix materializes");
+        assert_eq!(retained.data_type(), source.data_type());
+        let batch = RecordBatch::try_new(schema.clone(), vec![retained.clone()])
+            .expect("retained schema matches");
+        assert_eq!(batch.schema(), schema);
+        assert_eq!(
+            encode_ndjson(&[batch]).expect("retained values encode"),
+            expected
+        );
+        drop(source);
+        assert_eq!(
+            backing.strong_count(),
+            1,
+            "retained rows must release the original backing buffer after the source is dropped"
+        );
+        assert!(retained.get_array_memory_size() < 64 * 1024);
+        retained
+    }
+
+    #[test]
+    fn retained_boundary_dictionaries_preserve_keys_values_and_nulls() {
+        use lance::deps::arrow_array::types::{Int8Type, UInt8Type};
+        use lance::deps::arrow_array::{Int8Array, UInt8Array};
+
+        for count in [128, 300] {
+            let values = StringArray::from_iter_values((0..count).map(|i| {
+                if i == 0 || i == 127 {
+                    format!("small {i}")
+                } else {
+                    "x".repeat(16 * 1024)
+                }
+            }));
+            let backing = values.to_data().buffers()[1].clone();
+            let dict = DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![Some(3), Some(127), None, Some(0), Some(5)]),
+                Arc::new(values),
+            )
+            .expect("valid Int8 dictionary");
+            let retained = check_compact_slice(Arc::new(dict), 1, 3, backing);
+            assert_eq!(
+                retained.as_dictionary::<Int8Type>().keys().data_type(),
+                &DataType::Int8
+            );
+            assert_eq!(retained.as_dictionary::<Int8Type>().values().len(), 2);
+        }
+        let values = StringArray::from_iter_values((0..256).map(|i| {
+            if i == 0 || i == 255 {
+                format!("small {i}")
+            } else {
+                "y".repeat(16 * 1024)
+            }
+        }));
+        let backing = values.to_data().buffers()[1].clone();
+        let dict = DictionaryArray::<UInt8Type>::try_new(
+            UInt8Array::from(vec![Some(3), Some(255), None, Some(0)]),
+            Arc::new(values),
+        )
+        .expect("valid UInt8 dictionary");
+        let retained = check_compact_slice(Arc::new(dict), 1, 3, backing);
+        assert_eq!(
+            retained.as_dictionary::<UInt8Type>().keys().data_type(),
+            &DataType::UInt8
+        );
+
+        // Compaction must also work when every boundary dictionary entry is used.
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..128).map(|i| format!("v{i}")),
+        ));
+        let dict =
+            DictionaryArray::<Int8Type>::try_new(Int8Array::from_iter_values(0..=127), values)
+                .expect("all valid Int8 keys");
+        let retained = retained_prefix(&dict, 128).expect("all boundary entries survive");
+        assert_eq!(retained.to_data(), dict.to_data());
+        let values: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..256).map(|i| format!("v{i}")),
+        ));
+        let dict =
+            DictionaryArray::<UInt8Type>::try_new(UInt8Array::from_iter_values(0..=255), values)
+                .expect("all valid UInt8 keys");
+        assert_eq!(
+            retained_prefix(&dict, 256)
+                .expect("all unsigned entries survive")
+                .to_data(),
+            dict.to_data()
+        );
+    }
+
+    #[test]
+    fn retained_all_null_dictionary_keys_release_values() {
+        use lance::deps::arrow_array::Int8Array;
+        use lance::deps::arrow_array::types::Int8Type;
+
+        let values = StringArray::from_iter_values((0..128).map(|_| "unused".repeat(2048)));
+        let backing = values.to_data().buffers()[1].clone();
+        let dict = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(127), None, None, Some(0)]),
+            Arc::new(values),
+        )
+        .expect("valid dictionary with null keys");
+        let retained = check_compact_slice(Arc::new(dict), 1, 2, backing);
+        assert_eq!(retained.null_count(), 2);
+        assert!(retained.as_dictionary::<Int8Type>().values().is_empty());
+    }
+
+    #[test]
+    fn retained_nested_sliced_list_views_preserve_overlapping_out_of_order_values() {
+        use lance::deps::arrow_array::types::{Int8Type, UInt8Type};
+        use lance::deps::arrow_array::{
+            FixedSizeListArray, Int8Array, LargeListViewArray, ListArray, ListViewArray,
+            StructArray, UInt8Array,
+        };
+        use lance::deps::datafusion::arrow::buffer::OffsetBuffer;
+
+        let metadata = HashMap::from([("nested-note".into(), "kept".into())]);
+        for unsigned in [false, true] {
+            let count = if unsigned { 256 } else { 128 };
+            let values = StringViewArray::from_iter_values((0..count).map(|i| {
+                if i < 4 || i == count - 1 {
+                    format!("retained value {i}")
+                } else {
+                    format!("unused {i} {}", "z".repeat(16384))
+                }
+            }));
+            let backing = values.to_data().buffers()[1].clone();
+            let values = Arc::new(values) as ArrayRef;
+            let dict: ArrayRef = if unsigned {
+                Arc::new(
+                    DictionaryArray::<UInt8Type>::try_new(
+                        UInt8Array::from(vec![Some(255), Some(0), None, Some(1), Some(2), Some(3)]),
+                        values,
+                    )
+                    .expect("nested unsigned dictionary"),
+                )
+            } else {
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![Some(127), Some(0), None, Some(1), Some(2), Some(3)]),
+                        values,
+                    )
+                    .expect("nested signed dictionary"),
+                )
+            };
+            let item = Arc::new(
+                Field::new("item", dict.data_type().clone(), true).with_metadata(metadata.clone()),
+            );
+            let lists: ArrayRef = Arc::new(
+                ListViewArray::try_new(
+                    item,
+                    vec![4i32, 2, 0, 1, 0].into(),
+                    vec![2i32, 3, 3, 2, 0].into(),
+                    dict,
+                    Some(NullBuffer::from(vec![true, true, true, true, false])),
+                )
+                .expect("overlapping out-of-order lists"),
+            );
+            let field = Arc::new(
+                Field::new("lists", lists.data_type().clone(), true)
+                    .with_metadata(metadata.clone()),
+            );
+            let nested = StructArray::try_new(
+                vec![field].into(),
+                vec![lists],
+                Some(NullBuffer::from(vec![true, true, true, false, true])),
+            )
+            .expect("nested fixture");
+            check_compact_slice(Arc::new(nested), 1, 4, backing);
+        }
+
+        // The same dictionary boundary beneath ordinary/large/fixed lists.
+        for kind in [0, 1, 2] {
+            let values = StringArray::from_iter_values((0..128).map(|i| {
+                if i == 0 || i == 127 {
+                    format!("small {i}")
+                } else {
+                    "unused".repeat(2048)
+                }
+            }));
+            let backing = values.to_data().buffers()[1].clone();
+            let dict: ArrayRef = Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(vec![Some(127), None, Some(0), Some(127), None, Some(0)]),
+                    Arc::new(values),
+                )
+                .expect("nested list dictionary"),
+            );
+            let field = Arc::new(
+                Field::new("item", dict.data_type().clone(), true).with_metadata(metadata.clone()),
+            );
+            let lists: ArrayRef = match kind {
+                0 => Arc::new(
+                    ListArray::try_new(
+                        field,
+                        OffsetBuffer::new(vec![0i32, 2, 4, 6].into()),
+                        dict,
+                        None,
+                    )
+                    .expect("ordinary list"),
+                ),
+                1 => Arc::new(
+                    LargeListViewArray::try_new(
+                        field,
+                        vec![4i64, 2, 0].into(),
+                        vec![2i64, 3, 3].into(),
+                        dict,
+                        None,
+                    )
+                    .expect("large overlapping list"),
+                ),
+                _ => {
+                    Arc::new(FixedSizeListArray::try_new(field, 2, dict, None).expect("fixed list"))
+                }
+            };
+            check_compact_slice(lists, 1, 2, backing);
+        }
+    }
+
+    #[test]
+    fn retained_dictionary_children_in_maps_unions_and_runs() {
+        use lance::deps::arrow_array::types::{Int8Type, Int16Type};
+        use lance::deps::arrow_array::{Int8Array, Int16Array, MapArray, StructArray, UnionArray};
+        use lance::deps::arrow_schema::UnionFields;
+        use lance::deps::datafusion::arrow::buffer::OffsetBuffer;
+        use lance::deps::datafusion::arrow::util::display::array_value_to_string;
+
+        for kind in 0..4 {
+            let values = StringArray::from_iter_values((0..128).map(|i| {
+                if i == 0 || i == 127 {
+                    format!("small {i}")
+                } else {
+                    "unused".repeat(2048)
+                }
+            }));
+            let backing = values.to_data().buffers()[1].clone();
+            let dict: ArrayRef = Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(vec![Some(127), Some(0), None, Some(127)]),
+                    Arc::new(values),
+                )
+                .expect("boundary dictionary"),
+            );
+            let field = Arc::new(Field::new("dict", dict.data_type().clone(), true));
+            let array: ArrayRef = match kind {
+                0 => {
+                    let entries = StructArray::from(vec![
+                        (
+                            Arc::new(Field::new("key", DataType::Utf8, false)),
+                            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef,
+                        ),
+                        (field, dict),
+                    ]);
+                    let field = Arc::new(Field::new("entries", entries.data_type().clone(), false));
+                    Arc::new(
+                        MapArray::try_new(
+                            field,
+                            OffsetBuffer::new(vec![0i32, 1, 2, 3, 4].into()),
+                            entries,
+                            None,
+                            true,
+                        )
+                        .expect("map"),
+                    )
+                }
+                1 | 2 => {
+                    let fields =
+                        UnionFields::try_new(vec![3], vec![field]).expect("valid union fields");
+                    let offsets = (kind == 2).then(|| vec![3i32, 1, 2, 0].into());
+                    Arc::new(
+                        UnionArray::try_new(fields, vec![3i8; 4].into(), offsets, vec![dict])
+                            .expect("union"),
+                    )
+                }
+                _ => {
+                    let run = Arc::new(
+                        RunArray::<Int16Type>::try_new(
+                            &Int16Array::from(vec![2, 4, 6, 8]),
+                            dict.as_ref(),
+                        )
+                        .expect("run encoded"),
+                    );
+                    drop(dict);
+                    run
+                }
+            };
+            let source = array.slice(1, array.len() - 1);
+            drop(array);
+            let rows = source.len();
+            let expected = (0..rows)
+                .map(|i| array_value_to_string(source.as_ref(), i).expect("source renders"))
+                .collect::<Vec<_>>();
+            let retained =
+                retained_prefix(source.as_ref(), rows).expect("nested dictionary materializes");
+            assert_eq!(retained.data_type(), source.data_type());
+            assert_eq!(
+                (0..rows)
+                    .map(|i| array_value_to_string(retained.as_ref(), i).expect("retained renders"))
+                    .collect::<Vec<_>>(),
+                expected,
+                "kind {kind}"
+            );
+            drop(source);
+            assert_eq!(backing.strong_count(), 1, "kind {kind}");
+            assert!(retained.get_array_memory_size() < 64 * 1024);
+            assert_eq!(
+                retained_prefix(retained.as_ref(), 0)
+                    .expect("empty nested prefix")
+                    .len(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parquet_uses_actual_bytes_and_covers_the_footer_and_empty_schema() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(StringArray::from(vec![
+                "one repeated dictionary value";
+                8192
+            ])) as ArrayRef,
+        )])
+        .expect("fixture operation succeeds");
+        let mut reference = ArrowWriter::try_new(Vec::new(), batch.schema(), None)
+            .expect("fixture operation succeeds");
+        reference.write(&batch).expect("fixture operation succeeds");
+        let estimate = reference.in_progress_size();
+        reference.flush().expect("fixture operation succeeds");
+        let committed = reference.bytes_written();
+        let reference = reference.into_inner().expect("fixture operation succeeds");
+        assert!(
+            estimate > reference.len(),
+            "RLE estimate exceeds the whole encoded file"
+        );
+        assert!(committed < reference.len(), "footer adds bytes");
+
+        let df = || {
+            build_context()
+                .expect("fixture operation succeeds")
+                .read_batch(batch.clone())
+                .expect("fixture operation succeeds")
+        };
+        let Gathered::Export {
+            bytes,
+            rows,
+            columns,
+            ..
+        } = gather(df(), Mode::Export(Format::Parquet), 10, reference.len())
+            .await
+            .expect("fixture operation succeeds")
+        else {
+            panic!("Parquet export");
+        };
+        assert_eq!(
+            bytes.len(),
+            reference.len(),
+            "an exactly fitting file is accepted"
+        );
+        assert_eq!(rows, 8192);
+        assert_eq!(columns, ["v"]);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .expect("fixture operation succeeds");
+        assert_eq!(reader.schema(), &batch.schema());
+        let decoded: Vec<RecordBatch> = reader
+            .build()
+            .expect("fixture operation succeeds")
+            .collect::<Result<_, _>>()
+            .expect("fixture operation succeeds");
+        assert_eq!(
+            decoded.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            rows
+        );
+        for batch in decoded {
+            assert!(
+                batch
+                    .column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .all(|value| value == Some("one repeated dictionary value"))
+            );
+        }
+        assert!(
+            matches!(
+                gather(df(), Mode::Export(Format::Parquet), 10, reference.len() - 1).await,
+                Err(SqlError::Query(_))
+            ),
+            "a footer-only overflow is refused"
+        );
+
+        let empty = frame("SELECT CAST(1 AS BIGINT) AS n WHERE false").await;
+        let schema = empty.schema().as_arrow().clone();
+        let Gathered::Export {
+            bytes,
+            rows,
+            columns,
+            ..
+        } = gather(empty, Mode::Export(Format::Parquet), 10, MAX_EXPORT_BYTES)
+            .await
+            .expect("fixture operation succeeds")
+        else {
+            panic!("empty Parquet export");
+        };
+        assert_eq!(rows, 0);
+        assert_eq!(columns, ["n"]);
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .expect("fixture operation succeeds");
+        assert_eq!(reader.schema().as_ref(), &schema);
+        assert_eq!(
+            reader
+                .build()
+                .expect("fixture operation succeeds")
+                .map(|batch| batch.expect("fixture operation succeeds").num_rows())
+                .sum::<usize>(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn export_stops_at_its_byte_limit_instead_of_encoding_everything() {
+        // The repeated padding compresses well in Parquet. This budget is
+        // below even the encoded result, not only its uncompressed size.
+        let limit = 16 * 1024;
+        for format in [Format::Ndjson, Format::Parquet] {
+            let refused = gather(frame(WIDE).await, Mode::Export(format), 10, limit).await;
+            let Err(SqlError::Query(message)) = refused else {
+                match refused {
+                    Ok(Gathered::Export { bytes, rows, .. }) => panic!(
+                        "an export over the limit is refused: {format:?}, rows={rows}, bytes={}",
+                        bytes.len()
+                    ),
+                    Err(error) => panic!("unexpected export error: {error:?}"),
+                    Ok(_) => panic!("unexpected non-export result"),
+                }
+            };
+            let at_row: usize = message
+                .split("at row ")
+                .nth(1)
+                .and_then(|rest| rest.split(';').next())
+                .and_then(|row| row.parse().ok())
+                .expect("the message names the row");
+            assert!(
+                at_row < 20_000,
+                "stopped before the end of the result: {message}"
+            );
+        }
+
+        for format in [Format::Ndjson, Format::Parquet] {
+            let sql = "SELECT value FROM generate_series(1, 3)";
+            let Gathered::Export {
+                bytes,
+                rows,
+                columns,
+                ..
+            } = gather(frame(sql).await, Mode::Export(format), 10, limit)
+                .await
+                .expect("a small export fits")
+            else {
+                panic!("export gathers bytes");
+            };
+            assert_eq!((rows, columns), (3, vec!["value".to_owned()]));
+            match format {
+                Format::Ndjson => {
+                    let values: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                        .expect("fixture operation succeeds")
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("fixture operation succeeds"))
+                        .collect();
+                    assert_eq!(
+                        values,
+                        vec![
+                            serde_json::json!({"value": 1}),
+                            serde_json::json!({"value": 2}),
+                            serde_json::json!({"value": 3})
+                        ]
+                    );
+                }
+                Format::Parquet => {
+                    let reader =
+                        parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                            bytes::Bytes::from(bytes),
+                        )
+                        .expect("fixture operation succeeds");
+                    assert_eq!(reader.schema().field(0).name(), "value");
+                    let values: Vec<i64> = reader
+                        .build()
+                        .expect("fixture operation succeeds")
+                        .flat_map(|batch| {
+                            batch
+                                .expect("fixture operation succeeds")
+                                .column(0)
+                                .as_primitive::<lance::deps::arrow_array::types::Int64Type>()
+                                .values()
+                                .to_vec()
+                        })
+                        .collect();
+                    assert_eq!(values, [1, 2, 3]);
+                }
+            }
+        }
     }
 
     #[tokio::test]
