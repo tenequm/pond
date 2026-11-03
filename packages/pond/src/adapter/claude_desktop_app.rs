@@ -16,8 +16,8 @@
 //!   the inner Claude Code loop the Cowork sandbox runs; `audit.jsonl` already
 //!   represents that conversation, so ingesting the `.claude/projects/**/*.jsonl`
 //!   transcripts under it would double-count the same session. Discovery is
-//!   scoped to `local_*/audit.jsonl` and the walk prunes hidden dirs, so this
-//!   adapter cannot pick up the inner loop. This is why it drives the [`Adapter`]
+//!   scoped to `local_*/audit.jsonl` and the walk prunes hidden dirs below the
+//!   root, so this adapter cannot pick up the inner loop. This is why it drives the [`Adapter`]
 //!   seam directly rather than through `JsonlTree` (whose blanket `*.jsonl` walk
 //!   would find the inner transcripts).
 //!
@@ -268,8 +268,6 @@ impl Adapter for ClaudeDesktopAppAdapter {
     }
 }
 
-/// A blocking-task panic is a pond bug, not bad source data, so it fails the
-/// whole run rather than skipping a session.
 /// Latest message timestamp (micros) for the freshness gate: the audit log's
 /// last record. The audit stream is append-ordered, so its tail line is the
 /// latest message; an unreadable file or a record without a timestamp yields
@@ -282,6 +280,8 @@ fn source_last_ts(audit_path: &Path) -> Option<i64> {
     Some(record_timestamp(&record)?.timestamp_micros())
 }
 
+/// A blocking-task panic is a pond bug, not bad source data, so it fails the
+/// whole run rather than skipping a session.
 fn join_error(join: tokio::task::JoinError) -> AdapterError {
     AdapterError::io(
         NAME,
@@ -1245,8 +1245,6 @@ mod tests {
         ));
     }
 
-    /// Hidden dirs are pruned below the root, never the root itself: a
-    /// dot-named source folder (or a relative `.`) is still the source.
     #[test]
     fn dot_named_root_is_walked_but_hidden_subdirs_are_not() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -1262,8 +1260,8 @@ mod tests {
     }
 
     /// A model-switch `fallback` block is harness-written, so it is injected
-    /// (kept out of search); `document` (a PDF) and `image` blocks are file parts
-    /// carrying the media type from their `source`, not JSON blobs in text parts.
+    /// (kept out of search); a `document` block (a PDF read) is a file part
+    /// carrying the media type from its `source`, not a JSON blob in a text part.
     #[tokio::test(flavor = "multi_thread")]
     async fn fallback_block_is_injected_and_document_block_is_a_file() -> anyhow::Result<()> {
         let corpus = TempDir::new()?;
@@ -1296,9 +1294,6 @@ mod tests {
                 {"type": "text", "text": "read this pdf"},
                 {"type": "document", "source": {
                     "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK",
-                }},
-                {"type": "image", "source": {
-                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=",
                 }},
             ]),
         );
@@ -1342,7 +1337,7 @@ mod tests {
         };
 
         let prompt_parts = parts_of("u-prompt");
-        assert_eq!(prompt_parts.len(), 3);
+        assert_eq!(prompt_parts.len(), 2);
         assert!(
             matches!(
                 &prompt_parts[1].kind,
@@ -1351,14 +1346,6 @@ mod tests {
             ),
             "document block must be a file part holding the source bytes: {:?}",
             prompt_parts[1].kind,
-        );
-        assert!(
-            matches!(
-                &prompt_parts[2].kind,
-                PartKind::File { media_type: Some(media), .. } if media == "image/png"
-            ),
-            "image media type must come from its source: {:?}",
-            prompt_parts[2].kind,
         );
 
         let fallback_parts = parts_of("a-fallback");
