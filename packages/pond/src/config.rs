@@ -860,11 +860,14 @@ fn detect_legacy_sources(path: &Path) -> Option<String> {
     ))
 }
 
-/// A rootless path resolves against the syncing process's working directory,
-/// which under a scheduler (`/` for launchd, `$HOME` for systemd) is not the
-/// one the user meant.
+/// A path still relative after the factories' expansion resolves against the
+/// syncing process's working directory, which under a scheduler (`/` for
+/// launchd, `$HOME` for systemd) is not the one the user meant. Checking the
+/// expanded form keeps `$VAR/x` valid and rejects the `~user` and unset-`$VAR`
+/// spellings the expander leaves untouched.
 fn is_cwd_relative(path: &str) -> bool {
-    !path.starts_with('~') && !Path::new(path).has_root()
+    let home = home_dir().unwrap_or_default();
+    !expand_home_under(Path::new(path), &home).is_absolute()
 }
 
 /// Fan an entry whose `path` is an array out into one single-path entry per
@@ -1504,6 +1507,8 @@ path = [\"/srv/solo\"]
         for body in [
             "[adapters.claude-code]\nenabled = true\npath = \".\"\n",
             "[adapters.claude-code]\nenabled = true\npath = [\"/srv/a\", \"sessions\"]\n",
+            "[adapters.claude-code]\nenabled = true\npath = \"~user/sessions\"\n",
+            "[adapters.claude-code]\nenabled = true\npath = \"$POND_UNSET_ROOT/sessions\"\n",
         ] {
             figment::Jail::expect_with(|jail| {
                 jail.create_file("config.toml", body)?;
@@ -1521,6 +1526,24 @@ path = [\"/srv/solo\"]
             jail.create_file(
                 "config.toml",
                 "[adapters.claude-code]\nenabled = true\npath = [\"~/sessions\", \"/srv/a\"]\n",
+            )?;
+            let resolved = Config::load("config.toml")
+                .unwrap()
+                .resolve_adapters(None)
+                .unwrap();
+            assert_eq!(resolved.len(), 2);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn resolve_adapters_accepts_env_var_paths_that_expand_to_absolute() {
+        figment::Jail::expect_with(|jail| {
+            let root = std::path::absolute("/srv").unwrap();
+            jail.set_env("POND_TEST_ROOT", root.display().to_string());
+            jail.create_file(
+                "config.toml",
+                "[adapters.claude-code]\nenabled = true\npath = [\"$POND_TEST_ROOT/a\", \"${POND_TEST_ROOT}/b\"]\n",
             )?;
             let resolved = Config::load("config.toml")
                 .unwrap()
