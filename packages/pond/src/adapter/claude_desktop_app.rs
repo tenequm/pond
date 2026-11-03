@@ -44,13 +44,14 @@ use walkdir::WalkDir;
 
 use crate::{
     sessions::IngestEvent,
-    wire::{FileData, Message, Part, PartKind, Provenance, ProviderOptions, Session},
+    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
-    config_path, empty_options,
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    claude_code::file_part,
+    compact_json, config_path, empty_options,
     extract::{
         Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
     },
@@ -905,52 +906,6 @@ fn tool_result_part(
     }
 }
 
-fn file_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    value: &Value,
-    provenance: Provenance,
-) -> Part {
-    let media_type = value
-        .get("media_type")
-        .or_else(|| value.get("mime_type"))
-        .or_else(|| value.get("source")?.get("media_type"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let file_name = value
-        .get("file_name")
-        .or_else(|| value.get("name"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let data = if let Some(source) = value.get("source") {
-        if let Some(url) = source.get("url").and_then(Value::as_str) {
-            FileData::Url(url.to_owned())
-        } else if let Some(bytes) = source.get("data").and_then(Value::as_str) {
-            FileData::String(bytes.to_owned())
-        } else {
-            FileData::String(compact_json(source))
-        }
-    } else if let Some(url) = value.get("url").and_then(Value::as_str) {
-        FileData::Url(url.to_owned())
-    } else {
-        FileData::String(compact_json(value))
-    };
-    Part {
-        session_id: session_id.to_owned(),
-        id: part_id(message_id, ordinal),
-        message_id: message_id.to_owned(),
-        ordinal: part_ordinal(ordinal),
-        provenance,
-        options: empty_options(),
-        kind: PartKind::File {
-            media_type,
-            file_name,
-            data,
-        },
-    }
-}
-
 fn row_options(record: &Value, line: usize) -> ProviderOptions {
     let mut options = source_options(NAME, record);
     if let Some(source) = options.get_mut("source").and_then(Value::as_object_mut) {
@@ -1150,7 +1105,7 @@ mod tests {
     #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
-    use crate::{handlers::ingest_adapter, sessions::Store};
+    use crate::{handlers::ingest_adapter, sessions::Store, wire::FileData};
     use tempfile::TempDir;
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd

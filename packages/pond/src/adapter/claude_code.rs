@@ -1184,7 +1184,9 @@ fn tool_result_part(
     }
 }
 
-fn file_part(
+/// Shared with `claude_desktop_app`, whose rows carry the same Anthropic
+/// content blocks, so the two adapters cannot drift on file mapping.
+pub(crate) fn file_part(
     session_id: &str,
     message_id: &str,
     ordinal: usize,
