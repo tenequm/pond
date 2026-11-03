@@ -778,7 +778,7 @@ fn user_part(
             extract_str(value, "text"),
             Provenance::Conversational,
         ),
-        Some("image") | Some("file") => file_part(
+        Some("image" | "file" | "document") => file_part(
             session_id,
             message_id,
             ordinal,
@@ -839,12 +839,21 @@ fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Va
                 provider_executed: kind == "server_tool_use",
             },
         },
-        Some("image") | Some("file") => file_part(
+        Some("image" | "file" | "document") => file_part(
             session_id,
             message_id,
             ordinal,
             value,
             Provenance::Conversational,
+        ),
+        // A model-switch marker (`{"from":{"model"},"to":{"model"}}`) rides in
+        // assistant content but is written by the harness, not the model.
+        Some("fallback") => text_part(
+            session_id,
+            message_id,
+            ordinal,
+            Some(extract_compact_repr(value)),
+            Provenance::Injected,
         ),
         _ => text_part(
             session_id,
@@ -906,6 +915,7 @@ fn file_part(
     let media_type = value
         .get("media_type")
         .or_else(|| value.get("mime_type"))
+        .or_else(|| value.get("source")?.get("media_type"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let file_name = value
@@ -1442,5 +1452,116 @@ mod tests {
             IngestEvent::Message(Message::System { id, content, .. })
                 if id == "local-message-1" && content.as_deref().map(String::as_str) == Some("user")
         ));
+    }
+
+    /// A model-switch `fallback` block is harness-written, so it is injected
+    /// (kept out of search); `document` (a PDF) and `image` blocks are file parts
+    /// carrying the media type from their `source`, not JSON blobs in text parts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_block_is_injected_and_document_block_is_a_file() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        // The walk prunes hidden dirs, root included, and a TempDir is named `.tmp*`.
+        let root = corpus.path().join(SESSIONS_SUBDIR);
+        let workspace = root.join("acct").join("workspace");
+        let session_id = "local_88888888-8888-8888-8888-888888888888";
+        std::fs::create_dir_all(workspace.join(session_id))?;
+        std::fs::write(
+            workspace.join(format!("{session_id}.json")),
+            json!({
+                "sessionId": session_id,
+                "createdAt": 1_793_577_600_000_i64,
+                "cwd": "/tmp/pond-test",
+            })
+            .to_string(),
+        )?;
+        let row = |uuid: &str, role: &str, second: u32, content: Value| {
+            json!({
+                "type": role,
+                "uuid": uuid,
+                "_audit_timestamp": format!("2026-11-02T00:00:0{second}.000Z"),
+                "message": {"role": role, "content": content},
+            })
+        };
+        let prompt = row(
+            "u-prompt",
+            "user",
+            0,
+            json!([
+                {"type": "text", "text": "read this pdf"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK",
+                }},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=",
+                }},
+            ]),
+        );
+        let fallback = row(
+            "a-fallback",
+            "assistant",
+            1,
+            json!([{
+                "type": "fallback",
+                "from": {"model": "claude-fable-5"},
+                "to": {"model": "claude-opus-4-8"},
+            }]),
+        );
+        let reply = row(
+            "a-reply",
+            "assistant",
+            2,
+            json!([{"type": "text", "text": "the pdf says hello"}]),
+        );
+        std::fs::write(
+            workspace.join(session_id).join("audit.jsonl"),
+            format!("{prompt}\n{fallback}\n{reply}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeDesktopAppAdapter::new(&root);
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        let session = store
+            .get_session(session_id)
+            .await?
+            .expect("session ingests");
+        let parts_of = |id: &str| {
+            session
+                .messages
+                .iter()
+                .find(|stored| stored.message.id() == id)
+                .map(|stored| stored.parts.clone())
+                .unwrap_or_default()
+        };
+
+        let prompt_parts = parts_of("u-prompt");
+        assert_eq!(prompt_parts.len(), 3);
+        assert!(
+            matches!(
+                &prompt_parts[1].kind,
+                PartKind::File { media_type: Some(media), data: FileData::String(data), .. }
+                    if media == "application/pdf" && data == "JVBERi0xLjQK"
+            ),
+            "document block must be a file part holding the source bytes: {:?}",
+            prompt_parts[1].kind,
+        );
+        assert!(
+            matches!(
+                &prompt_parts[2].kind,
+                PartKind::File { media_type: Some(media), .. } if media == "image/png"
+            ),
+            "image media type must come from its source: {:?}",
+            prompt_parts[2].kind,
+        );
+
+        let fallback_parts = parts_of("a-fallback");
+        assert_eq!(fallback_parts.len(), 1);
+        assert!(matches!(fallback_parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(fallback_parts[0].provenance, Provenance::Injected);
+
+        let reply_parts = parts_of("a-reply");
+        assert_eq!(reply_parts[0].provenance, Provenance::Conversational);
+        Ok(())
     }
 }
