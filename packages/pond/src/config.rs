@@ -893,11 +893,19 @@ fn expand_path_array(
             "[adapters.{name}] has an empty `path`; set it to a directory, or disable the adapter with `pond adapters disable {name}`"
         );
     }
+    // A config error halts every adapter's sync, so each message states the
+    // blast radius and the way to keep working meanwhile.
+    let others = match enabled_total.saturating_sub(1) {
+        0 => String::new(),
+        n => format!(
+            " ({n} other enabled adapter(s) are unaffected - `pond sync <adapter>` syncs one meanwhile, `pond adapters list` shows every configured path)"
+        ),
+    };
     if let Some(path) = blob.get("path").and_then(Value::as_str)
         && is_cwd_relative(path)
     {
         bail!(
-            "[adapters.{name}] has a relative `path` {path:?}; set it to an absolute path or one starting with `~` (a scheduled sync would resolve it against the scheduler's working directory)"
+            "[adapters.{name}] has a relative `path` {path:?}; set it to an absolute path or one starting with `~` (a scheduled sync would resolve it against the scheduler's working directory){others}"
         );
     }
     let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
@@ -906,14 +914,6 @@ fn expand_path_array(
             config: blob,
             fanout_path: None,
         }]);
-    };
-    // A config error halts every adapter's sync, so each message states the
-    // blast radius and the way to keep working meanwhile.
-    let others = match enabled_total.saturating_sub(1) {
-        0 => String::new(),
-        n => format!(
-            " ({n} other enabled adapter(s) are unaffected - `pond sync <adapter>` syncs one meanwhile, `pond adapters list` shows every configured path)"
-        ),
     };
     if paths.is_empty() {
         bail!(
@@ -1522,6 +1522,22 @@ path = [\"/srv/solo\"]
                 Ok(())
             });
         }
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[adapters.claude-code]\nenabled = true\npath = \".\"\n\n[adapters.codex-cli]\nenabled = true\npath = \"/srv/b\"\n",
+            )?;
+            let err = Config::load("config.toml")
+                .unwrap()
+                .resolve_adapters(None)
+                .expect_err("a cwd-relative path must error")
+                .to_string();
+            assert!(
+                err.contains("1 other enabled adapter(s) are unaffected"),
+                "got: {err}"
+            );
+            Ok(())
+        });
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "config.toml",
