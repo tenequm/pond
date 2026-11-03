@@ -860,6 +860,13 @@ fn detect_legacy_sources(path: &Path) -> Option<String> {
     ))
 }
 
+/// A rootless path resolves against the syncing process's working directory,
+/// which under a scheduler (`/` for launchd, `$HOME` for systemd) is not the
+/// one the user meant.
+fn is_cwd_relative(path: &str) -> bool {
+    !path.starts_with('~') && !Path::new(path).has_root()
+}
+
 /// Fan an entry whose `path` is an array out into one single-path entry per
 /// element (other keys copied verbatim), preserving config order. Adapters
 /// only ever see a scalar `path`, so the seam and every factory stay
@@ -881,6 +888,13 @@ fn expand_path_array(
     if blob.get("path").and_then(Value::as_str) == Some("") {
         bail!(
             "[adapters.{name}] has an empty `path`; set it to a directory, or disable the adapter with `pond adapters disable {name}`"
+        );
+    }
+    if let Some(path) = blob.get("path").and_then(Value::as_str)
+        && is_cwd_relative(path)
+    {
+        bail!(
+            "[adapters.{name}] has a relative `path` {path:?}; set it to an absolute path or one starting with `~` (a scheduled sync would resolve it against the scheduler's working directory)"
         );
     }
     let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
@@ -917,6 +931,11 @@ fn expand_path_array(
         if path.is_empty() {
             bail!(
                 "[adapters.{name}] has an empty `path` element; set it to a directory, remove it, or disable the adapter with `pond adapters disable {name}`{others}"
+            );
+        }
+        if is_cwd_relative(path) {
+            bail!(
+                "[adapters.{name}] `path` element {path:?} is relative; set it to an absolute path or one starting with `~` (a scheduled sync would resolve it against the scheduler's working directory){others}"
             );
         }
         // Literal duplicates only, as a typo courtesy. Aliases (`~/x` vs its
@@ -1478,6 +1497,38 @@ path = [\"/srv/solo\"]
                 Ok(())
             });
         }
+    }
+
+    #[test]
+    fn resolve_adapters_rejects_cwd_relative_paths() {
+        for body in [
+            "[adapters.claude-code]\nenabled = true\npath = \".\"\n",
+            "[adapters.claude-code]\nenabled = true\npath = [\"/srv/a\", \"sessions\"]\n",
+        ] {
+            figment::Jail::expect_with(|jail| {
+                jail.create_file("config.toml", body)?;
+                let err = Config::load("config.toml")
+                    .unwrap()
+                    .resolve_adapters(None)
+                    .expect_err("a cwd-relative path must error")
+                    .to_string();
+                assert!(err.contains("relative"), "got: {err}");
+                assert!(err.contains("[adapters.claude-code]"), "got: {err}");
+                Ok(())
+            });
+        }
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[adapters.claude-code]\nenabled = true\npath = [\"~/sessions\", \"/srv/a\"]\n",
+            )?;
+            let resolved = Config::load("config.toml")
+                .unwrap()
+                .resolve_adapters(None)
+                .unwrap();
+            assert_eq!(resolved.len(), 2);
+            Ok(())
+        });
     }
 
     #[test]
