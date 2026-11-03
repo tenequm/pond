@@ -302,13 +302,13 @@ struct CoworkSession {
 
 /// Walk the root for `local_*/audit.jsonl`, pruning hidden directories below
 /// it so the nested `.claude/` inner loop is never reached. Sorted for
-/// deterministic ingest order. A missing root means "no sessions yet", not an
-/// error.
+/// deterministic ingest order. A missing root means "no sessions yet"; an
+/// unreadable one is an error rather than an empty result.
 fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
-    if !root.exists() {
+    let io = |source| AdapterError::io(NAME, root.display().to_string(), source);
+    if !root.try_exists().map_err(io)? {
         return Ok(Vec::new());
     }
-    let io = |source| AdapterError::io(NAME, root.display().to_string(), source);
     let mut out = Vec::new();
     let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
         // Prune any hidden dir (`.claude`, `.audit-key` is a file). The inner
