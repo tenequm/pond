@@ -523,7 +523,7 @@ Re-embedding rewrites only `vector` and `embedding_model`; no canonical column i
 
 #### `session-additive-schema-backfill`
 
-A schema change that adds derived nullable columns MUST upgrade existing data in place, never by re-ingest: on open, a store missing known derivable columns backfills them from data already stored (one `add_columns` commit per table; concurrent openers race benignly under OCC), and a `.pond` archive predating the change restores by deriving the missing cells at the read boundary - an archive is a snapshot and restore never mutates it. Why: re-ingest is not a migration path (`session-durable-copy` - a rotated source cannot supply its rows again), so an additive change that stranded existing stores or archives would violate the durability contract it sits on. The backfill derives only from stored data, preserving `model-no-synthesis`: a cell the stored record cannot justify stays NULL.
+A schema change that adds derived nullable columns MUST upgrade existing data in place, never by re-ingest: on a read-write open, a store missing known derivable columns backfills them from data already stored (one `add_columns` commit per table; concurrent openers race benignly under OCC; an MCP-only open never backfills, Section 7.7), and a `.pond` archive predating the change restores by deriving the missing cells at the read boundary - an archive is a snapshot and restore never mutates it. Why: re-ingest is not a migration path (`session-durable-copy` - a rotated source cannot supply its rows again), so an additive change that stranded existing stores or archives would violate the durability contract it sits on. The backfill derives only from stored data, preserving `model-no-synthesis`: a cell the stored record cannot justify stays NULL.
 
 ---
 
@@ -696,7 +696,7 @@ The server's instructions and tool descriptions MUST state only the capabilities
 
 `local-store-self-heal` (Section 3.3) is the single deliberate carve-out from the MCP surface's read-only rule: an open performed by the MCP server MAY execute heal's quarantine renames. This is substrate integrity restoration, not a write surface - rename-only, no user-data writes, no deletes, triggered only by an open that already failed - and the alternative is an MCP server that stays bricked on a crash-damaged store until an operator runs a CLI command. Every other MCP action remains read-only, hard-enforced; this exception is intentional and MUST NOT be read as precedent for MCP write paths.
 
-The open itself is read-only in an MCP-only process (`pond mcp`, and `pond serve --transport stdio` without `--with-sync` or `--bootstrap`): it creates no directory or table, backfills no column and sets no writer fence, so a missing table or an older schema fails naming `pond sync`. A stdio server started with `--with-sync` or `--bootstrap` (the plugin sidecars) writes by configuration and opens read-write; its MCP tools stay read-only.
+The open itself is read-only in an MCP-only process (`pond mcp`, and `pond serve --transport stdio` without `--with-sync` or `--bootstrap`): it creates no directory or table, backfills no column and sets no writer fence, so a missing table or a column `pond sync` can backfill fails naming `pond sync`, and any other schema gap fails as it would on a read-write open. A stdio server started with `--with-sync` or `--bootstrap` (the plugin sidecars) is configured to write, so it opens read-write; its MCP tools stay read-only.
 
 ### 7.8 CLI verbs
 

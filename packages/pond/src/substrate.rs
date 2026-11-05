@@ -2169,7 +2169,7 @@ impl Handle {
     /// Like [`Self::open_with_options`], plus an `_indices/*` disk cache rooted
     /// at `index_cache_dir` (caller supplies it, mirroring `ensure_rowmap`) so a
     /// fresh process skips the cold index load. Ignored for local-FS stores.
-    /// Read-only opens reject absent tables and columns instead of migrating them.
+    /// A read-only open creates and backfills nothing: an absent table or column fails.
     pub async fn open_with_options_cached(
         location: &Url,
         mut storage_options: HashMap<String, String>,
@@ -3190,11 +3190,11 @@ impl Handle {
             .with_context(|| format!("namespace returned no location for table {table_name}"))
     }
 
-    /// Whether the store holds synced data yet. `open` eagerly creates only the
-    /// `messages` dataset; `sessions` and `parts` open lazily on first use
-    /// (see `open_with_options`), so `parts`' presence is the "has been synced"
-    /// signal - letting read-only surfaces (`pond status`) render an empty state
-    /// instead of erroring on the first `parts` describe.
+    /// Whether the store holds synced data yet. A read-write `open` eagerly
+    /// creates only the `messages` dataset; `sessions` and `parts` open lazily
+    /// on first use (see `open_with_options`), so `parts`' presence is the "has
+    /// been synced" signal - letting read verbs (`pond status`) render an empty
+    /// state instead of erroring on the first `parts` describe.
     pub async fn initialized(&self) -> Result<bool> {
         let request = DescribeTableRequest {
             id: Some(self.nm_ident.as_table_id(sessions::PARTS)),
@@ -5095,9 +5095,10 @@ fn store_wrapper(
     }
 }
 
-/// Open the table at `table_name` via the namespace; create + initialize on
-/// `TableNotFound`. Schema-checks the on-disk dataset against pond's
-/// expectation so a stale data dir surfaces early.
+/// Open the table at `table_name` via the namespace; on `TableNotFound`,
+/// create + initialize it, or fail naming `pond sync` on a read-only open.
+/// Schema-checks the on-disk dataset against pond's expectation so a stale
+/// data dir surfaces early.
 ///
 /// Probes via `nm.describe_table` directly rather than `DatasetBuilder::from_namespace`:
 /// the builder re-wraps an already-`Namespace`-wrapped error
@@ -5168,9 +5169,7 @@ async fn open_or_create_via_ns(
         Err(error) => match &error {
             error if is_namespace_error_code(error, ErrorCode::TableNotFound) => {
                 if open_mode == OpenMode::ReadOnly {
-                    anyhow::bail!(
-                        "store has no {table_name} table yet; run `pond sync`, then restart the MCP client"
-                    );
+                    anyhow::bail!("store has no {table_name} table yet; run `pond sync`");
                 }
             }
             _ => {
@@ -5558,7 +5557,9 @@ fn classify_schema(
 /// (spec.md#session-durable-copy: a rotated source cannot supply rows again).
 /// Concurrent openers race benignly: `add_columns` commits through OCC, a
 /// losing writer sees a conflict, re-checks out latest, and finds the columns
-/// present.
+/// present. A read-only open backfills nothing: a gap a read-write open can
+/// fill fails naming `pond sync`, and any other gap fails exactly as it does
+/// on a read-write open.
 async fn ensure_current_schema(
     dataset: &mut Dataset,
     expected: &lance::deps::arrow_schema::Schema,
@@ -5569,20 +5570,16 @@ async fn ensure_current_schema(
     const MAX_MIGRATION_ATTEMPTS: usize = 3;
     for _ in 0..MAX_MIGRATION_ATTEMPTS {
         let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
-        if open_mode == OpenMode::ReadOnly {
-            let missing: Vec<_> = expected
-                .fields()
-                .iter()
-                .filter(|field| actual.field_with_name(field.name()).is_err())
-                .map(|field| field.name().as_str())
-                .collect();
-            if !missing.is_empty() {
+        match classify_schema(&actual, expected, table_name)? {
+            SchemaFit::MissingNullable(missing) if open_mode == OpenMode::ReadOnly => {
+                // The read-write open's own derivability check, so only a gap
+                // `pond sync` can fill names it.
+                sessions::column_backfill(table_name, &missing)?;
+                let names: Vec<&str> = missing.iter().map(|field| field.name().as_str()).collect();
                 anyhow::bail!(
-                    "table {table_name} is missing columns {missing:?}; run `pond sync`, then restart the MCP client"
+                    "table {table_name} is missing columns {names:?}; run `pond sync` to backfill them"
                 );
             }
-        }
-        match classify_schema(&actual, expected, table_name)? {
             SchemaFit::MissingNullable(missing) => {
                 backfill_missing_columns(dataset, table_name, missing).await?;
                 continue;
@@ -5657,7 +5654,7 @@ async fn backfill_missing_columns(
     // solver (E0275) once this future nests inside the open chain.
     // Unfenced on purpose: a backfill builds no index, so a Lance 13 writer
     // after it cannot reach a row-address BTree, and fencing here would let a
-    // read-only open commit the one-way fence.
+    // read verb's open (`pond status`, `pond search`) commit the one-way fence.
     let migration: std::pin::Pin<
         Box<dyn std::future::Future<Output = lance::Result<()>> + Send + '_>,
     > = Box::pin(dataset.add_columns(
@@ -5692,7 +5689,7 @@ async fn backfill_missing_columns(
                     format!(
                         "schema backfill failed for {table_name}; the one-time migration \
                          writes new column files, so it needs write access to the store - \
-                         re-run any pond command with write-capable credentials to complete it",
+                         re-run `pond sync` with write-capable credentials to complete it",
                     )
                 })
             }
@@ -5777,7 +5774,6 @@ mod tests {
             let error = open_read_only(&path).await.unwrap_err().to_string();
             assert!(error.contains("no messages table yet"), "{error}");
             assert!(error.contains("pond sync"), "{error}");
-            assert!(error.contains("restart the MCP client"), "{error}");
             assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
         }
         Ok(())
@@ -5804,25 +5800,33 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_open_missing_columns_does_not_backfill() -> Result<()> {
-        for (table, column) in [("messages", "embedding_model"), ("parts", "tool_name")] {
+        for (table, column, fix) in [
+            (Table::Messages, "project", "upgrade pond"),
+            (
+                Table::Messages,
+                "embedding_model",
+                "use the pond version that wrote it",
+            ),
+            (Table::Parts, "tool_name", "run `pond sync`"),
+        ] {
             let temp = TempDir::new()?;
             let writer = Handle::open(&config::url_for_path(temp.path())?).await?;
             writer.dataset(Table::Parts).await?;
             drop(writer);
-            let uri = temp.path().join(format!("{table}.lance"));
+            let uri = temp.path().join(format!("{}.lance", table.as_str()));
             let uri = uri.to_str().unwrap();
             let mut dataset = Dataset::open(uri).await?;
             dataset.drop_columns(&[column]).await?;
             let version = dataset.version_id();
             let result = open_read_only(temp.path()).await;
-            let error = if table == "messages" {
+            let error = if table == Table::Messages {
                 result.unwrap_err()
             } else {
-                result?.dataset(Table::Parts).await.unwrap_err()
+                result?.dataset(table).await.unwrap_err()
             }
             .to_string();
             assert!(error.contains(column), "{error}");
-            assert!(error.contains("pond sync"), "{error}");
+            assert!(error.contains(fix), "{error}");
             let unchanged = Dataset::open(uri).await?;
             assert_eq!(unchanged.version_id(), version);
             assert!(

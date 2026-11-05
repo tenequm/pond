@@ -1,6 +1,5 @@
 // Lance nests `init::run` futures past the default query depth limit.
 #![recursion_limit = "256"]
-use pond::substrate::OpenMode;
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -27,8 +26,8 @@ use pond::{
         Store,
     },
     substrate::{
-        self, CheckFailure, CheckNote, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
-        OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
+        self, CheckFailure, CheckNote, CredsBinding, IndexStatus, MaintenancePolicy, OpenMode,
+        OptimizeEvent, OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than,
     },
     transport::{self, AppState},
@@ -1220,6 +1219,11 @@ fn cap_scan_io_buffer() {
 /// fires when sync / remote writers have advanced the messages version.
 const ROWMAP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// An MCP-only server exits when its startup open fails, so only a client
+/// restart picks up the fix.
+const MCP_OPEN_FAILED: &str =
+    "the MCP server could not open the store; fix the cause and restart the MCP client";
+
 /// Warm the search indices in the background at server startup (spec.md#search).
 /// The cold S3 index load (175-442 s) is paid once here, off the request path,
 /// so the first user query is fast instead of catastrophic. Best effort:
@@ -1438,8 +1442,8 @@ async fn run() -> anyhow::Result<()> {
             if !store.initialized().await? {
                 // The local rows cost no store read, and an all-absent sync
                 // now leaves the store uninitialized - so this branch has to
-                // carry them, or the host this PR is about loses the only
-                // surface that names its missing sources.
+                // carry them, or a host whose sources are all absent loses the
+                // only surface that names them.
                 let local =
                     local_status(&loaded, &store, &store_key, crate::schedule::status_snapshot()).await;
                 let has_adapters = match loaded.resolve_adapters(None) {
@@ -1769,7 +1773,7 @@ async fn run() -> anyhow::Result<()> {
                 .map(|path| prepare_serve_socket(transport, &path))
                 .transpose()?;
             // A stdio server that syncs or bootstraps is a plugin's writer
-            // sidecar; only a bare one is MCP-only, and MCP never writes.
+            // sidecar; only a bare one is MCP-only, so only it opens read-only.
             let open_mode = if matches!(transport, ServeTransport::Stdio)
                 && !with_sync
                 && bootstrap.is_none()
@@ -1793,9 +1797,13 @@ async fn run() -> anyhow::Result<()> {
             // Constructing it loads nothing; with embedding disabled it is
             // never attached, so no path can reach a model.
             let embedder = Arc::new(LazyEmbedder::candle());
-            let opened = open_store(storage_path.clone(), &config, true, true, open_mode)
-                .await?
-                .1;
+            let opened = open_store(storage_path.clone(), &config, true, true, open_mode).await;
+            let opened = if open_mode == OpenMode::ReadOnly {
+                opened.context(MCP_OPEN_FAILED)
+            } else {
+                opened
+            }?
+            .1;
             let store = Arc::new(if pond::embed::embeddings_enabled() {
                 embedder.spawn_idle_reaper();
                 opened.with_embedder(embedder.clone())
@@ -1853,20 +1861,18 @@ async fn run() -> anyhow::Result<()> {
         Command::Mcp {} => {
             let config = Config::load(config_path(config))?;
             // Lazy: idle `pond mcp` instances in every Claude Code session stay
-            // light. The model load happens once per process - on the first
-            // vector-arm `pond_search` or the first embeddable ingested row -
-            // and the one instance is shared by the query arm and the store's
-            // inline embed-at-ingest path.
+            // light. The model loads once per process, on the first vector-arm
+            // `pond_search`; the read-only store never ingests, so it holds none.
             let embedder = Arc::new(LazyEmbedder::candle());
-            let opened = open_store(storage_path, &config, true, true, OpenMode::ReadOnly)
-                .await?
-                .1;
-            let store = Arc::new(if pond::embed::embeddings_enabled() {
+            let store = Arc::new(
+                open_store(storage_path, &config, true, true, OpenMode::ReadOnly)
+                    .await
+                    .context(MCP_OPEN_FAILED)?
+                    .1,
+            );
+            if pond::embed::embeddings_enabled() {
                 embedder.spawn_idle_reaper();
-                opened.with_embedder(embedder.clone())
-            } else {
-                opened
-            });
+            }
             let state = AppState::new(store, embedder, config.search.clone());
             spawn_prewarm(state.clone());
             transport::mcp::serve_stdio(state).await?;
@@ -2427,7 +2433,7 @@ fn fidelity_label(fidelity: adapter::RestoreFidelity) -> &'static str {
 }
 
 /// Open the store with an indicatif spinner ticking while
-/// [`Store::open_with_options`] runs. Open itself is cheap; the spinner only
+/// [`Store::open_with_options_cached`] runs. Open itself is cheap; the spinner only
 /// matters for visual consistency with other long-running commands.
 async fn open_store_with_spinner(
     location: &Url,
