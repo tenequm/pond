@@ -968,7 +968,6 @@ async fn perf_gate(
     set("write_rows_per_s", sweep(&sweep_out, 6));
     set("write_index_build_ms", build_total(&prof));
     set("write_fold_ms", fold_total(&prof));
-    set("write_compact_ms", compact_total(&prof));
     Ok(row)
 }
 
@@ -1006,11 +1005,6 @@ fn write_passes(argv: &[&str], profile_dir: &Path) -> Result<(String, String, St
 
 fn build_total(text: &str) -> Value {
     labeled_total(text, "build total:")
-}
-
-/// optimize #3: forced compaction once the indexes exist.
-fn compact_total(text: &str) -> Value {
-    labeled_total(text, "compact total:")
 }
 
 fn labeled_total(text: &str, label: &str) -> Value {

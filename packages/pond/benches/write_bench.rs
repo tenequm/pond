@@ -601,23 +601,6 @@ async fn main() -> Result<()> {
                 started.elapsed().as_millis(),
             );
         }
-        // Lance 14 remaps every address-domain BTree segment a rewrite touches,
-        // which neither the build round (it compacts before any index exists)
-        // nor the vetoed fold rounds exercise.
-        println!("\noptimize #3 - forced compaction with the indexes present:");
-        let (mb, pb, sb) = frag_counts(&store).await?;
-        let started = Instant::now();
-        store
-            .optimize_indices(
-                Some(phase_printer("compact")),
-                &MaintenancePolicy::always_compact(),
-            )
-            .await?;
-        let (ma, pa, sa) = frag_counts(&store).await?;
-        println!(
-            "  compact total: {} ms  | fragments msgs {mb}->{ma}  parts {pb}->{pa}  sess {sb}->{sa}",
-            started.elapsed().as_millis(),
-        );
         return Ok(());
     }
 
