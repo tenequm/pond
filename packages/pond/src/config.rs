@@ -108,7 +108,7 @@ where
 }
 
 /// True when the URL is on the local filesystem. Mirrors Lance's
-/// `ObjectStore::is_local` (lance-io/src/object_store.rs:541): the `file` and
+/// `ObjectStore::is_local` (lance-io `object_store.rs`): the `file` and
 /// `file+uring` schemes are local; everything else (incl. `memory://`) is not.
 pub fn is_local(url: &Url) -> bool {
     matches!(url.scheme(), "file" | "file+uring")

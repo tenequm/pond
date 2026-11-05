@@ -5623,8 +5623,10 @@ pub fn init_embedding_dim(dim: usize) {
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond copy --to <file>`
 /// snapshots plus deferred Lance tags (spec.md#session-durable-copy).
-/// `skip_auto_cleanup` suppresses the per-commit hook so cleanup stays
-/// operator-driven via `pond optimize` (one LIST per command instead of per write).
+/// `skip_auto_cleanup` suppresses the per-commit hook for pond's own write
+/// builders, so cleanup stays operator-driven via `pond optimize` (one LIST per
+/// command instead of per write); commits Lance makes itself (`add_columns`,
+/// index and compaction commits, the writer fence) can still run it.
 pub(crate) fn write_params_for_create() -> WriteParams {
     WriteParams {
         data_storage_version: Some(LanceFileVersion::V2_1),
@@ -6839,7 +6841,7 @@ fn json_size<T: Serialize>(value: &T) -> Result<usize> {
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     // Write JSONB bytes (not plain UTF-8 JSON text) so the on-disk encoding
     // matches the `lance.json` extension contract. Lance's compact path
-    // (`optimize.rs:908`) reads through `DatasetRecordBatchStream` which
+    // reads through `DatasetRecordBatchStream`, which
     // applies `decode_json -> encode_json` on this column; with proper JSONB
     // on disk that roundtrip is idempotent, with plain UTF-8 it corrupts
     // (the analogous fix landed for `update.rs` in PR #6741 by switching to
@@ -8444,37 +8446,82 @@ mod tests {
         Ok(())
     }
 
-    /// The writer fence (`CachedDataset::latest_for_write`): opening and
-    /// reading commit nothing, and the first write sets a writer-only flag
-    /// that Lance 13's writer gate refuses (it rejects every bit from 1 << 14).
-    #[tokio::test]
-    async fn first_write_fences_lance13_writers() -> anyhow::Result<()> {
-        // lance-table's `FLAG_NON_REUSABLE_FIELD_IDS`, which lance does not re-export.
-        const NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
+    /// lance-table's `FLAG_NON_REUSABLE_FIELD_IDS`, which lance does not re-export.
+    const NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
+    /// Lance 13's reader and writer gates refuse every flag from this bit up.
+    const LANCE_13_FLAG_UNKNOWN: u64 = 1 << 14;
 
+    /// An empty `sessions` table as a pond from before the writer fence created it.
+    async fn create_unfenced_sessions(root: &str) -> anyhow::Result<()> {
+        let uri = format!("{}/sessions.lance", root.trim_end_matches('/'));
+        Dataset::write(
+            empty_reader(session_schema())?,
+            uri.as_str(),
+            Some(write_params_for_create()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Tables this build creates are born fenced (`open_or_create_via_ns`), so
+    /// a table's first data write stays one commit; every reader flag stays
+    /// one Lance 13 can read.
+    #[tokio::test]
+    async fn tables_this_build_creates_are_born_fenced() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let store = Store::open_local(temp.path()).await?;
+        for table in [Table::Sessions, Table::Messages, Table::Parts] {
+            let dataset = store.handle.dataset(table).await?;
+            let manifest = dataset.manifest();
+            let label = table.label();
+            assert_ne!(
+                manifest.writer_feature_flags & NON_REUSABLE_FIELD_IDS,
+                0,
+                "{label} not fenced"
+            );
+            assert!(
+                manifest.reader_feature_flags < LANCE_13_FLAG_UNKNOWN,
+                "Lance 13 cannot read {label}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The writer fence (`CachedDataset::latest_for_write`) on a table an
+    /// older pond created: opening and reading it commit nothing, and the
+    /// first write fences it without touching a reader flag.
+    #[tokio::test]
+    async fn first_write_fences_an_older_table() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        create_unfenced_sessions(temp.path().to_str().unwrap()).await?;
+        let store = Store::open_local(temp.path()).await?;
         assert!(store.session_ids().await?.is_empty());
-        let sessions = store.handle.dataset(Table::Sessions).await?;
-        assert!(!sessions.manifest().uses_non_reusable_field_ids());
+        let before = store.handle.dataset(Table::Sessions).await?;
+        assert!(!before.manifest().uses_non_reusable_field_ids());
+        assert_eq!(before.version_id(), 1, "opening or reading committed");
 
         upsert_one_session_per_commit(&store, 2).await?;
-        let sessions = store.handle.dataset(Table::Sessions).await?;
-        let manifest = sessions.manifest();
-        assert!(manifest.uses_non_reusable_field_ids());
-        assert_ne!(manifest.writer_feature_flags & NON_REUSABLE_FIELD_IDS, 0);
-        assert_eq!(manifest.reader_feature_flags & NON_REUSABLE_FIELD_IDS, 0);
+        let after = store.handle.dataset(Table::Sessions).await?;
+        assert_ne!(
+            after.manifest().writer_feature_flags & NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_eq!(
+            after.manifest().reader_feature_flags,
+            before.manifest().reader_feature_flags
+        );
         assert_eq!(store.session_ids().await?.len(), 2);
         Ok(())
     }
 
-    /// Two hosts' first writes race the fence: the loser's commit conflict
-    /// re-reads the fenced manifest, and both writes land.
+    /// Two hosts' first writes race the fence on an older table: the loser's
+    /// commit conflict re-reads the fenced manifest, and both writes land.
     #[tokio::test]
     async fn concurrent_first_writes_share_one_fence() -> anyhow::Result<()> {
-        let url = Url::parse("shared-memory://pond-test-writer-fence-race/")?;
+        let root = "shared-memory://pond-test-writer-fence-race/";
+        create_unfenced_sessions(root).await?;
+        let url = Url::parse(root)?;
         let first = Store::open(&url).await?;
-        assert!(first.session_ids().await?.is_empty());
         let second = Store::open(&url).await?;
         let (session_a, session_b) = (
             [synthetic_session("fence-a")],

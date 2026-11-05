@@ -6,7 +6,7 @@
 //!
 //! Uses Lance's `shared-memory://` provider so two `Store` instances share
 //! one in-memory backing store and the conflict path that runs is the
-//! production `ConditionalPutCommitHandler` (lance-table/src/io/commit.rs:1111),
+//! production `ConditionalPutCommitHandler` (lance-table `io/commit.rs`),
 //! the same OCC handler S3 uses. A `file://`/`TempDir` test would route
 //! through the local-FS commit lock instead and prove a different primitive.
 #![expect(

@@ -775,41 +775,36 @@ fn condense_error_chain(error: &anyhow::Error) -> String {
     }
 }
 
-/// What a passing [`storage_check`] found that does not fail it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct StorageCheckReport {
+/// An advisory a passing [`storage_check`] reports without failing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckNote {
     /// A create-only copy overwrote an existing key: the backend enforces
     /// `If-None-Match` on PUT but not on copies (Hetzner). Lance 14+ publishes
     /// its namespace table-creation markers through that copy on S3, so two
     /// hosts creating the same table at once are not refused there; commits
     /// go through the conditional put and are unaffected.
-    pub copy_overwrites_existing: bool,
+    CopyOverwritesExisting,
 }
 
-impl StorageCheckReport {
-    /// `(class, message)` per finding, for both output formats.
-    pub fn notes(&self) -> Vec<(&'static str, &'static str)> {
-        let mut notes = Vec::new();
-        if self.copy_overwrites_existing {
-            notes.push((
-                "copy_overwrites_existing",
+impl std::fmt::Display for CheckNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CopyOverwritesExisting => f.write_str(
                 "this backend ignores If-None-Match on copies, so Lance's table-creation \
                  markers are not atomic here - create a new store from one host at a time; \
                  commits are unaffected",
-            ));
+            ),
         }
-        notes
     }
 }
 
 /// Probe a resolved storage destination end-to-end (spec.md#substrate): a
 /// conditional `PutMode::Create` pair proving the `If-None-Match` -> 412 OCC
-/// primitive Lance's commit handler relies on, a create-only copy pair for
-/// the advisory in [`StorageCheckReport`], then read-back and delete of the
-/// synthetic keys.
+/// primitive Lance's commit handler relies on, read-back, a create-only copy
+/// pair for the [`CheckNote`] advisory, then delete of the synthetic keys.
 pub async fn storage_check(
     resolved: &ResolvedStorage,
-) -> std::result::Result<StorageCheckReport, CheckFailure> {
+) -> std::result::Result<Vec<CheckNote>, CheckFailure> {
     use object_store::{Error as OsError, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
     let classify =
@@ -885,23 +880,23 @@ pub async fn storage_check(
         // without conditional copy returns NotSupported, and Lance's marker
         // then falls back to the conditional put proven above.
         let copy = object_store::path::Path::from(format!("{path}.copy"));
-        let copy_overwrites_existing = match store.inner.copy_if_not_exists(&path, &copy).await {
-            Ok(()) => {
-                let second = store.inner.copy_if_not_exists(&path, &copy).await;
-                let _ = store.inner.delete(&copy).await;
-                second.is_ok()
-            }
+        let copy_overwrites = match store.inner.copy_if_not_exists(&path, &copy).await {
+            Ok(()) => store.inner.copy_if_not_exists(&path, &copy).await.is_ok(),
             Err(_) => false,
         };
-        Ok(StorageCheckReport {
-            copy_overwrites_existing,
+        // Even a copy that errored may have landed (a lost ack).
+        let _ = store.inner.delete(&copy).await;
+        Ok(if copy_overwrites {
+            vec![CheckNote::CopyOverwritesExisting]
+        } else {
+            Vec::new()
         })
     }
     .await;
     let cleanup = store.inner.delete(&path).await;
-    let report = outcome?;
+    let notes = outcome?;
     cleanup.map_err(|error| classify(error, "cleanup delete"))?;
-    Ok(report)
+    Ok(notes)
 }
 
 /// Map an `object_store` error onto the check's failure classes: an auth
@@ -1389,18 +1384,16 @@ impl IndexTrigger {
 }
 
 impl IndexParamsKind {
-    /// True for families whose search results are row *addresses*
-    /// (`fragment_id << 32 | offset`) emitted straight from a persisted payload
-    /// that compaction never remaps - after Lance's
-    /// `ScalarIndex::results_are_row_addresses`, minus the BTree. Lance 14 has
-    /// three such families: ZoneMap, BloomFilter and FM-Index; pond ships only
-    /// the ZoneMap. Fragment ids die at compaction, so these indexes go stale
-    /// when covered fragments are rewritten. Lance 14 also builds BTree segments
-    /// in the address domain on stable-row-id tables (lance#9481), but it is the
-    /// one address family compaction remaps eagerly
+    /// True for families whose payload holds row *addresses*
+    /// (`fragment_id << 32 | offset`) that compaction never remaps, so they go
+    /// stale when covered fragments are rewritten and the indices phase probes
+    /// them (`address_index_is_stale`). Lance 14 has three: ZoneMap,
+    /// BloomFilter and FM-Index; pond ships only the ZoneMap. Lance 14 also
+    /// builds BTree segments in the address domain on stable-row-id tables
+    /// (lance#9481), but compaction remaps those eagerly
     /// (`IndexMetadata::supports_eager_remap`), so like the row-id-domain
-    /// families it survives rewrites and needs no staleness probe.
-    fn results_are_row_addresses(&self) -> bool {
+    /// families they survive rewrites.
+    fn compaction_orphans_payload(&self) -> bool {
         matches!(self, Self::Scalar(BuiltinIndexType::ZoneMap))
     }
 
@@ -2008,7 +2001,7 @@ impl Table {
         self.label()
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Sessions => "sessions",
             Self::Messages => "messages",
@@ -2047,6 +2040,7 @@ impl CachedDataset {
             refresh_after,
         }
     }
+    /// The current snapshot for a read. A commit takes [`Self::latest_for_write`].
     async fn latest(&mut self) -> Result<Dataset> {
         if self
             .last_refresh
@@ -2058,13 +2052,15 @@ impl CachedDataset {
         Ok(self.dataset.clone())
     }
     /// [`Self::latest`] for a commit. Every write seam takes this, so no commit
-    /// from this build lands on a table Lance 13 can still write: a Lance 13
+    /// of a write seam lands on a table Lance 13 can still write: a Lance 13
     /// compaction or update carries a Lance 14 row-address BTree's coverage
     /// onto rewritten fragments and Lance 14 readers then lose rows
     /// (lance#10351), while Lance's own writer fence (lance#10352) ships only
     /// from v15. The sticky, writer-only non-reusable-field-ids flag is one
-    /// Lance 13 refuses to write past yet still reads; a host racing the same
-    /// fence gets a commit conflict, which the caller's retry re-reads.
+    /// Lance 13 refuses to write past yet still reads; tables this build
+    /// creates carry it from birth (`open_or_create_via_ns`), so this fires
+    /// only on an older table, and a host racing the same fence gets a commit
+    /// conflict, which the caller's retry re-reads.
     async fn latest_for_write(&mut self) -> Result<Dataset> {
         let mut dataset = self.latest().await?;
         if !dataset.manifest().uses_non_reusable_field_ids() {
@@ -3452,10 +3448,12 @@ impl Handle {
 /// rewrote a 665 MiB tail fragment every 5-min sync). Only whole planned
 /// tasks are filtered, so OCC and conflict semantics are untouched.
 ///
-/// spec.md#lance-index-maintenance mandates FRI on by default, but lance
-/// rejects `defer_index_remap=true` on stable-row-id datasets
-/// (`optimize.rs:823`): they never remap, so there is nothing to defer - we
-/// only lose the documented concurrency-with-index-build benefit.
+/// spec.md#lance-index-maintenance mandates FRI on by default, but release
+/// builds of lance 14 reject `defer_index_remap=true` on stable-row-id
+/// datasets (`ensure_frag_reuse_recording_allowed`): recording their
+/// row-address moves in a fragment reuse index is debug-build-only, so
+/// compaction remaps their BTrees eagerly instead - we only lose the
+/// documented concurrency-with-index-build benefit.
 async fn optimize_table_compact(
     dataset: &mut Dataset,
     table: Table,
@@ -3727,7 +3725,7 @@ async fn optimize_table_indices(
         // with another fingerprint, or none - built before the stamp existed -
         // (see `fts_stemmer_fingerprint`) is recreated before any fold could
         // append this binary's stems to it.
-        let stale_reason = if intent.params.results_are_row_addresses()
+        let stale_reason = if intent.params.compaction_orphans_payload()
             && address_index_is_stale(dataset, intent, &existing).await?
         {
             Some("address-domain index references rewritten fragments; recreating it")
@@ -3939,12 +3937,12 @@ async fn optimize_table_indices(
 /// the manifest `fragment_bitmap`, across all delta segments sharing the
 /// intent name.
 ///
-/// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// runs the remapper only for an index that `supports_eager_remap` (a BTree
-/// segment in the address domain; lance-14 `optimize.rs` `needs_remapping`,
-/// `dataset/index.rs` `remap_indices`) and only rewrites every other covered
-/// index's `fragment_bitmap` to the new fragment ids (lance-table
-/// `transaction/index_maintenance.rs` `recalculate_fragment_bitmap`). A rewrite of covered
+/// Compaction on stable-row-id datasets never remaps a payload whose family
+/// lacks `supports_eager_remap` (every address-domain family but the BTree;
+/// lance-14 `optimize.rs` `needs_remapping`, `dataset/index.rs`
+/// `remap_indices`): it only rewrites such an index's `fragment_bitmap` to
+/// the new fragment ids (lance-table `transaction/index_maintenance.rs`
+/// `recalculate_fragment_bitmap`). A rewrite of covered
 /// fragments therefore leaves zones pointing at dead ids - `dead_in_payload`,
 /// the exact condition behind the query-time "fragment N referenced by an
 /// address-domain index result was not found" internal error - while the
@@ -5178,9 +5176,25 @@ async fn open_or_create_via_ns(
         });
     }
     let reader = sessions::empty_reader(schema)?;
-    Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
+    let mut dataset =
+        Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
+            .await
+            .with_context(|| format!("failed to create table {table_name}"))?;
+    // Born fenced (`CachedDataset::latest_for_write`), so the table's first
+    // data write stays one commit. A conflict means another writer reached it
+    // first; its write seam fences it.
+    match dataset
+        .migrate_to_non_reusable_field_ids()
         .await
-        .with_context(|| format!("failed to create table {table_name}"))
+        .map_err(anyhow::Error::from)
+    {
+        Ok(()) => {}
+        Err(error) if is_commit_conflict(&error) => dataset.checkout_latest().await?,
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to fence new table {table_name}"));
+        }
+    }
+    Ok(dataset)
 }
 
 /// Apply the same session/wrapper/storage-option store params to a
@@ -5331,7 +5345,7 @@ async fn heal_local_dataset(
     let mut probes = 0usize;
     for (version, path) in &manifests {
         let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        // Lance's footer needs >=16 bytes (lance-io utils.rs:128); below that is
+        // Lance's footer needs >=16 bytes (lance-io `read_metadata_offset`); below that is
         // definitively unreadable, so quarantine it without a probe.
         if len < 16 {
             doomed.push(path.clone());
@@ -5588,7 +5602,11 @@ async fn backfill_missing_columns(
 ) -> Result<()> {
     use lance::dataset::{BatchUDF, NewColumnTransform};
     let names: Vec<&str> = missing.iter().map(|f| f.name().as_str()).collect();
-    let spec = sessions::column_backfill(table_name, &missing)?;
+    let sessions::ColumnBackfill {
+        read_columns,
+        output_schema,
+        mapper,
+    } = sessions::column_backfill(table_name, &missing)?;
     // A full-column read over a remote store runs minutes; a silent stall
     // reads as a hang, so this one-time event gets a stderr notice (same
     // pattern as the embedding-model download notice in embed.rs).
@@ -5596,31 +5614,25 @@ async fn backfill_missing_columns(
         "migrating {table_name}: backfilling {names:?} from stored data (one-time, in place)...",
     ));
     let started = std::time::Instant::now();
-    let mapper = spec.mapper;
-    let (output_schema, read_columns) = (spec.output_schema, spec.read_columns);
-    let target = &mut *dataset;
     // Boxed: `add_columns`' concrete future is enormous (it embeds DataFusion
     // planner types), and inlining it here overflows rustc's auto-trait
     // solver (E0275) once this future nests inside the open chain.
+    // Unfenced on purpose: a backfill builds no index, so a Lance 13 writer
+    // after it cannot reach a row-address BTree, and fencing here would let a
+    // read-only open commit the one-way fence.
     let migration: std::pin::Pin<
         Box<dyn std::future::Future<Output = lance::Result<()>> + Send + '_>,
-    > = Box::pin(async move {
-        // The fence every write seam applies first (`CachedDataset::latest_for_write`).
-        target.migrate_to_non_reusable_field_ids().await?;
-        target
-            .add_columns(
-                NewColumnTransform::BatchUDF(BatchUDF {
-                    mapper: Box::new(move |batch| {
-                        mapper(batch).map_err(|error| lance::Error::io(format!("{error:#}")))
-                    }),
-                    output_schema,
-                    result_checkpoint: None,
-                }),
-                Some(read_columns),
-                None,
-            )
-            .await
-    });
+    > = Box::pin(dataset.add_columns(
+        NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(move |batch| {
+                mapper(batch).map_err(|error| lance::Error::io(format!("{error:#}")))
+            }),
+            output_schema,
+            result_checkpoint: None,
+        }),
+        Some(read_columns),
+        None,
+    ));
     let result = migration.await;
     match result {
         Ok(()) => {
@@ -6308,12 +6320,8 @@ mod tests {
             .unwrap()
             .resolve(&BTreeMap::new())
             .unwrap();
-        let report = storage_check(&resolved).await.expect("memory probe passes");
-        assert_eq!(
-            report,
-            StorageCheckReport::default(),
-            "memory copies are atomic"
-        );
+        let notes = storage_check(&resolved).await.expect("memory probe passes");
+        assert!(notes.is_empty(), "memory copies are atomic: {notes:?}");
     }
 
     #[test]

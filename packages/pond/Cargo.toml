@@ -255,20 +255,9 @@ assert_cmd = "2"
 # `Jail` for env-mirror tests: sandboxed env vars + cwd without `unsafe`
 # `std::env::set_var` in pond's own code (the crate denies unsafe).
 figment = { version = "0.10.19", features = ["test"] }
-# Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
-lance-linalg = "14.0.2"
-# Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
-# inverted index under different tokenizers (ngram vs simple) via the raw lance
-# create_index API and measure the index-size / RAM / latency tradeoff.
-# The `protoc` feature is activated via the non-Windows per-target gate below.
-lance = { version = "14.0.2" }
-lance-index = "14.0.2"
 # Re-declared so the MCP tests can drive the server in-process via the `client` feature.
 rmcp = { version = "3.5.1", features = ["client"] }
-# Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
-rusqlite = { version = "0.40", features = ["bundled"] }
 expect-test = "1.5.1"
-tempfile = "3.25"
 # `test-util` for `#[tokio::test(start_paused = true)]` + `time::advance`: the
 # embedder's idle eviction keys on `tokio::time::Instant`, so its tests drive
 # the clock instead of sleeping against a real threshold. Test builds only.
@@ -281,18 +270,6 @@ tower = { version = "0.5", features = ["util"] }
 s3s = "0.14"
 s3s-fs = "0.14"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-
-# Bench memory sampling: `getrusage` peak-RSS in commands_bench (any unix),
-# plus macOS `phys_footprint` in serve_mem_bench (RSS misleads there).
-[target.'cfg(unix)'.dev-dependencies]
-libc = "0.2"
-
-# Vendor protoc for integration/bench tests off Windows, matching the main
-# [dependencies] gate. Both tables must be gated: features unify across normal
-# and dev dependencies, so an ungated dev-dep re-enables `protoc` for the target
-# build and leaves `cargo build` passing while `cargo test` fails to link.
-[target.'cfg(not(windows))'.dev-dependencies]
-lance = { version = "14.0.2", features = ["protoc"] }
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
 [[bench]]

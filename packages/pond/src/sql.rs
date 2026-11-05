@@ -802,16 +802,16 @@ impl ScalarUDFImpl for FtsMisuse {
 }
 
 /// Vendored replacement for lance's `FtsQueryUDTF` (src/dataset/udtf.rs,
-/// byte-identical and still unfixed at lance-14.0.2). The upstream provider
-/// omits `_score` from its declared schema while leaving the scanner's scoring
-/// autoprojection on, so
-/// `_score` is physically appended but logically unknown: naming it in SQL
-/// fails ("No field named _score") and any aggregate over fts() dies on
-/// DataFusion's physical-vs-logical schema check (COUNT plans 0 columns,
-/// receives 1). This provider declares `_score` as a regular nullable Float32
-/// column, projects it explicitly, and disables the autoprojection - which is
-/// also lance's documented intended end state for score columns
-/// (scanner.rs "_score/_distance should become regular output columns").
+/// unchanged since lance-13.0.0 and still unfixed at lance-14.0.2). The
+/// upstream provider omits `_score` from its declared schema while leaving the
+/// scanner's scoring autoprojection on, so `_score` is physically appended but
+/// logically unknown: naming it in SQL fails ("No field named _score") and any
+/// aggregate over fts() dies on DataFusion's physical-vs-logical schema check
+/// (COUNT plans 0 columns, receives 1). This provider declares `_score` as a
+/// regular nullable Float32 column, projects it explicitly, and disables the
+/// autoprojection - which is also lance's documented intended end state for
+/// score columns (scanner.rs "_score/_distance should become regular output
+/// columns").
 /// Delete once fixed upstream.
 #[derive(Debug)]
 struct ScoredFtsUdtf {

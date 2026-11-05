@@ -26,7 +26,7 @@ use pond::{
         Store,
     },
     substrate::{
-        self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
+        self, CheckFailure, CheckNote, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
         OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than,
     },
@@ -2625,39 +2625,53 @@ fn check_failure_class(failure: &CheckFailure) -> &'static str {
     }
 }
 
-/// One `pond storage check --format json` document. `failure` is the
-/// `(class, message)` pair on a non-zero outcome, `None` on success; `notes`
-/// are a passing check's `(class, message)` advisories.
+/// Machine-readable class of a passing check's advisory, parallel to
+/// [`check_failure_class`].
+fn check_note_class(note: &CheckNote) -> &'static str {
+    match note {
+        CheckNote::CopyOverwritesExisting => "copy_overwrites_existing",
+    }
+}
+
+/// One `pond storage check --format json` document: a passing check's
+/// advisories, or a failure's `(exit code, class, message)`.
 fn storage_check_json(
     url: &str,
     binding: Option<&str>,
-    exit_code: i32,
-    failure: Option<(&str, String)>,
-    notes: &[(&str, &str)],
+    outcome: Result<&[CheckNote], (i32, &str, String)>,
 ) -> anyhow::Result<String> {
+    let (exit_code, failure, notes) = match outcome {
+        Ok(notes) => (0, None, notes),
+        Err((code, class, message)) => (
+            code,
+            Some(serde_json::json!({ "class": class, "message": message })),
+            &[][..],
+        ),
+    };
     let doc = serde_json::json!({
         "url": url,
         "ok": exit_code == 0,
         "exit_code": exit_code,
         "binding": binding,
-        "failure": failure.map(|(class, message)| serde_json::json!({
-            "class": class,
-            "message": message,
-        })),
+        "failure": failure,
         "notes": notes
             .iter()
-            .map(|(class, message)| serde_json::json!({ "class": class, "message": message }))
+            .map(|note| serde_json::json!({
+                "class": check_note_class(note),
+                "message": note.to_string(),
+            }))
             .collect::<Vec<_>>(),
     });
     serde_json::to_string_pretty(&doc).context("serialize storage check as JSON")
 }
 
-/// One yellow `note` line per advisory a passing check found; the exit code
-/// stays 0.
-fn render_check_notes(report: &pond::substrate::StorageCheckReport) -> anyhow::Result<()> {
-    for (_, message) in report.notes() {
+/// A passing check's line, plus one yellow `note` line per advisory; the exit
+/// code stays 0.
+fn render_check_ok(notes: &[CheckNote]) -> anyhow::Result<()> {
+    output("check: ok - conditional put (OCC), read-back, and delete all succeeded")?;
+    for note in notes {
         output_err(&pond::output::paint(
-            &format!("check: note - {message}"),
+            &format!("check: note - {note}"),
             pond::output::yellow(),
         ))?;
     }
@@ -2695,9 +2709,7 @@ async fn run_storage_command(
                             output(&storage_check_json(
                                 &raw,
                                 None,
-                                2,
-                                Some(("parse", format!("{error:#}"))),
-                                &[],
+                                Err((2, "parse", format!("{error:#}"))),
                             )?)?;
                             std::process::exit(2);
                         }
@@ -2715,21 +2727,15 @@ async fn run_storage_command(
                     let url = resolved.display();
                     let binding = resolved.binding.describe();
                     match pond::substrate::storage_check(&resolved).await {
-                        Ok(report) => output(&storage_check_json(
-                            &url,
-                            Some(&binding),
-                            0,
-                            None,
-                            &report.notes(),
-                        )?)?,
+                        Ok(notes) => {
+                            output(&storage_check_json(&url, Some(&binding), Ok(&notes))?)?
+                        }
                         Err(failure) => {
                             let code = check_failure_exit_code(&failure);
                             output(&storage_check_json(
                                 &url,
                                 Some(&binding),
-                                code,
-                                Some((check_failure_class(&failure), failure.to_string())),
-                                &[],
+                                Err((code, check_failure_class(&failure), failure.to_string())),
                             )?)?;
                             std::process::exit(code);
                         }
@@ -2743,12 +2749,7 @@ async fn run_storage_command(
                     ))?;
                     warn_unmatched_sets(&[&resolved], &loaded)?;
                     match pond::substrate::storage_check(&resolved).await {
-                        Ok(report) => {
-                            output(
-                                "check: ok - conditional put (OCC), read-back, and delete all succeeded",
-                            )?;
-                            render_check_notes(&report)?;
-                        }
+                        Ok(notes) => render_check_ok(&notes)?,
                         Err(failure) => {
                             // Distinct exit codes (documented in --help) so cron and
                             // CI can branch on the failure class.
@@ -3192,8 +3193,8 @@ async fn run_storage_use(
     spinner.enable_steady_tick(Duration::from_millis(120));
     let check = pond::substrate::storage_check(&dest_resolved).await;
     spinner.finish_and_clear();
-    let report = match check {
-        Ok(report) => report,
+    let notes = match check {
+        Ok(notes) => notes,
         Err(failure) => {
             output_err(&format!(
                 "use: destination failed the end-to-end check; config not changed: {failure}"
@@ -3202,8 +3203,7 @@ async fn run_storage_use(
             std::process::exit(check_failure_exit_code(&failure));
         }
     };
-    output("check: ok - conditional put (OCC), read-back, and delete all succeeded")?;
-    render_check_notes(&report)?;
+    render_check_ok(&notes)?;
 
     let current = resolve_storage_location(storage_path, loaded)?;
     let already_configured = loaded.storage.path.as_deref() == Some(dest.canonical().as_str())

@@ -750,13 +750,13 @@ async fn probe_destination(
     let spinner = cliclack::spinner();
     spinner.start(format!("Probing {}...", url.display()));
     match pond::substrate::storage_check(&resolved).await {
-        Ok(report) => {
+        Ok(notes) => {
             spinner.stop(format!(
                 "storage: {} reachable - conditional writes (OCC) supported",
                 url.display(),
             ));
-            for (_, message) in report.notes() {
-                let _ = cliclack::log::warning(message);
+            for note in &notes {
+                let _ = cliclack::log::warning(note.to_string());
             }
             Ok(())
         }
