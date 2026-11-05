@@ -1939,7 +1939,14 @@ fn resolve_cache_caps(location: &Url, caps: RuntimeCaps) -> (usize, usize) {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenMode {
+    ReadWrite,
+    ReadOnly,
+}
+
 pub struct Handle {
+    open_mode: OpenMode,
     datasets: DatasetSet,
     retry: RetryPolicy,
     /// One `lance::Session` shared across all three datasets. Carries the
@@ -2155,25 +2162,30 @@ impl Handle {
         storage_options: HashMap<String, String>,
         caps: RuntimeCaps,
     ) -> Result<Self> {
-        Self::open_with_options_cached(location, storage_options, caps, None).await
+        Self::open_with_options_cached(location, storage_options, caps, None, OpenMode::ReadWrite)
+            .await
     }
 
     /// Like [`Self::open_with_options`], plus an `_indices/*` disk cache rooted
     /// at `index_cache_dir` (caller supplies it, mirroring `ensure_rowmap`) so a
     /// fresh process skips the cold index load. Ignored for local-FS stores.
+    /// Read-only opens reject absent tables and columns instead of migrating them.
     pub async fn open_with_options_cached(
         location: &Url,
         mut storage_options: HashMap<String, String>,
         caps: RuntimeCaps,
         index_cache_dir: Option<PathBuf>,
+        open_mode: OpenMode,
     ) -> Result<Self> {
         if let Some(path) = config::local_path(location) {
-            tokio::fs::create_dir_all(&path).await.with_context(|| {
-                format!(
-                    "failed to create data dir {}; fix the storage destination ([storage].path in config) or re-run `pond init`",
-                    path.display()
-                )
-            })?;
+            if open_mode == OpenMode::ReadWrite {
+                tokio::fs::create_dir_all(&path).await.with_context(|| {
+                    format!(
+                        "failed to create data dir {}; fix the storage destination ([storage].path in config) or re-run `pond init`",
+                        path.display()
+                    )
+                })?;
+            }
         } else {
             apply_remote_storage_defaults(&mut storage_options);
         }
@@ -2220,6 +2232,7 @@ impl Handle {
         };
         let wrapper = store_wrapper(location, index_cache_dir.as_deref());
         let handle = Self {
+            open_mode,
             datasets: DatasetSet {
                 sessions: OnceCell::new(),
                 messages: Mutex::new(CachedDataset::new(
@@ -2231,6 +2244,7 @@ impl Handle {
                         &session,
                         &storage_options,
                         wrapper.clone(),
+                        open_mode,
                     )
                     .await?,
                     refresh_after,
@@ -3333,6 +3347,7 @@ impl Handle {
                 &self.session,
                 &self.storage_options,
                 self.store_wrapper.clone(),
+                self.open_mode,
             )
             .await?;
             Ok::<_, anyhow::Error>(Mutex::new(CachedDataset::new(
@@ -5091,6 +5106,10 @@ fn store_wrapper(
 /// wrap level and downcasts cleanly. Managed-versioning hookup (REST
 /// namespace external-manifest commits) is not wired here; v1 ships
 /// Directory v2 only.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one open seam carries the namespace, schema, cache, credentials, and access mode"
+)]
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
@@ -5099,6 +5118,7 @@ async fn open_or_create_via_ns(
     session: &Arc<Session>,
     storage_options: &HashMap<String, String>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    open_mode: OpenMode,
 ) -> Result<Dataset> {
     let table_id = nm_ident.as_table_id(table_name);
 
@@ -5142,12 +5162,16 @@ async fn open_or_create_via_ns(
                     }
                 }
             };
-            ensure_current_schema(&mut dataset, schema.as_ref(), table_name).await?;
+            ensure_current_schema(&mut dataset, schema.as_ref(), table_name, open_mode).await?;
             return Ok(dataset);
         }
         Err(error) => match &error {
             error if is_namespace_error_code(error, ErrorCode::TableNotFound) => {
-                // fall through to create
+                if open_mode == OpenMode::ReadOnly {
+                    anyhow::bail!(
+                        "store has no {table_name} table yet; run `pond sync`, then restart the MCP client"
+                    );
+                }
             }
             _ => {
                 return Err(anyhow::Error::from(error))
@@ -5539,11 +5563,25 @@ async fn ensure_current_schema(
     dataset: &mut Dataset,
     expected: &lance::deps::arrow_schema::Schema,
     table_name: &str,
+    open_mode: OpenMode,
 ) -> Result<()> {
     use lance::deps::arrow_schema::DataType;
     const MAX_MIGRATION_ATTEMPTS: usize = 3;
     for _ in 0..MAX_MIGRATION_ATTEMPTS {
         let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
+        if open_mode == OpenMode::ReadOnly {
+            let missing: Vec<_> = expected
+                .fields()
+                .iter()
+                .filter(|field| actual.field_with_name(field.name()).is_err())
+                .map(|field| field.name().as_str())
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "table {table_name} is missing columns {missing:?}; run `pond sync`, then restart the MCP client"
+                );
+            }
+        }
         match classify_schema(&actual, expected, table_name)? {
             SchemaFit::MissingNullable(missing) => {
                 backfill_missing_columns(dataset, table_name, missing).await?;
@@ -5720,6 +5758,81 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    async fn open_read_only(path: &std::path::Path) -> Result<Handle> {
+        Handle::open_with_options_cached(
+            &config::url_for_path(path)?,
+            HashMap::new(),
+            RuntimeCaps::default(),
+            None,
+            OpenMode::ReadOnly,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn read_only_open_missing_store_leaves_nothing() -> Result<()> {
+        let temp = TempDir::new()?;
+        for path in [temp.path().join("missing"), temp.path().to_path_buf()] {
+            let error = open_read_only(&path).await.unwrap_err().to_string();
+            assert!(error.contains("no messages table yet"), "{error}");
+            assert!(error.contains("pond sync"), "{error}");
+            assert!(error.contains("restart the MCP client"), "{error}");
+            assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_lazy_open_missing_tables_leaves_nothing() -> Result<()> {
+        let temp = TempDir::new()?;
+        Handle::open(&config::url_for_path(temp.path())?).await?;
+        let reader = open_read_only(temp.path()).await?;
+        for table in [Table::Sessions, Table::Parts] {
+            let error = reader.dataset(table).await.unwrap_err().to_string();
+            assert!(error.contains("pond sync"), "{error}");
+            assert!(error.contains(table.as_str()), "{error}");
+            assert!(
+                !temp
+                    .path()
+                    .join(format!("{}.lance", table.as_str()))
+                    .exists()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_open_missing_columns_does_not_backfill() -> Result<()> {
+        for (table, column) in [("messages", "embedding_model"), ("parts", "tool_name")] {
+            let temp = TempDir::new()?;
+            let writer = Handle::open(&config::url_for_path(temp.path())?).await?;
+            writer.dataset(Table::Parts).await?;
+            drop(writer);
+            let uri = temp.path().join(format!("{table}.lance"));
+            let uri = uri.to_str().unwrap();
+            let mut dataset = Dataset::open(uri).await?;
+            dataset.drop_columns(&[column]).await?;
+            let version = dataset.version_id();
+            let result = open_read_only(temp.path()).await;
+            let error = if table == "messages" {
+                result.unwrap_err()
+            } else {
+                result?.dataset(Table::Parts).await.unwrap_err()
+            }
+            .to_string();
+            assert!(error.contains(column), "{error}");
+            assert!(error.contains("pond sync"), "{error}");
+            let unchanged = Dataset::open(uri).await?;
+            assert_eq!(unchanged.version_id(), version);
+            assert!(
+                lance::deps::arrow_schema::Schema::from(unchanged.schema())
+                    .field_with_name(column)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     /// Built as layers, not a bare io error: the matcher has to see through
     /// object_store's box, Lance's box, and the anyhow context.

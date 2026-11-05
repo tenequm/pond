@@ -1,5 +1,6 @@
 // Lance nests `init::run` futures past the default query depth limit.
 #![recursion_limit = "256"]
+use pond::substrate::OpenMode;
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -1432,7 +1433,7 @@ async fn run() -> anyhow::Result<()> {
             // contract instead of empty stdout + an anyhow dump on stderr.
             let outcome: anyhow::Result<()> = async {
             let loaded = Config::load(config_path(config))?;
-            let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
+            let (resolved, store) = open_store(storage_path, &loaded, false, false, OpenMode::ReadWrite).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
             if !store.initialized().await? {
                 // The local rows cost no store read, and an all-absent sync
@@ -1640,7 +1641,8 @@ async fn run() -> anyhow::Result<()> {
             if force_embed && !pond::embed::embeddings_enabled() {
                 bail!("{}", pond::handlers::SEMANTIC_DISABLED_MESSAGE);
             }
-            let (_, store) = open_store(storage_path, &loaded, true, false).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, true, false, OpenMode::ReadWrite).await?;
             if let Some(name) = drop_index {
                 store
                     .drop_index_by_name(&name)
@@ -1766,6 +1768,16 @@ async fn run() -> anyhow::Result<()> {
             let socket = socket
                 .map(|path| prepare_serve_socket(transport, &path))
                 .transpose()?;
+            // A stdio server that syncs or bootstraps is a plugin's writer
+            // sidecar; only a bare one is MCP-only, and MCP never writes.
+            let open_mode = if matches!(transport, ServeTransport::Stdio)
+                && !with_sync
+                && bootstrap.is_none()
+            {
+                OpenMode::ReadOnly
+            } else {
+                OpenMode::ReadWrite
+            };
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1781,7 +1793,7 @@ async fn run() -> anyhow::Result<()> {
             // Constructing it loads nothing; with embedding disabled it is
             // never attached, so no path can reach a model.
             let embedder = Arc::new(LazyEmbedder::candle());
-            let opened = open_store(storage_path.clone(), &config, true, true)
+            let opened = open_store(storage_path.clone(), &config, true, true, open_mode)
                 .await?
                 .1;
             let store = Arc::new(if pond::embed::embeddings_enabled() {
@@ -1846,7 +1858,9 @@ async fn run() -> anyhow::Result<()> {
             // and the one instance is shared by the query arm and the store's
             // inline embed-at-ingest path.
             let embedder = Arc::new(LazyEmbedder::candle());
-            let opened = open_store(storage_path, &config, true, true).await?.1;
+            let opened = open_store(storage_path, &config, true, true, OpenMode::ReadOnly)
+                .await?
+                .1;
             let store = Arc::new(if pond::embed::embeddings_enabled() {
                 embedder.spawn_idle_reaper();
                 opened.with_embedder(embedder.clone())
@@ -1871,7 +1885,8 @@ async fn run() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             let embedder = LazyEmbedder::candle();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1911,7 +1926,8 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let loaded = Config::load(config_path(config))?;
             arm_io_trace();
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             load_rowmap_quietly(&store).await;
             io_trace_report("get-session/setup");
             let first_page = after_message_id.is_none() && before_message_id.is_none();
@@ -1951,7 +1967,8 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let loaded = Config::load(config_path(config))?;
             arm_io_trace();
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             load_rowmap_quietly(&store).await;
             io_trace_report("get-message/setup");
             let request = GetMessageRequest {
@@ -2013,7 +2030,8 @@ async fn run() -> anyhow::Result<()> {
                 );
             }
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             let mode = match format {
                 CliSqlFormat::Text => pond::sql::Mode::Inline,
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
@@ -2205,7 +2223,7 @@ async fn run_resume(
     }
 
     let loaded = Config::load(config_path(config))?;
-    let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+    let (_, store) = open_store(storage_path, &loaded, false, false, OpenMode::ReadWrite).await?;
 
     // The reported paths are absolute even when `--out-dir` is relative (it
     // defaults to `.`): a plugin hands them straight to its own client, which
@@ -2416,6 +2434,7 @@ async fn open_store_with_spinner(
     storage: HashMap<String, String>,
     caps: pond::substrate::RuntimeCaps,
     index_cache_dir: Option<PathBuf>,
+    open_mode: OpenMode,
 ) -> anyhow::Result<Store> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -2423,7 +2442,8 @@ async fn open_store_with_spinner(
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
-    let result = Store::open_with_options_cached(location, storage, caps, index_cache_dir).await;
+    let result =
+        Store::open_with_options_cached(location, storage, caps, index_cache_dir, open_mode).await;
     spinner.finish_and_clear();
     result
 }
@@ -2458,6 +2478,7 @@ async fn open_store(
     loaded: &Config,
     spinner: bool,
     index_cache: bool,
+    open_mode: OpenMode,
 ) -> anyhow::Result<(ResolvedStorage, Store)> {
     // Every store the CLI opens reads the embeddings flag (index intents,
     // search arm), so a config built without `Config::load` trips here.
@@ -2478,6 +2499,7 @@ async fn open_store(
             resolved.options.clone(),
             runtime_caps(loaded),
             index_cache_dir,
+            open_mode,
         )
         .await?
     } else {
@@ -2486,6 +2508,7 @@ async fn open_store(
             resolved.options.clone(),
             runtime_caps(loaded),
             index_cache_dir,
+            open_mode,
         )
         .await?
     };
@@ -3028,7 +3051,7 @@ async fn copy_store_to_archive(
     path: &Path,
     loaded: &Config,
 ) -> anyhow::Result<()> {
-    let (_, store) = open_store(Some(from), loaded, false, false).await?;
+    let (_, store) = open_store(Some(from), loaded, false, false, OpenMode::ReadWrite).await?;
     let summary = export_pond_archive(&store, path).await?;
     output(&format!(
         "{} {}  sessions={} messages={} parts={}",
@@ -3048,7 +3071,7 @@ async fn copy_store_to_jsonl(
     path: Option<PathBuf>,
     loaded: &Config,
 ) -> anyhow::Result<()> {
-    let (_, store) = open_store(Some(from), loaded, false, false).await?;
+    let (_, store) = open_store(Some(from), loaded, false, false, OpenMode::ReadWrite).await?;
     let to_stdout = path.is_none();
     let summary = match path {
         Some(path) => {
@@ -3089,7 +3112,7 @@ async fn copy_store_to_jsonl(
 /// store via the idempotent union merge.
 async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> anyhow::Result<()> {
     let cmd_started = std::time::Instant::now();
-    let (_, store) = open_store(Some(to), loaded, false, false).await?;
+    let (_, store) = open_store(Some(to), loaded, false, false, OpenMode::ReadWrite).await?;
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
     let dim = pond::output::dim();
@@ -4617,7 +4640,7 @@ async fn run_sync_stages(
     report: &mut SyncReport,
 ) -> anyhow::Result<()> {
     let open_started = std::time::Instant::now();
-    let (_, store) = open_store(storage_path, loaded, true, false).await?;
+    let (_, store) = open_store(storage_path, loaded, true, false, OpenMode::ReadWrite).await?;
     tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
     let flush_hud = Arc::new(FlushHud::default());
     // sync ingests through `upsert_session_batch`, which embeds inline; it
@@ -5108,7 +5131,7 @@ async fn run_sync_dry_run(
         }
         return Ok(());
     }
-    let (_, store) = open_store(storage_path, loaded, true, false).await?;
+    let (_, store) = open_store(storage_path, loaded, true, false, OpenMode::ReadWrite).await?;
     // The same oracle a real sync would resolve, so the preview matches what
     // sync would actually skip - including the cursor fallback.
     let oracle = if invocation.verify {

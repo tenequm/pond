@@ -210,6 +210,7 @@ async fn index_disk_cache_populates_from_a_fresh_reader() -> anyhow::Result<()> 
         std::collections::HashMap::new(),
         caps,
         Some(cache.path().to_path_buf()),
+        pond::substrate::OpenMode::ReadWrite,
     )
     .await?;
     let embedder = LazyEmbedder::from_loaded(Arc::new(FakeBackend) as Arc<dyn Embedder>);

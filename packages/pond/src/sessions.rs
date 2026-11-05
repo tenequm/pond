@@ -412,6 +412,7 @@ impl Store {
         storage_options: std::collections::HashMap<String, String>,
         caps: crate::substrate::RuntimeCaps,
         index_cache_dir: Option<std::path::PathBuf>,
+        open_mode: crate::substrate::OpenMode,
     ) -> Result<Self> {
         Ok(Self {
             handle: Handle::open_with_options_cached(
@@ -419,6 +420,7 @@ impl Store {
                 storage_options,
                 caps,
                 index_cache_dir,
+                open_mode,
             )
             .await?,
             rowmap: ArcSwapOption::empty(),
@@ -8460,6 +8462,27 @@ mod tests {
             Some(write_params_for_create()),
         )
         .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_open_keeps_current_table_unfenced() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        create_unfenced_sessions(temp.path().to_str().unwrap()).await?;
+        Store::open_local(temp.path()).await?;
+        let store = Store::open_with_options_cached(
+            &config::url_for_path(temp.path())?,
+            Default::default(),
+            crate::substrate::RuntimeCaps::default(),
+            None,
+            crate::substrate::OpenMode::ReadOnly,
+        )
+        .await?;
+        assert!(store.session_ids().await?.is_empty());
+        let uri = temp.path().join("sessions.lance");
+        let dataset = Dataset::open(uri.to_str().unwrap()).await?;
+        assert!(!dataset.manifest().uses_non_reusable_field_ids());
+        assert_eq!(dataset.version_id(), 1);
         Ok(())
     }
 
