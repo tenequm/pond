@@ -775,11 +775,41 @@ fn condense_error_chain(error: &anyhow::Error) -> String {
     }
 }
 
+/// What a passing [`storage_check`] found that does not fail it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StorageCheckReport {
+    /// A create-only copy overwrote an existing key: the backend enforces
+    /// `If-None-Match` on PUT but not on copies (Hetzner). Lance 14+ publishes
+    /// its namespace table-creation markers through that copy on S3, so two
+    /// hosts creating the same table at once are not refused there; commits
+    /// go through the conditional put and are unaffected.
+    pub copy_overwrites_existing: bool,
+}
+
+impl StorageCheckReport {
+    /// `(class, message)` per finding, for both output formats.
+    pub fn notes(&self) -> Vec<(&'static str, &'static str)> {
+        let mut notes = Vec::new();
+        if self.copy_overwrites_existing {
+            notes.push((
+                "copy_overwrites_existing",
+                "this backend ignores If-None-Match on copies, so Lance's table-creation \
+                 markers are not atomic here - create a new store from one host at a time; \
+                 commits are unaffected",
+            ));
+        }
+        notes
+    }
+}
+
 /// Probe a resolved storage destination end-to-end (spec.md#substrate): a
 /// conditional `PutMode::Create` pair proving the `If-None-Match` -> 412 OCC
-/// primitive Lance's commit handler relies on, then read-back and delete of
-/// the synthetic key.
-pub async fn storage_check(resolved: &ResolvedStorage) -> std::result::Result<(), CheckFailure> {
+/// primitive Lance's commit handler relies on, a create-only copy pair for
+/// the advisory in [`StorageCheckReport`], then read-back and delete of the
+/// synthetic keys.
+pub async fn storage_check(
+    resolved: &ResolvedStorage,
+) -> std::result::Result<StorageCheckReport, CheckFailure> {
     use object_store::{Error as OsError, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
     let classify =
@@ -851,13 +881,27 @@ pub async fn storage_check(resolved: &ResolvedStorage) -> std::result::Result<()
                 source: anyhow!("read-back returned different bytes than written"),
             });
         }
-        Ok(())
+        // Advisory only, so any error here means "not observed": a backend
+        // without conditional copy returns NotSupported, and Lance's marker
+        // then falls back to the conditional put proven above.
+        let copy = object_store::path::Path::from(format!("{path}.copy"));
+        let copy_overwrites_existing = match store.inner.copy_if_not_exists(&path, &copy).await {
+            Ok(()) => {
+                let second = store.inner.copy_if_not_exists(&path, &copy).await;
+                let _ = store.inner.delete(&copy).await;
+                second.is_ok()
+            }
+            Err(_) => false,
+        };
+        Ok(StorageCheckReport {
+            copy_overwrites_existing,
+        })
     }
     .await;
     let cleanup = store.inner.delete(&path).await;
-    outcome?;
+    let report = outcome?;
     cleanup.map_err(|error| classify(error, "cleanup delete"))?;
-    Ok(())
+    Ok(report)
 }
 
 /// Map an `object_store` error onto the check's failure classes: an auth
@@ -1140,7 +1184,7 @@ fn task_veto_reason(
 
     // Match the writer's own count: lance 12+ picks `max(1, floor(surviving_rows
     // / target))` outputs and spreads rows EVENLY across them, so each reaches
-    // the target (lance-13.0.0 optimize.rs:2585-2614). Lance 11's fixed
+    // the target (lance-14.0.2 optimize.rs:2776-2805). Lance 11's fixed
     // `max_rows_per_file = target` stranded a tail instead - one output per
     // input, a shrink the byte prediction had promised, and the same task
     // re-planned every sync (#288, ~80 GiB/day for a 4.5 GiB table). The floor
@@ -1346,12 +1390,16 @@ impl IndexTrigger {
 
 impl IndexParamsKind {
     /// True for families whose search results are row *addresses*
-    /// (`fragment_id << 32 | offset`) emitted straight from the persisted
-    /// payload - named after Lance's `ScalarIndex::results_are_row_addresses`.
-    /// Lance 13 has three such families: ZoneMap, BloomFilter and FM-Index; pond
-    /// ships only the ZoneMap. Fragment ids die at compaction, so these indexes go
-    /// stale when covered fragments are rewritten; row-id-domain families
-    /// survive rewrites via stable row ids.
+    /// (`fragment_id << 32 | offset`) emitted straight from a persisted payload
+    /// that compaction never remaps - after Lance's
+    /// `ScalarIndex::results_are_row_addresses`, minus the BTree. Lance 14 has
+    /// three such families: ZoneMap, BloomFilter and FM-Index; pond ships only
+    /// the ZoneMap. Fragment ids die at compaction, so these indexes go stale
+    /// when covered fragments are rewritten. Lance 14 also builds BTree segments
+    /// in the address domain on stable-row-id tables (lance#9481), but it is the
+    /// one address family compaction remaps eagerly
+    /// (`IndexMetadata::supports_eager_remap`), so like the row-id-domain
+    /// families it survives rewrites and needs no staleness probe.
     fn results_are_row_addresses(&self) -> bool {
         matches!(self, Self::Scalar(BuiltinIndexType::ZoneMap))
     }
@@ -2009,6 +2057,25 @@ impl CachedDataset {
         }
         Ok(self.dataset.clone())
     }
+    /// [`Self::latest`] for a commit. Every write seam takes this, so no commit
+    /// from this build lands on a table Lance 13 can still write: a Lance 13
+    /// compaction or update carries a Lance 14 row-address BTree's coverage
+    /// onto rewritten fragments and Lance 14 readers then lose rows
+    /// (lance#10351), while Lance's own writer fence (lance#10352) ships only
+    /// from v15. The sticky, writer-only non-reusable-field-ids flag is one
+    /// Lance 13 refuses to write past yet still reads; a host racing the same
+    /// fence gets a commit conflict, which the caller's retry re-reads.
+    async fn latest_for_write(&mut self) -> Result<Dataset> {
+        let mut dataset = self.latest().await?;
+        if !dataset.manifest().uses_non_reusable_field_ids() {
+            dataset
+                .migrate_to_non_reusable_field_ids()
+                .await
+                .context("failed to fence Lance 13 writers off the table")?;
+            self.replace(dataset.clone());
+        }
+        Ok(dataset)
+    }
     fn replace(&mut self, dataset: Dataset) {
         self.dataset = dataset;
         self.last_refresh = Some(Instant::now());
@@ -2366,7 +2433,7 @@ impl Handle {
             let execute = &execute;
             async move {
                 let mut cached = self.cached(table).await?.lock().await;
-                let existing = cached.latest().await?;
+                let existing = cached.latest_for_write().await?;
                 let (dataset, payload) = execute(Arc::new(existing)).await?;
                 cached.replace(dataset);
                 Ok(payload)
@@ -2630,7 +2697,7 @@ impl Handle {
         let result = self
             .retry_lance(table, || async {
                 let mut guard = self.cached(table).await?.lock().await;
-                let mut dataset = guard.latest().await?;
+                let mut dataset = guard.latest_for_write().await?;
                 let did_work =
                     optimize_table_indices(&mut dataset, intents, table, progress, folds).await?;
                 guard.replace(dataset);
@@ -2654,7 +2721,7 @@ impl Handle {
         let result = self
             .retry_lance(table, || async {
                 let mut guard = self.cached(table).await?.lock().await;
-                let mut dataset = guard.latest().await?;
+                let mut dataset = guard.latest_for_write().await?;
                 optimize_table_compact(&mut dataset, table, progress, policy).await?;
                 guard.replace(dataset);
                 Ok::<_, anyhow::Error>(())
@@ -2703,7 +2770,7 @@ impl Handle {
                 let did_rewrite = self
                     .retry_lance(table, || async {
                         let mut guard = self.cached(table).await?.lock().await;
-                        let mut dataset = guard.latest().await?;
+                        let mut dataset = guard.latest_for_write().await?;
                         let did_rewrite = reencode_fragment(&mut dataset, fragment_id).await?;
                         guard.replace(dataset);
                         Ok::<_, anyhow::Error>(did_rewrite)
@@ -2826,7 +2893,7 @@ impl Handle {
         let result = self
             .retry_lance(table, || async {
                 let mut guard = self.cached(table).await?.lock().await;
-                let mut dataset = guard.latest().await?;
+                let mut dataset = guard.latest_for_write().await?;
                 rebuild_index(&mut dataset, intent, progress, table).await?;
                 guard.replace(dataset);
                 Ok(())
@@ -3084,7 +3151,7 @@ impl Handle {
             |error| !is_index_not_found(error),
             || async {
                 let mut guard = self.cached(table).await?.lock().await;
-                let mut dataset = guard.latest().await?;
+                let mut dataset = guard.latest_for_write().await?;
                 dataset
                     .drop_index(name)
                     .await
@@ -3873,10 +3940,11 @@ async fn optimize_table_indices(
 /// intent name.
 ///
 /// Compaction on stable-row-id datasets never remaps such payloads: Lance
-/// skips the remapper entirely (lance-13 `optimize.rs` `needs_remapping`) and
-/// only rewrites each covered index's `fragment_bitmap` to the new fragment
-/// ids (lance-table `transaction/index_maintenance.rs`
-/// `recalculate_fragment_bitmap`). A rewrite of covered
+/// runs the remapper only for an index that `supports_eager_remap` (a BTree
+/// segment in the address domain; lance-14 `optimize.rs` `needs_remapping`,
+/// `dataset/index.rs` `remap_indices`) and only rewrites every other covered
+/// index's `fragment_bitmap` to the new fragment ids (lance-table
+/// `transaction/index_maintenance.rs` `recalculate_fragment_bitmap`). A rewrite of covered
 /// fragments therefore leaves zones pointing at dead ids - `dead_in_payload`,
 /// the exact condition behind the query-time "fragment N referenced by an
 /// address-domain index result was not found" internal error - while the
@@ -5529,22 +5597,30 @@ async fn backfill_missing_columns(
     ));
     let started = std::time::Instant::now();
     let mapper = spec.mapper;
+    let (output_schema, read_columns) = (spec.output_schema, spec.read_columns);
+    let target = &mut *dataset;
     // Boxed: `add_columns`' concrete future is enormous (it embeds DataFusion
     // planner types), and inlining it here overflows rustc's auto-trait
     // solver (E0275) once this future nests inside the open chain.
     let migration: std::pin::Pin<
         Box<dyn std::future::Future<Output = lance::Result<()>> + Send + '_>,
-    > = Box::pin(dataset.add_columns(
-        NewColumnTransform::BatchUDF(BatchUDF {
-            mapper: Box::new(move |batch| {
-                mapper(batch).map_err(|error| lance::Error::io(format!("{error:#}")))
-            }),
-            output_schema: spec.output_schema,
-            result_checkpoint: None,
-        }),
-        Some(spec.read_columns),
-        None,
-    ));
+    > = Box::pin(async move {
+        // The fence every write seam applies first (`CachedDataset::latest_for_write`).
+        target.migrate_to_non_reusable_field_ids().await?;
+        target
+            .add_columns(
+                NewColumnTransform::BatchUDF(BatchUDF {
+                    mapper: Box::new(move |batch| {
+                        mapper(batch).map_err(|error| lance::Error::io(format!("{error:#}")))
+                    }),
+                    output_schema,
+                    result_checkpoint: None,
+                }),
+                Some(read_columns),
+                None,
+            )
+            .await
+    });
     let result = migration.await;
     match result {
         Ok(()) => {
@@ -6232,7 +6308,12 @@ mod tests {
             .unwrap()
             .resolve(&BTreeMap::new())
             .unwrap();
-        storage_check(&resolved).await.expect("memory probe passes");
+        let report = storage_check(&resolved).await.expect("memory probe passes");
+        assert_eq!(
+            report,
+            StorageCheckReport::default(),
+            "memory copies are atomic"
+        );
     }
 
     #[test]

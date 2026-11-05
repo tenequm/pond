@@ -6789,7 +6789,7 @@ fn primary_field(name: &str, data_type: DataType, nullable: bool) -> Field {
 }
 
 // Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`), which is why
-// `write_params_for_create` pins file format 2.1: at >= 2.2 Lance 13 silently
+// `write_params_for_create` pins file format 2.1: at >= 2.2 Lance 13+ silently
 // stores this column as Blob v2 (`Struct<data, uri>`), a shape pond's parts
 // read/write paths and `.pond` archives do not expect, and the first 2.2 write
 // sets the sticky mixed-versions manifest flag that Lance 11 readers refuse.
@@ -8394,6 +8394,105 @@ mod tests {
             );
         }
         assert!(store.get_session("session-7").await?.is_some());
+        Ok(())
+    }
+
+    /// Lance 14 builds BTree segments in the row-address domain on stable-row-id
+    /// tables (lance#9481) and remaps them eagerly when compaction rewrites the
+    /// fragments they cover (lance#10041). The remapped bitmap claims the new
+    /// fragment, so Lance never scans it for an indexed lookup: a stale address
+    /// in the payload would lose the session rather than fall back to a scan.
+    #[tokio::test]
+    async fn compaction_remaps_the_address_domain_btree() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        upsert_one_session_per_commit(&store, 12).await?;
+        store.build_indices_only(None).await?.into_result()?;
+        drop(store);
+
+        let mut sessions =
+            Dataset::open(temp.path().join("sessions.lance").to_str().unwrap()).await?;
+        lance::dataset::optimize::compact_files(&mut sessions, Default::default(), None).await?;
+        assert_eq!(sessions.get_fragments().len(), 1);
+        let btree = sessions
+            .load_indices()
+            .await?
+            .iter()
+            .find(|index| index.name == "sessions_id_btree")
+            .cloned()
+            .context("sessions_id_btree missing after compaction")?;
+        assert_eq!(
+            btree.index_version, 1,
+            "BTree not in the row-address domain"
+        );
+        let live: roaring::RoaringBitmap = sessions
+            .get_fragments()
+            .iter()
+            .map(|fragment| u32::try_from(fragment.id()).unwrap())
+            .collect();
+        assert_eq!(
+            btree.fragment_bitmap,
+            Some(live),
+            "compaction dropped coverage"
+        );
+
+        let store = Store::open_local(temp.path()).await?;
+        for index in 0..12 {
+            let id = format!("session-{index}");
+            assert!(store.get_session(&id).await?.is_some(), "{id} lost");
+        }
+        Ok(())
+    }
+
+    /// The writer fence (`CachedDataset::latest_for_write`): opening and
+    /// reading commit nothing, and the first write sets a writer-only flag
+    /// that Lance 13's writer gate refuses (it rejects every bit from 1 << 14).
+    #[tokio::test]
+    async fn first_write_fences_lance13_writers() -> anyhow::Result<()> {
+        // lance-table's `FLAG_NON_REUSABLE_FIELD_IDS`, which lance does not re-export.
+        const NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
+
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        assert!(store.session_ids().await?.is_empty());
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        assert!(!sessions.manifest().uses_non_reusable_field_ids());
+
+        upsert_one_session_per_commit(&store, 2).await?;
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        let manifest = sessions.manifest();
+        assert!(manifest.uses_non_reusable_field_ids());
+        assert_ne!(manifest.writer_feature_flags & NON_REUSABLE_FIELD_IDS, 0);
+        assert_eq!(manifest.reader_feature_flags & NON_REUSABLE_FIELD_IDS, 0);
+        assert_eq!(store.session_ids().await?.len(), 2);
+        Ok(())
+    }
+
+    /// Two hosts' first writes race the fence: the loser's commit conflict
+    /// re-reads the fenced manifest, and both writes land.
+    #[tokio::test]
+    async fn concurrent_first_writes_share_one_fence() -> anyhow::Result<()> {
+        let url = Url::parse("shared-memory://pond-test-writer-fence-race/")?;
+        let first = Store::open(&url).await?;
+        assert!(first.session_ids().await?.is_empty());
+        let second = Store::open(&url).await?;
+        let (session_a, session_b) = (
+            [synthetic_session("fence-a")],
+            [synthetic_session("fence-b")],
+        );
+        let (left, right) = tokio::join!(
+            first.upsert_sessions(&session_a),
+            second.upsert_sessions(&session_b),
+        );
+        left?;
+        right?;
+
+        let reader = Store::open(&url).await?;
+        let sessions = reader.handle.dataset(Table::Sessions).await?;
+        assert!(sessions.manifest().uses_non_reusable_field_ids());
+        let mut ids = reader.session_ids().await?;
+        ids.sort();
+        assert_eq!(ids, ["fence-a", "fence-b"]);
         Ok(())
     }
 

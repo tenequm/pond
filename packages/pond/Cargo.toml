@@ -122,28 +122,30 @@ indicatif = "0.18"
 # which has never linked on Windows. The feature is activated for every
 # non-Windows target via the per-target gate below; Windows builds use a system
 # protoc found via PATH/PROTOC, which is what lance's own Windows CI does.
-lance = { version = "13.0.0" }
-lance-arrow = "13.0.0"
+lance = { version = "14.0.2" }
+lance-arrow = "14.0.2"
 # `pond_sql` registers lance's JSON / contains_tokens UDFs on the SQL
 # SessionContext via `lance_datafusion::udf::register_functions`. Already in
 # the tree transitively; named here to reach that one function.
-lance-datafusion = "13.0.0"
+lance-datafusion = "14.0.2"
 half = { version = "2.1", default-features = false }
 # JSONB decode for the lenient json_get_* UDF shadows in `src/sql.rs` (lance's
 # strict versions abort a whole scan when one row's field is non-scalar).
-# Already in the tree via lance-datafusion; default-features OFF is load-bearing:
-# jsonb's defaults enable serde_json/preserve_order + arbitrary_precision, which
-# flip serde_json behavior crate-wide and change restore output key order.
-jsonb = { version = "0.5", default-features = false, features = ["databend"] }
-lance-file = "13.0.0"
-lance-index = "13.0.0"
-lance-io = "13.0.0"
-lance-linalg = "13.0.0"
-lance-namespace = "13.0.0"
-lance-namespace-impls = "13.0.0"
+# Lance's own vendored copy of the jsonb crate (lance#9534), already in the tree
+# via lance-arrow, so pond decodes with exactly the code that encoded the
+# column. It has no features, and its serde_json carries neither preserve_order
+# nor arbitrary_precision, which would flip serde_json behavior crate-wide and
+# change restore output key order - keep it that way.
+lance-jsonb = "14.0.2"
+lance-file = "14.0.2"
+lance-index = "14.0.2"
+lance-io = "14.0.2"
+lance-linalg = "14.0.2"
+lance-namespace = "14.0.2"
+lance-namespace-impls = "14.0.2"
 # Already in the tree via lance-index; named so the FTS stemmer fingerprint
 # can iterate the tokenizer's token stream (`TokenStream::process`).
-lance-tokenizer = "13.0.0"
+lance-tokenizer = "14.0.2"
 # Memory-mapped, process-shareable row_id -> key map (`src/rowmap.rs`): the file
 # is mmap'd so the OS page cache holds one physical copy across pond instances.
 # Already in the tree via candle/safetensors.
@@ -151,7 +153,7 @@ memmap2 = "0.9"
 # Already in the tree via lance-io; named directly so `pond storage check` can
 # drive a conditional put (`PutMode::Create`) through `ObjectStore::inner` and
 # classify the typed errors (AlreadyExists / Unauthenticated / NotImplemented).
-object_store = { version = "0.14.1", default-features = false }
+object_store = { version = "0.14.2", default-features = false }
 # Parquet export writer for `pond_sql`. The only genuinely new compiled
 # crate the SQL tool adds (lance reads/writes its own format, not parquet).
 # `arrow` feature only; results are written uncompressed via `ArrowWriter`.
@@ -215,7 +217,7 @@ socket2 = "0.6.3"
 # per-target, but target-specific dependency tables merge, so re-declaring
 # lance here adds the feature only for the targets this cfg selects.
 [target.'cfg(not(windows))'.dependencies]
-lance = { version = "13.0.0", features = ["protoc"] }
+lance = { version = "14.0.2", features = ["protoc"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "0.10", features = ["metal"] }
@@ -254,13 +256,13 @@ assert_cmd = "2"
 # `std::env::set_var` in pond's own code (the crate denies unsafe).
 figment = { version = "0.10.19", features = ["test"] }
 # Re-declared (also in `[dependencies]`) so integration tests can name `MetricType`.
-lance-linalg = "13.0.0"
+lance-linalg = "14.0.2"
 # Re-declared so `serve_mem_bench --tokenizer-sweep` can rebuild the search_text
 # inverted index under different tokenizers (ngram vs simple) via the raw lance
 # create_index API and measure the index-size / RAM / latency tradeoff.
 # The `protoc` feature is activated via the non-Windows per-target gate below.
-lance = { version = "13.0.0" }
-lance-index = "13.0.0"
+lance = { version = "14.0.2" }
+lance-index = "14.0.2"
 # Re-declared so the MCP tests can drive the server in-process via the `client` feature.
 rmcp = { version = "3.5.1", features = ["client"] }
 # Re-declared so the opencode real-corpus restore oracle can read the source SQLite DB directly.
@@ -273,7 +275,7 @@ tempfile = "3.25"
 tokio = { version = "1.52", features = ["test-util"] }
 # Lets the HTTP integration test drive axum's `Router` without binding a socket.
 tower = { version = "0.5", features = ["util"] }
-# 0.14, not 0.13: lance-io pulls opendal (0.59 at lance 13), whose opendal-core
+# 0.14, not 0.13: lance-io pulls opendal (0.59 at lance 14), whose opendal-core
 # needs the md-5 0.11.0 release; s3s 0.13 pins md-5 =0.11.0-rc.5, which blocks
 # resolution. Coupled to the lance pins - keep in lockstep.
 s3s = "0.14"
@@ -290,7 +292,7 @@ libc = "0.2"
 # and dev dependencies, so an ungated dev-dep re-enables `protoc` for the target
 # build and leaves `cargo build` passing while `cargo test` fails to link.
 [target.'cfg(not(windows))'.dev-dependencies]
-lance = { version = "13.0.0", features = ["protoc"] }
+lance = { version = "14.0.2", features = ["protoc"] }
 
 # Plain `fn main` binaries (not libtest). Run with `cargo bench --bench <name> -- --help`.
 [[bench]]
