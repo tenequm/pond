@@ -330,7 +330,19 @@ fn toolchain() -> String {
 }
 
 fn cargo() -> Command {
-    Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
+    let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+    // `cargo bench` exports this package's CARGO_MANIFEST_* and CARGO_PKG_* to
+    // the gate, and ring's build script tracks them: a nested cargo inheriting
+    // them rebuilds ring and everything above it instead of reusing the build.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|k| k.starts_with("CARGO_MANIFEST_") || k.starts_with("CARGO_PKG_"))
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd
 }
 
 // ------------------------------------------------------------- process helper
