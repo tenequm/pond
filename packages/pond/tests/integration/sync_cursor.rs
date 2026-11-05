@@ -123,6 +123,41 @@ fn run_one_serve_sync(temp: &TempDir) -> String {
 }
 
 #[test]
+fn bare_stdio_server_never_creates_the_store() {
+    let temp = TempDir::new().expect("temp");
+    let store = temp.path().join("store");
+    let out = sandboxed_pond(&temp)
+        .env("POND_STORAGE_PATH", &store)
+        .args(["serve", "--transport", "stdio"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run serve");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a bare stdio server started on a store nothing created:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("run `pond sync`") && stderr.contains("restart the MCP client"),
+        "the startup failure must name both fixes:\n{stderr}"
+    );
+    assert!(!store.exists(), "a bare stdio server created the store");
+}
+
+#[test]
+fn sync_sidecar_creates_a_fresh_store() {
+    let temp = TempDir::new().expect("temp");
+    let source = temp.path().join("source");
+    copy_one_session(&source);
+    write_config(&temp, &source);
+    let logs = run_one_serve_sync(&temp);
+    assert!(
+        logs.contains("in-serve sync complete"),
+        "a --with-sync server must open read-write and sync a store no `pond sync` created:\n{logs}",
+    );
+}
+
+#[test]
 fn serve_restart_uses_persisted_cursor_when_rowmap_is_busy() {
     let temp = TempDir::new().expect("temp");
     let source = temp.path().join("source");
