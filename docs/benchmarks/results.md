@@ -273,7 +273,7 @@ sql_session                   1.60       1.56       1.26       2.67
 
 ### 2026-11-05 - mac-m1max -> s3-nbg1, table creation on a fresh prefix
 
-`pond status` creates the three tables. On this branch before `970c70b` it fails with "Failed to create table messages": the multipart copy Lance 14 publishes table markers with sends its UploadPartCopy without `Content-Length`, and Hetzner answers 411 MissingContentLength. Released 0.20.3 (Lance 13) creates the store (7 objects), and so does this branch with `aws_copy_if_not_exists = header:If-None-Match:*` (9 objects), the default `970c70b` sets for Hetzner endpoints. All three prefixes were deleted afterwards.
+`pond status` creates the three tables. On this branch before `970c70b` it fails with "Failed to create table messages": the multipart copy Lance 14 publishes table markers with sends its UploadPartCopy without `Content-Length`, and Hetzner answers 411 MissingContentLength. Released 0.20.3 (Lance 13) creates the store (7 objects), and so does this branch with `aws_copy_if_not_exists = header:If-None-Match:*` (9 objects), the plain conditional copy pond now falls back to on any S3 backend that rejects Lance's default. All three prefixes were deleted afterwards.
 
 ## bench-gate: Lance 12 -> 13 upgrade (#342)
 

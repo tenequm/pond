@@ -182,13 +182,15 @@ async fn s3s_fs_in_process_round_trips_a_session() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A backend that rejects the copy Lance creates tables with (Hetzner's
-/// Ceph, see `CephPartCopy`) fails the check naming the fix, and passes once
-/// the creds set's `extra` switches to a plain CopyObject.
+/// A backend that rejects the copy Lance creates tables with by default
+/// (Hetzner's Ceph, see `CephPartCopy`) passes the check on pond's plain-copy
+/// fallback, with a note; an explicit copy mode is used as given, so the same
+/// backend with `multipart` set fails it.
 #[tokio::test(flavor = "multi_thread")]
-async fn config_check_fails_when_the_table_creation_copy_is_rejected() -> anyhow::Result<()> {
+async fn config_check_falls_back_to_a_plain_copy_when_the_default_is_rejected() -> anyhow::Result<()>
+{
     use pond::config::CredsSet;
-    use pond::substrate::{CheckFailure, StorageUrl, storage_check};
+    use pond::substrate::{CheckFailure, CheckNote, StorageUrl, storage_check};
     use std::collections::BTreeMap;
 
     let fx = spawn_s3s_fs("pond-ceph", Some(CephPartCopy)).await?;
@@ -200,54 +202,51 @@ async fn config_check_fails_when_the_table_creation_copy_is_rejected() -> anyhow
         ..CredsSet::default()
     };
     let creds = BTreeMap::from([("test".to_owned(), set.clone())]);
+    let notes = storage_check(&url.resolve(&creds)?)
+        .await
+        .expect("the plain-copy fallback passes the check");
+    assert!(notes.contains(&CheckNote::PlainCopyFallback), "{notes:?}");
+
+    set.extra
+        .insert("aws_copy_if_not_exists".to_owned(), "multipart".to_owned());
+    let creds = BTreeMap::from([("test".to_owned(), set)]);
     match storage_check(&url.resolve(&creds)?).await {
         Err(CheckFailure::CopyRejected { .. }) => {}
-        other => panic!("a rejected table-creation copy must fail the check, got: {other:?}"),
+        other => panic!("an explicit, rejected copy mode must fail the check, got: {other:?}"),
     }
-
-    set.extra.insert(
-        "aws_copy_if_not_exists".to_owned(),
-        "header:If-None-Match:*".to_owned(),
-    );
-    let creds = BTreeMap::from([("test".to_owned(), set)]);
-    storage_check(&url.resolve(&creds)?)
-        .await
-        .expect("a plain CopyObject passes the check");
     Ok(())
 }
 
-/// Lance 14's default copy cannot create a table on a Ceph-like backend;
-/// the plain CopyObject pond defaults to on Hetzner can.
+/// Tables are created on a backend that rejects Lance's default copy, with no
+/// setting: pond falls back to a plain conditional copy. Setting Lance's
+/// default explicitly still fails there.
 #[tokio::test(flavor = "multi_thread")]
-async fn plain_copy_creates_tables_on_a_ceph_like_backend() -> anyhow::Result<()> {
+async fn tables_are_created_where_the_default_copy_is_rejected() -> anyhow::Result<()> {
     let fx = spawn_s3s_fs("pond", Some(CephPartCopy)).await?;
-    let Err(error) = Store::open_with_options(
-        &Url::parse("s3://pond/default-copy")?,
+    let store = Store::open_with_options(
+        &Url::parse("s3://pond/fallback")?,
         storage_options(&fx.endpoint),
+        pond::substrate::RuntimeCaps::default(),
+    )
+    .await?;
+    store.upsert_sessions(&[make_session(1)]).await?;
+    assert_eq!(store.row_counts().await?.0, 1);
+
+    let mut options = storage_options(&fx.endpoint);
+    options.insert("aws_copy_if_not_exists".into(), "multipart".into());
+    let Err(error) = Store::open_with_options(
+        &Url::parse("s3://pond/explicit-multipart")?,
+        options,
         pond::substrate::RuntimeCaps::default(),
     )
     .await
     else {
         panic!(
             "this open succeeding means object_store now sends Content-Length on \
-             UploadPartCopy, and the Hetzner copy default in apply_remote_storage_defaults can go"
+             UploadPartCopy, and pond's plain-copy fallback (plain_copy_namespace) can go"
         );
     };
     assert!(format!("{error:#}").contains("411"), "{error:#}");
-
-    let mut options = storage_options(&fx.endpoint);
-    options.insert(
-        "aws_copy_if_not_exists".into(),
-        "header:If-None-Match:*".into(),
-    );
-    let store = Store::open_with_options(
-        &Url::parse("s3://pond/plain-copy")?,
-        options,
-        pond::substrate::RuntimeCaps::default(),
-    )
-    .await?;
-    store.upsert_sessions(&[make_session(1)]).await?;
-    assert_eq!(store.row_counts().await?.0, 1);
     Ok(())
 }
 

@@ -727,7 +727,7 @@ pub enum CheckFailure {
     )]
     OccUnsupported { detail: String },
     #[error(
-        "backend rejects the create-only copy Lance creates tables with, so no table can be created here; try `extra = {{ aws_copy_if_not_exists = \"header:If-None-Match:*\" }}` on the creds set"
+        "backend rejects the create-only copy Lance creates tables with, both Lance's default and pond's plain fallback, so no table can be created here (an `aws_copy_if_not_exists` in the creds set's `extra` is used as given)"
     )]
     CopyRejected { source: anyhow::Error },
     #[error("storage probe failed")]
@@ -793,6 +793,9 @@ pub enum CheckNote {
     /// hosts creating the same table at once are not refused there; commits
     /// go through the conditional put and are unaffected.
     CopyOverwritesExisting,
+    /// The backend rejects Lance's default create-only copy, so pond creates
+    /// tables there with [`PLAIN_CONDITIONAL_COPY`] instead.
+    PlainCopyFallback,
 }
 
 impl std::fmt::Display for CheckNote {
@@ -803,6 +806,10 @@ impl std::fmt::Display for CheckNote {
                  markers are not atomic here - create a new store from one host at a time; \
                  commits are unaffected",
             ),
+            Self::PlainCopyFallback => f.write_str(
+                "this backend rejects the multipart copy Lance creates tables with by default, \
+                 so pond creates tables here with a plain conditional copy",
+            ),
         }
     }
 }
@@ -810,8 +817,9 @@ impl std::fmt::Display for CheckNote {
 /// Probe a resolved storage destination end-to-end (spec.md#substrate): a
 /// conditional `PutMode::Create` pair proving the `If-None-Match` -> 412 OCC
 /// primitive Lance's commit handler relies on, read-back, a create-only copy
-/// pair (a rejected copy fails the check, an overwriting one is the
-/// [`CheckNote`] advisory), then delete of the synthetic keys.
+/// pair with the plain-copy fallback table creation uses (a copy both modes
+/// reject fails the check; the fallback and an overwriting copy are
+/// [`CheckNote`] advisories), then delete of the synthetic keys.
 pub async fn storage_check(
     resolved: &ResolvedStorage,
 ) -> std::result::Result<Vec<CheckNote>, CheckFailure> {
@@ -830,11 +838,7 @@ pub async fn storage_check(
     if config::local_path(resolved.lance_url()).is_none() {
         apply_remote_storage_defaults(&mut options);
     }
-    let params = ObjectStoreParams {
-        storage_options_accessor: (!options.is_empty())
-            .then(|| Arc::new(StorageOptionsAccessor::with_static_options(options))),
-        ..Default::default()
-    };
+    let params = static_store_params(&options);
     let registry = Arc::new(ObjectStoreRegistry::default());
     let (store, path) = ObjectStore::from_uri_and_params(registry, &probe_uri, &params)
         .await
@@ -889,21 +893,19 @@ pub async fn storage_check(
             });
         }
         // Lance creates every table's namespace marker through this copy.
-        let copy = object_store::path::Path::from(format!("{path}.copy"));
-        let mut first_copy = store.inner.copy_if_not_exists(&path, &copy).await;
-        // The copy key is fresh, so "exists" with the key present is a retry
-        // meeting its own first attempt (a lost ack), not a refusal.
-        if matches!(
-            first_copy,
-            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. })
-        ) && store.inner.head(&copy).await.is_ok()
-        {
-            first_copy = Ok(());
+        let (mut first_copy, mut copy_overwrites) = probe_copy(&store, &path).await;
+        let mut plain_copy = false;
+        if copy_rejected(&first_copy) && copy_mode_is_ours(resolved.lance_url(), &options) {
+            // The fallback table creation takes (`plain_copy_namespace`).
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let plain_params = static_store_params(&with_plain_copy(&options));
+            if let Ok((plain_store, _)) =
+                ObjectStore::from_uri_and_params(registry, &probe_uri, &plain_params).await
+            {
+                (first_copy, copy_overwrites) = probe_copy(&plain_store, &path).await;
+                plain_copy = first_copy.is_ok();
+            }
         }
-        let copy_overwrites =
-            first_copy.is_ok() && store.inner.copy_if_not_exists(&path, &copy).await.is_ok();
-        // Even a copy that errored may have landed (a lost ack).
-        let _ = store.inner.delete(&copy).await;
         match first_copy {
             // Without a conditional copy, Lance's marker falls back to the
             // conditional put proven above.
@@ -915,11 +917,14 @@ pub async fn storage_check(
                 });
             }
         }
-        Ok(if copy_overwrites {
-            vec![CheckNote::CopyOverwritesExisting]
-        } else {
-            Vec::new()
-        })
+        let mut notes = Vec::new();
+        if plain_copy {
+            notes.push(CheckNote::PlainCopyFallback);
+        }
+        if copy_overwrites {
+            notes.push(CheckNote::CopyOverwritesExisting);
+        }
+        Ok(notes)
     }
     .await;
     let cleanup = store.inner.delete(&path).await;
@@ -2230,24 +2235,7 @@ impl Handle {
             Arc::new(ObjectStoreRegistry::default()),
         ));
         // Build the lance-namespace catalog seam once (spec.md#lance-chokepoints-catalog).
-        // The `root` property is whatever URL the Directory impl understands;
-        // `uri_to_url` (lance-io/object_store.rs) accepts both bare paths and
-        // URLs, so passing the scheme-qualified URL for local FS works the
-        // same as the bare-path form. Trailing slash stripped for clean logs.
-        let root = location.as_str().trim_end_matches('/').to_string();
-        let mut connect = ConnectBuilder::new("dir")
-            .property("root", root)
-            .session(session.clone());
-        // Object-store credentials/region/endpoint flow into the namespace
-        // via the `storage.<key>` property convention (lance-namespace-impls
-        // dir.rs from_properties: lines 423-436).
-        for (key, value) in &storage_options {
-            connect = connect.property(format!("storage.{key}"), value.clone());
-        }
-        let nm: Arc<dyn LanceNamespace> = connect
-            .connect()
-            .await
-            .context("failed to connect lance Directory namespace")?;
+        let nm = connect_namespace(location, &storage_options, &session).await?;
         let nm_ident = NamespaceIdent::root();
         // spec.md#lance-handle-freshness: refresh window is scheme-keyed. Local-FS
         // manifest reads are microsecond-cheap, so `0` (always-refresh) is
@@ -2268,6 +2256,7 @@ impl Handle {
                     open_or_create_via_ns(
                         &nm,
                         &nm_ident,
+                        location,
                         sessions::MESSAGES,
                         sessions::message_schema(),
                         &session,
@@ -3371,6 +3360,7 @@ impl Handle {
             let dataset = open_or_create_via_ns(
                 &self.nm,
                 &self.nm_ident,
+                &self.location,
                 table_name,
                 schema(),
                 &self.session,
@@ -5143,6 +5133,7 @@ fn store_wrapper(
 async fn open_or_create_via_ns(
     nm: &Arc<dyn LanceNamespace>,
     nm_ident: &NamespaceIdent,
+    location: &Url,
     table_name: &str,
     schema: lance::deps::arrow_schema::SchemaRef,
     session: &Arc<Session>,
@@ -5227,11 +5218,27 @@ async fn open_or_create_via_ns(
             ..Default::default()
         });
     }
-    let reader = sessions::empty_reader(schema)?;
-    let mut dataset =
-        Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
-            .await
-            .with_context(|| format!("failed to create table {table_name}"))?;
+    let reader = sessions::empty_reader(schema.clone())?;
+    let created = Dataset::write_into_namespace(
+        reader,
+        nm.clone(),
+        table_id.clone(),
+        Some(write_params.clone()),
+    )
+    .await;
+    let mut dataset = match created {
+        Ok(dataset) => dataset,
+        Err(error) => {
+            let Some(plain_nm) = plain_copy_namespace(location, storage_options, session).await
+            else {
+                return Err(error).with_context(|| format!("failed to create table {table_name}"));
+            };
+            let reader = sessions::empty_reader(schema)?;
+            Dataset::write_into_namespace(reader, plain_nm, table_id, Some(write_params))
+                .await
+                .with_context(|| format!("failed to create table {table_name}"))?
+        }
+    };
     // Born fenced (`CachedDataset::latest_for_write`), so the table's first
     // data write stays one commit. A conflict means another writer reached it
     // first; its write seam fences it.
@@ -5731,10 +5738,10 @@ async fn backfill_missing_columns(
 /// always wins.
 /// `aws_unsigned_payload` is gated on a custom endpoint (the marker for
 /// S3-compatible stores like Hetzner, MinIO, R2), where the SHA256 payload
-/// signature is wasted work the server does not validate. On Hetzner,
-/// `aws_copy_if_not_exists` moves off Lance 14's multipart default: object_store
-/// sends that copy's part request without `Content-Length`, Hetzner answers 411,
-/// and no table could be created; a plain CopyObject works there.
+/// signature is wasted work the server does not validate.
+/// The per-request timeout stays object_store's own (`timeout`, 30 s): one
+/// request that needs longer is a design or infra problem to fix (chunk the
+/// read, fix the endpoint), not a limit to raise.
 fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     fn set_default(options: &mut HashMap<String, String>, aliases: &[&str], value: &str) {
         if aliases
@@ -5747,38 +5754,154 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     }
     set_default(options, &["pool_idle_timeout"], "300 seconds");
     set_default(options, &["connect_timeout"], "10 seconds");
-    // `request_timeout` bounds a single object-store request (one range GET/PUT),
-    // not a whole scan - a streaming read issues many small requests, each well
-    // under this. We keep it deliberately tight as a HARD BARRIER: a single
-    // request exceeding 60s means a design/infra problem to fix (chunk the read,
-    // use change-data-feed, fix the endpoint), never something to paper over with
-    // a longer timeout. An explicit `extra` override still wins.
-    set_default(options, &["request_timeout"], "60 seconds");
-    // Canonical alias first: that is the one Lance uses when both are set.
-    let Some(endpoint) = ["aws_endpoint", "endpoint"].iter().find_map(|alias| {
-        options
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(alias))
-            .map(|(_, value)| value.clone())
-    }) else {
-        return;
-    };
-    set_default(
-        options,
-        &["aws_unsigned_payload", "unsigned_payload"],
-        "true",
-    );
-    let hetzner = Url::parse(&endpoint).is_ok_and(|url| {
-        url.host_str()
-            .is_some_and(|host| host.ends_with(".your-objectstorage.com"))
-    });
-    if hetzner {
+    let has_custom_endpoint = ["aws_endpoint", "endpoint"]
+        .iter()
+        .any(|alias| options.keys().any(|k| k.eq_ignore_ascii_case(alias)));
+    if has_custom_endpoint {
         set_default(
             options,
-            &["aws_copy_if_not_exists", "copy_if_not_exists"],
-            "header:If-None-Match:*",
+            &["aws_unsigned_payload", "unsigned_payload"],
+            "true",
         );
     }
+}
+
+/// The create-only copy pond falls back to on an S3 backend that rejects
+/// Lance's default multipart one, whose part request object_store sends
+/// without `Content-Length` (Hetzner answers 411): a plain CopyObject guarded
+/// by `If-None-Match`.
+const PLAIN_CONDITIONAL_COPY: &str = "header:If-None-Match:*";
+const COPY_MODE_KEYS: &[&str] = &["aws_copy_if_not_exists", "copy_if_not_exists"];
+
+/// Whether the copy mode is pond's to pick: an S3 store whose options set none.
+fn copy_mode_is_ours(location: &Url, options: &HashMap<String, String>) -> bool {
+    location.scheme() == "s3"
+        && !options.keys().any(|key| {
+            COPY_MODE_KEYS
+                .iter()
+                .any(|alias| key.eq_ignore_ascii_case(alias))
+        })
+}
+
+fn with_plain_copy(options: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut options = options.clone();
+    options.insert(
+        COPY_MODE_KEYS[0].to_owned(),
+        PLAIN_CONDITIONAL_COPY.to_owned(),
+    );
+    options
+}
+
+fn static_store_params(options: &HashMap<String, String>) -> ObjectStoreParams {
+    ObjectStoreParams {
+        storage_options_accessor: (!options.is_empty())
+            .then(|| Arc::new(StorageOptionsAccessor::with_static_options(options.clone()))),
+        ..Default::default()
+    }
+}
+
+/// One create-only copy of `path` onto a fresh `<path>.copy` key, the call
+/// Lance publishes namespace markers with: its outcome, and whether a second
+/// copy over the now-existing key also succeeds.
+async fn probe_copy(
+    store: &ObjectStore,
+    path: &object_store::path::Path,
+) -> (object_store::Result<()>, bool) {
+    use object_store::{Error as OsError, ObjectStoreExt};
+    let copy = object_store::path::Path::from(format!("{path}.copy"));
+    let mut first = store.inner.copy_if_not_exists(path, &copy).await;
+    // The copy key is fresh, so "exists" with the key present is a retry
+    // meeting its own first attempt (a lost ack), not a refusal.
+    if matches!(
+        first,
+        Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. })
+    ) && store.inner.head(&copy).await.is_ok()
+    {
+        first = Ok(());
+    }
+    let overwrites = first.is_ok() && store.inner.copy_if_not_exists(path, &copy).await.is_ok();
+    // Even a copy that errored may have landed (a lost ack).
+    let _ = store.inner.delete(&copy).await;
+    (first, overwrites)
+}
+
+/// A copy outcome Lance's marker cannot work with. Without a conditional copy
+/// at all (`NotSupported`) it falls back to the conditional put instead.
+fn copy_rejected(outcome: &object_store::Result<()>) -> bool {
+    !matches!(
+        outcome,
+        Ok(())
+            | Err(object_store::Error::NotSupported { .. }
+                | object_store::Error::NotImplemented { .. })
+    )
+}
+
+/// The namespace to create a table through when this S3 backend rejects
+/// Lance's default create-only copy: the same one with
+/// [`PLAIN_CONDITIONAL_COPY`]. `None` when the copy mode is not pond's to pick
+/// or a fresh probe copies fine, so the failed create had another cause.
+async fn plain_copy_namespace(
+    location: &Url,
+    storage_options: &HashMap<String, String>,
+    session: &Arc<Session>,
+) -> Option<Arc<dyn LanceNamespace>> {
+    use object_store::{ObjectStoreExt, PutPayload};
+    if !copy_mode_is_ours(location, storage_options) {
+        return None;
+    }
+    let probe_uri = format!(
+        "{}/_config-check/{}",
+        location.as_str().trim_end_matches('/'),
+        uuid::Uuid::now_v7(),
+    );
+    let registry = Arc::new(ObjectStoreRegistry::default());
+    let (store, path) = ObjectStore::from_uri_and_params(
+        registry,
+        &probe_uri,
+        &static_store_params(storage_options),
+    )
+    .await
+    .ok()?;
+    store
+        .inner
+        .put(&path, PutPayload::from_static(b"pond copy probe"))
+        .await
+        .ok()?;
+    let (outcome, _) = probe_copy(&store, &path).await;
+    let _ = store.inner.delete(&path).await;
+    if !copy_rejected(&outcome) {
+        return None;
+    }
+    tracing::info!(
+        store = %location,
+        "backend rejects Lance's default create-only copy; creating tables with a plain conditional copy",
+    );
+    connect_namespace(location, &with_plain_copy(storage_options), session)
+        .await
+        .ok()
+}
+
+/// Connect the Directory namespace over `location`. The `root` property is
+/// whatever URL the Directory impl understands (`uri_to_url` accepts bare
+/// paths and URLs alike); credentials, region and endpoint ride the
+/// `storage.<key>` property convention (lance-namespace-impls dir.rs
+/// from_properties).
+async fn connect_namespace(
+    location: &Url,
+    storage_options: &HashMap<String, String>,
+    session: &Arc<Session>,
+) -> Result<Arc<dyn LanceNamespace>> {
+    let root = location.as_str().trim_end_matches('/').to_string();
+    let mut connect = ConnectBuilder::new("dir")
+        .property("root", root)
+        .session(session.clone());
+    for (key, value) in storage_options {
+        connect = connect.property(format!("storage.{key}"), value.clone());
+    }
+    connect
+        .connect()
+        .await
+        .context("failed to connect lance Directory namespace")
 }
 
 fn quoted_string(value: &str) -> String {
@@ -6490,39 +6613,33 @@ mod tests {
     }
 
     #[test]
-    fn hetzner_endpoints_default_to_a_plain_conditional_copy() {
-        let copy_mode = |entries: &[(&str, &str)]| {
-            let mut options: HashMap<String, String> = entries
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect();
-            apply_remote_storage_defaults(&mut options);
-            options.get("aws_copy_if_not_exists").cloned()
-        };
-        let plain = Some("header:If-None-Match:*".to_owned());
-        assert_eq!(
-            copy_mode(&[("endpoint", "https://nbg1.your-objectstorage.com")]),
-            plain
+    fn the_copy_mode_is_ours_only_on_s3_without_an_explicit_one() {
+        let s3 = Url::parse("s3://bucket/prefix").unwrap();
+        let mut options = HashMap::from([(
+            "endpoint".to_owned(),
+            "https://nbg1.your-objectstorage.com".to_owned(),
+        )]);
+        apply_remote_storage_defaults(&mut options);
+        assert!(
+            copy_mode_is_ours(&s3, &options),
+            "no endpoint gets a copy mode by default: {options:?}",
         );
-        assert_eq!(
-            copy_mode(&[("aws_endpoint", "https://pond.fsn1.your-objectstorage.com")]),
-            plain,
-            "virtual-hosted endpoints carry the bucket in the host",
+        assert!(
+            !options
+                .keys()
+                .any(|key| key == "timeout" || key == "request_timeout"),
+            "the per-request timeout stays object_store's: {options:?}",
         );
-        assert_eq!(
-            copy_mode(&[
-                ("endpoint", "https://nbg1.your-objectstorage.com"),
-                ("copy_if_not_exists", "multipart"),
-            ]),
-            None,
-            "an explicit setting under either alias wins",
+        options.insert("copy_if_not_exists".to_owned(), "multipart".to_owned());
+        assert!(
+            !copy_mode_is_ours(&s3, &options),
+            "an explicit mode under either alias is used as given",
         );
-        assert_eq!(
-            copy_mode(&[("endpoint", "http://127.0.0.1:9000")]),
-            None,
-            "other endpoints keep Lance's default",
+        let gcs = Url::parse("gs://bucket/prefix").unwrap();
+        assert!(
+            !copy_mode_is_ours(&gcs, &HashMap::new()),
+            "only S3 falls back"
         );
-        assert_eq!(copy_mode(&[]), None, "AWS keeps Lance's default");
     }
 
     #[test]

@@ -2662,6 +2662,7 @@ fn check_failure_class(failure: &CheckFailure) -> &'static str {
 fn check_note_class(note: &CheckNote) -> &'static str {
     match note {
         CheckNote::CopyOverwritesExisting => "copy_overwrites_existing",
+        CheckNote::PlainCopyFallback => "plain_copy_fallback",
     }
 }
 

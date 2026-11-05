@@ -1516,7 +1516,7 @@ access_key_id     = "AKIA456"
 secret_access_key_command = "op read op://vault/pond/secret"
 region            = "fsn1"
 virtual_hosted_style_request = false
-extra = { request_timeout = "60 seconds" }
+extra = { timeout = "60 seconds" }
 "#,
             )?;
             let config = Config::load("config.toml").expect("config loads");
@@ -1531,7 +1531,7 @@ extra = { request_timeout = "60 seconds" }
                 Some("op read op://vault/pond/secret"),
             );
             assert_eq!(work.virtual_hosted_style_request, Some(false));
-            assert_eq!(work.extra["request_timeout"], "60 seconds");
+            assert_eq!(work.extra["timeout"], "60 seconds");
             Ok(())
         });
     }
