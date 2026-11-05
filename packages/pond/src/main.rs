@@ -2728,7 +2728,7 @@ async fn run_storage_command(
                     let binding = resolved.binding.describe();
                     match pond::substrate::storage_check(&resolved).await {
                         Ok(notes) => {
-                            output(&storage_check_json(&url, Some(&binding), Ok(&notes))?)?
+                            output(&storage_check_json(&url, Some(&binding), Ok(&notes))?)?;
                         }
                         Err(failure) => {
                             let code = check_failure_exit_code(&failure);
