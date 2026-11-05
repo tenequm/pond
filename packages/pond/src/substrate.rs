@@ -705,9 +705,11 @@ fn strip_one_newline(mut text: String) -> String {
     text
 }
 
-/// `pond storage check` failure classes, each with its own exit code at the
-/// CLI so cron and CI can branch on them. Display carries only the
-/// fix-naming lead; the underlying error is exposed separately through
+/// `pond storage check` failure classes, each with a documented exit code at
+/// the CLI so cron and CI can branch on them (a missing conditional put and a
+/// rejected create-only copy share one: each is a write primitive Lance needs
+/// from the backend). Display carries only the fix-naming lead; the
+/// underlying error is exposed separately through
 /// [`CheckFailure::concise_cause`] so surfaces stay one readable line
 /// instead of trailing the upstream chain (Lance flattens its inner errors
 /// into each level's Display, so the raw chain prints the same failure
@@ -888,11 +890,18 @@ pub async fn storage_check(
         }
         // Lance creates every table's namespace marker through this copy.
         let copy = object_store::path::Path::from(format!("{path}.copy"));
-        let first_copy = store.inner.copy_if_not_exists(&path, &copy).await;
-        let copy_overwrites = match &first_copy {
-            Ok(()) => store.inner.copy_if_not_exists(&path, &copy).await.is_ok(),
-            Err(_) => false,
-        };
+        let mut first_copy = store.inner.copy_if_not_exists(&path, &copy).await;
+        // The copy key is fresh, so "exists" with the key present is a retry
+        // meeting its own first attempt (a lost ack), not a refusal.
+        if matches!(
+            first_copy,
+            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. })
+        ) && store.inner.head(&copy).await.is_ok()
+        {
+            first_copy = Ok(());
+        }
+        let copy_overwrites =
+            first_copy.is_ok() && store.inner.copy_if_not_exists(&path, &copy).await.is_ok();
         // Even a copy that errored may have landed (a lost ack).
         let _ = store.inner.delete(&copy).await;
         match first_copy {
@@ -5718,7 +5727,8 @@ async fn backfill_missing_columns(
 }
 /// Object-store defaults injected for any non-local pond location. Each key
 /// is only set when neither the user-provided key nor its env-var-form alias
-/// is already present, so explicit overrides in `[storage]` always win.
+/// is already present, so an explicit override in a creds set's `extra`
+/// always wins.
 /// `aws_unsigned_payload` is gated on a custom endpoint (the marker for
 /// S3-compatible stores like Hetzner, MinIO, R2), where the SHA256 payload
 /// signature is wasted work the server does not validate. On Hetzner,
@@ -5742,17 +5752,15 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     // under this. We keep it deliberately tight as a HARD BARRIER: a single
     // request exceeding 60s means a design/infra problem to fix (chunk the read,
     // use change-data-feed, fix the endpoint), never something to paper over with
-    // a longer timeout. An explicit `[storage]` override still wins.
+    // a longer timeout. An explicit `extra` override still wins.
     set_default(options, &["request_timeout"], "60 seconds");
-    let endpoint = options
-        .iter()
-        .find(|(k, _)| {
-            ["aws_endpoint", "endpoint"]
-                .iter()
-                .any(|alias| k.eq_ignore_ascii_case(alias))
-        })
-        .map(|(_, v)| v.clone());
-    let Some(endpoint) = endpoint else {
+    // Canonical alias first: that is the one Lance uses when both are set.
+    let Some(endpoint) = ["aws_endpoint", "endpoint"].iter().find_map(|alias| {
+        options
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(alias))
+            .map(|(_, value)| value.clone())
+    }) else {
         return;
     };
     set_default(
@@ -5760,13 +5768,10 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
         &["aws_unsigned_payload", "unsigned_payload"],
         "true",
     );
-    let hetzner = Url::parse(&endpoint)
-        .ok()
-        .and_then(|url| {
-            url.host_str()
-                .map(|host| host.ends_with(".your-objectstorage.com"))
-        })
-        .unwrap_or(false);
+    let hetzner = Url::parse(&endpoint).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| host.ends_with(".your-objectstorage.com"))
+    });
     if hetzner {
         set_default(
             options,

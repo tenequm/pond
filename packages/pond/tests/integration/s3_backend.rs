@@ -62,7 +62,7 @@ impl S3Route for CephPartCopy {
     }
 }
 
-async fn spawn_s3s_fs(bucket: &str, ceph_part_copy: bool) -> anyhow::Result<S3sFixture> {
+async fn spawn_s3s_fs(bucket: &str, route: Option<CephPartCopy>) -> anyhow::Result<S3sFixture> {
     let root = TempDir::new()?;
     // s3s-fs maps `s3://<bucket>/<key>` to `<root>/<bucket>/<key>`; Lance's
     // S3 provider does not create buckets, so the dir must exist up front.
@@ -71,8 +71,8 @@ async fn spawn_s3s_fs(bucket: &str, ceph_part_copy: bool) -> anyhow::Result<S3sF
     let fs = FileSystem::new(root.path()).map_err(|e| anyhow::anyhow!("FileSystem::new: {e:?}"))?;
     let mut b = S3ServiceBuilder::new(fs);
     b.set_auth(SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY));
-    if ceph_part_copy {
-        b.set_route(CephPartCopy);
+    if let Some(route) = route {
+        b.set_route(route);
     }
     let service = b.build();
 
@@ -135,7 +135,7 @@ async fn config_check_probe_passes_and_classifies_auth_failure() -> anyhow::Resu
     use pond::substrate::{CheckFailure, StorageUrl, storage_check};
     use std::collections::BTreeMap;
 
-    let fx = spawn_s3s_fs("pond-check", false).await?;
+    let fx = spawn_s3s_fs("pond-check", None).await?;
     let endpoint_host = fx.endpoint.trim_start_matches("http://");
     let url = StorageUrl::parse(&format!("s3+http://{endpoint_host}/pond-check/data"))?;
     let mut creds = BTreeMap::new();
@@ -167,7 +167,7 @@ async fn config_check_probe_passes_and_classifies_auth_failure() -> anyhow::Resu
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3s_fs_in_process_round_trips_a_session() -> anyhow::Result<()> {
-    let fx = spawn_s3s_fs("pond", false).await?;
+    let fx = spawn_s3s_fs("pond", None).await?;
     let url = Url::parse("s3://pond/data")?;
     let store = Store::open_with_options(
         &url,
@@ -191,7 +191,7 @@ async fn config_check_fails_when_the_table_creation_copy_is_rejected() -> anyhow
     use pond::substrate::{CheckFailure, StorageUrl, storage_check};
     use std::collections::BTreeMap;
 
-    let fx = spawn_s3s_fs("pond-ceph", true).await?;
+    let fx = spawn_s3s_fs("pond-ceph", Some(CephPartCopy)).await?;
     let endpoint_host = fx.endpoint.trim_start_matches("http://");
     let url = StorageUrl::parse(&format!("s3+http://{endpoint_host}/pond-ceph/data"))?;
     let mut set = CredsSet {
@@ -220,7 +220,7 @@ async fn config_check_fails_when_the_table_creation_copy_is_rejected() -> anyhow
 /// the plain CopyObject pond defaults to on Hetzner can.
 #[tokio::test(flavor = "multi_thread")]
 async fn plain_copy_creates_tables_on_a_ceph_like_backend() -> anyhow::Result<()> {
-    let fx = spawn_s3s_fs("pond", true).await?;
+    let fx = spawn_s3s_fs("pond", Some(CephPartCopy)).await?;
     let Err(error) = Store::open_with_options(
         &Url::parse("s3://pond/default-copy")?,
         storage_options(&fx.endpoint),
@@ -257,6 +257,7 @@ async fn plain_copy_creates_tables_on_a_ceph_like_backend() -> anyhow::Result<()
 // stat-then-write (crates/s3s-fs/src/s3.rs:691 -> :749), so two concurrent
 // `PutMode::Create` calls can both pass the existence check, both write, and
 // the second silently overwrites the first. Real S3, Hetzner (Ceph RGW),
-// MinIO, and R2 do this atomically; s3s-fs does not. The smoke test above is
-// sufficient to verify pond's `s3://` wire path; OCC must be verified against
-// a real bucket via `cargo bench --bench backend_bench -- --s3-url s3://...`.
+// MinIO, and R2 do this atomically; s3s-fs does not. The
+// `s3s_fs_in_process_round_trips_a_session` smoke test is sufficient to verify
+// pond's `s3://` wire path; OCC must be verified against a real bucket via
+// `cargo bench --bench backend_bench -- --s3-url s3://...`.
