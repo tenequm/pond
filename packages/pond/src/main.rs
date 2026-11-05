@@ -2633,12 +2633,13 @@ async fn run_config_command(
 }
 
 /// Map a [`CheckFailure`] onto the documented `pond storage check` exit
-/// codes (3 no creds, 4 auth failed, 5 OCC unsupported, 1 other IO).
+/// codes (3 no creds, 4 auth failed, 5 a conditional write the store lacks,
+/// 1 other IO).
 fn check_failure_exit_code(failure: &CheckFailure) -> i32 {
     match failure {
         CheckFailure::NoCreds { .. } => 3,
         CheckFailure::Auth { .. } => 4,
-        CheckFailure::OccUnsupported { .. } => 5,
+        CheckFailure::OccUnsupported { .. } | CheckFailure::CopyRejected { .. } => 5,
         CheckFailure::Io { .. } => 1,
     }
 }
@@ -2650,6 +2651,7 @@ fn check_failure_class(failure: &CheckFailure) -> &'static str {
         CheckFailure::NoCreds { .. } => "no_creds",
         CheckFailure::Auth { .. } => "auth",
         CheckFailure::OccUnsupported { .. } => "occ_unsupported",
+        CheckFailure::CopyRejected { .. } => "copy_rejected",
         CheckFailure::Io { .. } => "io",
     }
 }

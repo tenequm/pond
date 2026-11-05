@@ -724,6 +724,10 @@ pub enum CheckFailure {
         "backend does not enforce conditional writes (If-None-Match); concurrent pond writers would corrupt each other - {detail}"
     )]
     OccUnsupported { detail: String },
+    #[error(
+        "backend rejects the create-only copy Lance creates tables with, so no table can be created here; try `extra = {{ aws_copy_if_not_exists = \"header:If-None-Match:*\" }}` on the creds set"
+    )]
+    CopyRejected { source: anyhow::Error },
     #[error("storage probe failed")]
     Io { source: anyhow::Error },
 }
@@ -736,7 +740,10 @@ impl CheckFailure {
     /// `detail` is already curated into its Display.
     pub fn concise_cause(&self) -> Option<String> {
         let source = match self {
-            Self::NoCreds { source } | Self::Auth { source, .. } | Self::Io { source } => source,
+            Self::NoCreds { source }
+            | Self::Auth { source, .. }
+            | Self::CopyRejected { source }
+            | Self::Io { source } => source,
             Self::OccUnsupported { .. } => return None,
         };
         Some(condense_error_chain(source))
@@ -801,7 +808,8 @@ impl std::fmt::Display for CheckNote {
 /// Probe a resolved storage destination end-to-end (spec.md#substrate): a
 /// conditional `PutMode::Create` pair proving the `If-None-Match` -> 412 OCC
 /// primitive Lance's commit handler relies on, read-back, a create-only copy
-/// pair for the [`CheckNote`] advisory, then delete of the synthetic keys.
+/// pair (a rejected copy fails the check, an overwriting one is the
+/// [`CheckNote`] advisory), then delete of the synthetic keys.
 pub async fn storage_check(
     resolved: &ResolvedStorage,
 ) -> std::result::Result<Vec<CheckNote>, CheckFailure> {
@@ -815,12 +823,14 @@ pub async fn storage_check(
         resolved.lance_url().as_str().trim_end_matches('/'),
         uuid::Uuid::now_v7(),
     );
+    // Probe with the options a real open uses, defaults included.
+    let mut options = resolved.options.clone();
+    if config::local_path(resolved.lance_url()).is_none() {
+        apply_remote_storage_defaults(&mut options);
+    }
     let params = ObjectStoreParams {
-        storage_options_accessor: (!resolved.options.is_empty()).then(|| {
-            Arc::new(StorageOptionsAccessor::with_static_options(
-                resolved.options.clone(),
-            ))
-        }),
+        storage_options_accessor: (!options.is_empty())
+            .then(|| Arc::new(StorageOptionsAccessor::with_static_options(options))),
         ..Default::default()
     };
     let registry = Arc::new(ObjectStoreRegistry::default());
@@ -876,16 +886,26 @@ pub async fn storage_check(
                 source: anyhow!("read-back returned different bytes than written"),
             });
         }
-        // Advisory only, so any error here means "not observed": a backend
-        // without conditional copy returns NotSupported, and Lance's marker
-        // then falls back to the conditional put proven above.
+        // Lance creates every table's namespace marker through this copy.
         let copy = object_store::path::Path::from(format!("{path}.copy"));
-        let copy_overwrites = match store.inner.copy_if_not_exists(&path, &copy).await {
+        let first_copy = store.inner.copy_if_not_exists(&path, &copy).await;
+        let copy_overwrites = match &first_copy {
             Ok(()) => store.inner.copy_if_not_exists(&path, &copy).await.is_ok(),
             Err(_) => false,
         };
         // Even a copy that errored may have landed (a lost ack).
         let _ = store.inner.delete(&copy).await;
+        match first_copy {
+            // Without a conditional copy, Lance's marker falls back to the
+            // conditional put proven above.
+            Ok(()) | Err(OsError::NotSupported { .. } | OsError::NotImplemented { .. }) => {}
+            Err(error) => {
+                return Err(match classify(error, "create-only copy probe") {
+                    CheckFailure::Io { source } => CheckFailure::CopyRejected { source },
+                    auth => auth,
+                });
+            }
+        }
         Ok(if copy_overwrites {
             vec![CheckNote::CopyOverwritesExisting]
         } else {
@@ -5701,7 +5721,10 @@ async fn backfill_missing_columns(
 /// is already present, so explicit overrides in `[storage]` always win.
 /// `aws_unsigned_payload` is gated on a custom endpoint (the marker for
 /// S3-compatible stores like Hetzner, MinIO, R2), where the SHA256 payload
-/// signature is wasted work the server does not validate.
+/// signature is wasted work the server does not validate. On Hetzner,
+/// `aws_copy_if_not_exists` moves off Lance 14's multipart default: object_store
+/// sends that copy's part request without `Content-Length`, Hetzner answers 411,
+/// and no table could be created; a plain CopyObject works there.
 fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     fn set_default(options: &mut HashMap<String, String>, aliases: &[&str], value: &str) {
         if aliases
@@ -5721,14 +5744,34 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
     // use change-data-feed, fix the endpoint), never something to paper over with
     // a longer timeout. An explicit `[storage]` override still wins.
     set_default(options, &["request_timeout"], "60 seconds");
-    let has_custom_endpoint = ["aws_endpoint", "endpoint"]
+    let endpoint = options
         .iter()
-        .any(|alias| options.keys().any(|k| k.eq_ignore_ascii_case(alias)));
-    if has_custom_endpoint {
+        .find(|(k, _)| {
+            ["aws_endpoint", "endpoint"]
+                .iter()
+                .any(|alias| k.eq_ignore_ascii_case(alias))
+        })
+        .map(|(_, v)| v.clone());
+    let Some(endpoint) = endpoint else {
+        return;
+    };
+    set_default(
+        options,
+        &["aws_unsigned_payload", "unsigned_payload"],
+        "true",
+    );
+    let hetzner = Url::parse(&endpoint)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.ends_with(".your-objectstorage.com"))
+        })
+        .unwrap_or(false);
+    if hetzner {
         set_default(
             options,
-            &["aws_unsigned_payload", "unsigned_payload"],
-            "true",
+            &["aws_copy_if_not_exists", "copy_if_not_exists"],
+            "header:If-None-Match:*",
         );
     }
 }
@@ -6439,6 +6482,42 @@ mod tests {
             .unwrap();
         let notes = storage_check(&resolved).await.expect("memory probe passes");
         assert!(notes.is_empty(), "memory copies are atomic: {notes:?}");
+    }
+
+    #[test]
+    fn hetzner_endpoints_default_to_a_plain_conditional_copy() {
+        let copy_mode = |entries: &[(&str, &str)]| {
+            let mut options: HashMap<String, String> = entries
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            apply_remote_storage_defaults(&mut options);
+            options.get("aws_copy_if_not_exists").cloned()
+        };
+        let plain = Some("header:If-None-Match:*".to_owned());
+        assert_eq!(
+            copy_mode(&[("endpoint", "https://nbg1.your-objectstorage.com")]),
+            plain
+        );
+        assert_eq!(
+            copy_mode(&[("aws_endpoint", "https://pond.fsn1.your-objectstorage.com")]),
+            plain,
+            "virtual-hosted endpoints carry the bucket in the host",
+        );
+        assert_eq!(
+            copy_mode(&[
+                ("endpoint", "https://nbg1.your-objectstorage.com"),
+                ("copy_if_not_exists", "multipart"),
+            ]),
+            None,
+            "an explicit setting under either alias wins",
+        );
+        assert_eq!(
+            copy_mode(&[("endpoint", "http://127.0.0.1:9000")]),
+            None,
+            "other endpoints keep Lance's default",
+        );
+        assert_eq!(copy_mode(&[]), None, "AWS keeps Lance's default");
     }
 
     #[test]

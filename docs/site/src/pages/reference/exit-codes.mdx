@@ -18,7 +18,7 @@ Branch on exit codes, not output text.
 | 3 | a target file already exists (nothing was written) | resume |
 | 4 | auth failed | storage, copy |
 | 4 | could not write the restored files (no restored session file was left behind) | resume |
-| 5 | store lacks conditional-put (OCC) | storage, copy |
+| 5 | store lacks conditional-put (OCC), or rejects the copy Lance creates tables with | storage, copy |
 | 6 | destination missing source rows, or duplicate destination rows | copy |
 
 Codes are scoped to the command, so the same number can mean different things across families - always branch on the pair, not the number alone.
