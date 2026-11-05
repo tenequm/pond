@@ -28,7 +28,7 @@ pond storage check s3+https://nbg1.your-objectstorage.com/my-pond
 
 Parses, resolves creds, runs a conditional put, reads back, deletes. Exit `0` = usable. See [Exit codes](/reference/exit-codes).
 
-The check also runs the create-only copy Lance creates every table with. A backend that rejects it fails the check with exit `5`, and the message names the setting to try. On Hetzner, pond already uses a plain copy there, because the multipart copy Lance uses by default is refused with 411.
+The check also runs the create-only copy Lance creates every table with. A backend that rejects it fails the check with exit `5`, and the message names the setting to try. Hetzner refuses the multipart copy Lance uses by default with 411, so on Hetzner endpoints pond uses a plain copy instead.
 
 A passing check can still print a `check: note`. On backends that honor `If-None-Match` on puts but not on copies (Hetzner), it says the namespace markers Lance writes when it creates a table are not atomic there. Commits are unaffected; create a new store from one host at a time.
 

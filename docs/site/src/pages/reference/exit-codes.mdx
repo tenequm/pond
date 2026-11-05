@@ -14,11 +14,11 @@ Branch on exit codes, not output text.
 | 2 | URL parse error | storage check, storage use |
 | 2 | disallowed statement (SQL surface is read-only) | sql |
 | 2 | unanswerable request - unknown adapter, ingest-only client, lineage too deep | resume |
-| 3 | no credentials matched | storage, copy |
+| 3 | no credentials matched | storage check, storage use |
 | 3 | a target file already exists (nothing was written) | resume |
-| 4 | auth failed | storage, copy |
+| 4 | auth failed | storage check, storage use |
 | 4 | could not write the restored files (no restored session file was left behind) | resume |
-| 5 | store lacks conditional-put (OCC), or rejects the copy Lance creates tables with | storage, copy |
+| 5 | store lacks conditional-put (OCC), or rejects the copy Lance creates tables with | storage check, storage use |
 | 6 | destination missing source rows, or duplicate destination rows | copy |
 
 Codes are scoped to the command, so the same number can mean different things across families - always branch on the pair, not the number alone.

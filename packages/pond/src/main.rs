@@ -1024,9 +1024,10 @@ enum StorageCmd {
     /// Probe a destination end-to-end.
     ///
     /// Parse, creds resolution, conditional put (the OCC primitive Lance's
-    /// commit handler relies on), read-back, delete. Exit codes: 0 ok,
-    /// 1 I/O error (network/DNS/bucket unreachable), 2 parse error,
-    /// 3 no creds, 4 auth failed, 5 OCC unsupported.
+    /// commit handler relies on), read-back, the create-only copy Lance
+    /// creates tables with, delete. Exit codes: 0 ok, 1 I/O error
+    /// (network/DNS/bucket unreachable), 2 parse error, 3 no creds, 4 auth
+    /// failed, 5 OCC unsupported or table-creation copy rejected.
     #[command(after_long_help = "Examples:
   pond storage check                                  probe the configured destination
   pond storage check s3+https://host/bucket/prefix    probe a candidate before switching")]
@@ -2633,8 +2634,8 @@ async fn run_config_command(
 }
 
 /// Map a [`CheckFailure`] onto the documented `pond storage check` exit
-/// codes (3 no creds, 4 auth failed, 5 a conditional write the store lacks,
-/// 1 other IO).
+/// codes (3 no creds, 4 auth failed, 5 OCC unsupported or table-creation copy
+/// rejected, 1 other IO).
 fn check_failure_exit_code(failure: &CheckFailure) -> i32 {
     match failure {
         CheckFailure::NoCreds { .. } => 3,
