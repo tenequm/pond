@@ -1765,6 +1765,14 @@ impl Store {
         let Some(rowids) = map.session_row_ids(session_id) else {
             return Ok(None);
         };
+        // The map answers `Some(empty)` both for a session with no rows and
+        // for one it does not hold (a chain damaged by an older binary). The
+        // caller already resolved the session, so scan rather than serve an
+        // empty transcript the store contradicts - `message_view`'s guard,
+        // mirrored.
+        if rowids.is_empty() {
+            return Ok(None);
+        }
         let (entries, misses) = map.hydrate(&rowids);
         if !misses.is_empty() {
             return Ok(None);
@@ -2032,7 +2040,7 @@ impl Store {
             );
         }
         if let Some(set) = self
-            .extend_rowmap_coordinated(cache_dir, &store_key, version)
+            .extend_rowmap_coordinated(cache_dir, &store_key)
             .await?
         {
             self.rowmap.store(Some(Arc::new(set)));
@@ -2121,10 +2129,21 @@ impl Store {
         let chain = discover_chain(cache_dir, &self.store_key())?;
         let set = RowMetaSet::open(&chain).ok()?;
         let live = self.handle.dataset(Table::Messages).await.ok()?;
-        if set.len() > live.count_rows(None).await.ok()? {
+        let live_rows = live.count_rows(None).await.ok()?;
+        if set.len() > live_rows {
             tracing::debug!(
                 store = self.store_key(),
                 "cached rowmap holds more rows than the store; ignoring it for the estimate"
+            );
+            return None;
+        }
+        // A shorter chain is normally just trailing - but at the store's own
+        // version it miscounts the exact rows it claims to describe, and the
+        // sessions it lacks would gate pending forever.
+        if set.version() == live.version().version && set.len() < live_rows {
+            tracing::debug!(
+                store = self.store_key(),
+                "cached rowmap miscounts the store at its own version; ignoring it for the estimate"
             );
             return None;
         }
@@ -2164,16 +2183,15 @@ impl Store {
         Ok(())
     }
 
-    /// Extend the chain to `version` under the build `flock` (spec: lock the
-    /// build only; atomic rename already prevents corruption). `None` when
-    /// another local process holds the lock - this caller keeps its current map
-    /// (or the take_rows fallback) until a later refresh opens what the winner
-    /// published.
+    /// Extend the chain to the store's current version under the build `flock`
+    /// (spec: lock the build only; atomic rename already prevents corruption).
+    /// `None` when another local process holds the lock - this caller keeps its
+    /// current map (or the take_rows fallback) until a later refresh opens what
+    /// the winner published.
     async fn extend_rowmap_coordinated(
         &self,
         cache_dir: &Path,
         store_key: &str,
-        version: u64,
     ) -> Result<Option<RowMetaSet>> {
         let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
         let lock = std::fs::File::create(&lock_path)
@@ -2186,13 +2204,25 @@ impl Store {
             }
         }
 
+        // One dataset snapshot for the version label, the probes and the delta
+        // scan. The caller's version read can be stale by the time the lock is
+        // held: an append landing in between once made the Complete probe fail
+        // for a chain that was complete at its own version, and the delta -
+        // computed against the newer store but named for the stale version -
+        // renamed over the chain's newest real segment, losing its rows for
+        // good. Pinning everything to one checkout makes a mislabeled segment
+        // impossible; if the store moves on mid-build, the published chain is
+        // simply trailing and the next ensure extends it.
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let version = dataset.version().version;
+
         // Re-check after acquiring: a sibling may have published `version`. An
         // open failure here (older MAGIC after an upgrade, or corruption) falls
         // through to the purge+rebuild below rather than erroring.
         if let Some(chain) = discover_chain(cache_dir, store_key)
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
-            && self.rowmap_matches_store(&set, Coverage::Complete).await?
+            && Self::rowmap_matches_dataset(&dataset, &set, Coverage::Complete).await?
         {
             return Ok(Some(set));
         }
@@ -2212,10 +2242,29 @@ impl Store {
                 // A chain from a previous store at this path is worse than no
                 // chain: extending it would layer this store's new rows onto
                 // another store's rows and call the result current.
-                Ok(set) if !self.rowmap_matches_store(&set, Coverage::Trailing).await? => {
+                Ok(set)
+                    if !Self::rowmap_matches_dataset(&dataset, &set, Coverage::Trailing)
+                        .await? =>
+                {
                     tracing::warn!(
                         store = store_key,
                         "cached rowmap describes a different store at this path; rebuilding"
+                    );
+                    Self::purge_rowmaps(cache_dir, store_key);
+                    None
+                }
+                // At the store's own version the re-check above already failed
+                // Complete coverage, so the chain miscounts the exact rows it
+                // claims to describe (a chain damaged by an older binary);
+                // above it, the store was rolled back under a cached chain.
+                // Neither can be repaired by appending - the old code layered
+                // an empty delta and republished the short chain forever.
+                Ok(set) if set.version() >= version => {
+                    tracing::warn!(
+                        store = store_key,
+                        version,
+                        chain_version = set.version(),
+                        "cached rowmap miscounts the store at its own version; rebuilding"
                     );
                     Self::purge_rowmaps(cache_dir, store_key);
                     None
@@ -2229,11 +2278,13 @@ impl Store {
             },
             None => None,
         };
-        // A row-id-keyed append delta (None on a reclaimed base or net deletion)
-        // decides the path.
+        // A row-id-keyed append delta (None on a reclaimed base, a net
+        // deletion, or a chain whose extension would not reach the pinned row
+        // count) decides the path.
         let delta = match &existing {
             Some((_, set)) => {
                 self.collect_row_metas_delta(
+                    &dataset,
                     set.version(),
                     set.max_row_id().unwrap_or(0),
                     set.len(),
@@ -2260,14 +2311,24 @@ impl Store {
                 set.compact_into(&path, version, entries)?;
                 version
             }
-            // No chain, or a reclaimed base / deletion since it: full scan -> base.
+            // No chain, or one that can't be extended (reclaimed base, deletion,
+            // or a miscounting chain): full scan -> base. Purge the rejected
+            // chain first - a rebuild labeled below a leftover segment's version
+            // would lose to it in `discover_chain`, and a same-version delta
+            // would double its rows.
             _ => {
+                if chain.is_some() {
+                    Self::purge_rowmaps(cache_dir, store_key);
+                }
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
                 // Streamed straight into the segment; only a store with no
                 // fragment order that yields ascending row ids falls back to
                 // collecting the corpus first.
-                if !self.build_rowmap_from_scan(&path, version).await? {
-                    let entries = self.collect_row_metas().await?;
+                if !self
+                    .build_rowmap_from_scan(&dataset, &path, version)
+                    .await?
+                {
+                    let entries = Self::collect_row_metas_on(&dataset).await?;
                     RowMetaMap::build(&path, version, entries)?;
                 }
                 version
@@ -2751,12 +2812,17 @@ impl Store {
     /// `RowMetaMap::build`. That decision is made from fragment metadata before
     /// a single data page is read, so the fallback does not pay for a scan it
     /// throws away.
-    async fn build_rowmap_from_scan(&self, path: &Path, version: u64) -> Result<bool> {
-        // One dataset handle for the plan, the row count and the scan: a
-        // re-`latest()` between them could plan against a manifest the scan no
-        // longer reads.
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let Some(fragments) = Self::ascending_row_id_fragments(&dataset).await? else {
+    async fn build_rowmap_from_scan(
+        &self,
+        dataset: &Dataset,
+        path: &Path,
+        version: u64,
+    ) -> Result<bool> {
+        // The caller's pinned dataset serves the plan, the row count and the
+        // scan: a re-`latest()` between them could plan against a manifest the
+        // scan no longer reads, or label the segment with a version the rows
+        // don't describe.
+        let Some(fragments) = Self::ascending_row_id_fragments(dataset).await? else {
             crate::rowmap::note_rowmap_scan_fallback();
             tracing::warn!(
                 store = %self.handle.location(),
@@ -2869,10 +2935,14 @@ impl Store {
 
     pub async fn message_store_probe(&self) -> Result<MessageStoreProbe> {
         let dataset = self.handle.dataset(Table::Messages).await?;
+        Self::message_store_probe_on(&dataset).await
+    }
+
+    /// [`Self::message_store_probe`] against a caller-pinned dataset, so the
+    /// rowmap build validates against the exact snapshot it labels.
+    async fn message_store_probe_on(dataset: &Dataset) -> Result<MessageStoreProbe> {
         let row_count = dataset.count_rows(None).await?;
-        let mut stream = self
-            .message_store_probe_scanner()
-            .await?
+        let mut stream = Self::message_store_probe_scanner(dataset)?
             .try_into_stream()
             .await?;
         let mut oldest_messages = Vec::new();
@@ -2893,8 +2963,9 @@ impl Store {
 
     /// The probe's own scanner, shared with the #310 regression test so the plan
     /// it asserts is the one the probe runs.
-    async fn message_store_probe_scanner(&self) -> Result<lance::dataset::scanner::Scanner> {
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+    fn message_store_probe_scanner(dataset: &Dataset) -> Result<lance::dataset::scanner::Scanner> {
+        let mut scanner = dataset.scan();
+        scanner.prefilter(true);
         scanner.with_row_id();
         scanner.project(&["id"])?;
         scanner.limit(Some(Self::ROWMAP_PROBE_ROWS), None)?;
@@ -2907,8 +2978,15 @@ impl Store {
     /// dominates the bytes, so this holds the whole corpus and the streaming
     /// path above is what a cold build normally takes.
     pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
-        let row_count = self.handle.count_rows(Table::Messages).await?;
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        Self::collect_row_metas_on(&dataset).await
+    }
+
+    /// [`Self::collect_row_metas`] against a caller-pinned dataset, so a full
+    /// rowmap rebuild reads exactly the snapshot its segment is labeled with.
+    async fn collect_row_metas_on(dataset: &Dataset) -> Result<Vec<RowMetaEntry>> {
+        let row_count = dataset.count_rows(None).await?;
+        let mut scanner = dataset.scan();
         scanner.with_row_id();
         scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
@@ -2968,10 +3046,23 @@ impl Store {
     /// for a foreign dataset. Cost is one metadata read plus one small scan per
     /// sync that finds a chain, against the hundreds of calls a sync makes.
     async fn rowmap_matches_store(&self, set: &RowMetaSet, coverage: Coverage) -> Result<bool> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        Self::rowmap_matches_dataset(&dataset, set, coverage).await
+    }
+
+    /// [`Self::rowmap_matches_store`] against a caller-pinned dataset: the
+    /// build path validates coverage and identity on the same snapshot it
+    /// labels its segments with, so a commit landing mid-build can't fail a
+    /// chain that is complete at its own version.
+    async fn rowmap_matches_dataset(
+        dataset: &Dataset,
+        set: &RowMetaSet,
+        coverage: Coverage,
+    ) -> Result<bool> {
         if set.is_empty() {
             return Ok(true);
         }
-        let probe = self.message_store_probe().await?;
+        let probe = Self::message_store_probe_on(dataset).await?;
         if coverage == Coverage::Complete && set.len() != probe.row_count {
             return Ok(false);
         }
@@ -3000,12 +3091,17 @@ impl Store {
 
     /// Row metas for the rows appended since the base segment - the input to a
     /// delta layered on a base whose high-water mark is `base_max_row_id` and
-    /// which covers `base_row_count` rows. `None` (caller rebuilds the base from
-    /// a full scan) when the chain can't be cheaply extended:
+    /// which covers `base_row_count` rows, read from the caller's pinned
+    /// `dataset`. `None` (caller rebuilds the base from a full scan) when the
+    /// chain can't be cheaply extended:
     /// - `base_version`'s manifest was reclaimed by the cleanup retention window
     ///   (spec.md#concurrency), so the version no longer resolves; or
     /// - the live row count dropped below the base: rows were deleted, and a
-    ///   pure append can't remove the base's now-stale entries.
+    ///   pure append can't remove the base's now-stale entries; or
+    /// - the extension would not land a Complete chain: a base that undercounts
+    ///   its own version (a chain damaged by an older binary) can never catch up
+    ///   through appends, because rows at or below its high-water mark are
+    ///   filtered out here forever.
     ///
     /// Stable row ids (`enable_stable_row_ids`) make this an append: embedding's
     /// `merge_update` and compaction rewrite message fragments but preserve
@@ -3015,15 +3111,16 @@ impl Store {
     /// base, which the per-segment count sums depend on.
     async fn collect_row_metas_delta(
         &self,
+        dataset: &Dataset,
         base_version: u64,
         base_max_row_id: u64,
         base_row_count: usize,
     ) -> Result<Option<Vec<RowMetaEntry>>> {
-        let dataset = self.handle.dataset(Table::Messages).await?;
         let Ok(old) = dataset.checkout_version(base_version).await else {
             return Ok(None);
         };
-        if dataset.count_rows(None).await? < base_row_count {
+        let live_rows = dataset.count_rows(None).await?;
+        if live_rows < base_row_count {
             return Ok(None);
         }
         // Restrict the scan to fragments added since the base (recent churn -
@@ -3037,24 +3134,26 @@ impl Store {
             .filter(|fragment| !old_ids.contains(&(fragment.id() as u64)))
             .map(|fragment| fragment.metadata().clone())
             .collect();
-        if added.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-        let mut scanner = dataset.scan();
-        scanner.with_fragments(added);
-        scanner.with_row_id();
-        scanner.project(&Self::ROW_META_COLUMNS)?;
-        let mut stream = scanner.try_into_stream().await?;
         let mut out = Vec::new();
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            let rowids = uint64(&batch, "_rowid")?;
-            for row in 0..batch.num_rows() {
-                let row_id = rowids.value(row);
-                if row_id > base_max_row_id {
-                    out.push(row_meta_entry(&batch, row_id, row)?);
+        if !added.is_empty() {
+            let mut scanner = dataset.scan();
+            scanner.with_fragments(added);
+            scanner.with_row_id();
+            scanner.project(&Self::ROW_META_COLUMNS)?;
+            let mut stream = scanner.try_into_stream().await?;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                let rowids = uint64(&batch, "_rowid")?;
+                for row in 0..batch.num_rows() {
+                    let row_id = rowids.value(row);
+                    if row_id > base_max_row_id {
+                        out.push(row_meta_entry(&batch, row_id, row)?);
+                    }
                 }
             }
+        }
+        if base_row_count + out.len() != live_rows {
+            return Ok(None);
         }
         Ok(Some(out))
     }
@@ -9694,7 +9793,8 @@ mod tests {
     /// Build the same store both ways and return `(streaming used, digests)`.
     async fn build_both_ways(store: &Store, dir: &Path) -> anyhow::Result<(bool, String, String)> {
         let streamed = dir.join("streamed.rmm");
-        let used = store.build_rowmap_from_scan(&streamed, 1).await?;
+        let dataset = store.handle.dataset(Table::Messages).await?;
+        let used = store.build_rowmap_from_scan(&dataset, &streamed, 1).await?;
         let collected = dir.join("collected.rmm");
         RowMetaMap::build(&collected, 1, store.collect_row_metas().await?)?;
         let streamed_digest = if used {
@@ -9848,8 +9948,9 @@ mod tests {
         std::fs::create_dir_all(&out)?;
         let before = crate::rowmap::rowmap_scan_fallbacks();
         let streamed = out.join("streamed.rmm");
+        let dataset = store.handle.dataset(Table::Messages).await?;
         assert!(
-            !store.build_rowmap_from_scan(&streamed, 1).await?,
+            !store.build_rowmap_from_scan(&dataset, &streamed, 1).await?,
             "interleaved live row ids have no ascending fragment order",
         );
         assert!(
@@ -9905,7 +10006,11 @@ mod tests {
         let before = crate::rowmap::rowmap_scan_fallbacks();
         assert!(
             !store
-                .build_rowmap_from_scan(&out.join("streamed.rmm"), 1)
+                .build_rowmap_from_scan(
+                    &store.handle.dataset(Table::Messages).await?,
+                    &out.join("streamed.rmm"),
+                    1,
+                )
                 .await?,
             "one fragment holding descending row ids cannot be reordered",
         );
@@ -9930,6 +10035,171 @@ mod tests {
         builder.ensure_rowmap(&cache).await?;
         reader.load_rowmap_if_present(&cache).await?;
         assert!(reader.rowmap_snapshot().is_some());
+        Ok(())
+    }
+
+    /// Recovery from race damage: extend used to take the caller's version
+    /// read, so an append landing between `ensure_rowmap_inner`'s version read
+    /// and its probe made the extend rename a delta - computed against the
+    /// newer store but named for the stale version - over the chain's newest
+    /// real segment. Those rows were gone for good: later deltas only take
+    /// `row_id > max_row_id`, and no rebuild trigger fired on an under-count,
+    /// so every later process installed a short map whose `session_row_ids`
+    /// answers `Some(empty)` for the lost session, which `session_view` served
+    /// as an empty transcript while the scan path still found the rows. The
+    /// race itself is now structurally impossible (extend pins one snapshot
+    /// for its version label, probes and delta), so this reproduces the
+    /// damaged chain such a binary left on disk and requires ensure to
+    /// converge out of it.
+    #[tokio::test]
+    async fn race_damaged_delta_chain_must_not_lose_rows_for_good() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let cache = temp.path().join("cache");
+
+        ingest_events(&store, conversational_events("session-a", 2)).await?;
+        store.ensure_rowmap(&cache).await?;
+
+        ingest_events(&store, conversational_events("session-b", 3)).await?;
+        store.ensure_rowmap(&cache).await?;
+        let delta_version = store.messages_version().await?;
+
+        // The append the racing ensure mislabeled its delta against.
+        ingest_events(&store, conversational_events("session-c", 1)).await?;
+
+        // The damage: session-c's rows renamed over the delta that held
+        // session-b's, chain still claiming `delta_version`.
+        let key = store.store_key();
+        let c_rows: Vec<RowMetaEntry> = store
+            .collect_row_metas()
+            .await?
+            .into_iter()
+            .filter(|entry| entry.session_id == "session-c")
+            .collect();
+        assert!(!c_rows.is_empty());
+        RowMetaMap::build(
+            &RowMetaMap::delta_path(&cache, &key, delta_version),
+            delta_version,
+            c_rows,
+        )?;
+
+        // Whatever the race wrote, a fresh process must converge to a map
+        // covering every store row.
+        let reader = Store::open_local(temp.path()).await?;
+        reader.ensure_rowmap(&cache).await?;
+        let set = reader.rowmap_snapshot().context("map installed")?;
+        let rows = reader
+            .handle
+            .dataset(Table::Messages)
+            .await?
+            .count_rows(None)
+            .await?;
+        assert_eq!(set.len(), rows, "installed map must cover every store row");
+
+        // And the map-served page must match the store scan.
+        let params = SessionViewParams {
+            at_message_id: None,
+            after_message_id: None,
+            before_message_id: None,
+            limit: 50,
+            budget_bytes: 1_000_000,
+            session_from: SessionFrom::Start,
+        };
+        let page = match reader.session_view("session-b", params).await? {
+            GetLookup::Found(page) => page,
+            other => panic!("expected a page, got {other:?}"),
+        };
+        assert_eq!(
+            page.messages.len(),
+            reader
+                .scan_conversational_messages("session-b")
+                .await?
+                .len(),
+            "resident map served a session it does not hold",
+        );
+        Ok(())
+    }
+
+    /// A chain that sits at the store's current version but holds fewer rows
+    /// than the store - however it got short - must never be trusted. The old
+    /// code noticed (the Complete probe failed) but responded by extending:
+    /// the delta at an unchanged version was empty, so it republished the
+    /// short chain, installed it, and `open_cached_rowmap` (the `pond status`
+    /// estimate) accepted it too, gating the missing sessions pending forever.
+    #[tokio::test]
+    async fn a_short_chain_at_the_head_version_is_rebuilt_not_trusted() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        ingest_events(&store, conversational_events("session-a", 2)).await?;
+        ingest_events(&store, conversational_events("session-b", 3)).await?;
+        let version = store.messages_version().await?;
+        let rows = store
+            .handle
+            .dataset(Table::Messages)
+            .await?
+            .count_rows(None)
+            .await?;
+
+        // Hand-build a head-version base missing session-b's rows.
+        let cache = temp.path().join("cache");
+        std::fs::create_dir_all(&cache)?;
+        let key = store.store_key();
+        let entries: Vec<RowMetaEntry> = store
+            .collect_row_metas()
+            .await?
+            .into_iter()
+            .filter(|entry| entry.session_id != "session-b")
+            .collect();
+        assert!(!entries.is_empty() && entries.len() < rows);
+        RowMetaMap::build(
+            &RowMetaMap::path_for(&cache, &key, version),
+            version,
+            entries,
+        )?;
+
+        let reader = Store::open_local(temp.path()).await?;
+        if let Some(set) = reader.open_cached_rowmap(&cache).await {
+            assert_eq!(
+                set.len(),
+                rows,
+                "open_cached_rowmap served a short chain at the head version",
+            );
+        }
+
+        reader.ensure_rowmap(&cache).await?;
+        let set = reader.rowmap_snapshot().context("map installed")?;
+        assert_eq!(
+            set.len(),
+            rows,
+            "ensure installed a short chain instead of rebuilding",
+        );
+        Ok(())
+    }
+
+    /// A chain seeded on an EMPTY store starts from a base with no high-water
+    /// mark. The delta filter `row_id > max_row_id`, with the empty base's
+    /// watermark defaulting to 0, silently dropped row 0 - so every store
+    /// whose chain was born before its first ingest (every `pond sync` into a
+    /// fresh store) stayed short by one row, and Complete validation failed
+    /// on it forever after.
+    #[tokio::test]
+    async fn a_chain_seeded_on_an_empty_store_covers_the_first_row() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+
+        ingest_events(&store, conversational_events("session-a", 2)).await?;
+        store.ensure_rowmap(&cache).await?;
+
+        let set = store.rowmap_snapshot().context("map installed")?;
+        let rows = store
+            .handle
+            .dataset(Table::Messages)
+            .await?
+            .count_rows(None)
+            .await?;
+        assert_eq!(set.len(), rows, "the chain must cover row 0");
         Ok(())
     }
 
@@ -10533,20 +10803,18 @@ mod tests {
             "one fragment per commit, so the pruning is observable"
         );
 
-        let plan = store
-            .message_store_probe_scanner()
-            .await?
-            .explain_plan(true)
-            .await?;
+        let plan =
+            Store::message_store_probe_scanner(&store.handle.dataset(Table::Messages).await?)?
+                .explain_plan(true)
+                .await?;
         assert!(plan.contains("num_fragments=1"), "{plan}");
 
         let mut messages = store.handle.dataset(Table::Messages).await?;
         messages.delete("id = 's0-m1'").await?;
-        let plan = store
-            .message_store_probe_scanner()
-            .await?
-            .explain_plan(true)
-            .await?;
+        let plan =
+            Store::message_store_probe_scanner(&store.handle.dataset(Table::Messages).await?)?
+                .explain_plan(true)
+                .await?;
         assert!(plan.contains("num_fragments=1"), "{plan}");
         let probe = store.message_store_probe().await?;
         let oldest: Vec<&str> = probe
