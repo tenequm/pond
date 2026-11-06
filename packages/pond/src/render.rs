@@ -38,8 +38,10 @@ fn count_noun(count: usize, noun: &str) -> String {
 pub fn render_subagents_footer(children: &[crate::wire::Session], surface: Surface) -> String {
     use std::fmt::Write;
     let how = match surface {
-        Surface::Mcp => "pass an id to pond_get_session(id=...)",
-        Surface::Cli => "pass an id to `pond get-session <ID>`",
+        Surface::Mcp => {
+            "pass an id to pond_get_session(id=..., from=\"end\") to read its final turn"
+        }
+        Surface::Cli => "pass an id to `pond get-session <ID> --from end` to read its final turn",
     };
     let mut out = String::new();
     let _ = writeln!(out);
@@ -91,10 +93,11 @@ pub fn render_search_transcript(
     let subagent_note = match (default_excludes_subagents(&request.filters), surface) {
         (false, _) => "",
         (true, Surface::Mcp) => {
-            " Subagent sessions excluded; reach them via pond_sql (parent_session_id)."
+            " Subagent sessions excluded; name a subpath source_agent to search them, or open them \
+             from a parent's pond_get_session footer."
         }
         (true, Surface::Cli) => {
-            " Subagent sessions excluded; reach them via `pond sql` (parent_session_id)."
+            " Subagent sessions excluded; open them from a parent's `pond get-session` footer."
         }
     };
     let recency_note = if matches!(request.sort_by, SortBy::Recency) {
@@ -281,6 +284,8 @@ pub fn render_get_transcript(response: &GetResponse, surface: Surface) -> String
             before_remaining,
             after_remaining,
             resolved_from_message_id,
+            stored_messages,
+            trailing,
         } => {
             let prefix = match surface {
                 Surface::Mcp => "pond_get_session",
@@ -289,22 +294,38 @@ pub fn render_get_transcript(response: &GetResponse, surface: Surface) -> String
             // A partial page must announce the session total up front: a
             // header saying only the page's count reads as the whole session
             // (field-tested miss - the rest of a long session went unread).
+            // The total counts the conversational view only, so a session with
+            // more stored rows says so - "4 of 4" over 482 stored rows once read
+            // as a truncated recording (#358).
             let total = *before_remaining + messages.len() + *after_remaining;
+            let (noun, outside) = if *stored_messages > total {
+                (
+                    "conversational message",
+                    Some(format!(
+                        "{stored_messages} stored in all - messages with no conversational \
+                         text (tool-only turns, results, harness records) stay outside this view"
+                    )),
+                )
+            } else {
+                ("message", None)
+            };
             if total > messages.len() {
                 let start = *before_remaining + 1;
                 let end = *before_remaining + messages.len();
+                let outside = outside.map(|note| format!("{note}; ")).unwrap_or_default();
                 let _ = writeln!(
                     out,
-                    "{prefix}: session {}, messages {start}-{end} of {total} \
-                     (pages are bounded by limit and a size budget).",
+                    "{prefix}: session {}, {noun}s {start}-{end} of {total} \
+                     ({outside}pages are bounded by limit and a size budget).",
                     session.id,
                 );
             } else {
+                let outside = outside.map(|note| format!(" ({note})")).unwrap_or_default();
                 let _ = writeln!(
                     out,
-                    "{prefix}: session {}, {}.",
+                    "{prefix}: session {}, {}{outside}.",
                     session.id,
-                    count_noun(messages.len(), "message"),
+                    count_noun(messages.len(), noun),
                 );
             }
             // The id was a message id; say so before the transcript so the
@@ -353,12 +374,42 @@ pub fn render_get_transcript(response: &GetResponse, surface: Surface) -> String
                 let _ = writeln!(out);
                 render_message(
                     &mut out,
-                    idx + 1,
+                    Some(idx + 1),
                     message,
                     None,
                     &message.parts_summary,
                     false,
                 );
+            }
+            // A session can end in turns with no conversational text - a
+            // subagent's report is often one bare tool call - so the last page
+            // names the final turn instead of ending on a stale fragment.
+            if let Some(trailing) = trailing {
+                let turn = &trailing.final_turn;
+                let expand = match surface {
+                    Surface::Mcp => format!("pond_get_message id={}", turn.id),
+                    Surface::Cli => format!("`pond get-message {}`", turn.id),
+                };
+                let after = if messages.is_empty() && *before_remaining == 0 {
+                    format!(
+                        "... {}, none with conversational text",
+                        count_noun(trailing.count, "message")
+                    )
+                } else {
+                    format!(
+                        "... {} after the last conversational one",
+                        count_noun(trailing.count, "more message")
+                    )
+                };
+                let _ = writeln!(out);
+                let _ = writeln!(
+                    out,
+                    "{after} (tool-only turns, results, harness records). The session's final \
+                     assistant turn - {expand} expands its tool bodies, where a subagent's report \
+                     lives (budget-bounded: check target_parts_remaining):",
+                );
+                let _ = writeln!(out);
+                render_message(&mut out, None, turn, None, &turn.parts_summary, false);
             }
             let _ = writeln!(out);
             let _ = writeln!(
@@ -435,7 +486,7 @@ pub fn render_get_transcript(response: &GetResponse, surface: Surface) -> String
                 let parts: Option<&[ResponsePart]> = is_target.then_some(target_parts.as_slice());
                 render_message(
                     &mut out,
-                    idx + 1,
+                    Some(idx + 1),
                     view,
                     parts,
                     &view.parts_summary,
@@ -490,7 +541,7 @@ fn rule_line(inner: &str) -> String {
 /// is present, else one-line summaries.
 fn render_message(
     out: &mut String,
-    index: usize,
+    index: Option<usize>,
     view: &MessageView,
     parts: Option<&[ResponsePart]>,
     summary: &[PartSummary],
@@ -498,11 +549,12 @@ fn render_message(
 ) {
     use std::fmt::Write;
     let marker = if is_target { "> " } else { "" };
+    let index = index.map(|n| format!("[{n}] ")).unwrap_or_default();
     let _ = writeln!(
         out,
         "{}",
         rule_line(&format!(
-            "[{index}] {marker}{} | {} | {}",
+            "{index}{marker}{} | {} | {}",
             view.role.as_str(),
             fmt_ts(&view.timestamp),
             view.id,
@@ -704,6 +756,8 @@ mod tests {
                 before_remaining: 100,
                 after_remaining: 32,
                 resolved_from_message_id: None,
+                stored_messages: 134,
+                trailing: None,
             },
         };
         let transcript = crate::render::render_get_transcript(&partial, Surface::Mcp);
@@ -719,10 +773,106 @@ mod tests {
                 before_remaining: 0,
                 after_remaining: 0,
                 resolved_from_message_id: None,
+                stored_messages: 2,
+                trailing: None,
             },
         };
         let transcript = crate::render::render_get_transcript(&full, Surface::Cli);
         assert!(transcript.starts_with("pond get-session: session s1, 2 messages."));
+    }
+
+    /// #358: a subagent whose report is a bare tool call read as "messages
+    /// 2-4 of 4" over 482 stored rows. The header must name the stored total,
+    /// and the last page must point at the final assistant turn.
+    #[test]
+    fn session_tail_names_stored_total_and_final_turn() {
+        let ts = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let session = crate::wire::GetSession {
+            id: "s1".to_owned(),
+            source_agent: "claude-code/Explore".to_owned(),
+            project: "/p".to_owned(),
+            created_at: ts,
+        };
+        let prompt = MessageView {
+            id: "m1".to_owned(),
+            role: crate::wire::Role::User,
+            timestamp: ts,
+            text: Some("audit it".to_owned()),
+            content: None,
+            parts_summary: Vec::new(),
+        };
+        let report = MessageView {
+            id: "m-final".to_owned(),
+            role: crate::wire::Role::Assistant,
+            timestamp: ts,
+            text: None,
+            content: None,
+            parts_summary: vec![PartSummary {
+                kind: "tool_call".to_owned(),
+                label: Some("SubagentHandback".to_owned()),
+                call_id: Some("toolu_1".to_owned()),
+            }],
+        };
+        let response = |messages: Vec<MessageView>, trailing| GetResponse {
+            session: session.clone(),
+            result: GetResult::Session {
+                messages,
+                before_remaining: 0,
+                after_remaining: 0,
+                resolved_from_message_id: None,
+                stored_messages: 482,
+                trailing,
+            },
+        };
+        let trailing = |count| {
+            Some(crate::wire::TrailingView {
+                count,
+                final_turn: report.clone(),
+            })
+        };
+
+        let transcript = crate::render::render_get_transcript(
+            &response(vec![prompt.clone()], trailing(478)),
+            Surface::Mcp,
+        );
+        assert!(transcript.starts_with(
+            "pond_get_session: session s1, 1 conversational message (482 stored in all - \
+             messages with no conversational text (tool-only turns, results, harness records) \
+             stay outside this view)."
+        ));
+        assert!(transcript.contains(
+            "... 478 more messages after the last conversational one (tool-only turns, results, \
+             harness records). The session's final assistant turn - pond_get_message \
+             id=m-final expands its tool bodies"
+        ));
+        assert!(transcript.contains("| m-final ---"), "{transcript}");
+        assert!(
+            !transcript.contains("[2] assistant"),
+            "the final turn is not numbered as if it followed the page: {transcript}"
+        );
+        assert!(
+            transcript.contains("-> SubagentHandback [toolu_1]"),
+            "{transcript}"
+        );
+
+        // A session with no conversational message at all: nothing to be "after".
+        let transcript = crate::render::render_get_transcript(
+            &response(Vec::new(), trailing(482)),
+            Surface::Cli,
+        );
+        assert!(
+            transcript.contains("... 482 messages, none with conversational text (tool-only"),
+            "{transcript}"
+        );
+
+        let transcript = crate::render::render_get_transcript(
+            &response(vec![prompt.clone()], None),
+            Surface::Cli,
+        );
+        assert!(
+            !transcript.contains("after the last conversational one"),
+            "{transcript}"
+        );
     }
 
     #[test]

@@ -1520,13 +1520,15 @@ impl Store {
     }
 
     /// Whole-session view for `pond_get_session` (spec.md#protocol).
-    /// Always the conversational view (`search_text IS NOT NULL`) with one-line
-    /// part summaries - full part bodies are reached by `message_id` scope, not
-    /// here. The page is the window selected by the anchors (`after_message_id`
+    /// The page is the conversational view (non-empty `search_text`) with
+    /// one-line part summaries - full part bodies are reached by `message_id`
+    /// scope, not here. The page is the window selected by the anchors (`after_message_id`
     /// pages forward, `before_message_id` pages backward) or, with neither,
     /// `session_from` (start/end); it is bounded by `limit` and a byte budget,
     /// never cutting mid-message. `before_remaining`/`after_remaining` drive the
-    /// bidirectional page markers.
+    /// bidirectional page markers. The page that reaches the end also names an
+    /// assistant turn after the last conversational message, so a session whose
+    /// final turn is a bare tool call (a subagent's report) still surfaces it.
     pub async fn session_view(
         &self,
         session_id: &str,
@@ -1535,24 +1537,18 @@ impl Store {
         let Some(session) = self.find_session(session_id).await? else {
             return Ok(GetLookup::NotFound);
         };
-        // Map-served rows keep only the conversational subset (non-empty
-        // text), matching the scan's IsNotNull(search_text) pushdown.
-        let mut rows: Vec<ScanRow> = match self.session_scan_rows_resident(session_id).await? {
-            Some(rows) => rows.into_iter().filter(|row| row.text.is_some()).collect(),
-            None => self
-                .scan_conversational_messages(session_id)
-                .await?
-                .into_iter()
-                .map(|row| ScanRow {
-                    id: row.message_id,
-                    role: row.role,
-                    timestamp: row.timestamp,
-                    text: Some(row.text.into_inner()),
-                    content: None,
-                })
-                .collect(),
+        let mut all = match self.session_scan_rows_resident(session_id).await? {
+            Some(rows) => rows,
+            None => self.scan_all_messages(session_id, false).await?,
         };
-        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        all.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        let stored_messages = all.len();
+        let tail_start = all
+            .iter()
+            .rposition(|row| row.text.is_some())
+            .map_or(0, |pos| pos + 1);
+        let tail = all.split_off(tail_start);
+        let rows: Vec<ScanRow> = all.into_iter().filter(|row| row.text.is_some()).collect();
 
         let size = |row: &ScanRow| row.text.as_deref().map_or(0, str::len);
         let total = rows.len();
@@ -1597,28 +1593,41 @@ impl Store {
         let emitted = &rows[win_start..win_end];
         let before_remaining = win_start;
         let after_remaining = total - win_end;
-        let ids: Vec<String> = emitted.iter().map(|row| row.id.clone()).collect();
+        let final_turn = if after_remaining == 0 {
+            tail.iter().rev().find(|row| row.role == Role::Assistant)
+        } else {
+            None
+        };
+        let ids: Vec<String> = emitted
+            .iter()
+            .chain(final_turn)
+            .map(|row| row.id.clone())
+            .collect();
 
         let mut parts_by_message = self.summary_parts_for_messages(session_id, &ids).await?;
-        let messages = emitted
-            .iter()
-            .map(|row| RetrievedMessage {
-                id: row.id.clone(),
-                role: row.role,
-                timestamp: row.timestamp,
-                text: row.text.clone(),
-                content: row.content.clone(),
-                parts: parts_by_message
-                    .remove(&(session_id.to_owned(), row.id.clone()))
-                    .unwrap_or_default(),
-            })
-            .collect();
+        let mut retrieve = |row: &ScanRow| RetrievedMessage {
+            id: row.id.clone(),
+            role: row.role,
+            timestamp: row.timestamp,
+            text: row.text.clone(),
+            content: row.content.clone(),
+            parts: parts_by_message
+                .remove(&(session_id.to_owned(), row.id.clone()))
+                .unwrap_or_default(),
+        };
+        let messages = emitted.iter().map(&mut retrieve).collect();
+        let trailing = final_turn.map(|row| SessionTrailing {
+            count: tail.len(),
+            final_turn: retrieve(row),
+        });
 
         Ok(GetLookup::Found(SessionPage {
             session,
             messages,
             before_remaining,
             after_remaining,
+            stored_messages,
+            trailing,
         }))
     }
 
@@ -1650,7 +1659,7 @@ impl Store {
             {
                 rows
             }
-            _ => self.scan_all_messages(&session_id).await?,
+            _ => self.scan_all_messages(&session_id, true).await?,
         };
         // Siblings are always the conversational view: in carrier-heavy sessions
         // the system/tool rows would otherwise fill the whole window and push
@@ -1717,13 +1726,26 @@ impl Store {
         }))
     }
 
-    async fn scan_all_messages(&self, session_id: &str) -> Result<Vec<ScanRow>> {
+    /// Every message of one session - the scan twin of
+    /// [`Self::session_scan_rows_resident`], with the same empty-text-is-None
+    /// rule. `content` is read only when asked: carriers hold whole records
+    /// there, and the session view never shows a system message.
+    async fn scan_all_messages(
+        &self,
+        session_id: &str,
+        with_content: bool,
+    ) -> Result<Vec<ScanRow>> {
+        let columns: &[&str] = if with_content {
+            &["id", "timestamp", "role", "search_text", "content"]
+        } else {
+            &["id", "timestamp", "role", "search_text"]
+        };
         let batch = self
             .handle
             .scan_batch(
                 Table::Messages,
                 Some(&Predicate::Eq("session_id", session_id.into())),
-                &["id", "timestamp", "role", "search_text", "content"],
+                columns,
             )
             .await?;
         let mut rows = Vec::with_capacity(batch.num_rows());
@@ -1736,8 +1758,12 @@ impl Store {
                 id,
                 role,
                 timestamp,
-                text: string(&batch, "search_text", row)?,
-                content: string(&batch, "content", row)?,
+                text: string(&batch, "search_text", row)?.filter(|text| !text.is_empty()),
+                content: if with_content {
+                    string(&batch, "content", row)?
+                } else {
+                    None
+                },
             });
         }
         Ok(rows)
@@ -1786,51 +1812,6 @@ impl Store {
             });
         }
         Ok(Some(rows))
-    }
-
-    /// Conversational scan over one session: rows ordered by
-    /// `(timestamp, id)`, `IsNotNull("search_text")` pushed down at the
-    /// read seam (spec.md#search-prefilter-pushdown).
-    pub async fn scan_conversational_messages(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<ConversationalRow>> {
-        let filter = Predicate::And(vec![
-            Predicate::Eq("session_id", session_id.into()),
-            Predicate::IsNotNull("search_text"),
-        ]);
-        let batch = self
-            .handle
-            .scan_batch(
-                Table::Messages,
-                Some(&filter),
-                &["id", "timestamp", "role", "search_text"],
-            )
-            .await?;
-
-        let mut rows = Vec::with_capacity(batch.num_rows());
-        for row in 0..batch.num_rows() {
-            let message_id = string(&batch, "id", row)?.context("message id is null")?;
-            let role =
-                role_from_str(&string(&batch, "role", row)?.context("message role is null")?)?;
-            let timestamp = datetime(&batch, "timestamp", row)?;
-            let text_str = string(&batch, "search_text", row)?.context(
-                "search_text null after IsNotNull pushdown - storage invariant violated",
-            )?;
-            rows.push(ConversationalRow {
-                session_id: session_id.to_owned(),
-                message_id,
-                role,
-                timestamp,
-                text: SearchText(text_str),
-            });
-        }
-        rows.sort_by(|a, b| {
-            a.timestamp
-                .cmp(&b.timestamp)
-                .then_with(|| a.message_id.cmp(&b.message_id))
-        });
-        Ok(rows)
     }
 
     /// Locate the session id for a stored message. The resident meta map is
@@ -5133,26 +5114,6 @@ pub fn search_text(message: &Message, parts: &[Part]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-/// Non-empty conversational text (spec.md#search).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchText(String);
-
-impl SearchText {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl AsRef<str> for SearchText {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageWithParts {
     pub message: Message,
@@ -5210,6 +5171,19 @@ pub struct SessionPage {
     pub messages: Vec<RetrievedMessage>,
     pub before_remaining: usize,
     pub after_remaining: usize,
+    /// Every stored message of the session, conversational or not.
+    pub stored_messages: usize,
+    /// Set on the page that reaches the end when an assistant turn follows
+    /// its last conversational message.
+    pub trailing: Option<SessionTrailing>,
+}
+
+/// The non-conversational tail of a session: how many messages follow the
+/// last conversational one, and the latest assistant turn among them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTrailing {
+    pub count: usize,
+    pub final_turn: RetrievedMessage,
 }
 
 /// Canonical retrieval result for `pond_get_message`. `target.parts` is
@@ -5241,17 +5215,6 @@ struct ScanRow {
     timestamp: DateTime<Utc>,
     text: Option<String>,
     content: Option<String>,
-}
-
-/// One row of the conversational scan. `text` is non-empty by
-/// `IsNotNull("search_text")` pushdown (spec.md#search).
-#[derive(Debug, Clone)]
-pub struct ConversationalRow {
-    pub session_id: String,
-    pub message_id: String,
-    pub role: Role,
-    pub timestamp: DateTime<Utc>,
-    pub text: SearchText,
 }
 
 /// Number of leading `items` that fit within `limit` and the byte budget,
@@ -7721,6 +7684,41 @@ mod tests {
                 .await?;
             seq += 2;
         }
+        // A tool-only assistant turn plus a trailing carrier: the parts of a
+        // page (stored count, trailing final turn) neither path may drop.
+        let at = |micros| DateTime::from_timestamp_micros(micros).unwrap();
+        for event in [
+            IngestEvent::Message(Message::Assistant {
+                id: "tool-turn".to_owned(),
+                session_id: session.id.clone(),
+                timestamp: at(1_700_000_001_500_000),
+                options: ProviderOptions::new(),
+            }),
+            IngestEvent::Part(Part {
+                session_id: session.id.clone(),
+                id: "tool-turn-p0".to_owned(),
+                message_id: "tool-turn".to_owned(),
+                ordinal: 0,
+                provenance: crate::wire::Provenance::Conversational,
+                options: ProviderOptions::new(),
+                kind: PartKind::ToolCall {
+                    call_id: Some(Extracted::from_test_value("call-1".to_owned())),
+                    name: Some(Extracted::from_test_value("Report".to_owned())),
+                    params: serde_json::json!({}),
+                    provider_executed: false,
+                },
+            }),
+            IngestEvent::Message(Message::System {
+                id: "carrier".to_owned(),
+                session_id: session.id.clone(),
+                timestamp: at(1_700_000_001_600_000),
+                content: None,
+                options: ProviderOptions::new(),
+            }),
+        ] {
+            validator.push(&store, seq, event).await?;
+            seq += 1;
+        }
         validator.finish(&store).await?;
 
         let params = SessionViewParams {
@@ -7755,10 +7753,26 @@ mod tests {
             other => panic!("expected a message page, got {other:?}"),
         };
 
-        let scanned = page_rows(store.session_view(&session.id, params.clone()).await?);
+        let scanned_page = store.session_view(&session.id, params.clone()).await?;
+        let GetLookup::Found(page) = &scanned_page else {
+            panic!("expected a page, got {scanned_page:?}");
+        };
+        assert_eq!(page.stored_messages, 4, "every stored row is counted");
+        let trailing = page
+            .trailing
+            .as_ref()
+            .expect("an assistant turn follows m2");
+        assert_eq!(trailing.count, 2, "the tool turn and the carrier follow m2");
+        assert_eq!(trailing.final_turn.id, "tool-turn");
+        let scanned = page_rows(scanned_page.clone());
         let scanned_view = view_rows(store.message_view("m2", view_params.clone()).await?);
         store.ensure_rowmap(&cache).await?;
-        let resident = page_rows(store.session_view(&session.id, params.clone()).await?);
+        let resident_page = store.session_view(&session.id, params.clone()).await?;
+        assert_eq!(
+            resident_page, scanned_page,
+            "map-served page must match the scan"
+        );
+        let resident = page_rows(resident_page);
         assert_eq!(resident, scanned, "map-served page must match the scan");
         let resident_view = view_rows(store.message_view("m2", view_params.clone()).await?);
         assert_eq!(
@@ -7785,7 +7799,19 @@ mod tests {
         )
         .await?;
 
-        let stale_map_page = page_rows(store.session_view(&session.id, params).await?);
+        let stale_lookup = store.session_view(&session.id, params).await?;
+        let GetLookup::Found(page) = &stale_lookup else {
+            panic!("expected a page, got {stale_lookup:?}");
+        };
+        assert_eq!(
+            page.stored_messages, 5,
+            "the stale map must not hide m3 from the count"
+        );
+        assert!(
+            page.trailing.is_none(),
+            "a later conversational message clears the old trailing turn"
+        );
+        let stale_map_page = page_rows(stale_lookup);
         assert_eq!(stale_map_page.len(), 3, "stale map must not hide m3");
         assert_eq!(stale_map_page[2].0, "m3");
         assert_eq!(

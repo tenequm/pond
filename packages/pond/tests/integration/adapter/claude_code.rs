@@ -72,7 +72,15 @@ async fn claude_code_fixtures_ingest_cleanly() -> anyhow::Result<()> {
 
     let mut conversational_total = 0;
     for session_id in &session_ids {
-        conversational_total += store.scan_conversational_messages(session_id).await?.len();
+        let session = store
+            .get_session(session_id)
+            .await?
+            .expect("listed session exists");
+        conversational_total += session
+            .messages
+            .iter()
+            .filter(|stored| pond::sessions::search_text(&stored.message, &stored.parts).is_some())
+            .count();
     }
     assert!(
         conversational_total > 0,

@@ -433,6 +433,15 @@ pub struct MessageView {
     pub parts_summary: Vec<PartSummary>,
 }
 
+/// What follows a session's last conversational message: the count, and the
+/// latest assistant turn among them (summary only - pond_get_message expands
+/// its bodies).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrailingView {
+    pub count: usize,
+    pub final_turn: MessageView,
+}
+
 /// Compact per-part descriptor (spec.md#protocol): enough to tell what a
 /// message carries without paying for full content. `call_id` is populated
 /// for `tool_call` / `tool_result` only.
@@ -556,6 +565,15 @@ pub enum GetResult {
         /// that message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolved_from_message_id: Option<String>,
+        /// Every stored message of the session - tool calls, results and
+        /// harness records included - against the conversational count the
+        /// page markers page over.
+        #[serde(default)]
+        stored_messages: usize,
+        /// Set on the page that reaches the end when an assistant turn follows
+        /// the last conversational message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trailing: Option<TrailingView>,
     },
     Message {
         target: MessageView,
