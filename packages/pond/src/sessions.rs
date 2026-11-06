@@ -347,6 +347,30 @@ enum RowmapEnsure {
     Contended,
 }
 
+/// Unlocked explicitly on drop: a subprocess spawned while it is held inherits
+/// the open file description and would hold the flock until it execs.
+struct RowmapBuildLock(std::fs::File);
+
+impl RowmapBuildLock {
+    /// `None` when another holder has the lock.
+    fn try_acquire(cache_dir: &Path, store_key: &str) -> Result<Option<Self>> {
+        let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
+        let lock = std::fs::File::create(&lock_path)
+            .with_context(|| format!("create rowmap build lock {}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(Self(lock))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock rowmap build"),
+        }
+    }
+}
+
+impl Drop for RowmapBuildLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl Store {
     /// Open against a local filesystem URL or a remote one for which the
     /// caller has no extra options to pass (env vars suffice). CLI verbs
@@ -2175,16 +2199,9 @@ impl Store {
         store_key: &str,
         version: u64,
     ) -> Result<Option<RowMetaSet>> {
-        let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
-        let lock = std::fs::File::create(&lock_path)
-            .with_context(|| format!("create rowmap build lock {}", lock_path.display()))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).context("lock rowmap build");
-            }
-        }
+        let Some(_lock) = RowmapBuildLock::try_acquire(cache_dir, store_key)? else {
+            return Ok(None);
+        };
 
         // Re-check after acquiring: a sibling may have published `version`. An
         // open failure here (older MAGIC after an upgrade, or corruption) falls
@@ -8785,11 +8802,9 @@ mod tests {
         store_with_messages_at_threshold(temp, count, VECTOR_INDEX_ACTIVATION_ROWS).await
     }
 
-    fn hold_rowmap_lock(store: &Store, cache: &Path) -> anyhow::Result<std::fs::File> {
-        let path = cache.join(format!("rowmetamap-{}.lock", store.store_key()));
-        let lock = std::fs::File::create(path)?;
-        lock.try_lock()?;
-        Ok(lock)
+    fn hold_rowmap_lock(store: &Store, cache: &Path) -> anyhow::Result<RowmapBuildLock> {
+        RowmapBuildLock::try_acquire(cache, &store.store_key())?
+            .context("rowmap build lock already held")
     }
 
     /// Same as [`store_with_messages`] but tests optimize with a custom
@@ -10555,6 +10570,25 @@ mod tests {
             .map(|(_, id)| id.as_str())
             .collect();
         assert_eq!(oldest, ["s0-m0", "s0-m2", "s0-m3"]);
+        Ok(())
+    }
+
+    /// A cloned descriptor shares the open file description exactly as a forked
+    /// child's inherited copy does, so this needs no real subprocess or timing.
+    #[cfg(unix)]
+    #[test]
+    fn rowmap_build_lock_frees_on_drop_while_an_inherited_descriptor_is_alive() -> anyhow::Result<()>
+    {
+        let dir = TempDir::new()?;
+        let lock = RowmapBuildLock::try_acquire(dir.path(), "k")?.context("fresh lock")?;
+        let inherited = lock.0.try_clone()?;
+        assert!(RowmapBuildLock::try_acquire(dir.path(), "k")?.is_none());
+        drop(lock);
+        assert!(
+            RowmapBuildLock::try_acquire(dir.path(), "k")?.is_some(),
+            "an inherited descriptor kept the build lock held after drop"
+        );
+        drop(inherited);
         Ok(())
     }
 }
