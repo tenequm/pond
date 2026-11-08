@@ -529,16 +529,27 @@ both for session-movement-complete.
   - `*.jsonl` - legacy pre-1.10 format, one per session. Filename stem = session id.
     Line 1 metadata; lines 2+ messages `{role, created, content}`.
 
-- DB sample: GENERATED via the sqlite3 CLI at fixture-capture time, not
-  captured from a real user (goose requires LLM provider credentials to
-  generate sessions). Schema verbatim from upstream; rows exercise multi-turn
-  text, tool request+response, sub_agent lineage, thinking blocks, and
-  scheduled session type.
+- Capture: real sandboxed self-capture of goose 1.49.0 (`/usr/local/bin/goose`)
+  run under a throwaway `HOME` with a local OpenAI-compatible mock LLM server
+  (no credentials). Schema verbatim from upstream. DB rows exercise multi-turn
+  text, a successful tool request+response, sub_agent lineage, thinking blocks,
+  an image block, a failed tool call, an error block, an unknown block type, a
+  non-user/assistant (system) role, and millisecond timestamps. The two legacy
+  JSONL files add an unfinished tool call and an empty (user-turn-only) session.
 
-- JSONL samples: SYNTHETIC SUPPLEMENTARY rows, hand-built to match
-  goose_legacy.rs semantics. The writer no longer produces these; they exist
-  only to exercise the legacy reader path. Marked synthetic in the
-  fixture itself.
+- Per-file row census (the count every integration test derives from):
+  - `sessions.db`: 4 sessions (`ses-user-001`, `ses-sub-002`, `ses-think-003`,
+    `ses-sched-004`), 14 messages; `ses-sub-002` has `parent_session_id =
+    ses-user-001` and brands `goose/sub-agent`.
+  - `legacy-001.jsonl`: 1 session (`legacy-001`), 2 messages (unfinished tool
+    call).
+  - `legacy-002.jsonl`: 1 session (`legacy-002`), 1 message (empty session,
+    user turn only).
+  - Totals: 6 ingestible sessions, 17 messages; legacy ids are disjoint from
+    DB ids.
+
+- JSONL samples: legacy pre-1.10 format retained solely to exercise the
+  legacy reader path; the DB is the current writer's format.
 
 - `trufflehog` and `gitleaks` report zero findings; no personal names,
   real project names, credentials, or IP addresses.

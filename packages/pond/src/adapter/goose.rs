@@ -12,11 +12,16 @@
 //! (counted, never silently dropped).
 //!
 //! Identity: DB session `id` verbatim; message id = `<session_id>:<rowid>`.
-//! Legacy message id = own `id` field or `<session>:line<N>`.
+//! Legacy message id = own `id` field or `<session>:line<N>` (N is the
+//! 1-based file line; the metadata line is line 1, so the first message
+//! line is line 2).
 //!
-//! Source agent taxonomy: `goose` (default/user), `goose/subagent`
-//! (sub_agent), `goose/scheduled`, `goose/hidden`, `goose/terminal`,
-//! `goose/gateway`, `goose/acp` -- keyed on `session_type` column.
+//! Source agent taxonomy (bounded): `goose` (default/user),
+//! `goose/sub-agent` (sub_agent), `goose/scheduled`, `goose/hidden`,
+//! `goose/terminal`, `goose/gateway`, `goose/acp` -- keyed on the
+//! `session_type` column. Any type outside the known set is an unsupported
+//! record and never brands itself as a plain user session in default search
+//! (spec 8.3).
 //!
 //! Content blocks: `content_json` is a JSON array of typed blocks.
 //! Each block dispatches to a canonical PartKind based on `type` field:
@@ -52,6 +57,7 @@ use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
     RestoreFidelity, RestoredFile, SkipOracle, SkipReason, config_path,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
+    jsonl::{PEEK_TAIL_CAP, parse_bounded, read_tail},
     part_id, part_ordinal, source_options,
     sqlite::{self, CHANNEL_CAP, ColKind, columns_sql, emit, row_to_json},
     validate_path_id,
@@ -142,44 +148,49 @@ impl AdapterFactory for GooseFactory {
     }
 }
 
-/// Resolve the goose data dir from the environment:
-/// 1. `$GOOSE_PATH_ROOT/data` (absolute only, per goose_paths.rs)
-/// 2. `$XDG_DATA_HOME/goose/data` (or `~/.local/share/goose/data`)
-/// 3. `~/Library/Application Support/Block/goose/data` (macOS)
+/// Resolve the goose data dir from the injected `Env` only, mirroring
+/// upstream `paths.rs` (`crates/goose/src/config/paths.rs`, goose 1.49.0,
+/// etcetera 0.11):
+///
+/// 1. XDG data home + `goose`: `$XDG_DATA_HOME/goose` or, when unset,
+///    `~/.local/share/goose`. etcetera 0.11's `choose_app_strategy`
+///    selects the Xdg strategy on Linux AND macOS, so there is no
+///    `~/Library/Application Support/Block/goose` arm on any current
+///    goose (the "Block" comment in upstream paths.rs is stale). A
+///    relative `XDG_DATA_HOME` is ignored, per the XDG spec and etcetera.
+///    Empirically verified with goose 1.49.0 on Linux: `sessions.db`
+///    landed under `$XDG_DATA_HOME/goose/sessions/` - no `data` suffix.
+/// 2. Windows: `%APPDATA%\Block\goose\data` - the etcetera Windows
+///    strategy derives `data_dir` as `{APPDATA}\{author}\{app_name}\data`
+///    (`app_strategy/windows.rs`), with `author = "Block"`, `app_name =
+///    "goose"`. Deriving it from `env.home` (devin precedent) means a
+///    redirected `%APPDATA%` outside the profile is not followed; Windows
+///    behavior is derived from upstream source, not verified on this box.
+///
+/// `GOOSE_PATH_ROOT` / `XDG_DATA_HOME` overrides are intentionally NOT read
+/// here (Phase B step 3): env lookups cannot be injected, so a probe that
+/// reads them cannot be tested against a sandboxed `HOME`. A relocated root
+/// is configured as an explicit `path`; overrides are the discovery layer's
+/// concern (#148).
 ///
 /// Only offered when the resolved path holds a `sessions/` directory
 /// containing `sessions.db` or `*.jsonl`.
 fn resolve_data_dir(env: &Env) -> Option<PathBuf> {
-    // $GOOSE_PATH_ROOT wins (must be absolute per goose_paths.rs).
-    if let Some(root) = std::env::var_os("GOOSE_PATH_ROOT") {
-        let root = PathBuf::from(root);
-        if root.is_absolute() {
-            let data = root.join("data");
-            if has_sessions_dir(&data) {
-                return Some(data);
-            }
-        }
-    }
-    // XDG_DATA_HOME / fallback
-    let xdg = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env.home.join(".local").join("share"));
-    let data = xdg.join("goose").join("data");
-    if has_sessions_dir(&data) {
-        return Some(data);
-    }
-    // macOS path
-    let mac = env
-        .home
-        .join("Library")
-        .join("Application Support")
-        .join("Block")
-        .join("goose")
-        .join("data");
-    if has_sessions_dir(&mac) {
-        return Some(mac);
-    }
-    None
+    // XDG_DATA_HOME (absolute only) / ~/.local/share fallback, then the
+    // Windows %APPDATA% arm (inert on non-Windows homes).
+    let candidates: [PathBuf; 2] = [
+        env.home.join(".local").join("share").join("goose"),
+        env.home
+            .join("AppData")
+            .join("Roaming")
+            .join("Block")
+            .join("goose")
+            .join("data"),
+    ];
+    candidates
+        .into_iter()
+        .filter(|path| !path.as_os_str().is_empty())
+        .find(|candidate| has_sessions_dir(candidate))
 }
 
 fn has_sessions_dir(data: &Path) -> bool {
@@ -320,7 +331,17 @@ fn enumerate_and_peek(root: &Path, peek: bool) -> Enumerated {
                     }
                 };
                 let watermarks = if peek {
-                    session_watermarks(&conn).unwrap_or_default()
+                    match session_watermarks(&conn) {
+                        Some(w) => w,
+                        None => {
+                            errors.push(AdapterError::schema(
+                                NAME,
+                                db_path.display().to_string(),
+                                "failed to read session watermarks from sessions.db",
+                            ));
+                            HashMap::new()
+                        }
+                    }
                 } else {
                     HashMap::new()
                 };
@@ -412,23 +433,18 @@ fn session_watermarks(conn: &Connection) -> Option<HashMap<String, i64>> {
 }
 
 fn peek_jsonl_watermark(path: &Path) -> Option<i64> {
-    // Read the last non-metadata line for the newest timestamp.
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut newest: Option<i64> = None;
-    for (idx, line) in content.lines().enumerate() {
-        if idx == 0 {
-            continue; // metadata line
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(line)
-            && let Some(created) = value.get("created").and_then(Value::as_i64)
-        {
-            let ts = normalize_ts(created);
-            if newest.is_none_or(|n| ts > n) {
-                newest = Some(ts);
-            }
-        }
-    }
-    newest.map(|ts| ts * 1_000_000)
+    // Tail-peek bounded by PEEK_TAIL_CAP: read only the file's tail, then parse
+    // the last line as a single bounded record for its `created` timestamp.
+    // Never reads the whole file or scans every line
+    // (adapter-bounded-values, Phase B step 1; decision-table row 10).
+    let tail = read_tail(path, PEEK_TAIL_CAP)?;
+    let text = std::str::from_utf8(&tail).ok()?;
+    let last_line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    let value: Value =
+        parse_bounded(NAME, last_line.as_bytes(), || path.display().to_string()).ok()?;
+    let created = value.get("created").and_then(Value::as_i64)?;
+    let ts = normalize_ts(created);
+    Some(ts * 1_000_000)
 }
 
 // -- Reading ----------------------------------------------------------------
@@ -501,7 +517,17 @@ fn read_db_session(
         return true;
     };
 
-    let source_agent = classify_source_agent(&row);
+    let Some(source_agent) = classify_source_agent(&row) else {
+        let _ = tx.blocking_send(Err(AdapterError::schema(
+            NAME,
+            session_id.to_owned(),
+            format!(
+                "unsupported goose session_type: {:?}",
+                row.get("session_type").and_then(Value::as_str)
+            ),
+        )));
+        return true;
+    };
     let session = build_db_session(session_id, &row, &source_agent, created_at);
     emit!(tx, Ok(AdapterYield::Event(IngestEvent::Session(session))));
 
@@ -587,18 +613,26 @@ fn parse_session_created(
     None
 }
 
-fn classify_source_agent(row: &Value) -> String {
-    let session_type = row
-        .get("session_type")
+fn classify_source_agent(row: &Value) -> Option<String> {
+    row.get("session_type")
         .and_then(Value::as_str)
-        .unwrap_or("user");
-    session_type_to_source_agent(session_type)
+        .and_then(session_type_to_source_agent)
 }
 
-fn session_type_to_source_agent(session_type: &str) -> String {
+fn session_type_to_source_agent(session_type: &str) -> Option<String> {
     match session_type {
-        "user" | "" => NAME.to_owned(),
-        other => format!("{}/{}", NAME, other.replace('_', "-")),
+        "user" | "" => Some(NAME.to_owned()),
+        "sub_agent" => Some("goose/sub-agent".to_owned()),
+        "scheduled" => Some("goose/scheduled".to_owned()),
+        "hidden" => Some("goose/hidden".to_owned()),
+        "terminal" => Some("goose/terminal".to_owned()),
+        "gateway" => Some("goose/gateway".to_owned()),
+        "acp" => Some("goose/acp".to_owned()),
+        // Anything outside the seven upstream variants is an unsupported
+        // record: never brand it `goose/<garbage>` (a `/` or whitespace in
+        // the value would yield a malformed `source_agent`), and never let it
+        // masquerade as a plain user session in default search (spec 8.3).
+        _ => None,
     }
 }
 
@@ -714,9 +748,20 @@ fn db_message_events(
     let options = message_options(row, rowid);
     let content_json = row.get("content_json").and_then(Value::as_str);
 
-    let blocks: Vec<Value> = content_json
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let blocks: Vec<Value> = match content_json {
+        Some(s) => match serde_json::from_str(s) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                return Err(AdapterError::parse(
+                    NAME,
+                    format!("{session_id}:{rowid}"),
+                    1,
+                    error,
+                ));
+            }
+        },
+        None => Vec::new(),
+    };
 
     let mut parts = Vec::new();
     let mut ordinal = 0usize;
@@ -765,8 +810,23 @@ fn db_message_events(
             }
         }
         _ => {
-            // Non user/assistant role -> System carrier.
-            let content = extract_str_from_content(blocks);
+            // Non user/assistant role -> lossless system carrier: every
+            // block is emitted as a Part so nothing is dropped (spec 6.5
+            // placement rule 3). `options` already carries `raw_record`.
+            let content = extract_str_from_content(blocks.clone());
+            for block in &blocks {
+                if let Some(part) = map_content_block(
+                    session_id,
+                    &message_id,
+                    ordinal,
+                    block,
+                    &metadata,
+                    tool_name_map,
+                ) {
+                    parts.push(part);
+                    ordinal += 1;
+                }
+            }
             Message::System {
                 id: message_id,
                 session_id: session_id.to_owned(),
@@ -792,39 +852,45 @@ fn map_content_block(
     metadata: &Value,
     tool_name_map: &HashMap<String, String>,
 ) -> Option<Part> {
-    let block_type = block.get("type").and_then(Value::as_str)?;
+    let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
     let user_visible = metadata.get("userVisible").and_then(Value::as_bool);
     let turn_context = metadata.get("turnContext").and_then(Value::as_bool);
     let force_injected = user_visible == Some(false) || turn_context == Some(true);
+    // Shared constructor for the six standard Part fields; every arm of the
+    // match below builds its Part through this closure (item 11 dedup).
+    let part = |kind: PartKind, provenance: Provenance, options: ProviderOptions| Part {
+        session_id: session_id.to_owned(),
+        id: part_id(message_id, ordinal),
+        message_id: message_id.to_owned(),
+        ordinal: part_ordinal(ordinal),
+        provenance,
+        options,
+        kind,
+    };
 
     match block_type {
-        "text" => Some(Part {
-            session_id: session_id.to_owned(),
-            id: part_id(message_id, ordinal),
-            message_id: message_id.to_owned(),
-            ordinal: part_ordinal(ordinal),
-            provenance: if force_injected {
+        "text" => Some(part(
+            PartKind::Text {
+                text: extract_str(block, "text"),
+            },
+            if force_injected {
                 Provenance::Injected
             } else {
                 Provenance::Conversational
             },
-            options: ProviderOptions::new(),
-            kind: PartKind::Text {
-                text: extract_str(block, "text"),
-            },
-        }),
+            ProviderOptions::new(),
+        )),
         "image" => {
             let Some(payload) = block.get("data").and_then(Value::as_str) else {
                 // Writer always emits data; absence is corruption. Preserve
                 // the block losslessly rather than storing a synthesized
                 // empty payload (spec.md#model-no-synthesis).
-                return Some(Part {
-                    session_id: session_id.to_owned(),
-                    id: part_id(message_id, ordinal),
-                    message_id: message_id.to_owned(),
-                    ordinal: part_ordinal(ordinal),
-                    provenance: Provenance::Injected,
-                    options: {
+                return Some(part(
+                    PartKind::Text {
+                        text: Some(extract_compact_repr(block)),
+                    },
+                    Provenance::Injected,
+                    {
                         let mut opts = ProviderOptions::new();
                         opts.insert(
                             "goose".to_owned(),
@@ -832,81 +898,62 @@ fn map_content_block(
                         );
                         opts
                     },
-                    kind: PartKind::Text {
-                        text: Some(extract_compact_repr(block)),
-                    },
-                });
+                ));
             };
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: if force_injected {
-                    Provenance::Injected
-                } else {
-                    Provenance::Conversational
-                },
-                options: ProviderOptions::new(),
-                kind: PartKind::File {
+            Some(part(
+                PartKind::File {
                     media_type: extract_str(block, "mimeType").map(|s| (*s).clone()),
                     file_name: None,
                     data: FileData::String(payload.to_owned()),
                 },
-            })
+                if force_injected {
+                    Provenance::Injected
+                } else {
+                    Provenance::Conversational
+                },
+                ProviderOptions::new(),
+            ))
         }
         "thinking" => {
             let mut opts = ProviderOptions::new();
             if let Some(sig) = extract_str(block, "signature") {
                 opts.insert("goose".to_owned(), json!({"signature": *sig}));
             }
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: if force_injected {
+            Some(part(
+                PartKind::Reasoning {
+                    text: extract_str(block, "thinking"),
+                },
+                if force_injected {
                     Provenance::Injected
                 } else {
                     Provenance::Conversational
                 },
-                options: opts,
-                kind: PartKind::Reasoning {
-                    text: extract_str(block, "thinking"),
-                },
-            })
+                opts,
+            ))
         }
         "redactedThinking" => {
             let text = extract_str(block, "data");
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: Provenance::Injected,
-                options: ProviderOptions::new(),
-                kind: PartKind::Text { text },
-            })
+            Some(part(
+                PartKind::Text { text },
+                Provenance::Injected,
+                ProviderOptions::new(),
+            ))
         }
         "toolRequest" => {
             let call_id = extract_str(block, "id");
             // On error status: call_id only, name/params absent.
             let status = block.pointer("/toolCall/status").and_then(Value::as_str);
             if status == Some("error") {
-                return Some(Part {
-                    session_id: session_id.to_owned(),
-                    id: part_id(message_id, ordinal),
-                    message_id: message_id.to_owned(),
-                    ordinal: part_ordinal(ordinal),
-                    provenance: Provenance::Injected,
-                    options: ProviderOptions::new(),
-                    kind: PartKind::ToolCall {
+                return Some(part(
+                    PartKind::ToolCall {
                         call_id,
                         name: None,
                         params: Value::Null,
                         provider_executed: false,
                     },
-                });
+                    Provenance::Injected,
+                    ProviderOptions::new(),
+                ));
             }
             let name = block
                 .pointer("/toolCall/value/name")
@@ -919,20 +966,16 @@ fn map_content_block(
                     other => other.clone(),
                 })
                 .unwrap_or(Value::Null);
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: Provenance::Injected,
-                options: ProviderOptions::new(),
-                kind: PartKind::ToolCall {
+            Some(part(
+                PartKind::ToolCall {
                     call_id,
                     name,
                     params,
                     provider_executed: false,
                 },
-            })
+                Provenance::Injected,
+                ProviderOptions::new(),
+            ))
         }
         "toolResponse" => {
             let call_id = extract_str(block, "id");
@@ -954,20 +997,16 @@ fn map_content_block(
                     .cloned()
                     .unwrap_or(Value::Null)
             };
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: Provenance::Injected,
-                options: ProviderOptions::new(),
-                kind: PartKind::ToolResult {
+            Some(part(
+                PartKind::ToolResult {
                     call_id,
                     name,
                     is_failure,
                     result,
                 },
-            })
+                Provenance::Injected,
+                ProviderOptions::new(),
+            ))
         }
         "toolConfirmationRequest" | "actionRequired" => {
             // In goose confirmation records the block `id` (or `data.id`
@@ -979,25 +1018,20 @@ fn map_content_block(
                 .or_else(|| block.pointer("/data").and_then(|v| extract_str(v, "id")))
                 .map(|e| (*e).clone());
             match id {
-                Some(id) => Some(Part {
-                    session_id: session_id.to_owned(),
-                    id: part_id(message_id, ordinal),
-                    message_id: message_id.to_owned(),
-                    ordinal: part_ordinal(ordinal),
-                    provenance: Provenance::Injected,
-                    options: ProviderOptions::new(),
-                    kind: PartKind::ToolApprovalRequest {
+                Some(id) => Some(part(
+                    PartKind::ToolApprovalRequest {
                         approval_id: id.clone(),
                         tool_call_id: id,
                     },
-                }),
-                None => Some(Part {
-                    session_id: session_id.to_owned(),
-                    id: part_id(message_id, ordinal),
-                    message_id: message_id.to_owned(),
-                    ordinal: part_ordinal(ordinal),
-                    provenance: Provenance::Injected,
-                    options: {
+                    Provenance::Injected,
+                    ProviderOptions::new(),
+                )),
+                None => Some(part(
+                    PartKind::Text {
+                        text: Some(extract_compact_repr(block)),
+                    },
+                    Provenance::Injected,
+                    {
                         let mut opts = ProviderOptions::new();
                         opts.insert(
                             "goose".to_owned(),
@@ -1005,10 +1039,7 @@ fn map_content_block(
                         );
                         opts
                     },
-                    kind: PartKind::Text {
-                        text: Some(extract_compact_repr(block)),
-                    },
-                }),
+                )),
             }
         }
         "frontendToolRequest" => {
@@ -1024,20 +1055,16 @@ fn map_content_block(
                     other => other.clone(),
                 })
                 .unwrap_or(Value::Null);
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: Provenance::Injected,
-                options: ProviderOptions::new(),
-                kind: PartKind::ToolCall {
+            Some(part(
+                PartKind::ToolCall {
                     call_id,
                     name,
                     params,
                     provider_executed: false,
                 },
-            })
+                Provenance::Injected,
+                ProviderOptions::new(),
+            ))
         }
         "systemNotification" => {
             let text = extract_str(block, "msg");
@@ -1045,15 +1072,7 @@ fn map_content_block(
             if let Some(ntype) = extract_str(block, "notificationType") {
                 opts.insert("goose".to_owned(), json!({"notificationType": *ntype}));
             }
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: Provenance::Injected,
-                options: opts,
-                kind: PartKind::Text { text },
-            })
+            Some(part(PartKind::Text { text }, Provenance::Injected, opts))
         }
         "error" => {
             let text = extract_str(block, "message");
@@ -1061,24 +1080,15 @@ fn map_content_block(
             if let Some(kind) = extract_str(block, "kind") {
                 opts.insert("goose".to_owned(), json!({"errorKind": *kind}));
             }
-            Some(Part {
-                session_id: session_id.to_owned(),
-                id: part_id(message_id, ordinal),
-                message_id: message_id.to_owned(),
-                ordinal: part_ordinal(ordinal),
-                provenance: Provenance::Injected,
-                options: opts,
-                kind: PartKind::Text { text },
-            })
+            Some(part(PartKind::Text { text }, Provenance::Injected, opts))
         }
         // Unknown type -> compact-repr TextPart (forward compat).
-        _ => Some(Part {
-            session_id: session_id.to_owned(),
-            id: part_id(message_id, ordinal),
-            message_id: message_id.to_owned(),
-            ordinal: part_ordinal(ordinal),
-            provenance: Provenance::Injected,
-            options: {
+        _ => Some(part(
+            PartKind::Text {
+                text: Some(extract_compact_repr(block)),
+            },
+            Provenance::Injected,
+            {
                 let mut opts = ProviderOptions::new();
                 opts.insert(
                     "goose".to_owned(),
@@ -1086,10 +1096,7 @@ fn map_content_block(
                 );
                 opts
             },
-            kind: PartKind::Text {
-                text: Some(extract_compact_repr(block)),
-            },
-        }),
+        )),
     }
 }
 
@@ -1114,7 +1121,7 @@ fn read_legacy_session(
         return tx.blocking_send(Err(error)).is_ok();
     }
 
-    let content = match std::fs::read_to_string(path) {
+    let content = match std::fs::read(path) {
         Ok(content) => content,
         Err(error) => {
             return tx
@@ -1126,22 +1133,19 @@ fn read_legacy_session(
                 .is_ok();
         }
     };
+    let text = String::from_utf8_lossy(&content);
 
-    let mut lines = content.lines();
+    let mut lines = text.lines();
     // Line 1: session metadata.
     let meta_line = match lines.next() {
         Some(line) => line,
         None => return true,
     };
-    let meta: Value = match serde_json::from_str(meta_line) {
+    let meta: Value = match parse_bounded(NAME, meta_line.as_bytes(), || path.display().to_string())
+    {
         Ok(value) => value,
         Err(error) => {
-            let _ = tx.blocking_send(Err(AdapterError::parse(
-                NAME,
-                path.display().to_string(),
-                1,
-                error,
-            )));
+            let _ = tx.blocking_send(Err(error)).is_ok();
             return true;
         }
     };
@@ -1171,7 +1175,7 @@ fn read_legacy_session(
     let source_agent = meta
         .get("session_type")
         .and_then(Value::as_str)
-        .map(session_type_to_source_agent)
+        .and_then(session_type_to_source_agent)
         .unwrap_or_else(|| NAME.to_owned());
 
     let project = if let Some(dir) = meta.get("working_dir").and_then(Value::as_str) {
@@ -1210,15 +1214,12 @@ fn read_legacy_session(
         if line.trim().is_empty() {
             continue;
         }
-        let msg_value: Value = match serde_json::from_str(line) {
+        let msg_value: Value = match parse_bounded(NAME, line.as_bytes(), || {
+            format!("{}:line{}", path.display(), line_idx + 2)
+        }) {
             Ok(value) => value,
             Err(error) => {
-                let _ = tx.blocking_send(Err(AdapterError::parse(
-                    NAME,
-                    path.display().to_string(),
-                    line_idx + 2,
-                    error,
-                )));
+                let _ = tx.blocking_send(Err(error)).is_ok();
                 continue;
             }
         };
@@ -1227,7 +1228,7 @@ fn read_legacy_session(
             .get("id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("{}:line{}", session_id, line_idx + 1));
+            .unwrap_or_else(|| format!("{}:line{}", session_id, line_idx + 2));
 
         // spec.md#model-no-synthesis sanctions timestamp fallback to the
         // session anchor; no parseable `created` -> use the session's own
@@ -1267,7 +1268,7 @@ fn read_legacy_session(
                     id: msg_id,
                     session_id: session_id.to_owned(),
                     timestamp,
-                    options: ProviderOptions::new(),
+                    options: source_options(NAME, &msg_value),
                 }
             }
             Some("assistant") => {
@@ -1289,17 +1290,21 @@ fn read_legacy_session(
                     id: msg_id,
                     session_id: session_id.to_owned(),
                     timestamp,
-                    options: ProviderOptions::new(),
+                    options: source_options(NAME, &msg_value),
                 }
             }
             _ => {
+                // Non user/assistant role -> lossless system carrier.
+                // Every block is carried verbatim (raw_record) so nothing is
+                // dropped; only the first text block is surfaced as `content`
+                // for backwards compat with the System message shape.
                 let content = extract_str_from_content(blocks);
                 Message::System {
                     id: msg_id,
                     session_id: session_id.to_owned(),
                     timestamp,
                     content,
-                    options: ProviderOptions::new(),
+                    options: source_options(NAME, &msg_value),
                 }
             }
         };
@@ -1368,17 +1373,8 @@ fn message_timestamp(row: &Value, message_id: &str) -> Result<DateTime<Utc>, Ada
 
 // -- Small helpers ----------------------------------------------------------
 
-fn message_options(row: &Value, rowid: i64) -> ProviderOptions {
-    let mut options = ProviderOptions::new();
-    options.insert(
-        "source".to_owned(),
-        json!({
-            "adapter": NAME,
-            "id": rowid,
-            "raw_record": extract_raw_record(row),
-        }),
-    );
-    options
+fn message_options(row: &Value, _rowid: i64) -> ProviderOptions {
+    source_options(NAME, row)
 }
 
 fn open_db(path: &Path) -> Result<Connection, AdapterError> {
@@ -1397,9 +1393,10 @@ fn join_error(join: tokio::task::JoinError) -> AdapterError {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![allow(clippy::expect_used, clippy::unwrap_used, reason = "test scaffolding")]
     use super::*;
     use crate::adapter::extracted_text;
+    use crate::adapter::jsonl::peek_metering;
     use tempfile::TempDir;
 
     const GOOSE_SCHEMA: &str = "
@@ -1480,27 +1477,53 @@ mod tests {
     }
 
     #[test]
-    fn goose_schema_matches_upstream() {
+    fn db_session_and_message_round_trip() {
         let temp = TempDir::new().unwrap();
-        let conn = create_db(&temp.path().join("test.db"));
-        // Verify tables exist.
-        let count: i32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('sessions','messages')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2, "sessions and messages tables must exist");
-        // Verify index.
-        let idx: i32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_session_created'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(idx, 1, "idx_messages_session_created must exist");
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let conn = create_db(&sessions_dir.join("sessions.db"));
+        insert_session(&conn, "s1", "sub_agent", "/proj");
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                "s1",
+                "user",
+                "[{\"type\":\"text\",\"text\":\"hello\"}]",
+                1_700_000_000,
+                "2023-11-04T00:00:00Z"
+            ],
+        )
+        .unwrap();
+
+        let all = events(temp.path());
+        let sessions: Vec<_> = all
+            .iter()
+            .filter_map(|e| match e {
+                IngestEvent::Session(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].source_agent, "goose/sub-agent");
+        let messages: Vec<_> = all
+            .iter()
+            .filter_map(|e| match e {
+                IngestEvent::Message(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id(), "s1:1");
+        let parts: Vec<_> = all
+            .iter()
+            .filter_map(|e| match e {
+                IngestEvent::Part(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parts.len(), 1);
+        assert!(matches!(parts[0].kind, PartKind::Text { .. }));
     }
 
     #[test]
@@ -1515,7 +1538,6 @@ mod tests {
             .join(".local")
             .join("share")
             .join("goose")
-            .join("data")
             .join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         assert!(GooseFactory.probe_default(&env).is_none());
@@ -1526,24 +1548,20 @@ mod tests {
             .as_ref()
             .and_then(|v| v.get("path"))
             .and_then(Value::as_str);
-        let expected = temp
-            .path()
-            .join(".local")
-            .join("share")
-            .join("goose")
-            .join("data");
+        let expected = temp.path().join(".local").join("share").join("goose");
         assert_eq!(path, Some(expected.to_str().unwrap()));
     }
 
     #[test]
     fn parse_ts_epoch_seconds_normalizes_millis() {
-        let above = MILLISECOND_TIMESTAMP_THRESHOLD + 1000;
-        let result = parse_ts_epoch_seconds(above);
-        assert!(result.is_some());
-        // Should have divided by 1000.
-        let below = 1_705_312_800;
-        let result_below = parse_ts_epoch_seconds(below);
-        assert!(result_below.is_some());
+        // Millis above the threshold are divided by 1000 to seconds.
+        let millis = MILLISECOND_TIMESTAMP_THRESHOLD + 1000;
+        let dt = parse_ts_epoch_seconds(millis).unwrap();
+        assert_eq!(dt.timestamp(), MILLISECOND_TIMESTAMP_THRESHOLD / 1000 + 1);
+        // Seconds below the threshold are used as-is.
+        let seconds = 1_705_312_800;
+        let dt2 = parse_ts_epoch_seconds(seconds).unwrap();
+        assert_eq!(dt2.timestamp(), seconds);
     }
 
     #[test]
@@ -1558,14 +1576,39 @@ mod tests {
 
     #[test]
     fn session_type_to_brand_taxonomy() {
-        assert_eq!(session_type_to_source_agent("user"), "goose");
-        assert_eq!(session_type_to_source_agent(""), "goose");
-        assert_eq!(session_type_to_source_agent("sub_agent"), "goose/sub-agent");
-        assert_eq!(session_type_to_source_agent("scheduled"), "goose/scheduled");
-        assert_eq!(session_type_to_source_agent("hidden"), "goose/hidden");
-        assert_eq!(session_type_to_source_agent("terminal"), "goose/terminal");
-        assert_eq!(session_type_to_source_agent("gateway"), "goose/gateway");
-        assert_eq!(session_type_to_source_agent("acp"), "goose/acp");
+        assert_eq!(
+            session_type_to_source_agent("user"),
+            Some("goose".to_owned())
+        );
+        assert_eq!(session_type_to_source_agent(""), Some("goose".to_owned()));
+        assert_eq!(
+            session_type_to_source_agent("sub_agent"),
+            Some("goose/sub-agent".to_owned())
+        );
+        assert_eq!(
+            session_type_to_source_agent("scheduled"),
+            Some("goose/scheduled".to_owned())
+        );
+        assert_eq!(
+            session_type_to_source_agent("hidden"),
+            Some("goose/hidden".to_owned())
+        );
+        assert_eq!(
+            session_type_to_source_agent("terminal"),
+            Some("goose/terminal".to_owned())
+        );
+        assert_eq!(
+            session_type_to_source_agent("gateway"),
+            Some("goose/gateway".to_owned())
+        );
+        assert_eq!(
+            session_type_to_source_agent("acp"),
+            Some("goose/acp".to_owned())
+        );
+        // Anything outside the seven upstream variants is unsupported.
+        assert_eq!(session_type_to_source_agent("random"), None);
+        assert_eq!(session_type_to_source_agent("goose/sub-agent"), None);
+        assert_eq!(session_type_to_source_agent("a/b"), None);
     }
 
     #[test]
@@ -1637,24 +1680,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_correlation_resolves_name() {
+    fn tool_response_resolves_name_from_map() {
         let mut map = HashMap::new();
         map.insert("toolu-001".to_owned(), "bash".to_owned());
-        let call_id = extract_str(&json!({"id": "toolu-001"}), "id");
-        let name = call_id
-            .as_deref()
-            .and_then(|id| map.get(id).and_then(|n| extract_str(&json!({"n": n}), "n")));
-        assert_eq!(name.as_ref().map(|e| e.as_str()), Some("bash"));
+        let block = json!({"type": "toolResponse", "id": "toolu-001", "toolResult": {"status": "success", "value": {"ok": true}}});
+        let part = map_content_block("s1", "s1:1", 0, &block, &json!({}), &map).unwrap();
+        match &part.kind {
+            PartKind::ToolResult { name, .. } => {
+                assert_eq!(extracted_text(name), "bash");
+            }
+            _ => panic!("toolResponse must be ToolResult"),
+        }
     }
 
     #[test]
-    fn tool_correlation_missing_name() {
+    fn tool_response_missing_name() {
         let map: HashMap<String, String> = HashMap::new();
-        let call_id = extract_str(&json!({"id": "toolu-999"}), "id");
-        let name = call_id
-            .as_deref()
-            .and_then(|id| map.get(id).and_then(|n| extract_str(&json!({"n": n}), "n")));
-        assert!(name.is_none());
+        let block = json!({"type": "toolResponse", "id": "toolu-999", "toolResult": {"status": "success", "value": {}}});
+        let part = map_content_block("s1", "s1:1", 0, &block, &json!({}), &map).unwrap();
+        match &part.kind {
+            PartKind::ToolResult { name, .. } => assert_eq!(extracted_text(name), ""),
+            _ => panic!("toolResponse must be ToolResult"),
+        }
     }
 
     #[test]
@@ -1786,5 +1833,31 @@ mod tests {
             .collect();
         assert_eq!(parts.len(), 1);
         assert!(matches!(parts[0].kind, PartKind::Text { .. }));
+    }
+
+    /// The legacy freshness watermark uses a bounded tail peek (PEEK_TAIL_CAP),
+    /// never a whole-file scan: the read budget is one tail window per file
+    /// (adapter-bounded-values, Phase B step 1; decision-table row 10).
+    #[test]
+    fn legacy_peek_stays_within_one_tail_window() {
+        let temp = TempDir::new().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("leg_budget.jsonl");
+        let mut content = String::new();
+        for i in 0..200 {
+            content.push_str(&format!(
+                "{{\"id\":\"m{i}\",\"role\":\"user\",\"created\":{},\"content\":\"msg {i}\"}}\n",
+                1_700_000_000 + i
+            ));
+        }
+        std::fs::write(&path, &content).unwrap();
+        let (watermark, bytes) = peek_metering::measure(|| peek_jsonl_watermark(&path));
+        assert!(watermark.is_some());
+        let budget = content.len().min(PEEK_TAIL_CAP as usize);
+        assert!(
+            bytes <= budget as u64,
+            "peek read {bytes} bytes over the {budget}-byte tail budget"
+        );
     }
 }
