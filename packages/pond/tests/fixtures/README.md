@@ -12,7 +12,8 @@ claude_code nested workflow-subagent sample added 2026-06-04; opencode
 opencode V2 `v2/opencode.db` captured 2026-10-12 from opencode 1.19.0 and
 2.0.27; synthetic hermes `state.db` fixtures generated 2026-07-23; letta-code
 transcripts captured 2026-08-24 from letta-code 0.30.30; grok-build sessions
-captured 2026-08-24 from grok-build 1.0.5; agy conversations captured
+captured 2026-08-24 from grok-build 1.0.5; synthetic goose `sessions.db` +
+legacy JSONL fixtures generated 2026-08-25; agy conversations captured
 2026-09-10 from agy 1.2.0 and its ACP server; devin session stores
 captured 2026-09-26, 2026-09-28 and 2026-09-29 from devin 3000.11.3).
 
@@ -55,6 +56,7 @@ adapter/
   codex_cli/                 OpenAI Codex CLI
   devin/                     Devin CLI (Cognition's `devin`), one `sessions.db` per platform plus a mid-run pair and a sidekick store
   grok-build/                grok-build (xAI `grok` CLI) session directories
+  goose/                     Goose (Block) CLI (SQLite sessions.db + legacy JSONL)
   hermes/                    Hermes Agent runtime (single SQLite state.db per profile)
   letta-code/                letta-code (`letta` CLI) client-side transcripts
   nanoclaw/                  nanoclaw runtime (Claude Code Agent SDK in containers)
@@ -512,6 +514,46 @@ sample tree.
 - Census: 5 ingestible sessions; secret sweep trufflehog 0 / gitleaks 0; every
   file parses; no host, username, `/Users/` path, `C:\` path or provider key
   string.
+
+### goose
+
+Goose (Block) has two on-disk formats; this fixture carries both. Current
+goose writes a SQLite DB; pre-1.10 wrote JSONL files. The adapter reads
+both for session-movement-complete.
+
+- Source-of-truth layout: `<data-dir>/sessions/` under
+  `~/.local/share/goose/data/` (Linux), `~/Library/Application Support/Block/goose/data/`
+  (macOS), `%APPDATA%\Block\goose\data` (Windows).
+  - `sessions.db` - WAL, `sessions`/`messages` tables.
+    Schema: github.com/aaif-goose/goose/blob/main/crates/goose/src/session/session_manager.rs ~L991-1090.
+    Checkpointed to rollback-journal `.db` here so the fixture is a single file.
+  - `*.jsonl` - legacy pre-1.10 format, one per session. Filename stem = session id.
+    Line 1 metadata; lines 2+ messages `{role, created, content}`.
+
+- Capture: real sandboxed self-capture of goose 1.49.0 (`/usr/local/bin/goose`)
+  run under a throwaway `HOME` with a local OpenAI-compatible mock LLM server
+  (no credentials). Schema verbatim from upstream. DB rows exercise multi-turn
+  text, a successful tool request+response, sub_agent lineage, thinking blocks,
+  an image block, a failed tool call, an error block, an unknown block type, a
+  non-user/assistant (system) role, and millisecond timestamps. The two legacy
+  JSONL files add an unfinished tool call and an empty (user-turn-only) session.
+
+- Per-file row census (the count every integration test derives from):
+  - `sessions.db`: 4 sessions (`ses-user-001`, `ses-sub-002`, `ses-think-003`,
+    `ses-sched-004`), 14 messages; `ses-sub-002` has `parent_session_id =
+    ses-user-001` and brands `goose/sub-agent`.
+  - `legacy-001.jsonl`: 1 session (`legacy-001`), 2 messages (unfinished tool
+    call).
+  - `legacy-002.jsonl`: 1 session (`legacy-002`), 1 message (empty session,
+    user turn only).
+  - Totals: 6 ingestible sessions, 17 messages; legacy ids are disjoint from
+    DB ids.
+
+- JSONL samples: legacy pre-1.10 format retained solely to exercise the
+  legacy reader path; the DB is the current writer's format.
+
+- `trufflehog` and `gitleaks` report zero findings; no personal names,
+  real project names, credentials, or IP addresses.
 
 ### nanoclaw
 

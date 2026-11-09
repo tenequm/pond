@@ -1,0 +1,2 @@
+{"id": "legacy-002", "description": "legacy empty session (user turn only)", "working_dir": "/tmp/goose-legacy", "created_at": "2026-01-14T10:00:00Z", "updated_at": "2026-01-14T10:00:05Z", "extension_data": {}, "message_count": 1}
+{"id": "msg-legacy-002-1", "role": "user", "created": 1768402802, "content": "Just saying hello."}
