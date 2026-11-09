@@ -275,6 +275,32 @@ sql_session                   1.60       1.56       1.26       2.67
 
 `pond status` creates the three tables. On this branch before `970c70b` it fails with "Failed to create table messages": the multipart copy Lance 14 publishes table markers with sends its UploadPartCopy without `Content-Length`, and Hetzner answers 411 MissingContentLength. Released 0.20.3 (Lance 13) creates the store (7 objects), and so does this branch with `aws_copy_if_not_exists = header:If-None-Match:*` (9 objects), the plain conditional copy pond now falls back to on any S3 backend that rejects Lance's default. All three prefixes were deleted afterwards.
 
+### 2026-11-09 - win-5700x3d -> S3 copy, release-readiness pair at `403ffe2` (same host)
+
+Store digest `358d41f101b8`: a fresh server-side `s5cmd` copy of the live s3-nbg1 store at `pondarium/pond-gate-copy` (20.9 GB in 881 objects; 25,098 sessions, 6.05M messages). Old side: released 0.20.3 through `POND_BIN` (CLI probes only, so its row carries no cargo-bench fields), 18:17:15Z, on the unmigrated copy. Then the first upgraded write (`pond optimize`: 33.4 s at a 456 MB peak working set; a second run 7.7 s). New side: `403ffe2`, 18:35:12Z, on the migrated copy, full row. The new row is tagged `403ffe2-dirty` because `write_bench` carried a local one-line patch: its "full copy == 1 msg commit" check is stale since tables are fenced by their first write (a fresh table's first write is the fence commit plus the append, so 2). Unpatched, the gate stops with `WRITE VERIFICATION FAILED` before the commit sweep.
+
+```
+  metric                  0.20.3 (POND_BIN)   403ffe2   delta
+  get_message_s                 8.7             3.8      -56%
+  get_session_mid_s            10.0             4.1      -59%
+  get_session_sid_s             4.9             4.2      -14%
+  search_s                      6.5             4.9      -25%
+  search_dated_s                3.8             3.9       +3%
+  sql_count_s                   1.4             1.2      -14%
+```
+
+The get-message and get-session drops are single samples and did not reproduce: two runs each of the same probes from the rig script on the same copy give the new build 8.7-9.2 s for `get-message` both before and after the migration. Write metrics against the 2026-11-05 Lance 14 row (`970c70b`, same synthetic-500x5 corpus): `write_copy_ms` 3106 -> 5037 (the extra fence commit per fresh table, once per store), `write_ms_per_commit` 321.2 -> 305.3, `write_fold_ms` 1357 -> 1635, `write_index_build_ms` 12021 -> 11220, `write_rows_per_s` 1557 -> 1365; all single samples.
+
+Cross-version on the migrated copy (rig probe script, seconds): 0.20.3 `search --mode fts` 42.6 vs 4.1 on `403ffe2`, `get-session` 17.4 vs 4.6, `get-message` 15.4 vs 9.0. A 0.20.3 `pond optimize --only index` is refused (Flags 32778) after printing "structural index fault; recover with `pond optimize --rebuild`" per table; following that hint is refused too ("cannot be written by this version of Lance") and leaves only orphan index files for the next cleanup. Windows: `pond storage check` passes, and `pond mcp` (read-only open) answers initialize, `pond_search` and `pond_sql` with no errors at a 200 MB idle working set.
+
+### 2026-11-09 - mac-m1max -> S3 copies, two-writer soak and compaction remap A/B at `403ffe2`
+
+Two concurrent `pond sync` processes (separate state dirs, so the per-host sync lock does not serialize them; real local sources) for 7 rounds on a fresh copy: every exit 0, Lance "Rewrite preempted" conflicts retried, no rows lost (sessions 25,098 -> 25,102), all 8 indexes ready. A first-write race on an unfenced copy: both writers hit "failed to fence Lance 13 writers off the table: Commit conflict", retried, and each new session landed exactly once. Idle `pond mcp` after one search: 178 MB on `403ffe2`, 166 MB on 0.20.3, same migrated copy. Migration (`pond optimize` on another copy): 71.1 s, 786 MB max RSS, concurrent with soak traffic.
+
+The soak also reproduced a pre-existing cross-host duplicate: two writers syncing new rows of the same session both append them (absent rows take the append path, which has no conflict to detect), on both `403ffe2` and 0.20.3, locally and on S3. The live store already holds one instance: session `9ea55249`, ingested by two hosts on 2026-07-10, 108 duplicated messages. It needs the same session on two hosts at once, so it is rare, and #370 does not change it.
+
+`write_bench --profile-optimize --skip-build --grown 16` on two copies of the live store, run one after the other (both overlapped soak traffic): total finalize 364.6 s on 0.20.3 vs 386.3 s on `403ffe2` (+5.9%). Compaction 40.6 -> 68.8 s, scalar fold 121.9 -> 143.1 s, index rebuild 180.0 -> 149.7 s. The large compactions are messages in one Lance 13 round (7 fragments, 17.5 s) and two Lance 14 rounds (22.4 s and 16.7 s). One run each: no sign of a remap blow-up; a multi-run A/B would be needed to bracket the compaction delta.
+
 ## bench-gate: Lance 12 -> 13 upgrade (#342)
 
 Store digest `5fcd5e32b8dd` (the live s3-nbg1 store), read-only. Write benches ran on scratch stores beside it. The primary pair is **same-host on mac-m1max**: a full gate (perf + mem `ci`) at `8b6ec39` (Lance 12; main plus the `store_probe` io-trace component) and at `b4965d0` (Lance 13; only the pins differ). The Lance 12 perf half ran at 2026-10-13T11:22:13Z, the Lance 13 one at 2026-10-13T10:08:59Z. There is also a third, unpaired row: a full Lance 12 gate on **bl** at 2026-10-13T07:08:32Z. Its Lance 13 partner was stopped mid-build, because the N100 needs about 1.5 h of compile per side.
