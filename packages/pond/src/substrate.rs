@@ -2082,21 +2082,16 @@ struct CachedDataset {
     /// `None` forces a refresh on the next [`Self::latest`].
     last_refresh: Option<Instant>,
     refresh_after: Duration,
-    open_mode: OpenMode,
 }
 impl CachedDataset {
-    fn new(dataset: Dataset, refresh_after: Duration, open_mode: OpenMode) -> Self {
+    fn new(dataset: Dataset, refresh_after: Duration) -> Self {
         Self {
             dataset,
             last_refresh: Some(Instant::now()),
             refresh_after,
-            open_mode,
         }
     }
     /// The current snapshot for a read. A commit takes [`Self::latest_for_write`].
-    /// A read-write handle first drops any BTree an older pond wrote past the
-    /// fence, so no read trusts one - a write's planning read included, which
-    /// would otherwise miss stored rows and append them again.
     async fn latest(&mut self) -> Result<Dataset> {
         if self
             .last_refresh
@@ -2104,11 +2099,6 @@ impl CachedDataset {
         {
             self.dataset.checkout_latest().await?;
             self.last_refresh = Some(Instant::now());
-        }
-        if self.open_mode == OpenMode::ReadWrite
-            && !self.dataset.manifest().uses_non_reusable_field_ids()
-        {
-            drop_btrees_written_past_the_fence(&mut self.dataset).await?;
         }
         Ok(self.dataset.clone())
     }
@@ -2125,6 +2115,7 @@ impl CachedDataset {
     async fn latest_for_write(&mut self) -> Result<Dataset> {
         let mut dataset = self.latest().await?;
         if !dataset.manifest().uses_non_reusable_field_ids() {
+            drop_btrees_written_past_the_fence(&mut dataset).await?;
             dataset
                 .migrate_to_non_reusable_field_ids()
                 .await
@@ -2139,20 +2130,30 @@ impl CachedDataset {
     }
 }
 
-/// A row-address BTree on an unfenced table means a pond on Lance 11 or older
-/// (0.18 and earlier) wrote past the fence - its Lance checks writer flags only
-/// on appends and clears them on every other commit - so its compactions may
-/// have left those segments pointing at rewritten rows (lance#10351). Drop them
-/// before any read trusts them, for the next index fold to rebuild from a full
-/// scan; the next write re-fences the table.
-async fn drop_btrees_written_past_the_fence(dataset: &mut Dataset) -> Result<()> {
-    let stale: std::collections::BTreeSet<String> = dataset
+/// The row-address BTrees on an unfenced table. Only a pond on Lance 11 or
+/// older (0.18 and earlier) leaves one - its Lance checks writer flags only on
+/// appends and clears them on every other commit - and its compactions may
+/// have left them pointing at rewritten rows (lance#10351). Reads skip them
+/// ([`Handle::scanner`]); the next write drops them.
+async fn btrees_written_past_the_fence(
+    dataset: &Dataset,
+) -> Result<std::collections::BTreeSet<String>> {
+    if dataset.manifest().uses_non_reusable_field_ids() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    Ok(dataset
         .load_indices()
         .await?
         .iter()
         .filter(|index| index.supports_eager_remap())
         .map(|index| index.name.clone())
-        .collect();
+        .collect())
+}
+
+/// Drop [`btrees_written_past_the_fence`] before re-fencing, for the next
+/// index fold to rebuild from a full scan.
+async fn drop_btrees_written_past_the_fence(dataset: &mut Dataset) -> Result<()> {
+    let stale = btrees_written_past_the_fence(dataset).await?;
     if stale.is_empty() {
         return Ok(());
     }
@@ -2321,7 +2322,6 @@ impl Handle {
                     )
                     .await?,
                     refresh_after,
-                    open_mode,
                 )),
                 parts: OnceCell::new(),
             },
@@ -3031,7 +3031,13 @@ impl Handle {
         predicate: Option<&Predicate>,
     ) -> Result<lance::dataset::scanner::Scanner> {
         let dataset = self.dataset(table).await?;
-        scanner_with_prefilter(&dataset, predicate)
+        let mut scanner = scanner_with_prefilter(&dataset, predicate)?;
+        // Read around a BTree an older pond wrote past the fence: it can miss
+        // rows, and a write planned from such a read would append them again.
+        if !btrees_written_past_the_fence(&dataset).await?.is_empty() {
+            scanner.use_scalar_index(false);
+        }
+        Ok(scanner)
     }
     /// Single read entry point: prefilter via `predicate`, optionally
     /// project, return the prepared `Scanner` (spec.md#lance-chokepoints-read).
@@ -3421,7 +3427,6 @@ impl Handle {
             Ok::<_, anyhow::Error>(Mutex::new(CachedDataset::new(
                 dataset,
                 self.lazy_refresh_after,
-                self.open_mode,
             )))
         })
         .await

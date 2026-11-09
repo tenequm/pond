@@ -8514,9 +8514,9 @@ mod tests {
 
     /// A pond on Lance 11 or older writes past the fence and clears it,
     /// leaving a row-address BTree on an unfenced table (built here straight
-    /// through Lance, since no pond seam can). A read-only handle leaves it, a
-    /// read-write one drops it before its first read - so no write plans from
-    /// it - the next write re-fences, and the next fold rebuilds it.
+    /// through Lance, since no pond seam can). Reads on either kind of handle
+    /// commit nothing and plan around it - so no write plans from it - the
+    /// next write drops it and re-fences, and the next fold rebuilds it.
     #[tokio::test]
     async fn a_btree_written_past_the_fence_is_rebuilt() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -8556,6 +8556,15 @@ mod tests {
             "Lance 14 built no row-address BTree"
         );
         assert!(!dataset.manifest().uses_non_reusable_field_ids());
+        async fn uses_btree(store: &Store) -> anyhow::Result<bool> {
+            let plan = store
+                .handle
+                .scanner(Table::Sessions, Some(&Predicate::Eq("id", "old-0".into())))
+                .await?
+                .explain_plan(true)
+                .await?;
+            Ok(plan.contains("ScalarIndexQuery"))
+        }
 
         let store = Store::open_local(temp.path()).await?;
         let reader = Store::open_with_options_cached(
@@ -8566,27 +8575,23 @@ mod tests {
             crate::substrate::OpenMode::ReadOnly,
         )
         .await?;
-        assert_eq!(reader.session_ids().await?.len(), 2);
-        let untouched = reader.handle.dataset(Table::Sessions).await?;
-        assert_eq!(
-            untouched.version_id(),
-            dataset.version_id(),
-            "a read-only read committed"
-        );
-        assert!(has_address_btree(&untouched).await?);
+        for handle in [&reader, &store] {
+            assert_eq!(handle.session_ids().await?.len(), 2);
+            assert!(
+                !uses_btree(handle).await?,
+                "a read planned from the BTree written past the fence"
+            );
+            let read = handle.handle.dataset(Table::Sessions).await?;
+            assert_eq!(read.version_id(), dataset.version_id(), "a read committed");
+        }
 
-        let read = store.handle.dataset(Table::Sessions).await?;
-        assert!(
-            !has_address_btree(&read).await?,
-            "a read-write read trusted the BTree written past the fence"
-        );
-        assert!(
-            !read.manifest().uses_non_reusable_field_ids(),
-            "a read fenced the table"
-        );
         store.upsert_sessions(&[synthetic_session("new")]).await?;
         let written = store.handle.dataset(Table::Sessions).await?;
         assert!(written.manifest().uses_non_reusable_field_ids());
+        assert!(
+            !has_address_btree(&written).await?,
+            "the write kept the BTree written past the fence"
+        );
 
         store.build_indices_only(None).await?.into_result()?;
         let rebuilt = store.handle.dataset(Table::Sessions).await?;
@@ -8594,6 +8599,7 @@ mod tests {
             has_address_btree(&rebuilt).await?,
             "the next fold did not rebuild it"
         );
+        assert!(uses_btree(&store).await?, "lookups skip the rebuilt BTree");
         for id in ["old-0", "old-1", "new"] {
             assert!(store.get_session(id).await?.is_some(), "{id} lost");
         }
