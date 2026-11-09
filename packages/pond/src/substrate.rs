@@ -3234,12 +3234,18 @@ impl Handle {
             |error| !is_index_not_found(error),
             || async {
                 let mut guard = self.cached(table).await?.lock().await;
+                // The fence's repair drops a BTree an older pond wrote past the
+                // fence before this does; that removal is the requested drop.
+                let repaired = btrees_written_past_the_fence(&guard.latest().await?)
+                    .await?
+                    .contains(name);
                 let mut dataset = guard.latest_for_write().await?;
-                dataset
-                    .drop_index(name)
-                    .await
-                    .with_context(|| format!("drop_index({name}) failed for {}", table.label()))?;
-                guard.replace(dataset);
+                if !repaired {
+                    dataset.drop_index(name).await.with_context(|| {
+                        format!("drop_index({name}) failed for {}", table.label())
+                    })?;
+                    guard.replace(dataset);
+                }
                 Ok(())
             },
         )

@@ -3106,8 +3106,13 @@ impl Store {
             return Ok(count);
         }
         let scope = Predicate::And(vec![Predicate::IsNotNull("search_text"), filter.clone()]);
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let count = dataset.count_rows(Some(scope.to_lance())).await?;
+        let count = self
+            .handle
+            .scanner(Table::Messages, Some(&scope))
+            .await?
+            .count_rows()
+            .await?;
+        let count = usize::try_from(count)?;
         Ok(count)
     }
 
@@ -8465,6 +8470,57 @@ mod tests {
         Ok(())
     }
 
+    /// The state a pond on Lance 11 or older leaves after writing past the
+    /// fence: an unfenced `sessions` table holding two sessions and a
+    /// row-address `sessions_id_btree`, built straight through Lance since no
+    /// pond seam can.
+    async fn unfenced_sessions_with_address_btree(
+        root: &std::path::Path,
+    ) -> anyhow::Result<Dataset> {
+        create_unfenced_sessions(root.to_str().unwrap()).await?;
+        let uri = root.join("sessions.lance");
+        let batches = sessions_batches(&[synthetic_session("old-0"), synthetic_session("old-1")])?;
+        let schema = batches[0].schema();
+        let mut dataset = Dataset::write(
+            lance::deps::arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..write_params_for_create()
+            }),
+        )
+        .await?;
+        dataset
+            .create_index_builder(
+                &["id"],
+                lance_index::IndexType::BTree,
+                &lance_index::scalar::ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            )
+            .name("sessions_id_btree".to_owned())
+            .await?;
+        Ok(dataset)
+    }
+
+    /// `pond optimize --drop-index` naming a BTree the fence's repair drops
+    /// first: the drop succeeds rather than reporting the index missing.
+    #[tokio::test]
+    async fn dropping_a_btree_written_past_the_fence_by_name_succeeds() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        unfenced_sessions_with_address_btree(temp.path()).await?;
+        let store = Store::open_local(temp.path()).await?;
+        store.drop_index_by_name("sessions_id_btree").await?;
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        assert!(sessions.manifest().uses_non_reusable_field_ids());
+        assert!(
+            !sessions
+                .load_indices()
+                .await?
+                .iter()
+                .any(|index| index.name == "sessions_id_btree")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn read_only_open_keeps_current_table_unfenced() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -8520,28 +8576,7 @@ mod tests {
     #[tokio::test]
     async fn a_btree_written_past_the_fence_is_rebuilt() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        create_unfenced_sessions(temp.path().to_str().unwrap()).await?;
-        let uri = temp.path().join("sessions.lance");
-        let uri = uri.to_str().unwrap();
-        let batches = sessions_batches(&[synthetic_session("old-0"), synthetic_session("old-1")])?;
-        let schema = batches[0].schema();
-        let mut dataset = Dataset::write(
-            lance::deps::arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
-            uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..write_params_for_create()
-            }),
-        )
-        .await?;
-        dataset
-            .create_index_builder(
-                &["id"],
-                lance_index::IndexType::BTree,
-                &lance_index::scalar::ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
-            )
-            .name("sessions_id_btree".to_owned())
-            .await?;
+        let dataset = unfenced_sessions_with_address_btree(temp.path()).await?;
         let has_address_btree =
             |dataset: &Dataset| {
                 let dataset = dataset.clone();
