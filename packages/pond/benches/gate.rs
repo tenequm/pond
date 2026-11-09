@@ -1004,13 +1004,9 @@ fn write_passes(argv: &[&str], profile_dir: &Path) -> Result<(String, String, St
 }
 
 fn build_total(text: &str) -> Value {
-    labeled_total(text, "build total:")
-}
-
-fn labeled_total(text: &str, label: &str) -> Value {
     number(
         text.lines()
-            .find(|line| line.contains(label))
+            .find(|line| line.contains("build total:"))
             .and_then(|line| line.split_whitespace().nth(2)),
     )
 }
