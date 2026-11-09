@@ -6913,11 +6913,9 @@ fn part_variant_json(kind: &PartKind) -> Result<Vec<u8>> {
             "data_kind": data_kind,
         }));
     }
-    let value = serde_json::to_value(kind)?;
-    let mut object = value
-        .as_object()
-        .cloned()
-        .context("part variant did not serialize to an object")?;
+    let serde_json::Value::Object(mut object) = serde_json::to_value(kind)? else {
+        anyhow::bail!("part variant did not serialize to an object");
+    };
     object.remove("type");
     json_bytes(&object)
 }
