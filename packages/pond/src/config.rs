@@ -108,7 +108,7 @@ where
 }
 
 /// True when the URL is on the local filesystem. Mirrors Lance's
-/// `ObjectStore::is_local` (lance-io/src/object_store.rs:541): the `file` and
+/// `ObjectStore::is_local` (lance-io `object_store.rs`): the `file` and
 /// `file+uring` schemes are local; everything else (incl. `memory://`) is not.
 pub fn is_local(url: &Url) -> bool {
     matches!(url.scheme(), "file" | "file+uring")
@@ -1516,7 +1516,7 @@ access_key_id     = "AKIA456"
 secret_access_key_command = "op read op://vault/pond/secret"
 region            = "fsn1"
 virtual_hosted_style_request = false
-extra = { request_timeout = "60 seconds" }
+extra = { timeout = "60 seconds" }
 "#,
             )?;
             let config = Config::load("config.toml").expect("config loads");
@@ -1531,7 +1531,7 @@ extra = { request_timeout = "60 seconds" }
                 Some("op read op://vault/pond/secret"),
             );
             assert_eq!(work.virtual_hosted_style_request, Some(false));
-            assert_eq!(work.extra["request_timeout"], "60 seconds");
+            assert_eq!(work.extra["timeout"], "60 seconds");
             Ok(())
         });
     }

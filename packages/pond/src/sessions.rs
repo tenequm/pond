@@ -412,6 +412,7 @@ impl Store {
         storage_options: std::collections::HashMap<String, String>,
         caps: crate::substrate::RuntimeCaps,
         index_cache_dir: Option<std::path::PathBuf>,
+        open_mode: crate::substrate::OpenMode,
     ) -> Result<Self> {
         Ok(Self {
             handle: Handle::open_with_options_cached(
@@ -419,6 +420,7 @@ impl Store {
                 storage_options,
                 caps,
                 index_cache_dir,
+                open_mode,
             )
             .await?,
             rowmap: ArcSwapOption::empty(),
@@ -3104,8 +3106,13 @@ impl Store {
             return Ok(count);
         }
         let scope = Predicate::And(vec![Predicate::IsNotNull("search_text"), filter.clone()]);
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let count = dataset.count_rows(Some(scope.to_lance())).await?;
+        let count = self
+            .handle
+            .scanner(Table::Messages, Some(&scope))
+            .await?
+            .count_rows()
+            .await?;
+        let count = usize::try_from(count)?;
         Ok(count)
     }
 
@@ -5623,8 +5630,10 @@ pub fn init_embedding_dim(dim: usize) {
 /// substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond copy --to <file>`
 /// snapshots plus deferred Lance tags (spec.md#session-durable-copy).
-/// `skip_auto_cleanup` suppresses the per-commit hook so cleanup stays
-/// operator-driven via `pond optimize` (one LIST per command instead of per write).
+/// `skip_auto_cleanup` suppresses the per-commit hook for pond's own write
+/// builders, so cleanup stays operator-driven via `pond optimize` (one LIST per
+/// command instead of per write); commits Lance makes itself (`add_columns`,
+/// index and compaction commits, the writer fence) can still run it.
 pub(crate) fn write_params_for_create() -> WriteParams {
     WriteParams {
         data_storage_version: Some(LanceFileVersion::V2_1),
@@ -6789,7 +6798,7 @@ fn primary_field(name: &str, data_type: DataType, nullable: bool) -> Field {
 }
 
 // Legacy blob storage (`LargeBinary` + `lance-encoding:blob=true`), which is why
-// `write_params_for_create` pins file format 2.1: at >= 2.2 Lance 13 silently
+// `write_params_for_create` pins file format 2.1: at >= 2.2 Lance 13+ silently
 // stores this column as Blob v2 (`Struct<data, uri>`), a shape pond's parts
 // read/write paths and `.pond` archives do not expect, and the first 2.2 write
 // sets the sticky mixed-versions manifest flag that Lance 11 readers refuse.
@@ -6838,10 +6847,10 @@ fn json_size<T: Serialize>(value: &T) -> Result<usize> {
 
 fn json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     // Write JSONB bytes (not plain UTF-8 JSON text) so the on-disk encoding
-    // matches the `lance.json` extension contract. Lance's compact path
-    // (`optimize.rs:908`) reads through `DatasetRecordBatchStream` which
-    // applies `decode_json -> encode_json` on this column; with proper JSONB
-    // on disk that roundtrip is idempotent, with plain UTF-8 it corrupts
+    // matches the `lance.json` extension contract. Lance's compact path reads
+    // through `DatasetRecordBatchStream`, which applies `decode_json ->
+    // encode_json` on this column; with proper JSONB on disk that roundtrip
+    // is idempotent, with plain UTF-8 it corrupts
     // (the analogous fix landed for `update.rs` in PR #6741 by switching to
     // `try_into_dfstream`; compact still goes through the adapter).
     let text = serde_json::to_string(value).context("failed to serialize JSON field")?;
@@ -8394,6 +8403,297 @@ mod tests {
             );
         }
         assert!(store.get_session("session-7").await?.is_some());
+        Ok(())
+    }
+
+    /// Lance 14 builds BTree segments in the row-address domain on stable-row-id
+    /// tables (lance#9481) and remaps them eagerly when compaction rewrites the
+    /// fragments they cover (lance#10041). The remapped bitmap claims the new
+    /// fragment, so Lance never scans it for an indexed lookup: a stale address
+    /// in the payload would lose the session rather than fall back to a scan.
+    #[tokio::test]
+    async fn compaction_remaps_the_address_domain_btree() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        upsert_one_session_per_commit(&store, 12).await?;
+        store.build_indices_only(None).await?.into_result()?;
+        drop(store);
+
+        let mut sessions =
+            Dataset::open(temp.path().join("sessions.lance").to_str().unwrap()).await?;
+        lance::dataset::optimize::compact_files(&mut sessions, Default::default(), None).await?;
+        assert_eq!(sessions.get_fragments().len(), 1);
+        let btree = sessions
+            .load_indices()
+            .await?
+            .iter()
+            .find(|index| index.name == "sessions_id_btree")
+            .cloned()
+            .context("sessions_id_btree missing after compaction")?;
+        assert_eq!(
+            btree.index_version, 1,
+            "BTree not in the row-address domain"
+        );
+        let live: roaring::RoaringBitmap = sessions
+            .get_fragments()
+            .iter()
+            .map(|fragment| u32::try_from(fragment.id()).unwrap())
+            .collect();
+        assert_eq!(
+            btree.fragment_bitmap,
+            Some(live),
+            "compaction dropped coverage"
+        );
+
+        let store = Store::open_local(temp.path()).await?;
+        for index in 0..12 {
+            let id = format!("session-{index}");
+            assert!(store.get_session(&id).await?.is_some(), "{id} lost");
+        }
+        Ok(())
+    }
+
+    /// lance-table's `FLAG_NON_REUSABLE_FIELD_IDS`, which lance does not re-export.
+    const NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
+    /// Lance 13's reader and writer gates refuse every flag from this bit up.
+    const LANCE_13_FLAG_UNKNOWN: u64 = 1 << 14;
+
+    /// An empty `sessions` table as a pond from before the writer fence created it.
+    async fn create_unfenced_sessions(root: &str) -> anyhow::Result<()> {
+        let uri = format!("{}/sessions.lance", root.trim_end_matches('/'));
+        Dataset::write(
+            empty_reader(session_schema())?,
+            uri.as_str(),
+            Some(write_params_for_create()),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The state a writer leaves that clears the fence but keeps Lance 14's
+    /// BTrees (no pond release does): an unfenced `sessions` table holding two
+    /// sessions and a row-address `sessions_id_btree`, built straight through
+    /// Lance since no pond seam can.
+    async fn unfenced_sessions_with_address_btree(
+        root: &std::path::Path,
+    ) -> anyhow::Result<Dataset> {
+        create_unfenced_sessions(root.to_str().unwrap()).await?;
+        let uri = root.join("sessions.lance");
+        let batches = sessions_batches(&[synthetic_session("old-0"), synthetic_session("old-1")])?;
+        let schema = batches[0].schema();
+        let mut dataset = Dataset::write(
+            lance::deps::arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..write_params_for_create()
+            }),
+        )
+        .await?;
+        dataset
+            .create_index_builder(
+                &["id"],
+                lance_index::IndexType::BTree,
+                &lance_index::scalar::ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            )
+            .name("sessions_id_btree".to_owned())
+            .await?;
+        Ok(dataset)
+    }
+
+    /// `pond optimize --drop-index` naming a BTree the fence's repair drops
+    /// first: the drop succeeds rather than reporting the index missing.
+    #[tokio::test]
+    async fn dropping_a_btree_written_past_the_fence_by_name_succeeds() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        unfenced_sessions_with_address_btree(temp.path()).await?;
+        let store = Store::open_local(temp.path()).await?;
+        store.drop_index_by_name("sessions_id_btree").await?;
+        let sessions = store.handle.dataset(Table::Sessions).await?;
+        assert!(sessions.manifest().uses_non_reusable_field_ids());
+        assert!(
+            !sessions
+                .load_indices()
+                .await?
+                .iter()
+                .any(|index| index.name == "sessions_id_btree")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_open_keeps_current_table_unfenced() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        create_unfenced_sessions(temp.path().to_str().unwrap()).await?;
+        Store::open_local(temp.path()).await?;
+        let store = Store::open_with_options_cached(
+            &config::url_for_path(temp.path())?,
+            Default::default(),
+            crate::substrate::RuntimeCaps::default(),
+            None,
+            crate::substrate::OpenMode::ReadOnly,
+        )
+        .await?;
+        assert!(store.session_ids().await?.is_empty());
+        let uri = temp.path().join("sessions.lance");
+        let dataset = Dataset::open(uri.to_str().unwrap()).await?;
+        assert!(!dataset.manifest().uses_non_reusable_field_ids());
+        assert_eq!(dataset.version_id(), 1);
+        Ok(())
+    }
+
+    /// Creating a table does not fence it - a read verb's open can create one on
+    /// a store nothing has written - its first write does, without a reader
+    /// flag Lance 13 refuses.
+    #[tokio::test]
+    async fn tables_are_fenced_by_their_first_write_not_their_creation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        upsert_one_session_per_commit(&store, 1).await?;
+        let written = store.handle.dataset(Table::Sessions).await?;
+        assert_ne!(
+            written.manifest().writer_feature_flags & NON_REUSABLE_FIELD_IDS,
+            0,
+            "the first write did not fence sessions"
+        );
+        assert!(
+            written.manifest().reader_feature_flags < LANCE_13_FLAG_UNKNOWN,
+            "Lance 13 cannot read sessions"
+        );
+        let created = store.handle.dataset(Table::Messages).await?;
+        assert!(
+            !created.manifest().uses_non_reusable_field_ids(),
+            "creating messages fenced it"
+        );
+        Ok(())
+    }
+
+    /// The backstop for a writer that clears the fence but keeps a row-address
+    /// BTree (built here straight through Lance, since no pond seam can). Reads
+    /// on either kind of handle commit nothing and plan around it - so no write
+    /// plans from it - the next write drops it and re-fences, and the next fold
+    /// rebuilds it.
+    #[tokio::test]
+    async fn a_btree_written_past_the_fence_is_rebuilt() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let dataset = unfenced_sessions_with_address_btree(temp.path()).await?;
+        let has_address_btree =
+            |dataset: &Dataset| {
+                let dataset = dataset.clone();
+                async move {
+                    anyhow::Ok(dataset.load_indices().await?.iter().any(|index| {
+                        index.name == "sessions_id_btree" && index.supports_eager_remap()
+                    }))
+                }
+            };
+        assert!(
+            has_address_btree(&dataset).await?,
+            "Lance 14 built no row-address BTree"
+        );
+        assert!(!dataset.manifest().uses_non_reusable_field_ids());
+        async fn uses_btree(store: &Store) -> anyhow::Result<bool> {
+            let plan = store
+                .handle
+                .scanner(Table::Sessions, Some(&Predicate::Eq("id", "old-0".into())))
+                .await?
+                .explain_plan(true)
+                .await?;
+            Ok(plan.contains("ScalarIndexQuery"))
+        }
+
+        let store = Store::open_local(temp.path()).await?;
+        let reader = Store::open_with_options_cached(
+            &config::url_for_path(temp.path())?,
+            Default::default(),
+            crate::substrate::RuntimeCaps::default(),
+            None,
+            crate::substrate::OpenMode::ReadOnly,
+        )
+        .await?;
+        for handle in [&reader, &store] {
+            assert_eq!(handle.session_ids().await?.len(), 2);
+            assert!(
+                !uses_btree(handle).await?,
+                "a read planned from the BTree written past the fence"
+            );
+            let read = handle.handle.dataset(Table::Sessions).await?;
+            assert_eq!(read.version_id(), dataset.version_id(), "a read committed");
+        }
+
+        store.upsert_sessions(&[synthetic_session("new")]).await?;
+        let written = store.handle.dataset(Table::Sessions).await?;
+        assert!(written.manifest().uses_non_reusable_field_ids());
+        assert!(
+            !has_address_btree(&written).await?,
+            "the write kept the BTree written past the fence"
+        );
+
+        store.build_indices_only(None).await?.into_result()?;
+        let rebuilt = store.handle.dataset(Table::Sessions).await?;
+        assert!(
+            has_address_btree(&rebuilt).await?,
+            "the next fold did not rebuild it"
+        );
+        assert!(uses_btree(&store).await?, "lookups skip the rebuilt BTree");
+        for id in ["old-0", "old-1", "new"] {
+            assert!(store.get_session(id).await?.is_some(), "{id} lost");
+        }
+        Ok(())
+    }
+
+    /// The writer fence (`CachedDataset::latest_for_write`) on a table an
+    /// older pond created: opening and reading it commit nothing, and the
+    /// first write fences it without touching a reader flag.
+    #[tokio::test]
+    async fn first_write_fences_an_older_table() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        create_unfenced_sessions(temp.path().to_str().unwrap()).await?;
+        let store = Store::open_local(temp.path()).await?;
+        assert!(store.session_ids().await?.is_empty());
+        let before = store.handle.dataset(Table::Sessions).await?;
+        assert!(!before.manifest().uses_non_reusable_field_ids());
+        assert_eq!(before.version_id(), 1, "opening or reading committed");
+
+        upsert_one_session_per_commit(&store, 2).await?;
+        let after = store.handle.dataset(Table::Sessions).await?;
+        assert_ne!(
+            after.manifest().writer_feature_flags & NON_REUSABLE_FIELD_IDS,
+            0
+        );
+        assert_eq!(
+            after.manifest().reader_feature_flags,
+            before.manifest().reader_feature_flags
+        );
+        assert_eq!(store.session_ids().await?.len(), 2);
+        Ok(())
+    }
+
+    /// Two hosts' first writes race the fence on an older table: the loser's
+    /// commit conflict re-reads the fenced manifest, and both writes land.
+    #[tokio::test]
+    async fn concurrent_first_writes_share_one_fence() -> anyhow::Result<()> {
+        let root = "shared-memory://pond-test-writer-fence-race/";
+        create_unfenced_sessions(root).await?;
+        let url = Url::parse(root)?;
+        let first = Store::open(&url).await?;
+        let second = Store::open(&url).await?;
+        let (session_a, session_b) = (
+            [synthetic_session("fence-a")],
+            [synthetic_session("fence-b")],
+        );
+        let (left, right) = tokio::join!(
+            first.upsert_sessions(&session_a),
+            second.upsert_sessions(&session_b),
+        );
+        left?;
+        right?;
+
+        let reader = Store::open(&url).await?;
+        let sessions = reader.handle.dataset(Table::Sessions).await?;
+        assert!(sessions.manifest().uses_non_reusable_field_ids());
+        let mut ids = reader.session_ids().await?;
+        ids.sort();
+        assert_eq!(ids, ["fence-a", "fence-b"]);
         Ok(())
     }
 

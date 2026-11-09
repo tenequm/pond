@@ -858,8 +858,8 @@ async fn main() -> Result<()> {
         full_plan.total() == args.sessions
     );
     println!(
-        "  full copy == 1 msg commit  : {}  (append collapses to one commit per table)",
-        full_commits == 1
+        "  full copy == 2 msg commits : {}  (the first write fences the fresh table, then one append)",
+        full_commits == 2
     );
     println!("  no-op delta == 0           : {}", noop_plan.is_empty());
     println!("  +1 delta == 1              : {}", delta_plan.total() == 1);

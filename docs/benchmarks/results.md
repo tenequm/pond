@@ -11,7 +11,7 @@ Numbers that have hardened into rules live in CLAUDE.md as prose (the S3 commit-
 ## Environments
 
 - **mac-m1max** - Apple M1 Max, macOS 26.6.2, APFS on internal SSD.
-- **win-5700x3d** - AMD Ryzen 7 5700X3D (8C/16T), 16 GB, Windows 11 Pro 10.0.26200, NTFS on NVMe SSD.
+- **win-5700x3d** - AMD Ryzen 7 5700X3D (8C/16T), 16 GB, Windows 11 Pro 10.0.26300, builds on a ReFS Dev Drive on NVMe SSD (NTFS before 2026-10-13). Its gate rows carry host `tenequm-w11-pc`, and it drives s3-nbg1 over a home link.
 - **s3-nbg1** - Hetzner object storage at `nbg1.your-objectstorage.com`, driven from mac-m1max.
 
 - **bl** - Beelink EQ13, Intel N100 (4C/4T), 16 GB, Ubuntu 24.04, ext4 on NVMe. Drives s3-nbg1 over a home link. Its rows carry host `Linux-x86_64`, the same tag as ws-pond-01's, though the hardware is far smaller.
@@ -205,6 +205,101 @@ sys	2m42.220s
 ```
 
 39m22s against 113m56s: first import is 2.89x faster with embeddings off (the new default). The gap is the inline embedding cost the old binary always paid; a new-enabled leg would land near the old number.
+
+## bench-gate: Lance 13 -> 14 upgrade (#370)
+
+Store digest `56752847c37e`: a server-side `s5cmd` copy of the live s3-nbg1 store at `pondarium/pond-lance14-copy` (20.7 GiB in 610 objects; 24,819 sessions, 5.90M messages, 3.46M parts), static through both gates and read-only for them. Write benches ran on scratch stores beside it. The pair is **same-host on win-5700x3d**:
+- Lance 13 at `3f10be0` (main, with this branch's `gate.rs` and `write_bench.rs`, so both rows carry the same fields), perf half at 2026-11-05T17:18:52Z.
+- Lance 14 at `970c70b`, perf half at 2026-11-05T19:07:02Z. A first Lance 14 run at `1334320` failed in `write_bench`, because Lance 14 could not create a table on Hetzner (below).
+
+There is also an unpaired Lance 13 row from mac-m1max against the live store (`5fcd5e32b8dd`, `3f10be0`, 2026-11-05T14:15:19Z), taken before any Lance 14 binary wrote it.
+
+### 2026-11-05 - win-5700x3d -> S3 copy of the live store, perf-gate pair (same host)
+
+```
+  metric                              prev           now    delta   (2026-11-05T17:18:52Z 3f10be0-dirty -> 2026-11-05T19:07:02Z 970c70b)
+  fts_iops                              20            28     +40%
+  get_message_iops                      22            22      +0%
+  get_message_s                        9.6           9.5      -1%
+  get_session_mid_s                    8.9           9.4      +6%
+  get_session_sid_s                    4.6           4.3      -7%
+  open_store_ms                       1076          1176      +9%
+  row_counts_ms                        874           743     -15%
+  rowmap_cold_ms                     21261         23939     +13%
+  rowmap_warm_ms                       513           229     -55%
+  search_dated_s                       4.0           3.8      -5%
+  search_iops                          153           153      +0%
+  search_s                             6.8           6.3      -7%
+  sql_count_s                          1.7           1.2     -29%
+  store_probe_iops                       1             1      +0%
+  vector_iops                           90            90      +0%
+  write_compact_ms                    4817          6342     +32%
+  write_copy_delta_ms                  619           459     -26%
+  write_copy_merge_ms                  700           501     -28%
+  write_copy_ms                       2730          3106     +14%
+  write_copy_noop_ms                   520           395     -24%
+  write_fold_ms                       2410          1357     -44%
+  write_index_build_ms               10930         12021     +10%
+  write_ms_per_commit                332.4         321.2      -3%
+  write_rows_per_s                    1504          1557      +4%
+```
+
+The copy is static, so its io-trace counts move with code, not store state. FTS is the one that moves:
+- Per warm query it reads 0.37 MB instead of 1.04 MB at p50 (1.52 MB instead of 5.88 MB at p95), in 28 requests instead of 20.
+- Over the 20 queries, `index/part_0_invert.lance` serves 416 requests and 6.6 MB instead of 310 and 40.8 MB. That is lance#10198 loading only the requested postings.
+- `pond_search` hydration drops from 43 to 35 requests at p50. Vector search, get-message and the store probe are request-for-request identical.
+
+The wall-clock fields are one sample each (the CLI probes best of 2) over a home link, so nothing under ~20% resolves. Two reads move by more: `rowmap_warm_ms` (513 -> 229) and `sql_count_s` (1.7 -> 1.2), the latter in line with lance#10016 summing `count_rows(None)` from the manifest. Two write fields do not measure Lance:
+- **`write_fold_ms`** (2,410 -> 1,357) is the fold bench's round 1. On Lance 13 that round fired the every-8th-version cleanup (898 ms) and on Lance 14 it did not: this branch creates tables already fenced, one extra commit, so its rounds land on v15/v17 instead of v14/v16.
+- **`write_compact_ms`** timed a "forced compaction" round that planned no compaction task on either side (fragments 3 -> 3, because Lance does not bin fragments covered by different index segments), so it measured cleanup and index-append only. The round and the field are dropped, and Lance 14's eager BTree remap stays unmeasured by the gate.
+
+### 2026-11-05 - win-5700x3d -> S3 copy, the first index pass and cross-version access
+
+After both gates, on the same copy: 5 one-shot CLI probes per binary and phase, each in a sandboxed HOME/XDG, best of 2 runs (Lance 13 after the migration: 1 run).
+
+```
+probe (best of runs, s)    v13-pre    v14-pre   v14-post   v13-post
+get_session                   4.15       4.30       4.89      17.90
+get_message                  10.15       9.16       8.71      13.51
+search_fts                    4.38       4.14       4.04      40.80
+sql_tool                      2.19       1.92       1.83       2.95
+sql_session                   1.60       1.56       1.26       2.67
+```
+
+- **Results:** identical in all four columns (the two `pond sql` outputs differ only in their elapsed-time line), and identical to a mac-m1max Lance 13 run against the same copy.
+- **First index pass:** Lance 14's `pond optimize --only index` took 36.4 s at a 423 MB peak working set. The copy had 6 indexes pending (the `messages.session_id`, `parts.session_id`, `parts.message_id` and `parts.tool_name` BTrees, the source-agent bitmap and the timestamp zonemap), all ready after it, and the pass also compacted the store from 22.42 to 22.25 GB.
+- **Lance 13 reads of the migrated store** stay correct but slow down: Lance 13 ignores the v1 BTrees ("Index ... has version 1, which is not supported (<=0), ignoring it"), so session lookups and search hydration scan: get-session 4.3x, FTS search 9.3x.
+- **Lance 13 writes are refused.** `pond sync` of a session the store lacks (0.20.3 from mac-m1max) fails with "This dataset cannot be written by this version of Lance. Please upgrade Lance to write to this dataset. Flags: 32778" (bit 15, 32768, set). `pond optimize --only index` fails earlier and also writes nothing: it cannot see the v1 `sessions_id_btree`, and its re-create collides with the name ("Index name 'sessions_id_btree' already exists").
+
+### 2026-11-05 - mac-m1max -> s3-nbg1, table creation on a fresh prefix
+
+`pond status` creates the three tables. On this branch before `970c70b` it fails with "Failed to create table messages": the multipart copy Lance 14 publishes table markers with sends its UploadPartCopy without `Content-Length`, and Hetzner answers 411 MissingContentLength. Released 0.20.3 (Lance 13) creates the store (7 objects), and so does this branch with `aws_copy_if_not_exists = header:If-None-Match:*` (9 objects), the plain conditional copy pond now falls back to on any S3 backend that rejects Lance's default. All three prefixes were deleted afterwards.
+
+### 2026-11-09 - win-5700x3d -> S3 copy, release-readiness pair at `403ffe2` (same host)
+
+Store digest `358d41f101b8`: a fresh server-side `s5cmd` copy of the live s3-nbg1 store at `pondarium/pond-gate-copy` (20.9 GB in 881 objects; 25,098 sessions, 6.05M messages). Old side: released 0.20.3 through `POND_BIN` (CLI probes only, so its row carries no cargo-bench fields), 18:17:15Z, on the unmigrated copy. Then the first upgraded write (`pond optimize`: 33.4 s at a 456 MB peak working set; a second run 7.7 s). New side: `403ffe2`, 18:35:12Z, on the migrated copy, full row. The new row is tagged `403ffe2-dirty` because `write_bench` carried a local one-line patch: its "full copy == 1 msg commit" check is stale since tables are fenced by their first write (a fresh table's first write is the fence commit plus the append, so 2). Unpatched, the gate stops with `WRITE VERIFICATION FAILED` before the commit sweep.
+
+```
+  metric                  0.20.3 (POND_BIN)   403ffe2   delta
+  get_message_s                 8.7             3.8      -56%
+  get_session_mid_s            10.0             4.1      -59%
+  get_session_sid_s             4.9             4.2      -14%
+  search_s                      6.5             4.9      -25%
+  search_dated_s                3.8             3.9       +3%
+  sql_count_s                   1.4             1.2      -14%
+```
+
+The get-message and get-session drops are single samples and did not reproduce: two runs each of the same probes from the rig script on the same copy give the new build 8.7-9.2 s for `get-message` both before and after the migration. Write metrics against the 2026-11-05 Lance 14 row (`970c70b`, same synthetic-500x5 corpus): `write_copy_ms` 3106 -> 5037 (the extra fence commit per fresh table, once per store), `write_ms_per_commit` 321.2 -> 305.3, `write_fold_ms` 1357 -> 1635, `write_index_build_ms` 12021 -> 11220, `write_rows_per_s` 1557 -> 1365; all single samples.
+
+Cross-version on the migrated copy (rig probe script, seconds): 0.20.3 `search --mode fts` 42.6 vs 4.1 on `403ffe2`, `get-session` 17.4 vs 4.6, `get-message` 15.4 vs 9.0. A 0.20.3 `pond optimize --only index` is refused (Flags 32778) after printing "structural index fault; recover with `pond optimize --rebuild`" per table; following that hint is refused too ("cannot be written by this version of Lance") and leaves only orphan index files for the next cleanup. Windows: `pond storage check` passes, and `pond mcp` (read-only open) answers initialize, `pond_search` and `pond_sql` with no errors at a 200 MB idle working set.
+
+### 2026-11-09 - mac-m1max -> S3 copies, two-writer soak and compaction remap A/B at `403ffe2`
+
+Two concurrent `pond sync` processes (separate state dirs, so the per-host sync lock does not serialize them; real local sources) for 7 rounds on a fresh copy: every exit 0, Lance "Rewrite preempted" conflicts retried, no rows lost (sessions 25,098 -> 25,102), all 8 indexes ready. A first-write race on an unfenced copy: both writers hit "failed to fence Lance 13 writers off the table: Commit conflict", retried, and each new session landed exactly once. Idle `pond mcp` after one search: 178 MB on `403ffe2`, 166 MB on 0.20.3, same migrated copy. Migration (`pond optimize` on another copy): 71.1 s, 786 MB max RSS, concurrent with soak traffic.
+
+The soak also reproduced a pre-existing cross-host duplicate: two writers syncing new rows of the same session both append them (absent rows take the append path, which has no conflict to detect), on both `403ffe2` and 0.20.3, locally and on S3. The live store already holds one instance: session `9ea55249`, ingested by two hosts on 2026-07-10, 108 duplicated messages. It needs the same session on two hosts at once, so it is rare, and #370 does not change it.
+
+`write_bench --profile-optimize --skip-build --grown 16` on two copies of the live store, run one after the other (both overlapped soak traffic): total finalize 364.6 s on 0.20.3 vs 386.3 s on `403ffe2` (+5.9%). Compaction 40.6 -> 68.8 s, scalar fold 121.9 -> 143.1 s, index rebuild 180.0 -> 149.7 s. The large compactions are messages in one Lance 13 round (7 fragments, 17.5 s) and two Lance 14 rounds (22.4 s and 16.7 s). One run each: no sign of a remap blow-up; a multi-run A/B would be needed to bracket the compaction delta.
 
 ## bench-gate: Lance 12 -> 13 upgrade (#342)
 

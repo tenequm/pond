@@ -1526,13 +1526,13 @@ fn entry_content_id(session_id: &str, value: &Value) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(session_id.as_bytes());
     hasher.update(b"\0");
-    // Deterministic because this workspace pins `jsonb` with
-    // `default-features = false` (Cargo.toml): jsonb's defaults would turn on
-    // serde_json's `preserve_order` crate-wide, and `Map` would become an
-    // insertion-ordered IndexMap instead of the sorted BTreeMap it is here.
-    // Either way one document serializes the same twice - but if that pin ever
-    // lapses, previously stored digests stop matching and every id-less entry
-    // re-inserts. The pin is load-bearing for this function.
+    // Deterministic because nothing in the tree enables serde_json's
+    // `preserve_order` (see the `lance-jsonb` note in Cargo.toml): with it,
+    // `Map` would become an insertion-ordered IndexMap instead of the sorted
+    // BTreeMap it is here. Either way one document serializes the same twice -
+    // but if that feature ever turns on, previously stored digests stop
+    // matching and every id-less entry re-inserts. That property is
+    // load-bearing for this function.
     hasher.update(value.to_string().as_bytes());
     // 128 bits of a 256-bit digest: collision-resistant far past any single
     // session's entry count, and half the PK bytes.

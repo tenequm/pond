@@ -98,8 +98,8 @@ fn closed_stdout_exits_quietly() {
 /// of failing one connection. Raising the signal directly proves the
 /// disposition without racing a real disconnect.
 #[cfg(unix)]
-#[test]
-fn serve_survives_sigpipe() {
+#[tokio::test]
+async fn serve_survives_sigpipe() {
     use std::{
         io::{BufRead, BufReader, Read, Write},
         os::unix::process::ExitStatusExt,
@@ -125,8 +125,13 @@ fn serve_survives_sigpipe() {
     }
 
     let temp = TempDir::new().expect("temp dir");
+    let store_path = temp.path().join("store");
+    pond::sessions::Store::open_local(&store_path)
+        .await
+        .expect("seed store");
     let mut child = ChildGuard(
         sandboxed_pond(&temp)
+            .env("POND_STORAGE_PATH", &store_path)
             .args(["serve", "--transport", "stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

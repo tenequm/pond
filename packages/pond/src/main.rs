@@ -26,8 +26,8 @@ use pond::{
         Store,
     },
     substrate::{
-        self, CheckFailure, CredsBinding, IndexStatus, MaintenancePolicy, OptimizeEvent,
-        OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
+        self, CheckFailure, CheckNote, CredsBinding, IndexStatus, MaintenancePolicy, OpenMode,
+        OptimizeEvent, OptimizeProgressFn, PhaseOutcome, ResolvedStorage, StorageUrl, TableSizes,
         VECTOR_INDEX_ACTIVATION_ROWS, default_cleanup_older_than,
     },
     transport::{self, AppState},
@@ -1024,9 +1024,10 @@ enum StorageCmd {
     /// Probe a destination end-to-end.
     ///
     /// Parse, creds resolution, conditional put (the OCC primitive Lance's
-    /// commit handler relies on), read-back, delete. Exit codes: 0 ok,
-    /// 1 I/O error (network/DNS/bucket unreachable), 2 parse error,
-    /// 3 no creds, 4 auth failed, 5 OCC unsupported.
+    /// commit handler relies on), read-back, the create-only copy Lance
+    /// creates tables with, delete. Exit codes: 0 ok, 1 I/O error
+    /// (network/DNS/bucket unreachable), 2 parse error, 3 no creds, 4 auth
+    /// failed, 5 OCC unsupported or table-creation copy rejected.
     #[command(after_long_help = "Examples:
   pond storage check                                  probe the configured destination
   pond storage check s3+https://host/bucket/prefix    probe a candidate before switching")]
@@ -1218,6 +1219,11 @@ fn cap_scan_io_buffer() {
 /// initial prewarm. A poll is a cheap version check; an actual rebuild only
 /// fires when sync / remote writers have advanced the messages version.
 const ROWMAP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An MCP-only server exits when its startup open fails, so only a client
+/// restart picks up the fix.
+const MCP_OPEN_FAILED: &str =
+    "the MCP server could not open the store; fix the cause and restart the MCP client";
 
 /// Warm the search indices in the background at server startup (spec.md#search).
 /// The cold S3 index load (175-442 s) is paid once here, off the request path,
@@ -1432,13 +1438,13 @@ async fn run() -> anyhow::Result<()> {
             // contract instead of empty stdout + an anyhow dump on stderr.
             let outcome: anyhow::Result<()> = async {
             let loaded = Config::load(config_path(config))?;
-            let (resolved, store) = open_store(storage_path, &loaded, false, false).await?;
+            let (resolved, store) = open_store(storage_path, &loaded, false, false, OpenMode::ReadWrite).await?;
             let store_key = pond::substrate::store_key(resolved.lance_url());
             if !store.initialized().await? {
                 // The local rows cost no store read, and an all-absent sync
                 // now leaves the store uninitialized - so this branch has to
-                // carry them, or the host this PR is about loses the only
-                // surface that names its missing sources.
+                // carry them, or a host whose sources are all absent loses the
+                // only surface that names them.
                 let local =
                     local_status(&loaded, &store, &store_key, crate::schedule::status_snapshot()).await;
                 let has_adapters = match loaded.resolve_adapters(None) {
@@ -1640,7 +1646,8 @@ async fn run() -> anyhow::Result<()> {
             if force_embed && !pond::embed::embeddings_enabled() {
                 bail!("{}", pond::handlers::SEMANTIC_DISABLED_MESSAGE);
             }
-            let (_, store) = open_store(storage_path, &loaded, true, false).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, true, false, OpenMode::ReadWrite).await?;
             if let Some(name) = drop_index {
                 store
                     .drop_index_by_name(&name)
@@ -1766,6 +1773,16 @@ async fn run() -> anyhow::Result<()> {
             let socket = socket
                 .map(|path| prepare_serve_socket(transport, &path))
                 .transpose()?;
+            // A stdio server that syncs or bootstraps is a plugin's writer
+            // sidecar; only a bare one is MCP-only, so only it opens read-only.
+            let open_mode = if matches!(transport, ServeTransport::Stdio)
+                && !with_sync
+                && bootstrap.is_none()
+            {
+                OpenMode::ReadOnly
+            } else {
+                OpenMode::ReadWrite
+            };
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1776,16 +1793,23 @@ async fn run() -> anyhow::Result<()> {
             {
                 config = Config::load(&config_file)?;
             }
-            // One resident embedder shared by the query arm (AppState) and the
-            // inline embed-at-ingest path (the store), so the model loads once.
-            // Constructing it loads nothing; with embedding disabled it is
-            // never attached, so no path can reach a model.
+            // One resident embedder shared by the query arm (AppState) and, on
+            // a read-write open, the inline embed-at-ingest path (the store),
+            // so the model loads once. Constructing it loads nothing; with
+            // embedding disabled it is never attached, so no path can reach a model.
             let embedder = Arc::new(LazyEmbedder::candle());
-            let opened = open_store(storage_path.clone(), &config, true, true)
-                .await?
-                .1;
-            let store = Arc::new(if pond::embed::embeddings_enabled() {
+            let opened = open_store(storage_path.clone(), &config, true, true, open_mode).await;
+            let opened = if open_mode == OpenMode::ReadOnly {
+                opened.context(MCP_OPEN_FAILED)
+            } else {
+                opened
+            }?
+            .1;
+            let embeddings = pond::embed::embeddings_enabled();
+            if embeddings {
                 embedder.spawn_idle_reaper();
+            }
+            let store = Arc::new(if embeddings && open_mode == OpenMode::ReadWrite {
                 opened.with_embedder(embedder.clone())
             } else {
                 opened
@@ -1841,18 +1865,18 @@ async fn run() -> anyhow::Result<()> {
         Command::Mcp {} => {
             let config = Config::load(config_path(config))?;
             // Lazy: idle `pond mcp` instances in every Claude Code session stay
-            // light. The model load happens once per process - on the first
-            // vector-arm `pond_search` or the first embeddable ingested row -
-            // and the one instance is shared by the query arm and the store's
-            // inline embed-at-ingest path.
+            // light. The model loads once per process, on the first vector-arm
+            // `pond_search`; the read-only store never ingests, so it holds none.
             let embedder = Arc::new(LazyEmbedder::candle());
-            let opened = open_store(storage_path, &config, true, true).await?.1;
-            let store = Arc::new(if pond::embed::embeddings_enabled() {
+            let store = Arc::new(
+                open_store(storage_path, &config, true, true, OpenMode::ReadOnly)
+                    .await
+                    .context(MCP_OPEN_FAILED)?
+                    .1,
+            );
+            if pond::embed::embeddings_enabled() {
                 embedder.spawn_idle_reaper();
-                opened.with_embedder(embedder.clone())
-            } else {
-                opened
-            });
+            }
             let state = AppState::new(store, embedder, config.search.clone());
             spawn_prewarm(state.clone());
             transport::mcp::serve_stdio(state).await?;
@@ -1871,7 +1895,8 @@ async fn run() -> anyhow::Result<()> {
             format,
         } => {
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             let embedder = LazyEmbedder::candle();
             let request = SearchRequest {
                 protocol_version: PROTOCOL_VERSION,
@@ -1911,7 +1936,8 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let loaded = Config::load(config_path(config))?;
             arm_io_trace();
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             load_rowmap_quietly(&store).await;
             io_trace_report("get-session/setup");
             let first_page = after_message_id.is_none() && before_message_id.is_none();
@@ -1951,7 +1977,8 @@ async fn run() -> anyhow::Result<()> {
         } => {
             let loaded = Config::load(config_path(config))?;
             arm_io_trace();
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             load_rowmap_quietly(&store).await;
             io_trace_report("get-message/setup");
             let request = GetMessageRequest {
@@ -2013,7 +2040,8 @@ async fn run() -> anyhow::Result<()> {
                 );
             }
             let loaded = Config::load(config_path(config))?;
-            let (_, store) = open_store(storage_path, &loaded, false, true).await?;
+            let (_, store) =
+                open_store(storage_path, &loaded, false, true, OpenMode::ReadWrite).await?;
             let mode = match format {
                 CliSqlFormat::Text => pond::sql::Mode::Inline,
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
@@ -2205,7 +2233,7 @@ async fn run_resume(
     }
 
     let loaded = Config::load(config_path(config))?;
-    let (_, store) = open_store(storage_path, &loaded, false, false).await?;
+    let (_, store) = open_store(storage_path, &loaded, false, false, OpenMode::ReadWrite).await?;
 
     // The reported paths are absolute even when `--out-dir` is relative (it
     // defaults to `.`): a plugin hands them straight to its own client, which
@@ -2409,13 +2437,14 @@ fn fidelity_label(fidelity: adapter::RestoreFidelity) -> &'static str {
 }
 
 /// Open the store with an indicatif spinner ticking while
-/// [`Store::open_with_options`] runs. Open itself is cheap; the spinner only
+/// [`Store::open_with_options_cached`] runs. Open itself is cheap; the spinner only
 /// matters for visual consistency with other long-running commands.
 async fn open_store_with_spinner(
     location: &Url,
     storage: HashMap<String, String>,
     caps: pond::substrate::RuntimeCaps,
     index_cache_dir: Option<PathBuf>,
+    open_mode: OpenMode,
 ) -> anyhow::Result<Store> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -2423,7 +2452,8 @@ async fn open_store_with_spinner(
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
-    let result = Store::open_with_options_cached(location, storage, caps, index_cache_dir).await;
+    let result =
+        Store::open_with_options_cached(location, storage, caps, index_cache_dir, open_mode).await;
     spinner.finish_and_clear();
     result
 }
@@ -2458,6 +2488,7 @@ async fn open_store(
     loaded: &Config,
     spinner: bool,
     index_cache: bool,
+    open_mode: OpenMode,
 ) -> anyhow::Result<(ResolvedStorage, Store)> {
     // Every store the CLI opens reads the embeddings flag (index intents,
     // search arm), so a config built without `Config::load` trips here.
@@ -2478,6 +2509,7 @@ async fn open_store(
             resolved.options.clone(),
             runtime_caps(loaded),
             index_cache_dir,
+            open_mode,
         )
         .await?
     } else {
@@ -2486,6 +2518,7 @@ async fn open_store(
             resolved.options.clone(),
             runtime_caps(loaded),
             index_cache_dir,
+            open_mode,
         )
         .await?
     };
@@ -2604,12 +2637,13 @@ async fn run_config_command(
 }
 
 /// Map a [`CheckFailure`] onto the documented `pond storage check` exit
-/// codes (3 no creds, 4 auth failed, 5 OCC unsupported, 1 other IO).
+/// codes (3 no creds, 4 auth failed, 5 OCC unsupported or table-creation copy
+/// rejected, 1 other IO).
 fn check_failure_exit_code(failure: &CheckFailure) -> i32 {
     match failure {
         CheckFailure::NoCreds { .. } => 3,
         CheckFailure::Auth { .. } => 4,
-        CheckFailure::OccUnsupported { .. } => 5,
+        CheckFailure::OccUnsupported { .. } | CheckFailure::CopyRejected { .. } => 5,
         CheckFailure::Io { .. } => 1,
     }
 }
@@ -2621,29 +2655,65 @@ fn check_failure_class(failure: &CheckFailure) -> &'static str {
         CheckFailure::NoCreds { .. } => "no_creds",
         CheckFailure::Auth { .. } => "auth",
         CheckFailure::OccUnsupported { .. } => "occ_unsupported",
+        CheckFailure::CopyRejected { .. } => "copy_rejected",
         CheckFailure::Io { .. } => "io",
     }
 }
 
-/// One `pond storage check --format json` document. `failure` is the
-/// `(class, message)` pair on a non-zero outcome, `None` on success.
+/// Machine-readable class of a passing check's advisory, parallel to
+/// [`check_failure_class`].
+fn check_note_class(note: &CheckNote) -> &'static str {
+    match note {
+        CheckNote::CopyOverwritesExisting => "copy_overwrites_existing",
+        CheckNote::PlainCopyFallback => "plain_copy_fallback",
+    }
+}
+
+/// One `pond storage check --format json` document: a passing check's
+/// advisories, or a failure's `(exit code, class, message)`.
 fn storage_check_json(
     url: &str,
     binding: Option<&str>,
-    exit_code: i32,
-    failure: Option<(&str, String)>,
+    outcome: Result<&[CheckNote], (i32, &str, String)>,
 ) -> anyhow::Result<String> {
+    let (exit_code, failure, notes) = match outcome {
+        Ok(notes) => (0, None, notes),
+        Err((code, class, message)) => (
+            code,
+            Some(serde_json::json!({ "class": class, "message": message })),
+            &[][..],
+        ),
+    };
     let doc = serde_json::json!({
         "url": url,
         "ok": exit_code == 0,
         "exit_code": exit_code,
         "binding": binding,
-        "failure": failure.map(|(class, message)| serde_json::json!({
-            "class": class,
-            "message": message,
-        })),
+        "failure": failure,
+        "notes": notes
+            .iter()
+            .map(|note| serde_json::json!({
+                "class": check_note_class(note),
+                "message": note.to_string(),
+            }))
+            .collect::<Vec<_>>(),
     });
     serde_json::to_string_pretty(&doc).context("serialize storage check as JSON")
+}
+
+/// A passing check's line, plus one yellow `note` line per advisory; the exit
+/// code stays 0.
+fn render_check_ok(notes: &[CheckNote]) -> anyhow::Result<()> {
+    output(
+        "check: ok - conditional put (OCC), read-back, create-only copy, and delete all passed",
+    )?;
+    for note in notes {
+        output_err(&pond::output::paint(
+            &format!("check: note - {note}"),
+            pond::output::yellow(),
+        ))?;
+    }
+    Ok(())
 }
 
 /// One dim `cause:` line under a probe failure's fix-naming lead. The full
@@ -2677,8 +2747,7 @@ async fn run_storage_command(
                             output(&storage_check_json(
                                 &raw,
                                 None,
-                                2,
-                                Some(("parse", format!("{error:#}"))),
+                                Err((2, "parse", format!("{error:#}"))),
                             )?)?;
                             std::process::exit(2);
                         }
@@ -2696,14 +2765,15 @@ async fn run_storage_command(
                     let url = resolved.display();
                     let binding = resolved.binding.describe();
                     match pond::substrate::storage_check(&resolved).await {
-                        Ok(()) => output(&storage_check_json(&url, Some(&binding), 0, None)?)?,
+                        Ok(notes) => {
+                            output(&storage_check_json(&url, Some(&binding), Ok(&notes))?)?;
+                        }
                         Err(failure) => {
                             let code = check_failure_exit_code(&failure);
                             output(&storage_check_json(
                                 &url,
                                 Some(&binding),
-                                code,
-                                Some((check_failure_class(&failure), failure.to_string())),
+                                Err((code, check_failure_class(&failure), failure.to_string())),
                             )?)?;
                             std::process::exit(code);
                         }
@@ -2717,11 +2787,7 @@ async fn run_storage_command(
                     ))?;
                     warn_unmatched_sets(&[&resolved], &loaded)?;
                     match pond::substrate::storage_check(&resolved).await {
-                        Ok(()) => {
-                            output(
-                                "check: ok - conditional put (OCC), read-back, and delete all succeeded",
-                            )?;
-                        }
+                        Ok(notes) => render_check_ok(&notes)?,
                         Err(failure) => {
                             // Distinct exit codes (documented in --help) so cron and
                             // CI can branch on the failure class.
@@ -3000,7 +3066,7 @@ async fn copy_store_to_archive(
     path: &Path,
     loaded: &Config,
 ) -> anyhow::Result<()> {
-    let (_, store) = open_store(Some(from), loaded, false, false).await?;
+    let (_, store) = open_store(Some(from), loaded, false, false, OpenMode::ReadWrite).await?;
     let summary = export_pond_archive(&store, path).await?;
     output(&format!(
         "{} {}  sessions={} messages={} parts={}",
@@ -3020,7 +3086,7 @@ async fn copy_store_to_jsonl(
     path: Option<PathBuf>,
     loaded: &Config,
 ) -> anyhow::Result<()> {
-    let (_, store) = open_store(Some(from), loaded, false, false).await?;
+    let (_, store) = open_store(Some(from), loaded, false, false, OpenMode::ReadWrite).await?;
     let to_stdout = path.is_none();
     let summary = match path {
         Some(path) => {
@@ -3061,7 +3127,7 @@ async fn copy_store_to_jsonl(
 /// store via the idempotent union merge.
 async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> anyhow::Result<()> {
     let cmd_started = std::time::Instant::now();
-    let (_, store) = open_store(Some(to), loaded, false, false).await?;
+    let (_, store) = open_store(Some(to), loaded, false, false, OpenMode::ReadWrite).await?;
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
     let dim = pond::output::dim();
@@ -3165,14 +3231,17 @@ async fn run_storage_use(
     spinner.enable_steady_tick(Duration::from_millis(120));
     let check = pond::substrate::storage_check(&dest_resolved).await;
     spinner.finish_and_clear();
-    if let Err(failure) = check {
-        output_err(&format!(
-            "use: destination failed the end-to-end check; config not changed: {failure}"
-        ))?;
-        render_check_cause(&failure)?;
-        std::process::exit(check_failure_exit_code(&failure));
-    }
-    output("check: ok - conditional put (OCC), read-back, and delete all succeeded")?;
+    let notes = match check {
+        Ok(notes) => notes,
+        Err(failure) => {
+            output_err(&format!(
+                "use: destination failed the end-to-end check; config not changed: {failure}"
+            ))?;
+            render_check_cause(&failure)?;
+            std::process::exit(check_failure_exit_code(&failure));
+        }
+    };
+    render_check_ok(&notes)?;
 
     let current = resolve_storage_location(storage_path, loaded)?;
     let already_configured = loaded.storage.path.as_deref() == Some(dest.canonical().as_str())
@@ -4586,7 +4655,7 @@ async fn run_sync_stages(
     report: &mut SyncReport,
 ) -> anyhow::Result<()> {
     let open_started = std::time::Instant::now();
-    let (_, store) = open_store(storage_path, loaded, true, false).await?;
+    let (_, store) = open_store(storage_path, loaded, true, false, OpenMode::ReadWrite).await?;
     tracing::debug!(target: "pond::perf", stage = "open_store", elapsed_ms = open_started.elapsed().as_millis() as u64, "sync stage");
     let flush_hud = Arc::new(FlushHud::default());
     // sync ingests through `upsert_session_batch`, which embeds inline; it
@@ -5077,7 +5146,7 @@ async fn run_sync_dry_run(
         }
         return Ok(());
     }
-    let (_, store) = open_store(storage_path, loaded, true, false).await?;
+    let (_, store) = open_store(storage_path, loaded, true, false, OpenMode::ReadWrite).await?;
     // The same oracle a real sync would resolve, so the preview matches what
     // sync would actually skip - including the cursor fallback.
     let oracle = if invocation.verify {
@@ -8258,7 +8327,7 @@ mod tests {
             "********"
         );
         assert_eq!(
-            redact_config_value("creds.work.extra.request_timeout", "60s"),
+            redact_config_value("creds.work.extra.timeout", "60s"),
             "60s"
         );
         // The path / command IS the safe part.

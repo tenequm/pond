@@ -802,15 +802,16 @@ impl ScalarUDFImpl for FtsMisuse {
 }
 
 /// Vendored replacement for lance's `FtsQueryUDTF` (src/dataset/udtf.rs,
-/// still unfixed at lance-13.0.0). The upstream provider omits `_score` from its
-/// declared schema while leaving the scanner's scoring autoprojection on, so
-/// `_score` is physically appended but logically unknown: naming it in SQL
-/// fails ("No field named _score") and any aggregate over fts() dies on
-/// DataFusion's physical-vs-logical schema check (COUNT plans 0 columns,
-/// receives 1). This provider declares `_score` as a regular nullable Float32
-/// column, projects it explicitly, and disables the autoprojection - which is
-/// also lance's documented intended end state for score columns
-/// (scanner.rs "_score/_distance should become regular output columns").
+/// unchanged since lance-13.0.0 and still unfixed at lance-14.0.2). The
+/// upstream provider omits `_score` from its declared schema while leaving the
+/// scanner's scoring autoprojection on, so `_score` is physically appended but
+/// logically unknown: naming it in SQL fails ("No field named _score") and any
+/// aggregate over fts() dies on DataFusion's physical-vs-logical schema check
+/// (COUNT plans 0 columns, receives 1). This provider declares `_score` as a
+/// regular nullable Float32 column, projects it explicitly, and disables the
+/// autoprojection - which is also lance's documented intended end state for
+/// score columns (scanner.rs "_score/_distance should become regular output
+/// columns").
 /// Delete once fixed upstream.
 #[derive(Debug)]
 struct ScoredFtsUdtf {
@@ -1002,7 +1003,7 @@ impl ScalarUDFImpl for LenientJsonGet {
 }
 
 /// One step of the key walk: object member by name, array element by index.
-fn json_step(raw: jsonb::RawJsonb<'_>, key: &str) -> Option<jsonb::OwnedJsonb> {
+fn json_step(raw: lance_jsonb::RawJsonb<'_>, key: &str) -> Option<lance_jsonb::OwnedJsonb> {
     let value = if raw.is_object().unwrap_or(false) {
         raw.get_by_name(key, false).ok().flatten()
     } else if raw.is_array().unwrap_or(false) {
@@ -1046,7 +1047,7 @@ fn json_get_lenient(
         })
         .collect::<Result<_, _>>()?;
 
-    let field = |row: usize| -> Option<jsonb::OwnedJsonb> {
+    let field = |row: usize| -> Option<lance_jsonb::OwnedJsonb> {
         if jsonb_array.is_null(row) {
             return None;
         }
@@ -1056,7 +1057,7 @@ fn json_get_lenient(
             return None;
         }
         let mut current = json_step(
-            jsonb::RawJsonb::new(jsonb_array.value(row)),
+            lance_jsonb::RawJsonb::new(jsonb_array.value(row)),
             first.value(row),
         )?;
         for key_array in keys {

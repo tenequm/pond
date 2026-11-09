@@ -355,9 +355,9 @@ pub(crate) async fn run(
     }
     // Materialize a local store dir the plan just announced: a user (or
     // agent) verifying setup looks for it, and an init that promises a path
-    // it never creates reads as a failed install. The store also creates it
-    // at first open, so failure here only warns - aborting would leave the
-    // config written but MCP, skill, and schedule unregistered.
+    // it never creates reads as a failed install. The first sync also creates
+    // it, so failure here only warns - aborting would leave the config
+    // written but MCP, skill, and schedule unregistered.
     if let Some(local_store) = config::local_path(chosen.canonical())
         && let Err(error) = std::fs::create_dir_all(&local_store)
     {
@@ -750,11 +750,14 @@ async fn probe_destination(
     let spinner = cliclack::spinner();
     spinner.start(format!("Probing {}...", url.display()));
     match pond::substrate::storage_check(&resolved).await {
-        Ok(()) => {
+        Ok(notes) => {
             spinner.stop(format!(
                 "storage: {} reachable - conditional writes (OCC) supported",
                 url.display(),
             ));
+            for note in &notes {
+                let _ = cliclack::log::warning(note.to_string());
+            }
             Ok(())
         }
         Err(failure) => {
