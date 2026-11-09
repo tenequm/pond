@@ -301,6 +301,23 @@ The soak also reproduced a pre-existing cross-host duplicate: two writers syncin
 
 `write_bench --profile-optimize --skip-build --grown 16` on two copies of the live store, run one after the other (both overlapped soak traffic): total finalize 364.6 s on 0.20.3 vs 386.3 s on `403ffe2` (+5.9%). Compaction 40.6 -> 68.8 s, scalar fold 121.9 -> 143.1 s, index rebuild 180.0 -> 149.7 s. The large compactions are messages in one Lance 13 round (7 fragments, 17.5 s) and two Lance 14 rounds (22.4 s and 16.7 s). One run each: no sign of a remap blow-up; a multi-run A/B would be needed to bracket the compaction delta.
 
+### 2026-11-09 - mac-m1max -> S3 copies, compaction remap A/B, 3 runs per side (`a80dcb0` vs 0.20.3)
+
+Brackets the single-run compaction delta above. One `s5cmd` snapshot of the live store (20.8 GB, 25,106 sessions, 6.05M messages) fanned out to six identical copies; the three Lance 14 copies were migrated first with `pond optimize` (71.0, 75.4 and 78.0 s at 759, 718 and 707 MB max RSS, run in parallel), so the migration stays out of the timings. Then `write_bench --profile-optimize --skip-build --grown 16`, one run at a time, alternating 0.20.3 (`69f527e`) and `a80dcb0` so slow S3 drift hits both sides. Sums of the 16 rounds, seconds:
+
+```
+  phase             0.20.3 run1  run2   run3   mean   | a80dcb0 run2  run3   mean
+  compact               32.6     33.3   34.9   33.6   |         47.1  53.9   50.5
+  cleanup               25.5     28.3   22.5   25.4   |         14.1  21.4   17.8
+  index-append         153.9    150.4  128.3  144.2   |        129.5 138.4  134.0
+  index-rebuild        118.2    116.0  125.8  120.0   |        129.0 127.1  128.1
+  total                337.3    340.7  321.3  333.1   |        329.0 350.9  340.0
+```
+
+`a80dcb0` run 1 is excluded: the Mac entered idle sleep the second it started (`pmset` log, 20:42:49Z) and it ran through maintenance wakes - 29 min wall for 395 s of rounds, with a 74.7 s messages index-rebuild no other run comes near. Reading: total finalize is +2%, inside 0.20.3's own 6% spread. The Lance 14 cost is real but confined to compaction: messages compaction sums 26.8-28.4 s against 4.0-5.7 s on 0.20.3 in every run, landing on the rounds that compact messages (roughly 15-20 s extra each at this size); lower cleanup and fold time offset it. Not measured: how that compaction cost grows on a store much larger than this one.
+
+R2 (Cloudflare, region `auto`, throwaway prefix in the Windows CI kache bucket, deleted after): `pond storage check` passes every probe with no plain-copy fallback note, so R2 accepts Lance's default create-only copy; `pond copy` creates a new store and verifies 414 rows, reads match, `pond optimize` commits, and 0.20.3 is refused with "cannot be written by this version of Lance".
+
 ## bench-gate: Lance 12 -> 13 upgrade (#342)
 
 Store digest `5fcd5e32b8dd` (the live s3-nbg1 store), read-only. Write benches ran on scratch stores beside it. The primary pair is **same-host on mac-m1max**: a full gate (perf + mem `ci`) at `8b6ec39` (Lance 12; main plus the `store_probe` io-trace component) and at `b4965d0` (Lance 13; only the pins differ). The Lance 12 perf half ran at 2026-10-13T11:22:13Z, the Lance 13 one at 2026-10-13T10:08:59Z. There is also a third, unpaired row: a full Lance 12 gate on **bl** at 2026-10-13T07:08:32Z. Its Lance 13 partner was stopped mid-build, because the N100 needs about 1.5 h of compile per side.
