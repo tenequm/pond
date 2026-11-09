@@ -8470,10 +8470,10 @@ mod tests {
         Ok(())
     }
 
-    /// The state a pond on Lance 11 or older leaves after writing past the
-    /// fence: an unfenced `sessions` table holding two sessions and a
-    /// row-address `sessions_id_btree`, built straight through Lance since no
-    /// pond seam can.
+    /// The state a writer leaves that clears the fence but keeps Lance 14's
+    /// BTrees (no pond release does): an unfenced `sessions` table holding two
+    /// sessions and a row-address `sessions_id_btree`, built straight through
+    /// Lance since no pond seam can.
     async fn unfenced_sessions_with_address_btree(
         root: &std::path::Path,
     ) -> anyhow::Result<Dataset> {
@@ -8568,11 +8568,11 @@ mod tests {
         Ok(())
     }
 
-    /// A pond on Lance 11 or older writes past the fence and clears it,
-    /// leaving a row-address BTree on an unfenced table (built here straight
-    /// through Lance, since no pond seam can). Reads on either kind of handle
-    /// commit nothing and plan around it - so no write plans from it - the
-    /// next write drops it and re-fences, and the next fold rebuilds it.
+    /// The backstop for a writer that clears the fence but keeps a row-address
+    /// BTree (built here straight through Lance, since no pond seam can). Reads
+    /// on either kind of handle commit nothing and plan around it - so no write
+    /// plans from it - the next write drops it and re-fences, and the next fold
+    /// rebuilds it.
     #[tokio::test]
     async fn a_btree_written_past_the_fence_is_rebuilt() -> anyhow::Result<()> {
         let temp = TempDir::new()?;

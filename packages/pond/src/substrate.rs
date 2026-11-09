@@ -2130,11 +2130,12 @@ impl CachedDataset {
     }
 }
 
-/// The row-address BTrees on an unfenced table. Only a pond on Lance 11 or
-/// older (0.18 and earlier) leaves one - its Lance checks writer flags only on
-/// appends and clears them on every other commit - and its compactions may
-/// have left them pointing at rewritten rows (lance#10351). Reads skip them
-/// ([`Handle::scanner`]); the next write drops them.
+/// The row-address BTrees on an unfenced table: a writer cleared the fence but
+/// kept them, so its compactions may have left them pointing at rewritten rows
+/// (lance#10351). A backstop - pond 0.18 and older (Lance 11 and older) clear
+/// the fence too, but drop the BTrees they cannot read in that same commit, so
+/// no pond release leaves one. Reads skip them ([`Handle::scanner`]); the next
+/// write drops them.
 async fn btrees_written_past_the_fence(
     dataset: &Dataset,
 ) -> Result<std::collections::BTreeSet<String>> {
@@ -2160,9 +2161,9 @@ async fn drop_btrees_written_past_the_fence(dataset: &mut Dataset) -> Result<()>
     tracing::warn!(
         table = dataset.uri(),
         indexes = ?stale,
-        "pond 0.18 or older wrote this table past the Lance 14 fence; dropping its BTree indexes, \
-         which the next index fold rebuilds (`pond optimize --only index` rebuilds them now) - \
-         upgrade every host that writes this store",
+        "a writer older than this release cleared the Lance 14 fence on this table but kept its \
+         BTree indexes; dropping them, which the next index fold rebuilds (`pond optimize --only \
+         index` rebuilds them now) - upgrade every host that writes this store",
     );
     for name in &stale {
         match dataset.drop_index(name).await {
