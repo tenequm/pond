@@ -20,7 +20,7 @@ The install added pond's directory to `PATH`, but only processes started afterwa
 
 ## The pond tools don't appear in my agent
 
-Clients load MCP servers at startup: after `pond init` or `claude mcp add`, restart the client. `claude mcp list` shows whether the registration exists at all. Registered but failing before the first sync is expected: `pond mcp` only reads the store, so it exits naming `pond sync` until a sync has created or upgraded it - run `pond sync`, then restart the client. On Windows, an entry registered with a Git Bash-style `/c/Users/...` path registers cleanly but never spawns - re-add with bare `pond` or a native `C:\...` path (see [Connect your agents](/get-started/connect-your-agents)).
+Clients load MCP servers at startup: after `pond init` or `claude mcp add`, restart the client. `claude mcp list` shows whether the registration exists at all. Registered but failing before the first sync is expected: `pond mcp` only reads the store, so it exits naming `pond sync` until a sync has created or upgraded it - run `pond sync` (`pond optimize` on a host with no agent sources, where sync skips the store), then restart the client. On Windows, an entry registered with a Git Bash-style `/c/Users/...` path registers cleanly but never spawns - re-add with bare `pond` or a native `C:\...` path (see [Connect your agents](/get-started/connect-your-agents)).
 
 ## The schedule stopped syncing
 
