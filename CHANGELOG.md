@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.21.0](https://github.com/tenequm/pond/compare/v0.20.3...v0.21.0) - 2026-11-09
+
+The storage engine moves to Lance 14.0.2. Full-text search reads up to
+three quarters fewer bytes per query, and unfiltered row counts come
+straight from table metadata. Lance 14 keeps BTree index entries as row
+addresses, which an older writer would silently corrupt, so this release
+fences older writers off every store it writes.
+
+**Upgrading:** upgrade every host that reads or writes a shared store,
+within your agents' session-retention window (Claude Code keeps 30 days
+by default), and restart anything that keeps pond running, such as an
+OpenClaw, pi or Hermes plugin host or `pond serve`: a running process
+keeps its old binary. Upgrade pond 0.18 and older first. Their Lance
+checks the fence only on appends, so their optimize and copy writes
+still land: they erase the fence and swap the new BTree indexes for
+older-format ones. Nothing is lost, but every swap costs a full index
+rebuild, and until a host on this release writes again, pond 0.19 and
+0.20 can write too. Once any host on this release has synced, optimized
+or copied into the store, pond 0.19 and 0.20 still read it correctly but
+more slowly (search up to about 9x slower on a 22 GB store, close to the
+60-second tool timeouts some MCP clients use), and each write they
+attempt fails with "This dataset cannot be written by this version of
+Lance" until they upgrade. Their `pond optimize` may instead report a
+"structural index fault" and suggest `pond optimize --rebuild`: ignore
+that hint, which is refused the same way and loses nothing, and upgrade.
+The first index pass on this release (a `pond optimize`, or a `pond
+sync` once enough new rows arrive) rebuilds the five BTree indexes once
+from a full scan: 36 seconds at a 423 MB peak on a 22 GB store. `pond
+mcp` on a store no sync has created yet exits naming `pond sync`; after
+that sync, restart the MCP client.
+
+### <!-- 0 -->🛠 Breaking Changes
+- [**breaking**] upgrade Lance to 14.0.2 ([#370](https://github.com/tenequm/pond/pull/370)) ([9e386bf](https://github.com/tenequm/pond/commit/9e386bfe57e757a29d0e68fa4637ea4eb76cf9f0))
+  Pond now runs on Lance 14.0.2. Once a host on this release writes a
+  store, pond 0.19 and 0.20 can still read it but not write it; upgrade
+  pond 0.18 and older first. `pond mcp` now opens the store read-only: on
+  a new or older-schema store it asks you to run `pond sync` first.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.20.3...v0.21.0
+
 ## [0.20.3](https://github.com/tenequm/pond/compare/v0.20.2...v0.20.3) - 2026-11-03
 
 ### <!-- 2 -->🐛 Bug Fixes
