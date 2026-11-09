@@ -436,8 +436,11 @@ async fn append_collapses_to_one_commit_per_table() -> anyhow::Result<()> {
 
     let dest = Store::open(&Url::parse("shared-memory://pond-test-collapse-dst/")?).await?;
     // Force the destination table into existence so the "before" version is the
-    // empty table, then measure the bump the copy adds.
-    let before = dest.dataset(Table::Messages).await?.version_id();
+    // empty table, then measure the bump the copy adds - net of the writer fence
+    // a table's first write commits once.
+    let empty = dest.dataset(Table::Messages).await?;
+    let before = empty.version_id();
+    let fence = u64::from(!empty.manifest().uses_non_reusable_field_ids());
     let plan = dest.plan_incremental_from(&source).await?;
     assert_eq!(
         plan.messages.append.len(),
@@ -449,10 +452,10 @@ async fn append_collapses_to_one_commit_per_table() -> anyhow::Result<()> {
     let after = dest.dataset(Table::Messages).await?.version_id();
 
     assert_eq!(
-        after - before,
+        after - before - fence,
         1,
         "from-empty append must be a single commit, not one per scan batch \
-         (before={before}, after={after})",
+         (before={before}, after={after}, fence={fence})",
     );
     Ok(())
 }
@@ -536,14 +539,18 @@ async fn session_present_but_messages_empty_appends_not_merges() -> anyhow::Resu
     assert!(plan.parts.merge.is_empty());
 
     // The append is a single commit on the messages table despite the session
-    // rows already being present - the resumed-copy fast path.
-    let before = dest.dataset(Table::Messages).await?.version_id();
+    // rows already being present - the resumed-copy fast path - net of the
+    // writer fence the table's first write commits once.
+    let empty = dest.dataset(Table::Messages).await?;
+    let before = empty.version_id();
+    let fence = u64::from(!empty.manifest().uses_non_reusable_field_ids());
     dest.copy_delta_from(&source, &plan).await?;
     let after = dest.dataset(Table::Messages).await?.version_id();
     assert_eq!(
-        after - before,
+        after - before - fence,
         1,
-        "messages must append in one commit, not per-batch merge (before={before}, after={after})",
+        "messages must append in one commit, not per-batch merge \
+         (before={before}, after={after}, fence={fence})",
     );
 
     // And the destination is now a complete, non-duplicated superset.

@@ -1793,10 +1793,10 @@ async fn run() -> anyhow::Result<()> {
             {
                 config = Config::load(&config_file)?;
             }
-            // One resident embedder shared by the query arm (AppState) and the
-            // inline embed-at-ingest path (the store), so the model loads once.
-            // Constructing it loads nothing; with embedding disabled it is
-            // never attached, so no path can reach a model.
+            // One resident embedder shared by the query arm (AppState) and, on
+            // a read-write open, the inline embed-at-ingest path (the store),
+            // so the model loads once. Constructing it loads nothing; with
+            // embedding disabled it is never attached, so no path can reach a model.
             let embedder = Arc::new(LazyEmbedder::candle());
             let opened = open_store(storage_path.clone(), &config, true, true, open_mode).await;
             let opened = if open_mode == OpenMode::ReadOnly {
@@ -1805,8 +1805,11 @@ async fn run() -> anyhow::Result<()> {
                 opened
             }?
             .1;
-            let store = Arc::new(if pond::embed::embeddings_enabled() {
+            let embeddings = pond::embed::embeddings_enabled();
+            if embeddings {
                 embedder.spawn_idle_reaper();
+            }
+            let store = Arc::new(if embeddings && open_mode == OpenMode::ReadWrite {
                 opened.with_embedder(embedder.clone())
             } else {
                 opened
@@ -2701,7 +2704,9 @@ fn storage_check_json(
 /// A passing check's line, plus one yellow `note` line per advisory; the exit
 /// code stays 0.
 fn render_check_ok(notes: &[CheckNote]) -> anyhow::Result<()> {
-    output("check: ok - conditional put (OCC), read-back, and delete all succeeded")?;
+    output(
+        "check: ok - conditional put (OCC), read-back, create-only copy, and delete all passed",
+    )?;
     for note in notes {
         output_err(&pond::output::paint(
             &format!("check: note - {note}"),
@@ -8322,7 +8327,7 @@ mod tests {
             "********"
         );
         assert_eq!(
-            redact_config_value("creds.work.extra.request_timeout", "60s"),
+            redact_config_value("creds.work.extra.timeout", "60s"),
             "60s"
         );
         // The path / command IS the safe part.

@@ -211,7 +211,10 @@ async fn config_check_falls_back_to_a_plain_copy_when_the_default_is_rejected() 
         .insert("aws_copy_if_not_exists".to_owned(), "multipart".to_owned());
     let creds = BTreeMap::from([("test".to_owned(), set)]);
     match storage_check(&url.resolve(&creds)?).await {
-        Err(CheckFailure::CopyRejected { .. }) => {}
+        Err(failure @ CheckFailure::CopyRejected { .. }) => assert!(
+            failure.to_string().contains("aws_copy_if_not_exists"),
+            "the failure must name the setting to remove: {failure}"
+        ),
         other => panic!("an explicit, rejected copy mode must fail the check, got: {other:?}"),
     }
     Ok(())

@@ -726,10 +726,11 @@ pub enum CheckFailure {
         "backend does not enforce conditional writes (If-None-Match); concurrent pond writers would corrupt each other - {detail}"
     )]
     OccUnsupported { detail: String },
-    #[error(
-        "backend rejects the create-only copy Lance creates tables with, both Lance's default and pond's plain fallback, so no table can be created here (an `aws_copy_if_not_exists` in the creds set's `extra` is used as given)"
-    )]
-    CopyRejected { source: anyhow::Error },
+    #[error("{lead}")]
+    CopyRejected {
+        lead: &'static str,
+        source: anyhow::Error,
+    },
     #[error("storage probe failed")]
     Io { source: anyhow::Error },
 }
@@ -744,7 +745,7 @@ impl CheckFailure {
         let source = match self {
             Self::NoCreds { source }
             | Self::Auth { source, .. }
-            | Self::CopyRejected { source }
+            | Self::CopyRejected { source, .. }
             | Self::Io { source } => source,
             Self::OccUnsupported { .. } => return None,
         };
@@ -817,8 +818,8 @@ impl std::fmt::Display for CheckNote {
 /// Probe a resolved storage destination end-to-end (spec.md#substrate): a
 /// conditional `PutMode::Create` pair proving the `If-None-Match` -> 412 OCC
 /// primitive Lance's commit handler relies on, read-back, a create-only copy
-/// pair with the plain-copy fallback table creation uses (a copy both modes
-/// reject fails the check; the fallback and an overwriting copy are
+/// pair with the plain-copy fallback table creation uses (a copy the backend
+/// refuses fails the check; the fallback and an overwriting copy are
 /// [`CheckNote`] advisories), then delete of the synthetic keys.
 pub async fn storage_check(
     resolved: &ResolvedStorage,
@@ -828,11 +829,7 @@ pub async fn storage_check(
     let classify =
         |error: OsError, step: &str| classify_check_error(error, &resolved.binding, step);
 
-    let probe_uri = format!(
-        "{}/_config-check/{}",
-        resolved.lance_url().as_str().trim_end_matches('/'),
-        uuid::Uuid::now_v7(),
-    );
+    let probe_uri = config_check_uri(resolved.lance_url());
     // Probe with the options a real open uses, defaults included.
     let mut options = resolved.options.clone();
     if config::local_path(resolved.lance_url()).is_none() {
@@ -894,28 +891,41 @@ pub async fn storage_check(
         }
         // Lance creates every table's namespace marker through this copy.
         let (mut first_copy, mut copy_overwrites) = probe_copy(&store, &path).await;
-        let mut plain_copy = false;
-        if copy_rejected(&first_copy) && copy_mode_is_ours(resolved.lance_url(), &options) {
-            // The fallback table creation takes (`plain_copy_namespace`).
+        let pond_picks_mode = copy_mode_is_ours(resolved.lance_url(), &options);
+        let (mut plain_tried, mut plain_copy) = (false, false);
+        if copy_rejected(&first_copy) && pond_picks_mode {
+            // The fallback that table creation takes (`plain_copy_namespace`).
             let registry = Arc::new(ObjectStoreRegistry::default());
             let plain_params = static_store_params(&with_plain_copy(&options));
             if let Ok((plain_store, _)) =
                 ObjectStore::from_uri_and_params(registry, &probe_uri, &plain_params).await
             {
                 (first_copy, copy_overwrites) = probe_copy(&plain_store, &path).await;
+                plain_tried = true;
                 plain_copy = first_copy.is_ok();
             }
         }
-        match first_copy {
-            // Without a conditional copy, Lance's marker falls back to the
-            // conditional put proven above.
-            Ok(()) | Err(OsError::NotSupported { .. } | OsError::NotImplemented { .. }) => {}
-            Err(error) => {
-                return Err(match classify(error, "create-only copy probe") {
-                    CheckFailure::Io { source } => CheckFailure::CopyRejected { source },
-                    auth => auth,
-                });
-            }
+        let rejected = copy_rejected(&first_copy);
+        // Without a conditional copy at all, Lance's marker falls back to the
+        // conditional put proven above.
+        if let Err(error) = first_copy
+            && !matches!(
+                error,
+                OsError::NotSupported { .. } | OsError::NotImplemented { .. }
+            )
+        {
+            let lead = if plain_tried {
+                "backend rejects both Lance's default create-only copy and pond's plain fallback, so no table can be created here"
+            } else if resolved.lance_url().scheme() == "s3" && !pond_picks_mode {
+                "backend rejects the create-only copy mode set for this store (`aws_copy_if_not_exists` in the creds set's `extra`, or in the environment); remove it to let pond pick one"
+            } else {
+                "backend rejects the create-only copy Lance creates tables with, so no table can be created here"
+            };
+            // Only a refusal is a capability verdict; a fault reports as I/O, as on the put probe.
+            return Err(match classify(error, "create-only copy probe") {
+                CheckFailure::Io { source } if rejected => CheckFailure::CopyRejected { lead, source },
+                other => other,
+            });
         }
         let mut notes = Vec::new();
         if plain_copy {
@@ -1989,7 +1999,7 @@ pub struct Handle {
     /// one cache pool covers all three tables and one S3 client serves all
     /// three datasets - load-bearing on object-store backends where a
     /// per-dataset client would mean 3x the connection pools and 3x the
-    /// credential refreshes (lance/src/dataset/builder.rs:509-517).
+    /// credential refreshes (lance `DatasetBuilder::with_session`).
     session: Arc<Session>,
     /// The `lance-namespace` catalog seam. v1 uses the Directory impl;
     /// future hosted pond swaps to "rest" without touching read/write paths
@@ -2042,7 +2052,7 @@ impl Table {
         self.label()
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Sessions => "sessions",
             Self::Messages => "messages",
@@ -2072,16 +2082,21 @@ struct CachedDataset {
     /// `None` forces a refresh on the next [`Self::latest`].
     last_refresh: Option<Instant>,
     refresh_after: Duration,
+    open_mode: OpenMode,
 }
 impl CachedDataset {
-    fn new(dataset: Dataset, refresh_after: Duration) -> Self {
+    fn new(dataset: Dataset, refresh_after: Duration, open_mode: OpenMode) -> Self {
         Self {
             dataset,
             last_refresh: Some(Instant::now()),
             refresh_after,
+            open_mode,
         }
     }
     /// The current snapshot for a read. A commit takes [`Self::latest_for_write`].
+    /// A read-write handle first drops any BTree an older pond wrote past the
+    /// fence, so no read trusts one - a write's planning read included, which
+    /// would otherwise miss stored rows and append them again.
     async fn latest(&mut self) -> Result<Dataset> {
         if self
             .last_refresh
@@ -2089,6 +2104,11 @@ impl CachedDataset {
         {
             self.dataset.checkout_latest().await?;
             self.last_refresh = Some(Instant::now());
+        }
+        if self.open_mode == OpenMode::ReadWrite
+            && !self.dataset.manifest().uses_non_reusable_field_ids()
+        {
+            drop_btrees_written_past_the_fence(&mut self.dataset).await?;
         }
         Ok(self.dataset.clone())
     }
@@ -2098,9 +2118,9 @@ impl CachedDataset {
     /// onto rewritten fragments and Lance 14 readers then lose rows
     /// (lance#10351), while Lance's own writer fence (lance#10352) ships only
     /// from v15. The sticky, writer-only non-reusable-field-ids flag is one
-    /// Lance 13 refuses to write past yet still reads; tables this build
-    /// creates carry it from birth (`open_or_create_via_ns`), so this fires
-    /// only on an older table, and a host racing the same fence gets a commit
+    /// Lance 12 and 13 refuse to write past yet still read. A table is fenced
+    /// by its first write, not its creation, so a read verb that creates one
+    /// locks no older host out; a host racing the same fence gets a commit
     /// conflict, which the caller's retry re-reads.
     async fn latest_for_write(&mut self) -> Result<Dataset> {
         let mut dataset = self.latest().await?;
@@ -2117,6 +2137,41 @@ impl CachedDataset {
         self.dataset = dataset;
         self.last_refresh = Some(Instant::now());
     }
+}
+
+/// A row-address BTree on an unfenced table means a pond on Lance 11 or older
+/// (0.18 and earlier) wrote past the fence - its Lance checks writer flags only
+/// on appends and clears them on every other commit - so its compactions may
+/// have left those segments pointing at rewritten rows (lance#10351). Drop them
+/// before any read trusts them, for the next index fold to rebuild from a full
+/// scan; the next write re-fences the table.
+async fn drop_btrees_written_past_the_fence(dataset: &mut Dataset) -> Result<()> {
+    let stale: std::collections::BTreeSet<String> = dataset
+        .load_indices()
+        .await?
+        .iter()
+        .filter(|index| index.supports_eager_remap())
+        .map(|index| index.name.clone())
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        table = dataset.uri(),
+        indexes = ?stale,
+        "pond 0.18 or older wrote this table past the Lance 14 fence; dropping its BTree indexes, \
+         which the next index fold rebuilds (`pond optimize --only index` rebuilds them now) - \
+         upgrade every host that writes this store",
+    );
+    for name in &stale {
+        match dataset.drop_index(name).await {
+            Ok(()) | Err(lance::Error::IndexNotFound { .. }) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to drop {name}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of one [`Handle::append_stream`] write. Lance's `execute_stream`
@@ -2266,6 +2321,7 @@ impl Handle {
                     )
                     .await?,
                     refresh_after,
+                    open_mode,
                 )),
                 parts: OnceCell::new(),
             },
@@ -2308,14 +2364,7 @@ impl Handle {
     /// object-store opens (export I/O, `table_sizes` listing) inherit the same
     /// credentials/region as the dataset opens. Empty options -> no accessor.
     fn object_store_params(&self) -> ObjectStoreParams {
-        ObjectStoreParams {
-            storage_options_accessor: (!self.storage_options.is_empty()).then(|| {
-                Arc::new(StorageOptionsAccessor::with_static_options(
-                    self.storage_options.clone(),
-                ))
-            }),
-            ..Default::default()
-        }
+        static_store_params(&self.storage_options)
     }
 
     /// Write a `pond_sql` export artifact, reusing the handle's
@@ -3372,6 +3421,7 @@ impl Handle {
             Ok::<_, anyhow::Error>(Mutex::new(CachedDataset::new(
                 dataset,
                 self.lazy_refresh_after,
+                self.open_mode,
             )))
         })
         .await
@@ -3406,6 +3456,12 @@ impl Handle {
         R: Fn(&anyhow::Error) -> bool,
     {
         let label = table.label();
+        // Every write seam runs through here and no read does, so this is where
+        // a read-only handle refuses to write, before any attempt.
+        anyhow::ensure!(
+            self.open_mode == OpenMode::ReadWrite,
+            "refusing to write {label}: this process opened the store read-only"
+        );
         let mut attempt = 0u8;
         loop {
             attempt = attempt.saturating_add(1);
@@ -5121,7 +5177,7 @@ fn store_wrapper(
 ///
 /// Probes via `nm.describe_table` directly rather than `DatasetBuilder::from_namespace`:
 /// the builder re-wraps an already-`Namespace`-wrapped error
-/// (lance/src/dataset/builder.rs:142), so going through it would force a
+/// (lance `DatasetBuilder::from_namespace`), so going through it would force a
 /// chain-walk to classify `TableNotFound`. The direct probe stays at one
 /// wrap level and downcasts cleanly. Managed-versioning hookup (REST
 /// namespace external-manifest commits) is not wired here; v1 ships
@@ -5149,11 +5205,11 @@ async fn open_or_create_via_ns(
     };
     match nm.describe_table(request).await {
         Ok(response) => {
-            let location = response.location.with_context(|| {
+            let table_location = response.location.with_context(|| {
                 format!("namespace returned no location for table {table_name}")
             })?;
             let builder = apply_open_params(
-                DatasetBuilder::from_uri(&location).with_session(session.clone()),
+                DatasetBuilder::from_uri(&table_location).with_session(session.clone()),
                 &wrapper,
                 storage_options,
             );
@@ -5166,10 +5222,10 @@ async fn open_or_create_via_ns(
                     // manifest that poisons the table permanently (spec.md#local-store-self-heal);
                     // self-heal by rolling back to the newest fully readable version.
                     // Remote stores never produce this (atomic PUT), so heal is local-only.
-                    match config::local_path(&uri_to_url(&location)?) {
+                    match config::local_path(&uri_to_url(&table_location)?) {
                         Some(table_root) => {
                             heal_local_dataset(
-                                &location,
+                                &table_location,
                                 &table_root,
                                 table_name,
                                 session,
@@ -5189,7 +5245,9 @@ async fn open_or_create_via_ns(
         Err(error) => match &error {
             error if is_namespace_error_code(error, ErrorCode::TableNotFound) => {
                 if open_mode == OpenMode::ReadOnly {
-                    anyhow::bail!("store has no {table_name} table yet; run `pond sync`");
+                    anyhow::bail!(
+                        "store has no {table_name} table yet; run `pond sync` (or `pond optimize` on a host with no agent sources) to create it"
+                    );
                 }
             }
             _ => {
@@ -5210,12 +5268,7 @@ async fn open_or_create_via_ns(
     if wrapper.is_some() || !storage_options.is_empty() {
         write_params.store_params = Some(ObjectStoreParams {
             object_store_wrapper: wrapper.clone(),
-            storage_options_accessor: (!storage_options.is_empty()).then(|| {
-                Arc::new(StorageOptionsAccessor::with_static_options(
-                    storage_options.clone(),
-                ))
-            }),
-            ..Default::default()
+            ..static_store_params(storage_options)
         });
     }
     let reader = sessions::empty_reader(schema.clone())?;
@@ -5226,8 +5279,9 @@ async fn open_or_create_via_ns(
         Some(write_params.clone()),
     )
     .await;
-    let mut dataset = match created {
-        Ok(dataset) => dataset,
+    // Created unfenced: its first write fences it (`CachedDataset::latest_for_write`).
+    match created {
+        Ok(dataset) => Ok(dataset),
         Err(error) => {
             let Some(plain_nm) = plain_copy_namespace(location, storage_options, session).await
             else {
@@ -5236,24 +5290,9 @@ async fn open_or_create_via_ns(
             let reader = sessions::empty_reader(schema)?;
             Dataset::write_into_namespace(reader, plain_nm, table_id, Some(write_params))
                 .await
-                .with_context(|| format!("failed to create table {table_name}"))?
-        }
-    };
-    // Born fenced (`CachedDataset::latest_for_write`), so the table's first
-    // data write stays one commit. A conflict means another writer reached it
-    // first; its write seam fences it.
-    match dataset
-        .migrate_to_non_reusable_field_ids()
-        .await
-        .map_err(anyhow::Error::from)
-    {
-        Ok(()) => {}
-        Err(error) if is_commit_conflict(&error) => dataset.checkout_latest().await?,
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to fence new table {table_name}"));
+                .with_context(|| format!("failed to create table {table_name}"))
         }
     }
-    Ok(dataset)
 }
 
 /// Apply the same session/wrapper/storage-option store params to a
@@ -5267,12 +5306,7 @@ fn apply_open_params(
     match wrapper {
         Some(wrapper) => builder.with_store_params(ObjectStoreParams {
             object_store_wrapper: Some(wrapper.clone()),
-            storage_options_accessor: (!storage_options.is_empty()).then(|| {
-                Arc::new(StorageOptionsAccessor::with_static_options(
-                    storage_options.clone(),
-                ))
-            }),
-            ..Default::default()
+            ..static_store_params(storage_options)
         }),
         None if !storage_options.is_empty() => {
             builder.with_storage_options(storage_options.clone())
@@ -5307,7 +5341,7 @@ fn parse_manifest_version(filename: &str) -> Option<u64> {
 
 /// Pin-open a specific version and drain a real scan over every column. The
 /// pinned open resolves the manifest path deterministically and never lists
-/// the directory or reads the poisoned head (lance builder.rs:239); draining
+/// the directory or reads the poisoned head (lance `DatasetBuilder::with_version`); draining
 /// the scan forces data-page reads, which catches a zeroed data file that
 /// manifest metadata alone hides. Full projection is load-bearing: a
 /// column-update commit (embed's write shape) puts later-added columns in
@@ -5613,7 +5647,7 @@ async fn ensure_current_schema(
                 sessions::column_backfill(table_name, &missing)?;
                 let names: Vec<&str> = missing.iter().map(|field| field.name().as_str()).collect();
                 anyhow::bail!(
-                    "table {table_name} is missing columns {names:?}; run `pond sync` to backfill them"
+                    "table {table_name} is missing columns {names:?}; run `pond sync` (or `pond optimize` on a host with no agent sources) to backfill them"
                 );
             }
             SchemaFit::MissingNullable(missing) => {
@@ -5773,14 +5807,26 @@ fn apply_remote_storage_defaults(options: &mut HashMap<String, String>) {
 const PLAIN_CONDITIONAL_COPY: &str = "header:If-None-Match:*";
 const COPY_MODE_KEYS: &[&str] = &["aws_copy_if_not_exists", "copy_if_not_exists"];
 
-/// Whether the copy mode is pond's to pick: an S3 store whose options set none.
+/// Whether the copy mode is pond's to pick: an S3 store whose options set none,
+/// nor the environment, whose `AWS_*` variables Lance merges in under them.
 fn copy_mode_is_ours(location: &Url, options: &HashMap<String, String>) -> bool {
+    let names_copy_mode = |key: &str| {
+        COPY_MODE_KEYS
+            .iter()
+            .any(|alias| key.eq_ignore_ascii_case(alias))
+    };
     location.scheme() == "s3"
-        && !options.keys().any(|key| {
-            COPY_MODE_KEYS
-                .iter()
-                .any(|alias| key.eq_ignore_ascii_case(alias))
-        })
+        && !options.keys().any(|key| names_copy_mode(key))
+        && !std::env::vars_os().any(|(key, _)| key.to_str().is_some_and(names_copy_mode))
+}
+
+/// A fresh probe key under `location`'s `_config-check/` prefix.
+fn config_check_uri(location: &Url) -> String {
+    format!(
+        "{}/_config-check/{}",
+        location.as_str().trim_end_matches('/'),
+        uuid::Uuid::now_v7(),
+    )
 }
 
 fn with_plain_copy(options: &HashMap<String, String>) -> HashMap<String, String> {
@@ -5825,15 +5871,36 @@ async fn probe_copy(
     (first, overwrites)
 }
 
-/// A copy outcome Lance's marker cannot work with. Without a conditional copy
-/// at all (`NotSupported`) it falls back to the conditional put instead.
+/// A copy outcome Lance's marker cannot work with: the backend refused the
+/// request. Without a conditional copy at all (`NotSupported`,
+/// `NotImplemented`) the marker falls back to the conditional put, and a fault
+/// (a 5xx, a timeout, the network) says nothing about the backend.
 fn copy_rejected(outcome: &object_store::Result<()>) -> bool {
-    !matches!(
-        outcome,
-        Ok(())
-            | Err(object_store::Error::NotSupported { .. }
-                | object_store::Error::NotImplemented { .. })
-    )
+    use object_store::Error as OsError;
+    match outcome {
+        Ok(()) | Err(OsError::NotSupported { .. } | OsError::NotImplemented { .. }) => false,
+        Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => true,
+        Err(error) => refused_by_backend(error),
+    }
+}
+
+/// Whether an error is the backend refusing the request: a 4xx other than the
+/// transient 408 and 429, or a 501. object_store keeps the status private, so
+/// read the first `non-2xx status code: NNN` its request error renders - the
+/// response body follows it, and may quote other codes.
+fn refused_by_backend(error: &object_store::Error) -> bool {
+    let status =
+        std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |error| {
+            error.source()
+        })
+        .find_map(|error| {
+            let rendered = error.to_string();
+            let (_, rest) = rendered.split_once("non-2xx status code: ")?;
+            rest.get(..3)?.parse::<u16>().ok()
+        });
+    status.is_some_and(|status| {
+        ((400..500).contains(&status) && !matches!(status, 408 | 429)) || status == 501
+    })
 }
 
 /// The namespace to create a table through when this S3 backend rejects
@@ -5849,11 +5916,7 @@ async fn plain_copy_namespace(
     if !copy_mode_is_ours(location, storage_options) {
         return None;
     }
-    let probe_uri = format!(
-        "{}/_config-check/{}",
-        location.as_str().trim_end_matches('/'),
-        uuid::Uuid::now_v7(),
-    );
+    let probe_uri = config_check_uri(location);
     let registry = Arc::new(ObjectStoreRegistry::default());
     let (store, path) = ObjectStore::from_uri_and_params(
         registry,
@@ -6006,6 +6069,28 @@ mod tests {
                     .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_handle_refuses_writes() -> Result<()> {
+        let temp = TempDir::new()?;
+        Handle::open(&config::url_for_path(temp.path())?).await?;
+        let reader = open_read_only(temp.path()).await?;
+        let version = reader.dataset(Table::Messages).await?.version_id();
+        for error in [
+            reader
+                .drop_index(Table::Messages, "messages_session_id_btree")
+                .await
+                .unwrap_err(),
+            reader
+                .cleanup_table_versions(Table::Messages, chrono::Duration::hours(1))
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("read-only"), "{error:#}");
+        }
+        assert_eq!(reader.dataset(Table::Messages).await?.version_id(), version);
         Ok(())
     }
 
@@ -6613,6 +6698,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "figment::Jail closures return figment::Error by contract"
+    )]
     fn the_copy_mode_is_ours_only_on_s3_without_an_explicit_one() {
         let s3 = Url::parse("s3://bucket/prefix").unwrap();
         let mut options = HashMap::from([(
@@ -6620,16 +6709,18 @@ mod tests {
             "https://nbg1.your-objectstorage.com".to_owned(),
         )]);
         apply_remote_storage_defaults(&mut options);
-        assert!(
-            copy_mode_is_ours(&s3, &options),
-            "no endpoint gets a copy mode by default: {options:?}",
-        );
-        assert!(
-            !options
-                .keys()
-                .any(|key| key == "timeout" || key == "request_timeout"),
-            "the per-request timeout stays object_store's: {options:?}",
-        );
+        figment::Jail::expect_with(|jail| {
+            assert!(
+                copy_mode_is_ours(&s3, &options),
+                "no endpoint gets a copy mode by default: {options:?}",
+            );
+            jail.set_env("AWS_COPY_IF_NOT_EXISTS", "multipart");
+            assert!(
+                !copy_mode_is_ours(&s3, &options),
+                "a mode Lance reads from the environment is used as given",
+            );
+            Ok(())
+        });
         options.insert("copy_if_not_exists".to_owned(), "multipart".to_owned());
         assert!(
             !copy_mode_is_ours(&s3, &options),
@@ -6640,6 +6731,53 @@ mod tests {
             !copy_mode_is_ours(&gcs, &HashMap::new()),
             "only S3 falls back"
         );
+    }
+
+    #[test]
+    fn remote_defaults_leave_the_request_timeout_to_object_store() {
+        let mut options = HashMap::from([(
+            "endpoint".to_owned(),
+            "https://nbg1.your-objectstorage.com".to_owned(),
+        )]);
+        apply_remote_storage_defaults(&mut options);
+        assert!(
+            !options
+                .keys()
+                .any(|key| key == "timeout" || key == "request_timeout"),
+            "the per-request timeout stays object_store's: {options:?}",
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_rejects_a_copy() {
+        let response = |status: &str| -> object_store::Result<()> {
+            Err(object_store::Error::Generic {
+                store: "S3",
+                source: format!(
+                    "Error performing PUT http://host/key in 2ms - Server returned non-2xx status code: {status}: "
+                )
+                .into(),
+            })
+        };
+        assert!(copy_rejected(&response("411 Length Required")));
+        assert!(copy_rejected(&response("501 Not Implemented")));
+        assert!(!copy_rejected(&response("503 Service Unavailable")));
+        assert!(!copy_rejected(&response("408 Request Timeout")));
+        assert!(!copy_rejected(&response("429 Too Many Requests")));
+        assert!(
+            !copy_rejected(&response(
+                "503 Service Unavailable: <Message>non-2xx status code: 411</Message>"
+            )),
+            "a code quoted in the body is not the response's own",
+        );
+        assert!(!copy_rejected(&Err(object_store::Error::Generic {
+            store: "S3",
+            source: "connection reset by peer".into(),
+        })));
+        assert!(!copy_rejected(&Err(object_store::Error::NotSupported {
+            source: "no conditional copy".into(),
+        })));
+        assert!(!copy_rejected(&Ok(())));
     }
 
     #[test]
