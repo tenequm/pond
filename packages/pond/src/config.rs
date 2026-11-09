@@ -860,6 +860,16 @@ fn detect_legacy_sources(path: &Path) -> Option<String> {
     ))
 }
 
+/// A path still relative after the factories' expansion resolves against the
+/// syncing process's working directory, which under a scheduler (`/` for
+/// launchd, `$HOME` for systemd) is not the one the user meant. Checking the
+/// expanded form keeps `$VAR/x` valid and rejects the `~user` and unset-`$VAR`
+/// spellings the expander leaves untouched.
+fn is_cwd_relative(path: &str) -> bool {
+    let home = home_dir().unwrap_or_default();
+    !expand_home_under(Path::new(path), &home).is_absolute()
+}
+
 /// Fan an entry whose `path` is an array out into one single-path entry per
 /// element (other keys copied verbatim), preserving config order. Adapters
 /// only ever see a scalar `path`, so the seam and every factory stay
@@ -883,13 +893,6 @@ fn expand_path_array(
             "[adapters.{name}] has an empty `path`; set it to a directory, or disable the adapter with `pond adapters disable {name}`"
         );
     }
-    let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
-        return Ok(vec![ResolvedAdapter {
-            name,
-            config: blob,
-            fanout_path: None,
-        }]);
-    };
     // A config error halts every adapter's sync, so each message states the
     // blast radius and the way to keep working meanwhile.
     let others = match enabled_total.saturating_sub(1) {
@@ -897,6 +900,20 @@ fn expand_path_array(
         n => format!(
             " ({n} other enabled adapter(s) are unaffected - `pond sync <adapter>` syncs one meanwhile, `pond adapters list` shows every configured path)"
         ),
+    };
+    if let Some(path) = blob.get("path").and_then(Value::as_str)
+        && is_cwd_relative(path)
+    {
+        bail!(
+            "[adapters.{name}] has a relative `path` {path:?}; set it to an absolute path or one starting with `~` (a scheduled sync would resolve it against the scheduler's working directory){others}"
+        );
+    }
+    let Some(paths) = blob.get("path").and_then(Value::as_array).cloned() else {
+        return Ok(vec![ResolvedAdapter {
+            name,
+            config: blob,
+            fanout_path: None,
+        }]);
     };
     if paths.is_empty() {
         bail!(
@@ -917,6 +934,11 @@ fn expand_path_array(
         if path.is_empty() {
             bail!(
                 "[adapters.{name}] has an empty `path` element; set it to a directory, remove it, or disable the adapter with `pond adapters disable {name}`{others}"
+            );
+        }
+        if is_cwd_relative(path) {
+            bail!(
+                "[adapters.{name}] `path` element {path:?} is relative; set it to an absolute path or one starting with `~` (a scheduled sync would resolve it against the scheduler's working directory){others}"
             );
         }
         // Literal duplicates only, as a typo courtesy. Aliases (`~/x` vs its
@@ -1478,6 +1500,100 @@ path = [\"/srv/solo\"]
                 Ok(())
             });
         }
+    }
+
+    #[test]
+    fn resolve_adapters_rejects_cwd_relative_paths() {
+        for body in [
+            "[adapters.claude-code]\nenabled = true\npath = \".\"\n",
+            "[adapters.claude-code]\nenabled = true\npath = [\"/srv/a\", \"sessions\"]\n",
+            "[adapters.claude-code]\nenabled = true\npath = \"~user/sessions\"\n",
+            "[adapters.claude-code]\nenabled = true\npath = \"$POND_UNSET_ROOT/sessions\"\n",
+        ] {
+            figment::Jail::expect_with(|jail| {
+                jail.create_file("config.toml", body)?;
+                let err = Config::load("config.toml")
+                    .unwrap()
+                    .resolve_adapters(None)
+                    .expect_err("a cwd-relative path must error")
+                    .to_string();
+                assert!(err.contains("relative"), "got: {err}");
+                assert!(err.contains("[adapters.claude-code]"), "got: {err}");
+                Ok(())
+            });
+        }
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[adapters.claude-code]\nenabled = true\npath = \".\"\n\n[adapters.codex-cli]\nenabled = true\npath = \"/srv/b\"\n",
+            )?;
+            let err = Config::load("config.toml")
+                .unwrap()
+                .resolve_adapters(None)
+                .expect_err("a cwd-relative path must error")
+                .to_string();
+            assert!(
+                err.contains("1 other enabled adapter(s) are unaffected"),
+                "got: {err}"
+            );
+            Ok(())
+        });
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "[adapters.claude-code]\nenabled = true\npath = [\"~/sessions\", \"/srv/a\"]\n",
+            )?;
+            let resolved = Config::load("config.toml")
+                .unwrap()
+                .resolve_adapters(None)
+                .unwrap();
+            assert_eq!(resolved.len(), 2);
+            Ok(())
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_cwd_relative_rejects_drive_less_windows_paths() {
+        for path in [
+            "\\sessions",
+            "/sessions",
+            "C:sessions",
+            "sessions",
+            "~user\\sessions",
+        ] {
+            assert!(
+                is_cwd_relative(path),
+                "{path} depends on the cwd drive or dir"
+            );
+        }
+        for path in [
+            "C:\\sessions",
+            "C:/sessions",
+            "\\\\host\\share\\s",
+            "~\\sessions",
+            "~/sessions",
+        ] {
+            assert!(!is_cwd_relative(path), "{path} names a fixed location");
+        }
+    }
+
+    #[test]
+    fn resolve_adapters_accepts_env_var_paths_that_expand_to_absolute() {
+        figment::Jail::expect_with(|jail| {
+            let root = std::path::absolute("/srv").unwrap();
+            jail.set_env("POND_TEST_ROOT", root.display().to_string());
+            jail.create_file(
+                "config.toml",
+                "[adapters.claude-code]\nenabled = true\npath = [\"$POND_TEST_ROOT/a\", \"${POND_TEST_ROOT}/b\"]\n",
+            )?;
+            let resolved = Config::load("config.toml")
+                .unwrap()
+                .resolve_adapters(None)
+                .unwrap();
+            assert_eq!(resolved.len(), 2);
+            Ok(())
+        });
     }
 
     #[test]
