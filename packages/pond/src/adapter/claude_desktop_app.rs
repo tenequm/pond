@@ -22,8 +22,8 @@
 //!   would find the inner transcripts).
 //!
 //! The per-line `message` object is the Anthropic Messages shape (the same
-//! content blocks claude-code carries), so the part mapping mirrors that
-//! adapter. Records that are not a `user`/`assistant` turn (`system`, `result`,
+//! content blocks claude-code carries), so it reuses that adapter's part
+//! mapping. Records that are not a `user`/`assistant` turn (`system`, `result`,
 //! `rate_limit_event`, ...) become System carriers: their `subtype`/`type` is
 //! the content and the verbatim row survives in `options.source.raw_record`, so
 //! native restore reproduces the full `audit.jsonl`. `system/permission_*`
@@ -44,19 +44,18 @@ use walkdir::WalkDir;
 
 use crate::{
     sessions::IngestEvent,
-    wire::{FileData, Message, Part, PartKind, Provenance, ProviderOptions, Session},
+    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use super::{
     Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
-    config_path, empty_options,
-    extract::{
-        Extracted, Source, bound_value, extract_compact_repr, extract_self_str, extract_str,
-    },
+    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    claude_code::{assistant_part, is_tool_result, text_part, tool_result_part, user_part},
+    compact_json, config_path,
+    extract::{Extracted, Source, bound_value, extract_self_str, extract_str},
     extracted_text,
     jsonl::{RECORD_CAP, peek_last_line},
-    jsonl_bytes, part_id, part_ordinal, raw_record, source_options,
+    jsonl_bytes, raw_record, source_options,
 };
 
 const NAME: &str = "claude-desktop-app";
@@ -269,8 +268,6 @@ impl Adapter for ClaudeDesktopAppAdapter {
     }
 }
 
-/// A blocking-task panic is a pond bug, not bad source data, so it fails the
-/// whole run rather than skipping a session.
 /// Latest message timestamp (micros) for the freshness gate: the audit log's
 /// last record. The audit stream is append-ordered, so its tail line is the
 /// latest message; an unreadable file or a record without a timestamp yields
@@ -283,6 +280,8 @@ fn source_last_ts(audit_path: &Path) -> Option<i64> {
     Some(record_timestamp(&record)?.timestamp_micros())
 }
 
+/// A blocking-task panic is a pond bug, not bad source data, so it fails the
+/// whole run rather than skipping a session.
 fn join_error(join: tokio::task::JoinError) -> AdapterError {
     AdapterError::io(
         NAME,
@@ -303,12 +302,13 @@ struct CoworkSession {
 
 /// Walk the root for `local_*/audit.jsonl`, pruning hidden directories so the
 /// nested `.claude/` inner loop is never reached. Sorted for deterministic
-/// ingest order. A missing root means "no sessions yet", not an error.
+/// ingest order. A missing root means "no sessions yet"; an unreadable one is
+/// an error rather than an empty result.
 fn collect_sessions(root: &Path) -> Result<Vec<CoworkSession>, AdapterError> {
-    if !root.exists() {
+    let io = |source| AdapterError::io(NAME, root.display().to_string(), source);
+    if !root.try_exists().map_err(io)? {
         return Ok(Vec::new());
     }
-    let io = |source| AdapterError::io(NAME, root.display().to_string(), source);
     let mut out = Vec::new();
     let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
         // Prune any hidden dir (`.claude`, `.audit-key` is a file). The inner
@@ -692,7 +692,14 @@ fn message_events(
         }
         ("user", Value::Array(items)) => {
             parts.extend(items.iter().enumerate().map(|(ordinal, item)| {
-                user_part(session_id, uuid, ordinal, item, tool_call_names)
+                user_part(
+                    session_id,
+                    uuid,
+                    ordinal,
+                    item,
+                    tool_call_names,
+                    Provenance::Conversational,
+                )
             }));
             Message::User {
                 id: uuid.to_owned(),
@@ -745,202 +752,6 @@ fn message_carrier_event(
     })
 }
 
-fn text_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    text: Option<Extracted<String>>,
-    provenance: Provenance,
-) -> Part {
-    Part {
-        session_id: session_id.to_owned(),
-        id: part_id(message_id, ordinal),
-        message_id: message_id.to_owned(),
-        ordinal: part_ordinal(ordinal),
-        provenance,
-        options: empty_options(),
-        kind: PartKind::Text { text },
-    }
-}
-
-fn user_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    value: &Value,
-    tool_call_names: &HashMap<String, Extracted<String>>,
-) -> Part {
-    match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            extract_str(value, "text"),
-            Provenance::Conversational,
-        ),
-        Some("image") | Some("file") => file_part(
-            session_id,
-            message_id,
-            ordinal,
-            value,
-            Provenance::Conversational,
-        ),
-        Some("tool_result") => tool_result_part(
-            session_id,
-            message_id,
-            ordinal,
-            value,
-            None,
-            tool_call_names,
-        ),
-        // Unknown user block: preserve the raw JSON in a Text slot rather than
-        // drop it - a lossless encoding, not a synthesized value.
-        _ => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            Some(extract_compact_repr(value)),
-            Provenance::Conversational,
-        ),
-    }
-}
-
-fn assistant_part(session_id: &str, message_id: &str, ordinal: usize, value: &Value) -> Part {
-    match value.get("type").and_then(Value::as_str) {
-        Some("text") => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            extract_str(value, "text"),
-            Provenance::Conversational,
-        ),
-        Some("thinking") => Part {
-            session_id: session_id.to_owned(),
-            id: part_id(message_id, ordinal),
-            message_id: message_id.to_owned(),
-            ordinal: part_ordinal(ordinal),
-            provenance: Provenance::Conversational,
-            options: signature_options(value),
-            kind: PartKind::Reasoning {
-                text: extract_str(value, "thinking"),
-            },
-        },
-        Some(kind @ ("tool_use" | "server_tool_use")) => Part {
-            session_id: session_id.to_owned(),
-            id: part_id(message_id, ordinal),
-            message_id: message_id.to_owned(),
-            ordinal: part_ordinal(ordinal),
-            provenance: Provenance::Conversational,
-            options: empty_options(),
-            kind: PartKind::ToolCall {
-                call_id: extract_str(value, "id"),
-                name: extract_str(value, "name"),
-                params: value.get("input").cloned().unwrap_or(Value::Null),
-                provider_executed: kind == "server_tool_use",
-            },
-        },
-        Some("image") | Some("file") => file_part(
-            session_id,
-            message_id,
-            ordinal,
-            value,
-            Provenance::Conversational,
-        ),
-        _ => text_part(
-            session_id,
-            message_id,
-            ordinal,
-            Some(extract_compact_repr(value)),
-            Provenance::Conversational,
-        ),
-    }
-}
-
-fn tool_result_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    value: &Value,
-    source_tool_result: Option<&Value>,
-    tool_call_names: &HashMap<String, Extracted<String>>,
-) -> Part {
-    let call_id = extract_str(value, "tool_use_id");
-    // The name lives on the prior `tool_use`, resolved via the per-session map;
-    // a miss surfaces as `None`, never a sentinel (spec.md#model-no-synthesis).
-    let name = value
-        .str_field("tool_use_id")
-        .and_then(|id| tool_call_names.get(id))
-        .cloned();
-    let result = value
-        .get("content")
-        .cloned()
-        .or_else(|| source_tool_result.cloned())
-        .unwrap_or(Value::Null);
-    Part {
-        session_id: session_id.to_owned(),
-        id: part_id(message_id, ordinal),
-        message_id: message_id.to_owned(),
-        ordinal: part_ordinal(ordinal),
-        // spec.md#model-part-provenance: tool output is runtime-produced.
-        provenance: Provenance::Injected,
-        options: empty_options(),
-        kind: PartKind::ToolResult {
-            call_id,
-            name,
-            is_failure: value
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            result,
-        },
-    }
-}
-
-fn file_part(
-    session_id: &str,
-    message_id: &str,
-    ordinal: usize,
-    value: &Value,
-    provenance: Provenance,
-) -> Part {
-    let media_type = value
-        .get("media_type")
-        .or_else(|| value.get("mime_type"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let file_name = value
-        .get("file_name")
-        .or_else(|| value.get("name"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let data = if let Some(source) = value.get("source") {
-        if let Some(url) = source.get("url").and_then(Value::as_str) {
-            FileData::Url(url.to_owned())
-        } else if let Some(bytes) = source.get("data").and_then(Value::as_str) {
-            FileData::String(bytes.to_owned())
-        } else {
-            FileData::String(compact_json(source))
-        }
-    } else if let Some(url) = value.get("url").and_then(Value::as_str) {
-        FileData::Url(url.to_owned())
-    } else {
-        FileData::String(compact_json(value))
-    };
-    Part {
-        session_id: session_id.to_owned(),
-        id: part_id(message_id, ordinal),
-        message_id: message_id.to_owned(),
-        ordinal: part_ordinal(ordinal),
-        provenance,
-        options: empty_options(),
-        kind: PartKind::File {
-            media_type,
-            file_name,
-            data,
-        },
-    }
-}
-
 fn row_options(record: &Value, line: usize) -> ProviderOptions {
     let mut options = source_options(NAME, record);
     if let Some(source) = options.get_mut("source").and_then(Value::as_object_mut) {
@@ -963,18 +774,6 @@ fn assistant_options(record: &Value, message_value: &Value, line: usize) -> Prov
     });
     options.insert("anthropic".to_owned(), anthropic);
     options
-}
-
-fn signature_options(value: &Value) -> ProviderOptions {
-    let mut options = ProviderOptions::new();
-    if let Some(signature) = value.get("signature").and_then(Value::as_str) {
-        options.insert("anthropic".to_owned(), json!({ "signature": signature }));
-    }
-    options
-}
-
-fn is_tool_result(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("tool_result")
 }
 
 fn serialize_session(
@@ -1140,7 +939,7 @@ mod tests {
     #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
-    use crate::{handlers::ingest_adapter, sessions::Store};
+    use crate::{handlers::ingest_adapter, sessions::Store, wire::FileData};
     use tempfile::TempDir;
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
@@ -1442,5 +1241,105 @@ mod tests {
             IngestEvent::Message(Message::System { id, content, .. })
                 if id == "local-message-1" && content.as_deref().map(String::as_str) == Some("user")
         ));
+    }
+
+    /// A model-switch `fallback` block is harness-written, so it is injected
+    /// (kept out of search); a `document` block (a PDF read) is a file part
+    /// carrying the media type from its `source`, not a JSON blob in a text part.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_block_is_injected_and_document_block_is_a_file() -> anyhow::Result<()> {
+        let corpus = TempDir::new()?;
+        // The walk prunes hidden dirs, root included, and a TempDir is named `.tmp*`.
+        let root = corpus.path().join(SESSIONS_SUBDIR);
+        let workspace = root.join("acct").join("workspace");
+        let session_id = "local_88888888-8888-8888-8888-888888888888";
+        std::fs::create_dir_all(workspace.join(session_id))?;
+        std::fs::write(
+            workspace.join(format!("{session_id}.json")),
+            json!({
+                "sessionId": session_id,
+                "createdAt": 1_793_577_600_000_i64,
+                "cwd": "/tmp/pond-test",
+            })
+            .to_string(),
+        )?;
+        let row = |uuid: &str, role: &str, second: u32, content: Value| {
+            json!({
+                "type": role,
+                "uuid": uuid,
+                "_audit_timestamp": format!("2026-11-02T00:00:0{second}.000Z"),
+                "message": {"role": role, "content": content},
+            })
+        };
+        let prompt = row(
+            "u-prompt",
+            "user",
+            0,
+            json!([
+                {"type": "text", "text": "read this pdf"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK",
+                }},
+            ]),
+        );
+        let fallback = row(
+            "a-fallback",
+            "assistant",
+            1,
+            json!([{
+                "type": "fallback",
+                "from": {"model": "claude-fable-5"},
+                "to": {"model": "claude-opus-4-8"},
+            }]),
+        );
+        let reply = row(
+            "a-reply",
+            "assistant",
+            2,
+            json!([{"type": "text", "text": "the pdf says hello"}]),
+        );
+        std::fs::write(
+            workspace.join(session_id).join("audit.jsonl"),
+            format!("{prompt}\n{fallback}\n{reply}\n"),
+        )?;
+
+        let store_dir = TempDir::new()?;
+        let store = Store::open_local(store_dir.path()).await?;
+        let adapter = ClaudeDesktopAppAdapter::new(&root);
+        ingest_adapter(&store, &adapter, &crate::adapter::NoopOracle, |_| {}).await?;
+
+        let session = store
+            .get_session(session_id)
+            .await?
+            .expect("session ingests");
+        let parts_of = |id: &str| {
+            session
+                .messages
+                .iter()
+                .find(|stored| stored.message.id() == id)
+                .map(|stored| stored.parts.clone())
+                .unwrap_or_default()
+        };
+
+        let prompt_parts = parts_of("u-prompt");
+        assert_eq!(prompt_parts.len(), 2);
+        assert!(
+            matches!(
+                &prompt_parts[1].kind,
+                PartKind::File { media_type: Some(media), data: FileData::String(data), .. }
+                    if media == "application/pdf" && data == "JVBERi0xLjQK"
+            ),
+            "document block must be a file part holding the source bytes: {:?}",
+            prompt_parts[1].kind,
+        );
+
+        let fallback_parts = parts_of("a-fallback");
+        assert_eq!(fallback_parts.len(), 1);
+        assert!(matches!(fallback_parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(fallback_parts[0].provenance, Provenance::Injected);
+
+        let reply_parts = parts_of("a-reply");
+        assert_eq!(reply_parts[0].provenance, Provenance::Conversational);
+        Ok(())
     }
 }
