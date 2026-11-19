@@ -1011,6 +1011,11 @@ mod get_handler {
                 before_remaining: view.before_remaining,
                 after_remaining: view.after_remaining,
                 resolved_from_message_id,
+                stored_messages: view.stored_messages,
+                trailing: view.trailing.map(|trailing| crate::wire::TrailingView {
+                    count: trailing.count,
+                    final_turn: to_message_view(trailing.final_turn),
+                }),
             },
         }
     }
@@ -2714,6 +2719,171 @@ mod get_tests {
             "start returns the oldest two"
         );
         assert_eq!(start_after, 3, "three newer messages follow the head");
+        Ok(())
+    }
+
+    /// #358: a session ending in a bare tool call (a subagent's report) must
+    /// name that final assistant turn on the last page and count every stored
+    /// row, while earlier pages stay unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pond_get_session_tail_names_the_final_tool_only_turn() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let session_id = "handback-session";
+        let at = |minute: u32| Utc.with_ymd_and_hms(2026, 1, 1, 0, minute, 0).unwrap();
+        let tool_call = |message_id: &str, name: &str| Part {
+            session_id: session_id.to_owned(),
+            id: format!("{message_id}-call"),
+            message_id: message_id.to_owned(),
+            ordinal: 0,
+            provenance: Provenance::Conversational,
+            options: ProviderOptions::new(),
+            kind: PartKind::ToolCall {
+                call_id: Some(crate::adapter::Extracted::from_test_value(format!(
+                    "{message_id}-id"
+                ))),
+                name: Some(crate::adapter::Extracted::from_test_value(name.to_owned())),
+                params: serde_json::json!({"message": "the full report"}),
+                provider_executed: false,
+            },
+        };
+        let assistant = |id: &str, minute: u32| {
+            super::IngestEvent::Message(Message::Assistant {
+                id: id.to_owned(),
+                session_id: session_id.to_owned(),
+                timestamp: at(minute),
+                options: ProviderOptions::new(),
+            })
+        };
+        let carrier = |id: &str, minute: u32| {
+            super::IngestEvent::Message(Message::System {
+                id: id.to_owned(),
+                session_id: session_id.to_owned(),
+                timestamp: at(minute),
+                content: None,
+                options: ProviderOptions::new(),
+            })
+        };
+        let events = vec![
+            super::IngestEvent::Session(session(session_id, "pond-handback")),
+            super::IngestEvent::Message(Message::User {
+                id: "m0".to_owned(),
+                session_id: session_id.to_owned(),
+                timestamp: at(1),
+                options: ProviderOptions::new(),
+            }),
+            super::IngestEvent::Part(text_part(session_id, "m0", "m0-text", "audit it")),
+            assistant("m1", 2),
+            super::IngestEvent::Part(text_part(session_id, "m1", "m1-text", "Now the client.")),
+            assistant("m2", 3),
+            super::IngestEvent::Part(tool_call("m2", "Read")),
+            carrier("m3", 4),
+            assistant("m4", 5),
+            super::IngestEvent::Part(tool_call("m4", "SubagentHandback")),
+            carrier("m5", 6),
+        ];
+        ingest(&store, events).await;
+
+        let get = |from: SessionFrom, limit: usize| {
+            super::pond_get_session(
+                &store,
+                GetSessionRequest {
+                    protocol_version: crate::PROTOCOL_VERSION,
+                    namespace: Some("local".to_owned()),
+                    id: session_id.to_owned(),
+                    limit,
+                    from,
+                    after_message_id: None,
+                    before_message_id: None,
+                },
+            )
+        };
+        let GetEnvelope::Success(response) = get(SessionFrom::End, 20).await else {
+            panic!("get must succeed");
+        };
+        let GetResult::Session {
+            messages,
+            stored_messages,
+            trailing,
+            ..
+        } = response.result
+        else {
+            panic!("session-scope result expected");
+        };
+        let ids: Vec<_> = messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["m0", "m1"], "the conversational view is unchanged");
+        assert_eq!(stored_messages, 6, "every stored row is counted");
+        let trailing = trailing.expect("the tail page reports what follows");
+        assert_eq!(
+            trailing.count, 4,
+            "m2..m5 follow the last conversational message"
+        );
+        let final_turn = trailing.final_turn;
+        assert_eq!(
+            final_turn.id, "m4",
+            "the latest assistant turn, not the carrier after it"
+        );
+        assert_eq!(
+            final_turn.parts_summary[0].label.as_deref(),
+            Some("SubagentHandback"),
+            "the turn carries its one-line tool ref",
+        );
+
+        let GetEnvelope::Success(response) = get(SessionFrom::Start, 1).await else {
+            panic!("get must succeed");
+        };
+        let GetResult::Session { trailing, .. } = response.result else {
+            panic!("session-scope result expected");
+        };
+        assert!(
+            trailing.is_none(),
+            "only the page reaching the end reports the tail"
+        );
+
+        // A session with no conversational message still names its final turn.
+        let tool_only = "tool-only-session";
+        ingest(
+            &store,
+            vec![
+                super::IngestEvent::Session(session(tool_only, "pond-tool-only")),
+                super::IngestEvent::Message(Message::Assistant {
+                    id: "t0".to_owned(),
+                    session_id: tool_only.to_owned(),
+                    timestamp: at(1),
+                    options: ProviderOptions::new(),
+                }),
+                super::IngestEvent::Part(Part {
+                    session_id: tool_only.to_owned(),
+                    ..tool_call("t0", "SubagentHandback")
+                }),
+            ],
+        )
+        .await;
+        let GetEnvelope::Success(response) = super::pond_get_session(
+            &store,
+            GetSessionRequest {
+                protocol_version: crate::PROTOCOL_VERSION,
+                namespace: Some("local".to_owned()),
+                id: tool_only.to_owned(),
+                limit: 20,
+                from: SessionFrom::End,
+                after_message_id: None,
+                before_message_id: None,
+            },
+        )
+        .await
+        else {
+            panic!("get must succeed");
+        };
+        let GetResult::Session {
+            messages, trailing, ..
+        } = response.result
+        else {
+            panic!("session-scope result expected");
+        };
+        assert!(messages.is_empty(), "nothing conversational");
+        let trailing = trailing.expect("the final turn is still named");
+        assert_eq!((trailing.count, trailing.final_turn.id.as_str()), (1, "t0"));
         Ok(())
     }
 

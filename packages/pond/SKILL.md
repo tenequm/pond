@@ -19,8 +19,11 @@ something that sounds prior, search pond.
   one call, full readable transcript (a message id also works: it resolves to
   its parent session, page anchored at that message).
 - Expand one message with its full tool bodies -> `pond_get_message(id)`.
-- Corpus-wide aggregation, exact strings inside tool bodies, subagent
-  sessions, bulk export -> `pond_sql` (read-only SQL). Read resource
+- A subagent's final report -> open the parent with `pond_get_session`, pass a
+  footer id back with `from="end"`, then `pond_get_message` the final turn the
+  page names.
+- Corpus-wide aggregation, exact strings inside tool bodies, bulk export ->
+  `pond_sql` (read-only SQL). Read resource
   `schema://pond-sql` first - do not guess columns or JSON paths.
 
 ## Rules that prevent wrong conclusions
