@@ -414,72 +414,29 @@ mod lock_release_regression {
     #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
     use super::*;
 
-    /// Guards the fix in `SyncLockGuard::drop`. `flock` belongs to the open file
-    /// description, so a subprocess spawned while the guard is alive inherits a
-    /// duplicate descriptor and keeps the lock alive past the guard - unless the
-    /// guard unlocks explicitly. Without the `unlock()` call this reproduces
-    /// within a handful of rounds; the loop is generous only so a slow or busy
-    /// machine cannot pass it by luck.
-    ///
-    /// unix-only: the mechanism is `flock` plus fd inheritance across fork.
-    /// Windows locks are mandatory byte-range locks with different handle
-    /// inheritance, so the same shape proves nothing there.
+    /// Guards the fix in `SyncLockGuard::drop`: a cloned descriptor shares the
+    /// open file description exactly as a forked child's inherited copy does.
+    /// unix-only: Windows locks belong to the handle, not a shared description.
     #[test]
-    fn lock_frees_on_drop_even_while_subprocesses_are_spawning() {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Counted, not assumed. A spawn that never succeeds turns this test
-        // green without ever opening the fork/exec window it exists to probe -
-        // which is exactly what a hardcoded /usr/bin/true would do on NixOS or
-        // a minimal container, where that path does not exist. `/bin/sh` is
-        // present on every unix, and the count is asserted below.
-        let spawned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let spawner = {
-            let stop = std::sync::Arc::clone(&stop);
-            let spawned = std::sync::Arc::clone(&spawned);
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    if std::process::Command::new("/bin/sh")
-                        .args(["-c", ":"])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .is_ok()
-                    {
-                        spawned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            })
-        };
-
+    fn lock_frees_on_drop_while_an_inherited_descriptor_is_alive() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut result = Ok(());
-        for round in 0..2_000 {
-            let guard = match try_acquire_sync_lock_in(dir.path(), "k").unwrap() {
-                SyncLockState::Acquired(guard) => guard,
-                SyncLockState::Busy(_) => {
-                    result = Err(format!("round {round}: fresh lock reported busy"));
-                    break;
-                }
-            };
-            drop(guard);
-            if let SyncLockState::Busy(holder) = try_acquire_sync_lock_in(dir.path(), "k").unwrap()
-            {
-                result = Err(format!(
-                    "round {round}: lock still held after drop (holder={holder:?}) - \
-                     an inherited descriptor is keeping the flock alive"
-                ));
-                break;
-            }
-        }
-
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        spawner.join().unwrap();
-        if let Err(message) = result {
-            panic!("{message}");
-        }
+        let SyncLockState::Acquired(guard) = try_acquire_sync_lock_in(dir.path(), "k").unwrap()
+        else {
+            panic!("fresh lock must acquire");
+        };
+        let inherited = guard.file.try_clone().unwrap();
+        assert!(matches!(
+            try_acquire_sync_lock_in(dir.path(), "k").unwrap(),
+            SyncLockState::Busy(_)
+        ));
+        drop(guard);
         assert!(
-            spawned.load(std::sync::atomic::Ordering::Relaxed) > 0,
-            "no subprocess ever spawned - this test proved nothing",
+            matches!(
+                try_acquire_sync_lock_in(dir.path(), "k").unwrap(),
+                SyncLockState::Acquired(_)
+            ),
+            "an inherited descriptor kept the flock alive after drop"
         );
+        drop(inherited);
     }
 }
