@@ -51,6 +51,10 @@ export const site = {
   ],
 } as const
 
+export function sidebarGroup(path: string) {
+  for (const entry of site.sidebar) if ('items' in entry && entry.items.some((item) => item.link === path)) return entry
+}
+
 export const pageOrder = site.sidebar.flatMap<{ text: string; link: string }>((entry) =>
   'items' in entry ? entry.items : [entry],
 )

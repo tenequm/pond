@@ -87,7 +87,7 @@ export function CopyButton({
       className={page ? 'copy-page' : line === undefined ? 'copy-code' : 'copy-code copy-command'}
       onClick={copy}
       style={line === undefined ? undefined : ({ '--line': line } as CSSProperties)}
-      aria-label={page && state === 'idle' ? 'Copy page content as markdown for AI' : label}
+      aria-label={page ? undefined : label}
       title={label}
       data-state={state}
     >
@@ -249,10 +249,12 @@ function Release({ version, date, url, children }: ReleaseProps) {
     <section className="release" id={version}>
       <div className="release-label">
         <div>
-          <SiteLink href={url}>
-            {version}
-            <ExternalLink size={12} />
-          </SiteLink>
+          <h2>
+            <SiteLink href={url}>
+              {version}
+              <ExternalLink size={12} />
+            </SiteLink>
+          </h2>
           <time dateTime={date}>
             {new Date(date).toLocaleDateString('en-US', {
               month: 'long',

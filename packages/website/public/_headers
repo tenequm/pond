@@ -1,0 +1,16 @@
+# Unfingerprinted media and the font: a replaced file reaches returning visitors within a day.
+/*.png
+  Cache-Control: public, max-age=86400
+/*.svg
+  Cache-Control: public, max-age=86400
+/*.gif
+  Cache-Control: public, max-age=86400
+/*.mp4
+  Cache-Control: public, max-age=86400
+/*.woff2
+  Cache-Control: public, max-age=86400
+
+# Vite fingerprints everything under /assets, so a changed file always gets a new URL.
+/assets/*
+  ! Cache-Control
+  Cache-Control: public, max-age=31556952, immutable

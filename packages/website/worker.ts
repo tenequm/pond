@@ -1,9 +1,13 @@
+// The endpoints Rybbit's script requests; nothing else under /mesh/ is relayed to the analytics host.
+const analyticsPath =
+  /^\/mesh\/(script\.js|replay\.js|track|identify|site\/tracking-config\/[\w-]+|session-replay\/record\/[\w-]+)$/
+
 export default {
   async fetch(request: Request, env: { ASSETS: { fetch: typeof fetch }; RYBBIT_HOST: string }): Promise<Response> {
     const url = new URL(request.url)
     // First-party analytics: the page loads /mesh/script.js, which then posts to
     // /mesh/track. Rybbit serves both under /api/ upstream.
-    if (url.pathname.startsWith('/mesh/')) {
+    if (analyticsPath.test(url.pathname)) {
       const upstream = new Request(
         `${env.RYBBIT_HOST}/api${url.pathname.slice('/mesh'.length)}${url.search}`,
         request,
@@ -13,8 +17,15 @@ export default {
       const visitorIp = request.headers.get('CF-Connecting-IP') ?? ''
       upstream.headers.set('X-Real-IP', visitorIp)
       upstream.headers.set('X-Forwarded-For', visitorIp)
+      upstream.headers.delete('Cookie')
       return fetch(upstream)
     }
-    return env.ASSETS.fetch(request)
+    // No asset matched. Served from here because a _headers rule matches by path alone, and would
+    // let a browser keep the 404 for a not-yet-deployed /assets file for a year.
+    const notFound = await env.ASSETS.fetch(new URL('/404', url))
+    return new Response(notFound.body, {
+      status: 404,
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
   },
 }

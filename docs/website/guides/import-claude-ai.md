@@ -1,5 +1,5 @@
 ---
-description: Import Claude.ai conversations into pond from the official data export with pond sync claude-ai-export --path. Accepts the .zip, an extracted directory, or conversations.json; idempotent.
+description: Import Claude.ai conversations into pond from the official data export - the .zip, an extracted directory or conversations.json. Safe to run again.
 ---
 
 # Import a Claude.ai export

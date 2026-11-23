@@ -117,7 +117,7 @@ export function Navigation({ home = false }: { home?: boolean }) {
   }, [])
   const logo = (
     <SiteLink className="brand" href="/" aria-label="pond home">
-      <img src="/logo.png" alt="Logo" />
+      <img src="/logo.png" alt="Logo" width="257" height="168" />
     </SiteLink>
   )
   return (

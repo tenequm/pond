@@ -1,5 +1,5 @@
 ---
-description: Run pond serve as a long-lived read side on a host you control - point it at the bucket without a config file, name the host for /mcp, put auth in front, give it a writable cache, and stop it cleanly under a supervisor.
+description: Run pond serve as a long-lived read side on a host you control - point it at the bucket, put auth in front, and stop it cleanly under a supervisor.
 ---
 
 # Run a remote serve

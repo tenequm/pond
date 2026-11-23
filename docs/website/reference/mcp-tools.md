@@ -1,5 +1,5 @@
 ---
-description: pond's MCP tools - pond_search (full-text search over agent sessions, semantic when enabled), pond_get_session (a whole session by id), pond_get_message (one message with full tool bodies), and pond_sql (read-only SQL over sessions, messages, and parts).
+description: pond's MCP tools - pond_search (search agent sessions), pond_get_session, pond_get_message and pond_sql (read-only SQL over sessions, messages and parts).
 ---
 
 # MCP tools

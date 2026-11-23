@@ -1,5 +1,5 @@
 ---
-description: pond CLI reference - init, sync, search, serve, get, copy, sql, storage, creds, and schedule commands for ingesting, searching, and moving your AI agent session archive.
+description: pond CLI reference - init, sync, search, serve, get, copy, sql, storage, creds and schedule commands for ingesting and searching your AI agent sessions.
 ---
 
 # CLI commands
