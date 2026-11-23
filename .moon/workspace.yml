@@ -7,6 +7,7 @@ projects:
   openclaw-pond: 'packages/openclaw-pond'
   hermes-pond: 'packages/hermes-pond'
   pi-pond: 'packages/pi-pond'
+  website: 'packages/website'
   repo: '.'
 
 vcs:
