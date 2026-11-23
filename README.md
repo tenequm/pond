@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/site/assets/logo.png" alt="pond" width="200">
+  <img src="docs/assets/logo.png" alt="pond" width="200">
 </p>
 
 # pond
@@ -25,14 +25,14 @@ scoop install tenequm/pond
 Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)"* - the full, failure-proofed version of that prompt is in [Connect your agents](https://pond.locker/get-started/connect-your-agents#agent-setup-prompt).
 
 <p align="center">
-  <img src="docs/site/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
+  <img src="docs/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
 </p>
-<p align="center"><sub>A live 12k-session corpus, then a three-month-old fix found and verified against the current code (<a href="docs/site/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
+<p align="center"><sub>A live 12k-session corpus, then a three-month-old fix found and verified against the current code (<a href="docs/assets/demo-search.mp4">crisper MP4</a>)</sub></p>
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/site/assets/tokens-chart-dark.svg">
-    <img src="docs/site/assets/tokens-chart-light.svg" alt="Bar chart: tokens into context for one recall answer. pond_search returns a complete ranked answer in 1.5-3k tokens; grep plus reading one matching transcript costs 90-255k tokens, chosen from 23-3,270 unranked matching files" width="920">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/tokens-chart-dark.svg">
+    <img src="docs/assets/tokens-chart-light.svg" alt="Bar chart: tokens into context for one recall answer. pond_search returns a complete ranked answer in 1.5-3k tokens; grep plus reading one matching transcript costs 90-255k tokens, chosen from 23-3,270 unranked matching files" width="920">
   </picture>
 </p>
 <p align="center"><sub>Five real recall questions, one corpus, one machine - method, raw numbers, and a rerunnable script in <a href="docs/benchmarks/recall-context-cost.md">docs/benchmarks</a></sub></p>

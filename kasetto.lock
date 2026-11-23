@@ -32,4 +32,11 @@ skills:
     source: https://github.com/tenequm/skills
     source_revision: ref:skills-3a565b1
     scope: project
-assets: {}
+assets:
+  mcp::<inline>::openseo:
+    kind: mcp
+    name: openseo
+    hash: 67c5729d7f1f69f730f638896a5e1aa2f8f73022f7ade0b5c9c141ce97df2f18
+    source: <inline>
+    destination: openseo
+    source_revision: <inline>
