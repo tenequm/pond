@@ -114,8 +114,9 @@ button { cursor: pointer; }
 }
 @media (width < 748px) {
   :root { --px: 1rem; --py: 2rem; --h1: 1.75rem; --code-px: 1rem; background: var(--color-surface); }
-  .topbar { border-bottom: 1px solid var(--color-line); transition: transform .15s; }
-  .topbar[data-hidden=true] { transform: translateY(-100%); }
+  .topbar { border-bottom: 1px solid var(--color-line); transition: transform .15s, visibility .15s; }
+  /* Hidden as well as moved, so its off-screen buttons leave the tab order. */
+  .topbar[data-hidden=true] { transform: translateY(-100%); visibility: hidden; }
   .search-trigger { display: none; }
   .mobile-actions .search-icon { display: flex; }
   .docs-main::before { display: none; }
@@ -134,7 +135,7 @@ button { cursor: pointer; }
 .prose :is(h2,h3,h4,h5,h6) { font-weight: 500; letter-spacing: -.025em; color: white; }
 .prose h2 { font-size: 24px; line-height: 1em; scroll-margin-top: -20px; }
 .prose h3 { font-size: 20px; line-height: 1em; scroll-margin-top: -16px; }
-.prose h4 { font-size: 18px; }
+.prose h4 { font-size: 18px; scroll-margin-top: -16px; }
 .prose :is(h4,h5,h6,strong) { font-weight: 600; }
 .prose > :not(h1,hgroup) + h2 { padding-top: 32px; margin-top: 40px; border-top: 1px solid var(--color-line); }
 .prose > :is(h3,h4,h5,h6) { padding-top: 16px; }
@@ -248,7 +249,11 @@ pre:hover .copy-code, .copy-code:focus-visible, .copy-code[data-state=copied] { 
 .mobile-outline button > svg:last-child:not(:first-child) { color: var(--color-muted); }
 .outline-popup .outline-list { border: 0; }
 @media (width >= 1376px) { .mobile-outline { display: none; } }
-@media (width < 1376px) { .outline-rail, .versions-rail { display: none; } }
+@media (width < 1376px) {
+  .outline-rail, .versions-rail { display: none; }
+  /* The sticky outline bar is 45px tall and would cover a heading the page jumps to. */
+  :root:has(.mobile-outline) { scroll-padding-top: calc(var(--bar) + 1rem + 45px); }
+}
 @media (1080px <= width < 1376px) { .mobile-outline { border-width: 1px 0 1px 1px; border-top-left-radius: 16px; } }
 .release { content-visibility: auto; contain-intrinsic-size: auto 400px; @apply relative flex gap-12; scroll-margin-top: 80px; margin-bottom: 0; }
 .release:not(:has(+ .release)) { margin-bottom: 24px; }

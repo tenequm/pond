@@ -1,4 +1,4 @@
-import { Link, useLocation } from '@tanstack/react-router'
+import { Link, useLocation, useNavigate } from '@tanstack/react-router'
 import { ChevronDown, TextAlignJustify, Search, X } from 'lucide-react'
 import { Dialog, DropdownMenu } from 'radix-ui'
 import { type ComponentProps, lazy, type MouseEvent, Suspense, useEffect, useState } from 'react'
@@ -10,23 +10,36 @@ const SearchPanel = lazy(() => import('./search.tsx'))
 export const plainClick = (event: MouseEvent) =>
   !(event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button)
 
-export function SiteLink({ href = '', children, ...props }: ComponentProps<'a'>) {
+export function SiteLink({ href = '', children, onClick, ...props }: ComponentProps<'a'>) {
+  const navigate = useNavigate()
   if (/^(?:[a-z][\w+.-]*:|\/\/)/i.test(href)) {
     return (
-      <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+      <a href={href} target="_blank" rel="noopener noreferrer" onClick={onClick} {...props}>
         {children}
       </a>
     )
   }
   const [path, hash] = href.split('#')
+  // The router's Link marks a link whose hash matches the URL as the current page, so a
+  // link to a section navigates through the router without its active state.
+  if (hash) {
+    return (
+      <a
+        {...props}
+        href={href}
+        onClick={(event) => {
+          onClick?.(event)
+          if (event.defaultPrevented || !plainClick(event)) return
+          event.preventDefault()
+          void navigate({ to: path || '.', hash })
+        }}
+      >
+        {children}
+      </a>
+    )
+  }
   return (
-    <Link
-      {...props}
-      to={path || '.'}
-      hash={hash}
-      activeOptions={{ exact: true, includeHash: Boolean(hash) }}
-      activeProps={{ className: '' }}
-    >
+    <Link {...props} onClick={onClick} to={path || '.'} activeOptions={{ exact: true }} activeProps={{ className: '' }}>
       {children}
     </Link>
   )
@@ -82,7 +95,8 @@ export function Navigation({ home = false }: { home?: boolean }) {
   }
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+      // A non-Latin layout reports its own letter in `key`, so the physical key counts too.
+      if ((event.metaKey || event.ctrlKey) && (event.key.toLowerCase() === 'k' || event.code === 'KeyK')) {
         event.preventDefault()
         setMenu(false)
         setSearch((open) => !open)

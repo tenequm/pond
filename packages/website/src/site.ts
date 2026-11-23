@@ -50,3 +50,7 @@ export const site = {
     { text: 'Changelog', link: '/changelog' },
   ],
 } as const
+
+export const pageOrder = site.sidebar.flatMap<{ text: string; link: string }>((entry) =>
+  'items' in entry ? entry.items : [entry],
+)

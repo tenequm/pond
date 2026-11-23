@@ -6,7 +6,7 @@ import { CopyButton, markdownComponents } from '../components/markdown.tsx'
 import { Navigation, plainClick, SiteLink } from '../components/navigation.tsx'
 import { type Page, pages } from '../content.ts'
 import { pageHead } from '../seo.ts'
-import { site } from '../site.ts'
+import { pageOrder } from '../site.ts'
 
 export const Route = createFileRoute('/$')({
   loader: async ({ params }) => {
@@ -58,10 +58,6 @@ function DocPage() {
   )
 }
 
-const order = site.sidebar.flatMap<{ text: string; link: string }>((entry) =>
-  'items' in entry ? entry.items : [entry],
-)
-
 function Outline({ slug, meta }: Pick<Page, 'slug' | 'meta'>) {
   const versions = slug === 'changelog'
   const items = meta.toc
@@ -69,6 +65,7 @@ function Outline({ slug, meta }: Pick<Page, 'slug' | 'meta'>) {
   const [scrolled, setScrolled] = useState(false)
   const [open, setOpen] = useState(false)
   const rail = useRef<HTMLElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
   useEffect(() => {
     function scroll() {
       const threshold = innerHeight * 0.2
@@ -133,12 +130,22 @@ function Outline({ slug, meta }: Pick<Page, 'slug' | 'meta'>) {
       {!versions && (
         <div className="mobile-outline">
           <Popover.Root open={open} onOpenChange={setOpen}>
-            <Popover.Trigger>
+            <Popover.Trigger ref={trigger}>
               {label}
               <ChevronRight size={14} />
             </Popover.Trigger>
             <Popover.Portal>
-              <Popover.Content align="start" sideOffset={8} className="outline-popup">
+              <Popover.Content
+                align="start"
+                sideOffset={8}
+                className="outline-popup"
+                aria-label="On this page"
+                // A scrolling focus would pull the page back to the sticky bar and undo the jump.
+                onCloseAutoFocus={(event) => {
+                  event.preventDefault()
+                  trigger.current?.focus({ preventScroll: true })
+                }}
+              >
                 {list}
               </Popover.Content>
             </Popover.Portal>
@@ -165,9 +172,9 @@ function Outline({ slug, meta }: Pick<Page, 'slug' | 'meta'>) {
 
 function DocFooter({ slug }: { slug: string }) {
   const updated = __PAGE_DATES__[`/${slug}`]
-  const index = order.findIndex((item) => item.link === '/' + slug)
-  const previous = order[index - 1]
-  const next = order[index + 1]
+  const index = pageOrder.findIndex((item) => item.link === '/' + slug)
+  const previous = pageOrder[index - 1]
+  const next = index < 0 ? undefined : pageOrder[index + 1]
   const navigate = useNavigate()
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
@@ -178,6 +185,7 @@ function DocFooter({ slug }: { slug: string }) {
         event.altKey ||
         event.metaKey ||
         document.querySelector('[role="dialog"]') ||
+        getSelection()?.isCollapsed === false ||
         (event.target instanceof HTMLElement &&
           (event.target.isContentEditable || event.target.matches('input,textarea,select')))
       )

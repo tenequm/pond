@@ -8,7 +8,7 @@ import { unified } from 'unified'
 import type { Plugin } from 'vite'
 import { compilePage, fetchReleases, pageSources, repoRoot } from './markdown/plugin.ts'
 import { home } from './src/seo.ts'
-import { site } from './src/site.ts'
+import { pageOrder, site } from './src/site.ts'
 
 // Last content change per page from one `git log`. A pure rename keeps the older date, so moving a
 // file does not mark it updated; a file git has never seen gets the build time.
@@ -55,7 +55,7 @@ export function staticFiles(): Plugin {
         `  <url>\n    <loc>${site.url}${path}</loc>\n    <lastmod>${dates[path].slice(0, 10)}</lastmod>\n  </url>`)
       emit('sitemap.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + urls.join('\n') + '\n</urlset>\n')
       emit('robots.txt', `User-agent: *\nAllow: /\n\nSitemap: ${site.url}/sitemap.xml\n`)
-      const order: string[] = site.sidebar.flatMap(item => 'items' in item ? item.items.map(i => i.link) : [item.link])
+      const order: string[] = pageOrder.map(page => page.link)
       const markdown = unified().use(remarkParse).use(remarkDirective).use(remarkStringify, {
         // Preserve the existing twins' escaping inside prose while leaving code and destinations intact.
         handlers: {
