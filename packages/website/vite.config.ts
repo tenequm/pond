@@ -11,7 +11,7 @@ export default defineConfig({
   resolve: { tsconfigPaths: true },
   server: { port: 5173, fs: { allow: ['../..'] } },
   plugins: [
-    markdown(),
+    markdown({ repo: 'tenequm/pond' }),
     tailwindcss(),
     tanstackStart({
       prerender: { enabled: true, crawlLinks: true, failOnError: true },

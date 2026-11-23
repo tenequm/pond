@@ -1,5 +1,5 @@
 import { type ComponentType, lazy } from 'react'
-import type { PageMeta } from '../markdown/plugin.ts'
+import type { PageMeta, SearchDoc } from '../markdown/plugin.ts'
 
 // MDX hands each mapped component its own element's props, so no single prop type fits.
 // biome-ignore lint/suspicious/noExplicitAny: see above
@@ -22,3 +22,5 @@ export const pages: Record<string, Page> = Object.fromEntries(
     return [slug, { slug, meta, Body: lazy(bodyModules[key]) }]
   }),
 )
+
+export const loadSearchIndex = (): Promise<SearchDoc[]> => import('virtual:pond-search').then((module) => module.default)
