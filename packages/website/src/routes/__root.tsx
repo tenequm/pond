@@ -1,4 +1,5 @@
-import { createRootRoute, HeadContent, Link, Outlet, Scripts } from '@tanstack/react-router'
+import { createRootRoute, HeadContent, Outlet, Scripts } from '@tanstack/react-router'
+import { NotFound } from './404'
 import { siteHead } from '../seo.ts'
 import styles from '../styles.css?url'
 
@@ -8,7 +9,7 @@ export const Route = createRootRoute({
     return { ...head, links: [...head.links, { rel: 'stylesheet', href: styles }] }
   },
   component: Root,
-  notFoundComponent: () => <h1>Page not found</h1>,
+  notFoundComponent: NotFound,
 })
 
 function Root() {
@@ -18,15 +19,6 @@ function Root() {
         <HeadContent />
       </head>
       <body>
-        <nav className="flex gap-4 p-4">
-          <Link to="/">home</Link>
-          <Link to="/$" params={{ _splat: 'why' }}>
-            why
-          </Link>
-          <Link to="/$" params={{ _splat: 'get-started/install' }}>
-            install
-          </Link>
-        </nav>
         <Outlet />
         <Scripts />
       </body>

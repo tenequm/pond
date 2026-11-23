@@ -1,5 +1,8 @@
 import { createFileRoute, notFound } from '@tanstack/react-router'
 import { Suspense } from 'react'
+import { Navigation } from '../components/navigation'
+import { CopyButton } from '../components/copy'
+import { DocFooter, Outline } from '../components/doc-navigation'
 import { markdownComponents } from '../components/markdown.tsx'
 import { pages } from '../content.ts'
 import { pageHead } from '../seo.ts'
@@ -22,13 +25,28 @@ export const Route = createFileRoute('/$')({
 })
 
 function DocPage() {
-  const { slug } = Route.useLoaderData()
+  const { slug, meta } = Route.useLoaderData()
   const { Body } = pages[slug]
   return (
-    <article className="p-4">
-      <Suspense>
-        <Body components={markdownComponents} />
-      </Suspense>
-    </article>
+    <>
+      <Navigation />
+      <main className="docs-main" id="content" key={slug}>
+        <Outline slug={slug} meta={meta} />
+        <article className="docs-page page-width prose">
+          <Suspense>
+            <Body components={markdownComponents} />
+          </Suspense>
+          <DocFooter slug={slug} meta={meta} />
+          <CopyButton
+            page
+            read={async () => {
+              const response = await fetch(`/${slug}.md`)
+              if (!response.ok) throw new Error('Markdown is unavailable')
+              return response.text()
+            }}
+          />
+        </article>
+      </main>
+    </>
   )
 }
