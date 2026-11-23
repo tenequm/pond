@@ -3,6 +3,8 @@ import { sidebarGroup, site } from './site.ts'
 export const home = {
   title: 'pond - lossless storage and search for AI agent sessions',
   description: 'pond stores every AI agent session - Claude Code, Codex, OpenCode and more - losslessly in storage you own, searchable and SQL-queryable over MCP.',
+  // llms.txt has no length limit, so its home entry names every client.
+  summary: 'Pond ingests every AI agent session - Claude Code, Codex, OpenCode, OpenClaw, oh-my-pi, Claude Desktop, Claude.ai, Pi, Letta Code, Grok, Antigravity, Devin, Hermes, nanoclaw - losslessly into storage you own, then makes the whole corpus searchable and SQL-queryable over MCP. One Rust binary, Lance-backed, local by default.',
 }
 
 export function siteHead() {

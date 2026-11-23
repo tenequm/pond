@@ -87,7 +87,7 @@ export function staticFiles(): Plugin {
         emit(path.slice(1) + '.md', path === '/docs/spec' ? source : rendered)
         bodies.push(rendered.trimEnd())
       }
-      links.push(`- [${home.title}](/): ${home.description}`)
+      links.push(`- [${home.title}](/): ${home.summary}`)
       const intro = `# ${site.title}\n\n${site.description}\n\n`
       emit('llms.txt', intro + links.join('\n'))
       emit('llms-full.txt', intro + '<!--\nSitemap:\n' + links.join('\n') + '\n-->\n\n' + bodies.join('\n\n'))
