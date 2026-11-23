@@ -7,9 +7,11 @@ import { plainClick, SiteLink } from './navigation.tsx'
 type Hit = { href: string; title: string; titles: string; text: string }
 type SearchDoc = (typeof import('virtual:pond-search'))['default'][number]
 
+const words = (text: string) => text.split(/[^\p{L}\p{N}_]+/u).filter(Boolean)
+
+// The index also holds the words inside a camelCase or snake_case identifier; a query is matched as typed.
 function tokenize(text: string) {
-  // Keep a whole API identifier searchable alongside its camelCase or snake_case words.
-  return text.split(/[\s./:@-]+/).filter(Boolean).flatMap((word) => {
+  return words(text).flatMap((word) => {
     const parts = word
       .replace(/([a-z])([A-Z])/g, '$1 $2')
       .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -27,12 +29,11 @@ function buildIndex(docs: SearchDoc[]) {
     idField: 'href',
     tokenize,
     searchOptions: {
+      tokenize: words,
       combineWith: 'AND',
       fuzzy: 0.2,
       prefix: true,
       boost: { title: 4, subtitle: 3, text: 2, category: 1, titles: 1 },
-      // All indexed URLs are below /docs, which Vocs treats as the root for depth.
-      boostDocument: (href: string) => 1.5 / Math.max(1, href.split('/').length - 2),
     },
   })
   const byHref = new Map<string, Hit>()

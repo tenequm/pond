@@ -1,4 +1,4 @@
-import { site } from './site.ts'
+import { sidebarGroup, site } from './site.ts'
 
 export const home = {
   title: 'pond - lossless storage and search for AI agent sessions',
@@ -65,10 +65,11 @@ function structuredData(path: string, title: string, description: string) {
       },
     ]
   }
-  const group = site.sidebar.find((entry) => 'items' in entry && entry.items.some((item) => item.link === path))
+  // A group has no page of its own, so its crumb links to its first page, and is left out on that page.
+  const group = sidebarGroup(path)
   const trail = [
     { name: site.title, item: site.url + '/' },
-    ...(group && 'items' in group ? [{ name: group.text, item: site.url + group.items[0].link }] : []),
+    ...(group && group.items[0].link !== path ? [{ name: group.text, item: site.url + group.items[0].link }] : []),
     { name: title, item: site.url + path },
   ]
   return [

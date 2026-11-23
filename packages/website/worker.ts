@@ -20,6 +20,12 @@ export default {
       upstream.headers.delete('Cookie')
       return fetch(upstream)
     }
-    return env.ASSETS.fetch(request)
+    // No asset matched. Served from here because a _headers rule matches by path alone, and would
+    // let a browser keep the 404 for a not-yet-deployed /assets file for a year.
+    const notFound = await env.ASSETS.fetch(new URL('/404', url))
+    return new Response(notFound.body, {
+      status: 404,
+      headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
   },
 }

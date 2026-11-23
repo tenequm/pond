@@ -66,10 +66,15 @@ export function staticFiles(): Plugin {
       })
       const links: string[] = []
       const bodies: string[] = []
+      const descriptions = new Set([home.description])
       for (const path of new Set([...order, ...Object.keys(paths).filter(p => p !== '/')])) {
         const source = readFileSync(paths[path], 'utf8')
         const body = source.replace(/^---\n[\s\S]*?\n---\n\s*/, '')
         const { meta } = await compilePage(paths[path], source)
+        // Search results cut a longer description, and a shared one tells them nothing about the page.
+        if (!meta.description || meta.description.length > 160 || descriptions.has(meta.description))
+          this.error(`${paths[path]}: needs a description of its own, at most 160 characters`)
+        descriptions.add(meta.description)
         links.push(`- [${meta.title}](${path})` + (meta.description ? ': ' + meta.description : ''))
         let expanded = body
         if (path === '/docs/changelog') {

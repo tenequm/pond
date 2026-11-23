@@ -15,7 +15,7 @@ import { SKIP, visit } from 'unist-util-visit'
 import type { VFile } from 'vfile'
 import type { Plugin } from 'vite'
 import { parse as parseYaml } from 'yaml'
-import { site } from '../src/site.ts'
+import { sidebarGroup, site } from '../src/site.ts'
 
 export type TocEntry = { depth: number; id: string; text: string }
 export type SearchSection = { id: string; heading: string; ancestors: string[]; text: string }
@@ -282,8 +282,7 @@ export function markdown(): Plugin {
         Object.entries(pageSources()).map(async ([path, file]) => {
           this.addWatchFile(file)
           const { meta, sections } = await compilePage(file)
-          const category = site.topNav.find((item) => path === item.link || path.startsWith(item.link + '/'))?.text
-          return { slug: path.slice(1), title: meta.title, subtitle: meta.subtitle, category, sections }
+          return { slug: path.slice(1), title: meta.title, subtitle: meta.subtitle, category: sidebarGroup(path)?.text, sections }
         }),
       )
       return `export default ${JSON.stringify(docs)}`
