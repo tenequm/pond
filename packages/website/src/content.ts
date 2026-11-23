@@ -1,8 +1,7 @@
-import { type ComponentType, lazy } from 'react'
-import type { PageMeta, SearchDoc } from '../markdown/plugin.ts'
+import type { ComponentType } from 'react'
+import type { PageMeta } from '../markdown/plugin.ts'
 
 // MDX hands each mapped component its own element's props, so no single prop type fits.
-// biome-ignore lint/suspicious/noExplicitAny: see above
 type Body = ComponentType<{ components?: Record<string, ComponentType<any>> }>
 
 const metaModules = import.meta.glob<PageMeta>(['../content/**/*.md', '../../../docs/spec.md'], {
@@ -11,16 +10,25 @@ const metaModules = import.meta.glob<PageMeta>(['../content/**/*.md', '../../../
   import: 'meta',
 })
 const bodyModules = import.meta.glob<{ default: Body }>(['../content/**/*.md', '../../../docs/spec.md'])
+const bodies = new Map<string, Body | Promise<Body>>()
 
-const slugOf = (key: string) => key.replace(/^.*\/(content|docs)\//, '').replace(/\.md$/, '')
-
-export type Page = { slug: string; meta: PageMeta; Body: Body }
+export type Page = { slug: string; meta: PageMeta; body: () => Body | Promise<Body> }
 
 export const pages: Record<string, Page> = Object.fromEntries(
   Object.entries(metaModules).map(([key, meta]) => {
-    const slug = slugOf(key)
-    return [slug, { slug, meta, Body: lazy(bodyModules[key]) }]
+    const slug = key.endsWith('/docs/spec.md') ? 'spec' : key.slice('../content/'.length, -'.md'.length)
+    // The route loader awaits this, so the prerendered HTML and every client navigation render the
+    // article at once; only hydration, where no loader runs, sees the promise and suspends.
+    const body = () => {
+      if (!bodies.has(slug)) {
+        const loading = bodyModules[key]().then((module) => {
+          bodies.set(slug, module.default)
+          return module.default
+        })
+        bodies.set(slug, loading)
+      }
+      return bodies.get(slug)!
+    }
+    return [slug, { slug, meta, body }]
   }),
 )
-
-export const loadSearchIndex = (): Promise<SearchDoc[]> => import('virtual:pond-search').then((module) => module.default)

@@ -2,6 +2,7 @@ import {
   Check,
   ChevronDown,
   CircleAlert,
+  Clipboard,
   ClipboardList,
   ExternalLink,
   Info,
@@ -14,37 +15,89 @@ import {
   Children,
   cloneElement,
   type ComponentProps,
+  type CSSProperties,
   isValidElement,
   type ReactNode,
   useEffect,
   useRef,
   useState,
 } from 'react'
-import { CopyButton } from './copy'
-import { SiteLink } from './navigation'
+import { SiteLink } from './navigation.tsx'
 
-export type PageTitleProps = { subtitle?: string; children: ReactNode }
-export type CalloutProps = {
+// The Markdown pipeline (markdown/plugin.ts) emits these custom tags; everything
+// else in a page body is a plain HTML element.
+type PageTitleProps = { subtitle?: string; children: ReactNode }
+type CalloutProps = {
   type: 'info' | 'note' | 'tip' | 'warning' | 'danger'
   title?: string
   children: ReactNode
 }
-export type CodeGroupProps = { children: ReactNode }
-export type StepsProps = { children: ReactNode }
-export type ReleaseProps = { version: string; date: string; url: string; children: ReactNode }
-export type PreProps = ComponentProps<'pre'> & { 'data-lang'?: string; 'data-title'?: string }
+type ReleaseProps = { version: string; date: string; url: string; children: ReactNode }
+// Highlighted code arrives as <pre data-lang="sh" data-title="Homebrew"> holding one <code>;
+// data-lang is set only when the fence names a language, data-title only for ```sh [Homebrew].
+type PreProps = ComponentProps<'pre'> & { 'data-lang'?: string; 'data-title'?: string }
+
+export function CopyButton({
+  page,
+  line,
+  read,
+}: {
+  page?: boolean
+  line?: number
+  read: () => string | Promise<string>
+}) {
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  useEffect(() => () => clearTimeout(timer.current), [])
+  const Icon = state === 'copied' ? Check : Clipboard
+  const label =
+    state === 'copied'
+      ? 'Copied!'
+      : state === 'failed'
+        ? 'Copy failed'
+        : page
+          ? 'Copy page for AI'
+          : line === undefined
+            ? 'Copy code'
+            : 'Copy command'
+  async function copy() {
+    try {
+      // Start the clipboard write inside the click gesture even when Markdown needs fetching.
+      const value = read()
+      if (typeof value === 'string') await navigator.clipboard.writeText(value)
+      else {
+        // A failed fetch still reports through the write below, and stays handled if the write throws first.
+        value.catch(() => {})
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/plain': value.then((text) => new Blob([text], { type: 'text/plain' })),
+          }),
+        ])
+      }
+      setState('copied')
+    } catch {
+      setState('failed')
+    }
+    clearTimeout(timer.current)
+    timer.current = setTimeout(() => setState('idle'), 2000)
+  }
+  return (
+    <button
+      type="button"
+      className={page ? 'copy-page' : line === undefined ? 'copy-code' : 'copy-code copy-command'}
+      onClick={copy}
+      style={line === undefined ? undefined : ({ '--line': line } as CSSProperties)}
+      aria-label={page && state === 'idle' ? 'Copy page content as markdown for AI' : label}
+      title={label}
+      data-state={state}
+    >
+      <Icon size={line === undefined ? 16 : 14} />
+      {page && <span>{label}</span>}
+    </button>
+  )
+}
 
 function PageTitle({ subtitle, children }: PageTitleProps) {
-  // The router may try to scroll before the lazy article has mounted its headings.
-  useEffect(() => {
-    const hash = location.hash.slice(1)
-    if (!hash) return
-    try {
-      document.getElementById(decodeURIComponent(hash))?.scrollIntoView()
-    } catch {
-      /* A malformed fragment cannot identify a heading. */
-    }
-  }, [])
   return subtitle ? (
     <hgroup>
       {children}
@@ -89,10 +142,10 @@ function heading(Tag: 'h2' | 'h3' | 'h4' | 'h5' | 'h6') {
             aria-label="Copy link and go to this section"
             title="Copy link and go to this section"
             onClick={(event) => {
-              void navigator.clipboard
-                .writeText(event.currentTarget.href)
-                .then(() => setCopied(true))
-                .catch(() => {})
+              void navigator.clipboard?.writeText(event.currentTarget.href).then(
+                () => setCopied(true),
+                () => {},
+              )
             }}
             onBlur={() => setCopied(false)}
             onMouseLeave={() => setCopied(false)}
@@ -112,15 +165,13 @@ function codeText(node: ReactNode): string {
 }
 
 export function CodeBlock({ children, 'data-title': title, ...props }: PreProps) {
-  const frame = useRef<HTMLPreElement>(null)
   const shell = /^(sh|shell|bash|zsh|console|terminal|ps1?|powershell|fish)$/.test(props['data-lang'] ?? '')
   const code = isValidElement<ComponentProps<'code'>>(children) ? children : undefined
-  const lines =
-    code && shell ? Children.toArray(code.props.children).filter(isValidElement<ComponentProps<'span'>>) : []
+  const lines = code ? Children.toArray(code.props.children).filter(isValidElement<ComponentProps<'span'>>) : []
   const text = lines.map(codeText)
   const prompt = /^([#$>%] )/
   const commands = text.flatMap((line, i) => {
-    if (!prompt.test(line)) return []
+    if (!shell || !prompt.test(line)) return []
     const command = [line.slice(2)]
     for (
       let next = i + 1;
@@ -149,27 +200,21 @@ export function CodeBlock({ children, 'data-title': title, ...props }: PreProps)
   return (
     <div className="code-frame">
       {title && <div className="code-title">{title}</div>}
-      <pre {...props} ref={frame} tabIndex={0}>
+      <pre {...props} tabIndex={0}>
         {content}
         {commands.length ? (
           commands.map((command) => (
             <CopyButton key={command.index} line={command.index} read={() => command.text} />
           ))
         ) : (
-          <CopyButton
-            read={() => {
-              const element = frame.current!.querySelector('code')!
-              const rows = Array.from(element.querySelectorAll(':scope > .line'), (line) => line.textContent)
-              return rows.length ? rows.join('\n') : element.textContent
-            }}
-          />
+          <CopyButton read={() => text.join('\n')} />
         )}
       </pre>
     </div>
   )
 }
 
-function CodeGroup({ children }: CodeGroupProps) {
+function CodeGroup({ children }: { children: ReactNode }) {
   const blocks = Children.toArray(children).filter((child) => isValidElement<PreProps>(child))
   if (!blocks.length) return null
   return (
@@ -181,13 +226,11 @@ function CodeGroup({ children }: CodeGroupProps) {
           </Tabs.Trigger>
         ))}
       </Tabs.List>
-      <div className="grid">
-        {blocks.map((block, i) => (
-          <Tabs.Content key={i} forceMount value={String(i)} className="code-panel">
-            {block}
-          </Tabs.Content>
-        ))}
-      </div>
+      {blocks.map((block, i) => (
+        <Tabs.Content key={i} forceMount value={String(i)} className="code-panel">
+          {block}
+        </Tabs.Content>
+      ))}
     </Tabs.Root>
   )
 }
@@ -242,7 +285,7 @@ export const markdownComponents = {
   'page-title': PageTitle,
   callout: Callout,
   'code-group': CodeGroup,
-  steps: ({ children }: StepsProps) => <div className="steps">{children}</div>,
+  steps: ({ children }: { children: ReactNode }) => <div className="steps">{children}</div>,
   release: Release,
   pre: CodeBlock,
   a: (props: ComponentProps<'a'>) => <SiteLink className="body-link" {...props} />,

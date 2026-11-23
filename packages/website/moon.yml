@@ -1,15 +1,11 @@
 language: typescript
 
 fileGroups:
-  sources:
+  code:
     - 'src/**/*'
     - 'markdown/**/*'
-    - 'public/**/*'
     - '*.ts'
     - '*.json'
-    - '/docs/website/**/*'
-    - '/docs/spec.md'
-    - 'wrangler.jsonc'
 
 tasks:
   install:
@@ -20,16 +16,21 @@ tasks:
     inputs:
       - 'package.json'
       - 'package-lock.json'
+      - '.npmrc'
     options:
       cache: false
 
   typecheck:
     command: 'npm run typecheck'
     deps: ['~:install']
-    inputs: ['@group(sources)']
+    inputs: ['@group(code)']
 
   build:
     command: 'npm run build'
     deps: ['~:install']
-    inputs: ['@group(sources)']
+    inputs:
+      - '@group(code)'
+      - 'public/**/*'
+      - '/docs/website/**/*'
+      - '/docs/spec.md'
     outputs: ['dist/client']

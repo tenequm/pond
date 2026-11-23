@@ -1,8 +1,7 @@
 import { CornerDownRight, FileText, Hash, Search } from 'lucide-react'
 import { Dialog } from 'radix-ui'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { loadSearchIndex } from '../content'
-import { SiteLink } from './navigation'
+import { plainClick, SiteLink } from './navigation.tsx'
 
 type Hit = { href: string; page: string; heading: string; text: string }
 const historyKey = 'pond-docs-recent-searches'
@@ -17,8 +16,8 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
   const returnFocus = useRef(document.activeElement)
   useEffect(() => {
     let mounted = true
-    void loadSearchIndex()
-      .then((docs) => {
+    void import('virtual:pond-search')
+      .then(({ default: docs }) => {
         if (!mounted) return
         setIndex(
           docs.flatMap((doc) =>
@@ -103,7 +102,7 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
       }}
     >
       <Dialog.Portal>
-        <Dialog.Overlay className="overlay bg-black/60" />
+        <Dialog.Overlay className="overlay" />
         <Dialog.Content
           className="search-panel"
           onCloseAutoFocus={(event) => {
@@ -111,7 +110,8 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
             if (returnFocus.current instanceof HTMLElement) returnFocus.current.focus({ preventScroll: true })
           }}
           onKeyDown={(event) => {
-            if (!hits.length) return
+            // Enter and the arrows belong to an input method while it is composing.
+            if (!hits.length || event.nativeEvent.isComposing || event.keyCode === 229) return
             if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
               event.preventDefault()
               list.current?.querySelector<HTMLAnchorElement>(`#search-hit-${selected} a`)?.click()
@@ -172,7 +172,7 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
                 const Icon = jump ? CornerDownRight : hit.href.includes('#') ? Hash : FileText
                 return (
                   <li key={hit.href} id={`search-hit-${i}`} role="option" aria-selected={selected === i}>
-                    <SiteLink href={hit.href} onClick={() => choose(hit)}>
+                    <SiteLink href={hit.href} onClick={(event) => plainClick(event) && choose(hit)}>
                       <Icon size={16} />
                       <div>
                         {jump ? (

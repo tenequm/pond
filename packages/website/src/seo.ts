@@ -5,8 +5,6 @@ export const home = {
   description: 'Pond ingests every AI agent session - Claude Code, Codex, OpenCode, OpenClaw, oh-my-pi, Claude Desktop, Claude.ai, Pi, Letta Code, Grok, Antigravity, Devin, Hermes, nanoclaw - losslessly into storage you own, then makes the whole corpus searchable and SQL-queryable over MCP. One Rust binary, Lance-backed, local by default.',
 }
 
-declare const __PAGE_DATES__: Record<string, string>
-
 export function siteHead() {
   return {
     meta: [
@@ -22,23 +20,22 @@ export function siteHead() {
 }
 
 export function pageHead({ title, description = site.description, path }: { title: string; description?: string; path: string }) {
-  const pageTitle = title.replace(/ (?:-|\u2013) pond$/, '')
   // A title that already names the site stands alone, as on the old site.
-  const standaloneTitle = pageTitle.toLowerCase().includes(site.title)
+  const standaloneTitle = title.toLowerCase().includes(site.title)
   const url = site.url + path
   return {
     meta: [
-      { title: standaloneTitle ? pageTitle : `${pageTitle} \u2013 pond` },
+      { title: standaloneTitle ? title : `${title} \u2013 pond` },
       { name: 'description', content: description },
       { property: 'og:type', content: 'website' },
-      { property: 'og:title', content: pageTitle },
+      { property: 'og:title', content: title },
       { property: 'og:site_name', content: site.title },
       { property: 'og:url', content: url },
       { property: 'og:description', content: description },
       { property: 'og:image', content: site.ogImage },
       { property: 'article:modified_time', content: __PAGE_DATES__[path] },
       { name: 'twitter:card', content: 'summary_large_image' },
-      { name: 'twitter:title', content: pageTitle },
+      { name: 'twitter:title', content: title },
       { name: 'twitter:description', content: description },
       { name: 'twitter:image', content: site.ogImage },
     ],

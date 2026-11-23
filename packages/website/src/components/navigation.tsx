@@ -1,10 +1,14 @@
 import { Link, useLocation } from '@tanstack/react-router'
 import { ChevronDown, TextAlignJustify, Search, X } from 'lucide-react'
 import { Dialog, DropdownMenu } from 'radix-ui'
-import { type ComponentProps, lazy, Suspense, useEffect, useState } from 'react'
-import { site } from '../site'
+import { type ComponentProps, lazy, type MouseEvent, Suspense, useEffect, useState } from 'react'
+import { site } from '../site.ts'
 
-const SearchPanel = lazy(() => import('./search'))
+const SearchPanel = lazy(() => import('./search.tsx'))
+
+// A modified click opens the link elsewhere, so the surface it sits on should stay open.
+export const plainClick = (event: MouseEvent) =>
+  !(event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button)
 
 export function SiteLink({ href = '', children, ...props }: ComponentProps<'a'>) {
   if (/^(?:[a-z][\w+.-]*:|\/\/)/i.test(href)) {
@@ -28,13 +32,13 @@ export function SiteLink({ href = '', children, ...props }: ComponentProps<'a'>)
   )
 }
 
-function SidebarLinks({ onNavigate }: { onNavigate?: () => void }) {
+function SidebarLinks({ onNavigate }: { onNavigate?: (event: MouseEvent) => void }) {
   return (
     <nav className="sidebar-links" aria-label="Documentation">
       {site.sidebar.map((entry, index) =>
         'items' in entry ? (
           <section key={entry.text}>
-            <h2>{entry.text}</h2>
+            <div>{entry.text}</div>
             {entry.items.map((item) => (
               <SiteLink key={item.link} href={item.link} onClick={onNavigate}>
                 {item.text}
@@ -59,16 +63,10 @@ function SidebarLinks({ onNavigate }: { onNavigate?: () => void }) {
 function Socials() {
   return (
     <div className="socials">
-      {site.socials.map(({ icon, link }) => (
-        <a
-          key={icon}
-          href={link}
-          target="_blank"
-          rel="noopener noreferrer"
-          aria-label={{ github: 'GitHub', telegram: 'Telegram', x: 'X (Twitter)' }[icon]}
-        >
+      {Object.entries(site.socials).map(([icon, link]) => (
+        <SiteLink key={icon} href={link} aria-label={{ github: 'GitHub', telegram: 'Telegram', x: 'X (Twitter)' }[icon]}>
           <span style={{ maskImage: `url(/social-${icon}.svg)` }} />
-        </a>
+        </SiteLink>
       ))}
     </div>
   )
@@ -79,6 +77,9 @@ export function Navigation({ home = false }: { home?: boolean }) {
   const [menu, setMenu] = useState(false)
   const [search, setSearch] = useState(false)
   const [hideTop, setHideTop] = useState(false)
+  const closeMenu = (event: MouseEvent) => {
+    if (plainClick(event)) setMenu(false)
+  }
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -141,7 +142,7 @@ export function Navigation({ home = false }: { home?: boolean }) {
         </nav>
         <div className="mobile-actions">
           {!home && (
-            <button aria-label="Search" onClick={() => setSearch(true)}>
+            <button className="search-icon" aria-label="Search" onClick={() => setSearch(true)}>
               <Search size={16} />
             </button>
           )}
@@ -163,7 +164,7 @@ export function Navigation({ home = false }: { home?: boolean }) {
                       <DropdownMenu.Content align="start" sideOffset={4} className="drawer-options">
                         {site.topNav.map((item) => (
                           <DropdownMenu.Item asChild key={item.link}>
-                            <SiteLink href={item.link} onClick={() => setMenu(false)}>
+                            <SiteLink href={item.link} onClick={closeMenu}>
                               {item.text}
                             </SiteLink>
                           </DropdownMenu.Item>
@@ -176,7 +177,7 @@ export function Navigation({ home = false }: { home?: boolean }) {
                   </Dialog.Close>
                 </div>
                 <div className="drawer-scroll">
-                  <SidebarLinks onNavigate={() => setMenu(false)} />
+                  <SidebarLinks onNavigate={closeMenu} />
                   <Socials />
                 </div>
               </Dialog.Content>

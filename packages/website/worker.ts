@@ -1,5 +1,5 @@
 export default {
-  async fetch(request: Request, env: { ASSETS: Fetcher; RYBBIT_HOST: string }): Promise<Response> {
+  async fetch(request: Request, env: { ASSETS: { fetch: typeof fetch }; RYBBIT_HOST: string }): Promise<Response> {
     const url = new URL(request.url)
     // First-party analytics: the page loads /mesh/script.js, which then posts to
     // /mesh/track. Rybbit serves both under /api/ upstream.

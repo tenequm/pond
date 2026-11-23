@@ -15,8 +15,6 @@
   --color-line: oklch(29% 0 0);
   --color-muted: oklch(72% 0 0);
   --color-ink: oklch(93.3% 0 0);
-  --breakpoint-md: 748px;
-  --breakpoint-lg: 1080px;
 }
 :root {
   color-scheme: dark;
@@ -59,14 +57,14 @@ button { cursor: pointer; }
 .mobile-actions { display: none; }
 .sidebar-gutter { @apply fixed inset-y-0 left-0 z-10 flex flex-col items-end bg-canvas; width: var(--gutter); }
 .sidebar-logo { @apply flex w-[300px] items-center px-6; height: var(--bar); flex-shrink: 0; }
-.sidebar .socials { min-height: 42px; align-items: center; padding-top: 0; }
+.sidebar .socials { min-height: 42px; }
 .sidebar { @apply flex w-[300px] grow flex-col overflow-y-auto px-6 pt-4; }
 .sidebar-links { @apply flex flex-1 flex-col pb-8 text-sm font-[450]; }
 .sidebar-links a { @apply -mx-3 -my-0.5 block rounded-md px-3 py-1.5 text-ink/80 hover:text-white; }
 .sidebar-links > a + a { margin-top: 0; }
 .sidebar-links a[aria-current="page"] { background: oklch(64% 0 0 / 12%); color: white; }
 .sidebar-links section { margin-top: 16px; }
-.sidebar-links h2 { @apply flex items-center font-medium text-white; height: 2.5em; }
+.sidebar-links section > div { @apply flex items-center font-medium text-white; height: 2.5em; }
 .sidebar-links .after-group { margin-top: 28px; }
 .socials { @apply sticky bottom-0 flex items-center bg-canvas pb-2; box-shadow: 0 -8px 12px var(--color-canvas); }
 .socials a { @apply flex size-7 items-center justify-center text-ink/60 hover:text-ink; }
@@ -83,8 +81,8 @@ button { cursor: pointer; }
 .drawer-scroll .socials { position: static; box-shadow: none; }
 .docs-main { isolation: isolate; margin-left: var(--gutter); padding: var(--bar) 0 80px; min-height: 100vh; }
 .docs-main::before { content: ""; position: fixed; z-index: -1; inset: var(--bar) 0 0 var(--gutter); background: var(--color-surface); border: 1px solid var(--color-line); border-width: 1px 0 0 1px; border-top-left-radius: 16px; }
-.docs-page { position: relative; /* Reserve the strip above the title for the copy plate at every width. */
-  padding-top: calc(var(--py) + 2.75rem); }
+/* Reserve the strip above the title for the copy plate at every width. */
+.docs-page { position: relative; padding-top: calc(var(--py) + 2.75rem); }
 .copy-page { @apply absolute flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-[13px] text-muted hover:text-white; top: var(--py); right: var(--px); min-width: 115.8px; }
 .home-main .page-width { margin: auto; }
 .home { @apply flex flex-col items-center px-6 text-center; gap: 1.1rem; padding-block: 1.5rem 1rem; }
@@ -109,7 +107,7 @@ button { cursor: pointer; }
   .topbar, .topbar.home-bar { padding: 0 12px 0 24px; }
   .topbar:not(.home-bar) .brand, .mobile-actions { display: flex; }
   .mobile-actions { gap: 4px; }
-  .mobile-actions button[aria-label="Search"] { display: none; }
+  .mobile-actions .search-icon { display: none; }
   .search-trigger { width: 180px; }
   .docs-page { margin-inline: auto; }
   .docs-main::before { border-radius: 0; border-left: 0; }
@@ -119,7 +117,7 @@ button { cursor: pointer; }
   .topbar { border-bottom: 1px solid var(--color-line); transition: transform .15s; }
   .topbar[data-hidden=true] { transform: translateY(-100%); }
   .search-trigger { display: none; }
-  .mobile-actions button[aria-label="Search"] { display: flex; }
+  .mobile-actions .search-icon { display: flex; }
   .docs-main::before { display: none; }
   .home-logo { height: 48px; }
   .home .tagline { @apply text-xl; }
@@ -182,9 +180,9 @@ article :is(p,li,td) a { overflow-wrap: anywhere; max-width: 100%; }
   overflow: hidden; white-space: pre;
 }
 .code-frame pre > code { display: grid; overflow-x: auto; font-size: var(--code-size); }
-.code-frame pre .line { border-left: 2px solid transparent; padding-inline: var(--code-px); line-height: var(--code-leading); }
-.code-frame .line { min-height: 1lh; }
-.code-frame [data-lang=text] .line { line-height: 1.5; border: 0; color: var(--color-ink); }
+.code-frame pre .line { min-height: 1lh; border-left: 2px solid transparent; padding-inline: var(--code-px); line-height: var(--code-leading); }
+/* A fence written without a language is plain text, set tighter than highlighted code. */
+.code-frame pre:not([data-lang]) .line { line-height: 1.5; border: 0; color: var(--color-ink); }
 .copy-code { @apply absolute top-2.5 right-2.5 rounded-md p-1.5 text-muted opacity-0 transition-opacity hover:text-white; }
 pre:has(.line:only-child) .copy-code { top: 50%; transform: translateY(-50%); }
 .shell-prompt { user-select: none; opacity: .5; }
@@ -201,7 +199,6 @@ pre:hover .copy-code, .copy-code:focus-visible, .copy-code[data-state=copied] { 
 .code-tabs { @apply overflow-x-auto overflow-y-hidden px-2 text-sm whitespace-nowrap; }
 .code-tabs button { @apply h-full shrink-0 border-b-[1.5px] border-transparent px-3 font-medium tracking-tight text-muted hover:text-white; margin-bottom: -1.5px; }
 .code-tabs button[data-state=active] { @apply border-white text-white; }
-.code-panel { grid-area: 1 / 1; min-width: 0; }
 .code-panel[data-state=inactive] { display: none; }
 .code-group .code-title { display: none; }
 .code-group pre, .code-title + pre { border-top-width: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
@@ -239,8 +236,7 @@ pre:hover .copy-code, .copy-code:focus-visible, .copy-code[data-state=copied] { 
 .outline-label, .mobile-outline { @apply flex items-center gap-1 text-[13px] font-medium; }
 .outline-label { margin-bottom: 12px; }
 .outline-list { @apply border-l-2 border-line text-[13px]; }
-.outline-list a { @apply block py-0.75 leading-snug font-[450] text-muted hover:text-white; }
-.outline-list a { line-height: 1.5; }
+.outline-list a { @apply block py-0.75 font-[450] text-muted hover:text-white; line-height: 1.5; }
 .outline-list a:is([data-current=true],[data-parent=true]) { @apply text-white; }
 :is(.outline-rail,.versions-rail) .outline-list li[data-track=true] { box-shadow: -2px 0 white; }
 .versions-rail { width: 12rem; right: max(2rem, (100vw - 1200px) / 2); top: calc(var(--bar) + 24px); padding: 0; max-height: calc(100vh - var(--bar) - 48px); }
@@ -273,7 +269,7 @@ pre:hover .copy-code, .copy-code:focus-visible, .copy-code[data-state=copied] { 
 @media (width < 748px) {
   .topbar[data-hidden=true] ~ main .mobile-outline { top: 0; }
   .code-frame pre, .code-title, .code-tabs { margin-inline: -16px; border-radius: 0; }
-  .code-frame pre { --code-py: 16px; padding-block: var(--code-py); border-inline: 0; }
+  .code-frame pre { --code-py: 16px; border-inline: 0; }
   .code-tabs { padding-inline: 4px; }
   .home pre { margin-inline: auto; }
   .steps { margin-left: 4px; }
@@ -286,7 +282,6 @@ pre:hover .copy-code, .copy-code:focus-visible, .copy-code[data-state=copied] { 
   .release-label { width: auto; padding-top: 24px; }
   .release-label > div { @apply static mb-4 flex-row items-center gap-3 py-0; }
   .release-details { padding: 0 0 24px; }
-
 }
 @media (width < 640px) {
   .doc-footer nav { flex-direction: column; }

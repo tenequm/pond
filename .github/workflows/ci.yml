@@ -117,7 +117,7 @@ jobs:
       # downloads its own into PROTO_HOME either way).
       #
       # `moon ci`, not `moon run`: it drops targets that the changed files do
-      # not affect BEFORE hashing them, so a Rust-only PR never pays the two
+      # not affect BEFORE hashing them, so a Rust-only PR never pays the three
       # uncached `npm ci` installs that dominate today's cache-hit path. The
       # explicit target list still applies - `moon ci` filters it, it does not
       # widen it. Requires the fetch-depth: 0 checkout above; moon resolves the
@@ -140,6 +140,8 @@ jobs:
           website:typecheck website:build
           hermes-pond:test
         env:
+          # website:build fetches the GitHub releases for the changelog page; the
+          # token is the job's read-only one.
           GITHUB_TOKEN: ${{ github.token }}
 
       # Publishes the toolchain closure this job entered, so cold pods, fork PRs

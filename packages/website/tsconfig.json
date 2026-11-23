@@ -7,11 +7,14 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["vite/client", "node"],
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
     "noEmit": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": true,
-    "allowImportingTsExtensions": true,
-    "paths": { "@/*": ["./src/*"] }
+    "allowImportingTsExtensions": true
   },
-  "include": ["src", "markdown", "vite.config.ts"]
+  "include": ["src", "markdown", "*.ts"]
 }

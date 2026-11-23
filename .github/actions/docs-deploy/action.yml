@@ -32,6 +32,11 @@ runs:
       working-directory: packages/website
       run: npm ci
 
+    - name: Typecheck
+      shell: bash
+      working-directory: packages/website
+      run: npm run typecheck
+
     - name: Build
       shell: bash
       working-directory: packages/website

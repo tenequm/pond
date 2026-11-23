@@ -1,24 +1,32 @@
-import { globSync } from 'node:fs'
 import tailwindcss from '@tailwindcss/vite'
 import { tanstackStart } from '@tanstack/react-start/plugin/vite'
 import viteReact from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
+import { markdown, pageSources } from './markdown/plugin.ts'
 import { staticFiles } from './static-files.ts'
-import { markdown } from './markdown/plugin.ts'
-
-const docPaths = globSync('**/*.md', { cwd: '../../docs/website' }).map((f) => `/${f.replace(/\.md$/, '')}`)
 
 export default defineConfig({
-  resolve: { tsconfigPaths: true },
-  server: { port: 5173, fs: { allow: ['../..'] } },
+  server: { fs: { allow: ['../..'] } },
   plugins: [
     staticFiles(),
-    markdown({ repo: 'tenequm/pond' }),
+    markdown(),
     tailwindcss(),
     tanstackStart({
-      prerender: { enabled: true, crawlLinks: true, failOnError: true },
+      prerender: {
+        enabled: true,
+        crawlLinks: true,
+        failOnError: true,
+        // A crawled `/page#section` link would render `/page` again.
+        filter: (page) => !page.path.includes('#'),
+        // React streams a suspended subtree into a hidden segment that only a script moves into place.
+        onSuccess: ({ page, html }) => {
+          if (html.includes('<template id="B:')) {
+            throw new Error(`${page.path} suspended while prerendering; await its data in the route loader instead`)
+          }
+        },
+      },
       pages: [
-        ...['/', '/spec', ...docPaths].map((path) => ({ path })),
+        ...['/', ...Object.keys(pageSources())].map((path) => ({ path })),
         { path: '/404', prerender: { outputPath: '/404.html' } },
       ],
     }),

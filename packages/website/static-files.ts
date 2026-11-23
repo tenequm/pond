@@ -1,25 +1,50 @@
 import { execFileSync } from 'node:child_process'
-import { globSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
+import { relative, resolve } from 'node:path'
 import remarkDirective from 'remark-directive'
 import remarkParse from 'remark-parse'
 import remarkStringify from 'remark-stringify'
 import { unified } from 'unified'
 import type { Plugin } from 'vite'
-import { parse } from 'yaml'
-import { fetchReleases } from './markdown/plugin.ts'
+import { compilePage, fetchReleases, pageSources, repoRoot } from './markdown/plugin.ts'
 import { home } from './src/seo.ts'
 import { site } from './src/site.ts'
 
-export function staticFiles(): Plugin {
-  const paths: Record<string, string> = { '/': 'src/routes/index.tsx', '/spec': '../../docs/spec.md' }
-  for (const file of globSync('**/*.md', { cwd: '../../docs/website' })) {
-    paths['/' + file.slice(0, -3)] = '../../docs/website/' + file
+// Last content change per page from one `git log`. A pure rename keeps the older date, so moving a
+// file does not mark it updated; a file git has never seen gets the build time.
+function pageDates(paths: Record<string, string>): Record<string, string> {
+  const pages = new Map(Object.entries(paths).map(([path, file]) => [relative(repoRoot, file), path]))
+  let log: string
+  try {
+    log = execFileSync('git', ['log', '--format=@%ct', '--name-status', '-M'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+    })
+  } catch (error) {
+    throw new Error('page dates come from git history: build inside a git checkout with git on PATH', { cause: error })
   }
-  const dates = Object.fromEntries(Object.entries(paths).map(([slug, file]) => {
-    const stamp = execFileSync('git', ['log', '-1', '--format=%ct', '--', file], { encoding: 'utf8' }).trim()
-    const date = stamp ? new Date(Number(stamp) * 1000) : new Date()
-    return [slug, date.toISOString().replace('.000Z', 'Z')]
-  }))
+  const iso = (seconds: number) => new Date(seconds * 1000).toISOString().replace('.000Z', 'Z')
+  const dates: Record<string, string> = {}
+  let stamp = ''
+  for (const line of log.split('\n')) {
+    if (line.startsWith('@')) {
+      stamp = iso(Number(line.slice(1)))
+      continue
+    }
+    const [status, file, renamedTo] = line.split('\t')
+    const page = pages.get(renamedTo ?? file)
+    if (!page) continue
+    if (renamedTo) pages.set(file, page)
+    if (status !== 'R100') dates[page] ??= stamp
+  }
+  for (const path of Object.keys(paths)) dates[path] ??= iso(Math.floor(Date.now() / 1000))
+  return dates
+}
+
+export function staticFiles(): Plugin {
+  const paths: Record<string, string> = { '/': resolve(import.meta.dirname, 'src/routes/index.tsx'), ...pageSources() }
+  const dates = pageDates(paths)
   return {
     name: 'pond-static-files',
     config: () => ({ define: { __PAGE_DATES__: JSON.stringify(dates) } }),
@@ -43,15 +68,13 @@ export function staticFiles(): Plugin {
       const bodies: string[] = []
       for (const path of [...new Set([...order, ...Object.keys(paths).filter(p => p !== '/'), '/'])]) {
         const source = path === '/' ? '' : readFileSync(paths[path], 'utf8')
-        const header = source.match(/^---\n([\s\S]*?)\n---\n\s*/)
-        const body = source.slice(header?.[0].length ?? 0)
-        const meta = path === '/' ? home : header ? parse(header[1]) : {}
-        const title = meta.title ?? body.match(/^# (.+)$/m)?.[1]
+        const body = source.replace(/^---\n[\s\S]*?\n---\n\s*/, '')
+        const meta = path === '/' ? home : (await compilePage(paths[path], source)).meta
         const slug = path === '/' ? '/index' : path
-        links.push(`- [${title}](${slug})` + (meta.description ? ': ' + meta.description : ''))
+        links.push(`- [${meta.title}](${slug})` + (meta.description ? ': ' + meta.description : ''))
         let expanded = body
         if (path === '/changelog') {
-          const releases = await fetchReleases(site.repo)
+          const releases = await fetchReleases()
           const notes = releases.map(r =>
             `## ${r.tag_name} (${r.published_at.slice(0, 10)})\n\n${r.body?.trim() ?? ''}`)
           expanded = body.replace('::changelog', () => notes.join('\n\n'))

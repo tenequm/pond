@@ -4,13 +4,11 @@ export const site = {
   url: 'https://pond.locker',
   repo: 'tenequm/pond',
   ogImage: 'https://pond.locker/og-image.png',
-  editBase: 'https://github.com/tenequm/pond/edit/main/',
-  editText: 'Suggest changes to this page',
-  socials: [
-    { icon: 'github', link: 'https://github.com/tenequm/pond' },
-    { icon: 'telegram', link: 'https://t.me/tenequm' },
-    { icon: 'x', link: 'https://x.com/opwizardx' },
-  ],
+  socials: {
+    github: 'https://github.com/tenequm/pond',
+    telegram: 'https://t.me/tenequm',
+    x: 'https://x.com/opwizardx',
+  },
   topNav: [
     { text: 'Quickstart', link: '/get-started/quickstart' },
     { text: 'Reference', link: '/reference/cli' },
