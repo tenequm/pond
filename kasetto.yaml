@@ -6,9 +6,3 @@ skills:
   - source: https://github.com/tenequm/skills
     ref: skills-3a565b1
     skills: [rust-dev, lance-format, mcp-best-practices]
-mcps:
-  - name: openseo
-    servers:
-      openseo:
-        type: http
-        url: https://openseo.brown-hydra.ts.net/mcp
