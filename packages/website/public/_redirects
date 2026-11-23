@@ -1,0 +1,18 @@
+# The docs lived at the site root before they moved under /docs; published READMEs still link there.
+/docs /docs/get-started/quickstart 302
+/docs/ /docs/get-started/quickstart 302
+/why /docs/why 301
+/why/ /docs/why 301
+/why.md /docs/why.md 301
+/compare /docs/compare 301
+/compare/ /docs/compare 301
+/compare.md /docs/compare.md 301
+/spec /docs/spec 301
+/spec/ /docs/spec 301
+/spec.md /docs/spec.md 301
+/changelog /docs/changelog 301
+/changelog/ /docs/changelog 301
+/changelog.md /docs/changelog.md 301
+/get-started/* /docs/get-started/:splat 301
+/guides/* /docs/guides/:splat 301
+/reference/* /docs/reference/:splat 301

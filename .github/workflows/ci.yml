@@ -117,7 +117,7 @@ jobs:
       # downloads its own into PROTO_HOME either way).
       #
       # `moon ci`, not `moon run`: it drops targets that the changed files do
-      # not affect BEFORE hashing them, so a Rust-only PR never pays the two
+      # not affect BEFORE hashing them, so a Rust-only PR never pays the three
       # uncached `npm ci` installs that dominate today's cache-hit path. The
       # explicit target list still applies - `moon ci` filters it, it does not
       # widen it. Requires the fetch-depth: 0 checkout above; moon resolves the
@@ -137,7 +137,12 @@ jobs:
           pond:check-package pond:format pond:lint pond:test
           openclaw-pond:typecheck openclaw-pond:test
           pi-pond:typecheck pi-pond:test
+          website:typecheck website:build
           hermes-pond:test
+        env:
+          # website:build fetches the GitHub releases for the changelog page; the
+          # token is the job's read-only one.
+          GITHUB_TOKEN: ${{ github.token }}
 
       # Publishes the toolchain closure this job entered, so cold pods, fork PRs
       # and dev machines substitute it (plan 2.7). Main pushes only: the signing
@@ -1024,7 +1029,7 @@ jobs:
   #         # Classic PAT: winget-releaser rejects fine-grained tokens.
   #         token: ${{ secrets.WINGET_PAT }}
 
-  # The docs site (docs/site) on Cloudflare, redeployed on every main push
+  # The docs site (packages/website) on Cloudflare, redeployed on every main push
   # rather than only on docs changes: both deploy jobs share one cancellable
   # group, and each builds the whole site from main's head and fetches releases
   # at build time, so a newer deploy supersedes whatever it cancels.
@@ -1036,12 +1041,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency: { group: deploy-docs, cancel-in-progress: true }
-    # pnpm install runs third-party lifecycle scripts; nothing here needs the
+    # npm ci runs third-party lifecycle scripts; nothing here needs the
     # remote-cache secret the workflow-level env hands every job.
     env:
       BAZEL_REMOTE_AUTH: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { fetch-depth: 0 } # Page modification dates use file history.
       - uses: ./.github/actions/docs-deploy
         with:
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -1060,7 +1066,7 @@ jobs:
       # main, not the release commit: the shared group must only ever deploy
       # main's head, never roll the site back to an older commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: { ref: main }
+        with: { ref: main, fetch-depth: 0 } # Page modification dates use file history.
       - uses: ./.github/actions/docs-deploy
         with:
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}

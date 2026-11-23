@@ -25,7 +25,7 @@
 - [ ] `probe_default` reads only the injected `Env`; `assert_probe_default` test
 - [ ] Conformance suite through the shared harness, plus taxonomy, lineage, and project assertions
 - [ ] Run-as-a-user output pasted in `## Adapter evidence` above
-- [ ] README harness row, `docs/site` roster, release note
+- [ ] README harness row, `docs/website` roster, release note
 -->
 
 <!-- The section below is extracted from the squash-commit body (the whole PR

@@ -1,6 +1,0 @@
-node_modules
-dist
-cache
-.vocs
-src/pages.gen.ts
-src/pages/spec.md

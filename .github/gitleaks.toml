@@ -26,3 +26,10 @@ regexTarget = "line"
 regexes = [
   '''"idempotencyKey":\s*"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"''',
 ]
+
+[[allowlists]]
+description = "`fileToken` in pen.dev design files is the per-file UUID the editor writes at the root of every .pen document (pen.dev's published example files carry one too), not a credential."
+regexTarget = "line"
+regexes = [
+  '''"fileToken":\s*"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"''',
+]

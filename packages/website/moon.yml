@@ -1,0 +1,36 @@
+language: typescript
+
+fileGroups:
+  code:
+    - 'src/**/*'
+    - 'markdown/**/*'
+    - '*.ts'
+    - '*.json'
+
+tasks:
+  install:
+    script: 'npm ci && cat package.json package-lock.json > node_modules/.moon-install-stamp'
+    checks:
+      - check: 'condition'
+        script: 'cat package.json package-lock.json | cmp -s - node_modules/.moon-install-stamp'
+    inputs:
+      - 'package.json'
+      - 'package-lock.json'
+      - '.npmrc'
+    options:
+      cache: false
+
+  typecheck:
+    command: 'npm run typecheck'
+    deps: ['~:install']
+    inputs: ['@group(code)']
+
+  build:
+    command: 'npm run build'
+    deps: ['~:install']
+    inputs:
+      - '@group(code)'
+      - 'public/**/*'
+      - '/docs/website/**/*'
+      - '/docs/spec.md'
+    outputs: ['dist/client']

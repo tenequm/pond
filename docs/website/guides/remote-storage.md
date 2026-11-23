@@ -1,0 +1,59 @@
+---
+description: Point pond at S3-compatible object storage - Hetzner, Cloudflare R2, Backblaze B2, MinIO, or AWS - via add-credentials, probe, copy, switch. Your local data stays as a backup.
+---
+
+# Remote storage
+
+pond stores data locally by default (`$XDG_DATA_HOME/pond`). To use an S3-compatible bucket (Hetzner, R2, B2, MinIO, AWS): add credentials, probe, copy, switch. Your local data is never modified - it stays as a backup.
+
+::::steps
+
+## Add credentials
+
+```sh
+pond creds add   # set name (default), access key, hidden secret
+```
+
+Writes a `[creds.<name>]` block to `config.toml`. A scope-less `default` set matches any URL.
+
+:::warning[CI]
+Skip the prompt with env: `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `POND_CREDS_DEFAULT_SECRET_ACCESS_KEY`. Never pass secrets as flags or in the URL.
+:::
+
+## Probe (gate)
+
+```sh
+pond storage check s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+Parses, resolves creds, runs a conditional put, reads back, deletes. Exit `0` = usable. See [Exit codes](/docs/reference/exit-codes).
+
+The check also runs the create-only copy Lance creates every table with. Where a backend rejects Lance's default (a multipart copy, which Hetzner refuses with 411), pond creates tables with a plain conditional copy instead, and the check says so in a note. A backend that rejects both fails the check with exit `5`.
+
+A passing check can still print a `check: note`. On backends that honor `If-None-Match` on puts but not on copies (Hetzner), it says the namespace markers Lance writes when it creates a table are not atomic there. Commits are unaffected; create a new store from one host at a time.
+
+## Copy
+
+```sh
+pond copy --from local --to s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+Idempotent union merge: re-runnable, resumable, never touches the source. Rebuilds destination indexes and verifies every row landed - exit `0` synced, `6` if rows are missing (re-run; it converges) or duplicated.
+
+## Switch
+
+```sh
+pond storage use s3+https://nbg1.your-objectstorage.com/my-pond
+```
+
+Re-probes, then flips `[storage].path`. Moves no data. Roll back with `pond storage use local`.
+
+::::
+
+## URL forms
+
+`s3+https://host/bucket` carries endpoint + bucket in one URL (any S3-compatible store); append `/prefix` for a subpath. `s3://`, `gs://`, `az://` use the ambient cloud SDK credential chain when no creds set matches.
+
+## No config file
+
+`POND_STORAGE_PATH` + `POND_CREDS_DEFAULT_*` is a complete configuration - handy for containers and CI.
