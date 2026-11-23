@@ -2,7 +2,7 @@ import { site } from './site.ts'
 
 export const home = {
   title: 'pond - lossless storage and search for AI agent sessions',
-  description: 'Pond ingests every AI agent session - Claude Code, Codex, OpenCode, OpenClaw, oh-my-pi, Claude Desktop, Claude.ai, Pi, Letta Code, Grok, Antigravity, Devin, Hermes, nanoclaw - losslessly into storage you own, then makes the whole corpus searchable and SQL-queryable over MCP. One Rust binary, Lance-backed, local by default.',
+  description: 'pond stores every AI agent session - Claude Code, Codex, OpenCode and more - losslessly in storage you own, searchable and SQL-queryable over MCP.',
 }
 
 export function siteHead() {
@@ -38,7 +38,44 @@ export function pageHead({ title, description = site.description, path }: { titl
       { name: 'twitter:title', content: title },
       { name: 'twitter:description', content: description },
       { name: 'twitter:image', content: site.ogImage },
+      // The router renders these as JSON-LD scripts; its React head types do not list the key yet.
+      ...(structuredData(path, title, description).map((data) => ({ 'script:ld+json': data })) as object[]),
     ],
     links: [{ rel: 'canonical', href: url }],
   }
+}
+
+// The home page tells search engines the site's name and what the software is; a docs page gives its place in the sidebar.
+function structuredData(path: string, title: string, description: string) {
+  const context = { '@context': 'https://schema.org' }
+  if (path === '/') {
+    return [
+      { ...context, '@type': 'WebSite', name: site.title, url: site.url + '/' },
+      {
+        ...context,
+        '@type': 'SoftwareApplication',
+        name: site.title,
+        description,
+        url: site.url + '/',
+        applicationCategory: 'DeveloperApplication',
+        operatingSystem: 'macOS, Linux, Windows',
+        license: 'https://www.apache.org/licenses/LICENSE-2.0',
+        sameAs: site.socials.github,
+        offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+      },
+    ]
+  }
+  const group = site.sidebar.find((entry) => 'items' in entry && entry.items.some((item) => item.link === path))
+  const trail = [
+    { name: site.title, item: site.url + '/' },
+    ...(group && 'items' in group ? [{ name: group.text, item: site.url + group.items[0].link }] : []),
+    { name: title, item: site.url + path },
+  ]
+  return [
+    {
+      ...context,
+      '@type': 'BreadcrumbList',
+      itemListElement: trail.map((crumb, i) => ({ '@type': 'ListItem', position: i + 1, ...crumb })),
+    },
+  ]
 }

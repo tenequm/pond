@@ -47,7 +47,7 @@ button { cursor: pointer; }
 .topbar.home-bar { left: 0; padding: 0 16px 0 24px; }
 .top-left { @apply flex h-full items-center gap-5 py-2; }
 .brand { @apply flex items-center; }
-.brand img { height: 28px; }
+.brand img { height: 28px; width: auto; }
 .topbar:not(.home-bar) .brand { display: none; }
 .search-trigger { @apply flex h-full w-60 items-center gap-2 rounded-xl border border-line bg-surface pl-3 pr-2 text-sm text-muted hover:bg-tint hover:text-ink; }
 .search-trigger kbd { @apply flex h-5 items-center rounded-sm border border-line bg-canvas px-0.75 font-sans text-xs; }
@@ -86,14 +86,15 @@ button { cursor: pointer; }
 .copy-page { @apply absolute flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-[13px] text-muted hover:text-white; top: var(--py); right: var(--px); min-width: 115.8px; }
 .home-main .page-width { margin: auto; }
 .home { @apply flex flex-col items-center px-6 text-center; gap: 1.1rem; padding-block: 1.5rem 1rem; }
-.home-logo { height: 56px; }
+.home-logo { height: 56px; width: auto; }
 .home .tagline { @apply max-w-2xl text-2xl; }
 .home > p:not(.tagline) { font-size: .875rem; opacity: .55; }
 .home-buttons { @apply flex flex-wrap justify-center gap-3; }
 .plate { @apply inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-surface px-5 py-2.5 font-medium text-white hover:bg-tint; }
 .home-buttons .plate { font-size: 15px; }
 .plate.primary { @apply border-0 bg-white text-black hover:opacity-90; }
-.home video { width: auto; max-width: min(960px, 100%); max-height: clamp(260px, 100vh - 545px, 68vh); margin-top: 8px; border: 1px solid rgb(128 128 128 / .25); border-radius: 12px; }
+/* Sized from the viewport alone, so the box is final before the video loads and nothing below it moves. */
+.home video { width: min(960px, 100%, clamp(260px, 100vh - 545px, 68vh) * 1960 / 1080); height: auto; aspect-ratio: 1960 / 1080; margin-top: 8px; border: 1px solid rgb(128 128 128 / .25); border-radius: 12px; }
 /* A centered pre and its flex wrapper must both be capped for long commands to stay reachable. */
 .home .code-frame { max-width: 100%; }
 .home pre { width: fit-content; max-width: 100%; margin-inline: auto; padding-right: 3.5rem; text-align: left; }
@@ -262,6 +263,7 @@ pre:hover .copy-code, .copy-code:focus-visible, .copy-code[data-state=copied] { 
 .release-label > div { @apply sticky top-20 flex flex-col items-start gap-2 py-6; }
 .release-label > div::after { content: ""; position: absolute; top: 32px; left: calc(100% + 16px); height: 10px; width: 10px; border-radius: 50%; background: var(--color-muted); }
 .release-label a, .release-expand button { @apply inline-flex items-center gap-1.5 rounded-md border border-line bg-tint px-2.5 py-1 text-sm font-medium text-white; }
+.release-label h2 { display: flex; font: inherit; letter-spacing: normal; }
 .release-label a { font-family: var(--font-mono); }
 .release-label time { @apply text-sm text-muted; }
 .release-details { @apply relative min-w-0 flex-1 py-6; }

@@ -1,5 +1,5 @@
 ---
-description: Configure pond via config.toml with POND_* environment overrides - storage backend, credentials, adapters, opt-in embeddings, and sync schedule, resolved with flag > env > config precedence.
+description: Configure pond with config.toml and POND_* environment overrides - storage, credentials, adapters, embeddings and the sync schedule. Flag > env > config.
 ---
 
 # Configuration & environment

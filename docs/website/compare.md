@@ -1,6 +1,6 @@
 ---
 title: How pond compares
-description: pond next to session-search tools (ctx, deja-vu, cass), memory layers (Mem0, Letta, claude-mem) and proxy recorders (Tapes, virtual-context). What each kind does well, where pond differs, and when to pick which.
+description: pond next to session-search tools (ctx, deja-vu, cass), memory layers (Mem0, Letta, claude-mem) and proxy recorders - where it differs and when to pick which.
 ---
 
 # How pond compares [Three kinds of tool get called "memory". They do different jobs.]

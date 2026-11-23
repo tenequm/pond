@@ -1,5 +1,5 @@
 ---
-description: Diagnose common pond problems - a missing binary after install, a sync that finds nothing, a schedule that stopped firing, missing MCP tools, empty search results after an upgrade, and where pond keeps its files and logs.
+description: Fix common pond problems - a missing binary, a sync that finds nothing, a schedule that stopped, missing MCP tools, or empty search results after an upgrade.
 ---
 
 # Troubleshooting

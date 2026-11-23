@@ -1,6 +1,6 @@
 ---
 title: Why pond?
-description: Lossless storage and search for AI agent sessions, across every agentic client.
+description: Your AI agent history is scattered across tools that can't search it. pond ingests every session losslessly into storage you own and makes it all searchable.
 ---
 
 # Why pond? [One searchable archive of every AI session, restorable into any client]

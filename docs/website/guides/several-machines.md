@@ -1,5 +1,5 @@
 ---
-description: Share one pond store across several machines by pointing each config.toml at the same bucket. Lance optimistic concurrency makes concurrent syncs safe; pond status --hosts shows per-machine activity.
+description: Share one pond store across several machines by pointing each at the same bucket. Concurrent syncs are safe; pond status --hosts shows each machine.
 ---
 
 # Several machines, one bucket

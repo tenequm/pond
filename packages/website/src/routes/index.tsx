@@ -21,8 +21,8 @@ function Home() {
       <main id="content" className="home-main">
         <article className="page-width">
           <div className="home">
-            <img className="home-logo" src="/logo.png" alt="pond" />
-            <p className="tagline">{site.description}</p>
+            <img className="home-logo" src="/logo.png" alt="pond" width="257" height="168" />
+            <h1 className="tagline">{site.description}</h1>
             <CodeBlock data-lang="sh">
               <code>
                 {commands.map(([command, args, comment], i) => (
@@ -56,6 +56,8 @@ function Home() {
             </div>
             <video
               src="/demo-search.mp4"
+              width="1960"
+              height="1080"
               autoPlay
               loop
               muted

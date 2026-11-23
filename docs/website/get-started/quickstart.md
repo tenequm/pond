@@ -1,5 +1,5 @@
 ---
-description: Get started with pond - pond init sets up storage, adapters, and MCP registration; pond sync ingests and indexes your Claude Code, Codex, and OpenCode sessions; then ask any agent about your past work.
+description: Get started with pond - pond init sets up storage, adapters and MCP; pond sync ingests your Claude Code, Codex and OpenCode sessions. Then ask any agent.
 ---
 
 # Quickstart

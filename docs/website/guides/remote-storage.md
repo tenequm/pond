@@ -1,5 +1,5 @@
 ---
-description: Point pond at S3-compatible object storage - Hetzner, Cloudflare R2, Backblaze B2, MinIO, or AWS - via add-credentials, probe, copy, switch. Your local data stays as a backup.
+description: Point pond at S3-compatible storage - Hetzner, Cloudflare R2, Backblaze B2, MinIO or AWS. Add credentials, probe, copy, switch; local data stays as a backup.
 ---
 
 # Remote storage

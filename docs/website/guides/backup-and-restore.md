@@ -1,5 +1,5 @@
 ---
-description: Back up and restore pond with .pond archives - compact, index-free Lance snapshots with embeddings preserved. pond copy snapshots and restores; restore is an idempotent deduped merge.
+description: Back up and restore pond with .pond archives - compact, index-free snapshots with embeddings preserved. Restore is an idempotent, deduplicated merge.
 ---
 
 # Backup & restore
