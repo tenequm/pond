@@ -1,0 +1,35 @@
+language: typescript
+
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'markdown/**/*'
+    - 'public/**/*'
+    - '*.ts'
+    - '*.json'
+    - '/docs/website/**/*'
+    - '/docs/spec.md'
+    - 'wrangler.jsonc'
+
+tasks:
+  install:
+    script: 'npm ci && cat package.json package-lock.json > node_modules/.moon-install-stamp'
+    checks:
+      - check: 'condition'
+        script: 'cat package.json package-lock.json | cmp -s - node_modules/.moon-install-stamp'
+    inputs:
+      - 'package.json'
+      - 'package-lock.json'
+    options:
+      cache: false
+
+  typecheck:
+    command: 'npm run typecheck'
+    deps: ['~:install']
+    inputs: ['@group(sources)']
+
+  build:
+    command: 'npm run build'
+    deps: ['~:install']
+    inputs: ['@group(sources)']
+    outputs: ['dist/client']
