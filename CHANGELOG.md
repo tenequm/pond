@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.21.1](https://github.com/tenequm/pond/compare/v0.21.0...v0.21.1) - 2026-11-23
+
+### <!-- 4 -->🚜 Refactor
+- **docs:** rebuild the docs site in packages/website and move the docs under /docs ([#377](https://github.com/tenequm/pond/pull/377)) ([b2eb292](https://github.com/tenequm/pond/commit/b2eb292a35a66e1f00234089f3e8f4bc233447c2))
+  The docs site at pond.locker is rebuilt as a static site with the same
+  content. Docs pages now live under pond.locker/docs/ and the old URLs
+  redirect there. The site is dark-theme only, and the old
+  pond.cascade.fyi address no longer redirects.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.21.0...v0.21.1
+
 ## [0.21.0](https://github.com/tenequm/pond/compare/v0.20.3...v0.21.0) - 2026-11-09
 
 The storage engine moves to Lance 14.0.2. Full-text search reads up to
