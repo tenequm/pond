@@ -4,7 +4,7 @@ description: Get started with pond - pond init sets up storage, adapters, and MC
 
 # Quickstart
 
-Set up, ingest, ask. (`pond` not installed yet? [Install](/get-started/install) first.)
+Set up, ingest, ask. (`pond` not installed yet? [Install](/docs/get-started/install) first.)
 
 ::::steps
 
@@ -45,4 +45,4 @@ Search spans every client - including sessions made in a different tool. Re-run 
 
 ::::
 
-Next: [Connect your agents](/get-started/connect-your-agents).
+Next: [Connect your agents](/docs/get-started/connect-your-agents).

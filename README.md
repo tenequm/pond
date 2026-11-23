@@ -22,7 +22,7 @@ scoop bucket add tenequm https://github.com/tenequm/scoop-bucket   # Windows
 scoop install tenequm/pond
 ```
 
-Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)"* - the full, failure-proofed version of that prompt is in [Connect your agents](https://pond.locker/get-started/connect-your-agents#agent-setup-prompt).
+Or prompt your agent: *"Please install and set up pond (see github.com/tenequm/pond)"* - the full, failure-proofed version of that prompt is in [Connect your agents](https://pond.locker/docs/get-started/connect-your-agents#agent-setup-prompt).
 
 <p align="center">
   <img src="docs/assets/demo-search.gif" alt="A live pond corpus, then Claude Code answering a three-month-old debugging question from it" width="900">
@@ -49,7 +49,7 @@ pond init   # guided setup: storage, adapters, MCP + agent skill, optional sched
 pond sync   # ingest and index - every enabled adapter
 ```
 
-`pond init` registers pond as an MCP server for Claude Code and installs the bundled pond skill; for Codex it prints the command to run instead - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
+`pond init` registers pond as an MCP server for Claude Code and installs the bundled pond skill; for Codex it prints the command to run instead - restart the client afterwards so the tools load. By hand: `claude mcp add -s user pond -- pond mcp`, `codex mcp add pond -- pond mcp`; skill: `mkdir -p ~/.claude/skills/pond && pond skill > ~/.claude/skills/pond/SKILL.md` (that whole line is POSIX-only - `mkdir -p`, `&&`, and `>` all break or corrupt in Windows PowerShell 5.1; use the PowerShell block in [Connect your agents](https://pond.locker/docs/get-started/connect-your-agents)). Then ask your agent - real prompts from daily use:
 
 ```
 check in pond how we solved this before, then apply the same fix here
@@ -82,7 +82,7 @@ Three kinds of tool get called "memory". Side by side:
 
 Pick session search for fast local recall. Pick a memory layer when the agent should carry distilled facts, not the record. Pick pond when you want the sessions themselves, in storage you own, from every machine you run.
 
-Full comparison, with receipts per tool: [pond.locker/compare](https://pond.locker/compare). Every cell is a claim about a specific version of someone else's project. If one has gone stale, [open an issue](https://github.com/tenequm/pond/issues) and it gets fixed the same day.
+Full comparison, with receipts per tool: [pond.locker/docs/compare](https://pond.locker/docs/compare). Every cell is a claim about a specific version of someone else's project. If one has gone stale, [open an issue](https://github.com/tenequm/pond/issues) and it gets fixed the same day.
 
 ## Background
 
@@ -119,7 +119,7 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
 irm get.scoop.sh | iex
 ```
 
-Then open a new terminal - `PATH` changes reach only processes started after the install. See the [Windows notes](https://pond.locker/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
+Then open a new terminal - `PATH` changes reach only processes started after the install. See the [Windows notes](https://pond.locker/docs/get-started/install#windows) for Defender, long paths, scheduling, and WSL.
 
 **No package manager (any platform):** every [release](https://github.com/tenequm/pond/releases) attaches prebuilt binaries (`pond-x86_64-pc-windows-msvc.zip` on Windows, ~223 MB unpacked) - unpack one and add its directory to `PATH` (on Windows: Settings > System > About > Advanced system settings > Environment Variables, under your user variables), nothing else to install.
 
@@ -150,7 +150,7 @@ cargo install --path packages/pond --features cuda
 
 On macOS the Metal backend is selected automatically; on other systems the CPU fallback runs without extra features. Building from source on Windows additionally needs `protoc` (`winget install Google.Protobuf`) and NASM (`winget install NASM.NASM`, then add `C:\Program Files\NASM` to `PATH` yourself - its installer doesn't) on `PATH`.
 
-If any install path fails, the [Troubleshooting guide](https://pond.locker/guides/troubleshooting) covers the common stalls.
+If any install path fails, the [Troubleshooting guide](https://pond.locker/docs/guides/troubleshooting) covers the common stalls.
 
 ## Usage
 
@@ -252,7 +252,7 @@ Search is BM25 full-text by default. Semantic search is opt-in and off unless yo
 enabled = true
 ```
 
-Full detail, including what it costs and how mixed fleets behave, is in the [configuration reference](https://pond.locker/reference/configuration).
+Full detail, including what it costs and how mixed fleets behave, is in the [configuration reference](https://pond.locker/docs/reference/configuration).
 
 ### Supported harnesses
 

@@ -49,7 +49,7 @@ What it costs: with embeddings off a pond process sits around 100 MiB; once any 
 
 Machines sharing one store may disagree about this switch, and that is supported. Rows ingested by a machine with embeddings off stay un-embedded until a machine with embeddings on runs `pond optimize --only embed`; `pond sync` never probes for that backlog. A machine with embeddings on shows the pending rows in `pond status -v`.
 
-Disagreeing about the pond *version* is a different matter and is not supported - see [mixed versions](/guides/several-machines#mixed-versions).
+Disagreeing about the pond *version* is a different matter and is not supported - see [mixed versions](/docs/guides/several-machines#mixed-versions).
 
 ### Turning it back off
 

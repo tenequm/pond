@@ -4,7 +4,7 @@ description: pond's MCP tools - pond_search (full-text search over agent session
 
 # MCP tools
 
-What your agent gets when pond is registered as an MCP server ([Connect your agents](/get-started/connect-your-agents)). The wire schemas ship with the server; this page is the human-facing summary.
+What your agent gets when pond is registered as an MCP server ([Connect your agents](/docs/get-started/connect-your-agents)). The wire schemas ship with the server; this page is the human-facing summary.
 
 Three tools cover almost every request: `pond_search` finds, `pond_get_session` reads a session, `pond_get_message` expands one message. `pond_sql` is the advanced escape hatch for what those cannot express.
 
@@ -15,7 +15,7 @@ Find relevant messages across all stored sessions. Returns a readable transcript
 | Parameter | Meaning |
 |---|---|
 | `query` | what to search for - distinctive words from the work you are looking for |
-| `mode` | `fts` (default, exact whole words, BM25) or `vector` (matches on meaning) - the `vector` arm is refused unless [semantic search is enabled](/reference/configuration#embeddings) |
+| `mode` | `fts` (default, exact whole words, BM25) or `vector` (matches on meaning) - the `vector` arm is refused unless [semantic search is enabled](/docs/reference/configuration#embeddings) |
 | `sort_by` | `relevance` (default) or `recency` |
 | `project` | only sessions whose project path contains this substring |
 | `session_id` | search within one session |
@@ -30,7 +30,7 @@ Search indexes only conversational text (user and assistant turns). Tool calls, 
 
 Read a whole session as a readable transcript - the tool for analyzing, reviewing, or summarizing a past session: user/assistant text plus one-line tool and file references. Takes one `id`; a message id also works and resolves to its parent session with the page anchored at that message. Page with `limit` (default 20 messages), `from: "start" | "end"` (`end` reads the most recent page first - the session's final state, e.g. recovering context after compaction), and `after_message_id` / `before_message_id` to page onward.
 
-The first page lists the session's subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/reference/cli).
+The first page lists the session's subagent sessions in a footer so each can be opened in turn. Not for bulk export - that is [`pond copy`](/docs/reference/cli).
 
 ## pond_get_message
 

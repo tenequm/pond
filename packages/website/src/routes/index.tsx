@@ -41,13 +41,13 @@ function Home() {
             </p>
             <p>
               Runs on macOS &middot; Linux &middot; Windows -{' '}
-              <SiteLink href="/get-started/install">all install options</SiteLink>
+              <SiteLink href="/docs/get-started/install">all install options</SiteLink>
             </p>
             <div className="home-buttons">
-              <SiteLink href="/get-started/quickstart" className="plate primary">
+              <SiteLink href="/docs/get-started/quickstart" className="plate primary">
                 Get started
               </SiteLink>
-              <SiteLink href="/why" className="plate">
+              <SiteLink href="/docs/why" className="plate">
                 Why pond?
               </SiteLink>
               <SiteLink href={site.socials.github} className="plate">

@@ -40,8 +40,8 @@ export const repoRoot = realpathSync(resolve(import.meta.dirname, '../../..'))
 // URL path -> source file, for every Markdown page. Real paths, so they equal Vite's module ids.
 export function pageSources(): Record<string, string> {
   const docs = resolve(repoRoot, 'docs/website')
-  const pages = globSync('**/*.md', { cwd: docs }).map((file) => [`/${file.slice(0, -'.md'.length)}`, resolve(docs, file)])
-  return { '/spec': resolve(repoRoot, 'docs/spec.md'), ...Object.fromEntries(pages) }
+  const pages = globSync('**/*.md', { cwd: docs }).map((file) => [`/docs/${file.slice(0, -'.md'.length)}`, resolve(docs, file)])
+  return { '/docs/spec': resolve(repoRoot, 'docs/spec.md'), ...Object.fromEntries(pages) }
 }
 
 // vite dev serves an empty changelog when GitHub is unreachable; a build fails instead.

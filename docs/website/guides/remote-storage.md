@@ -26,7 +26,7 @@ Skip the prompt with env: `POND_CREDS_DEFAULT_ACCESS_KEY_ID` / `POND_CREDS_DEFAU
 pond storage check s3+https://nbg1.your-objectstorage.com/my-pond
 ```
 
-Parses, resolves creds, runs a conditional put, reads back, deletes. Exit `0` = usable. See [Exit codes](/reference/exit-codes).
+Parses, resolves creds, runs a conditional put, reads back, deletes. Exit `0` = usable. See [Exit codes](/docs/reference/exit-codes).
 
 The check also runs the create-only copy Lance creates every table with. Where a backend rejects Lance's default (a multipart copy, which Hetzner refuses with 411), pond creates tables with a plain conditional copy instead, and the check says so in a note. A backend that rejects both fails the check with exit `5`.
 

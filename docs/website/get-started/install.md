@@ -88,6 +88,6 @@ Running the Linux binary under WSL works when both the agent session files and t
 
 ## Updating
 
-`brew upgrade pond` / `nix profile upgrade pond` / `scoop update pond` / `cargo binstall pond-db` (re-run) / a fresh zip - and `pond --version` to check what you're on. Keep every machine that writes to a shared store on the same version: a store-schema release migrates the store in place, after which older binaries stop syncing until they upgrade (see [Several machines, one bucket](/guides/several-machines#mixed-versions)).
+`brew upgrade pond` / `nix profile upgrade pond` / `scoop update pond` / `cargo binstall pond-db` (re-run) / a fresh zip - and `pond --version` to check what you're on. Keep every machine that writes to a shared store on the same version: a store-schema release migrates the store in place, after which older binaries stop syncing until they upgrade (see [Several machines, one bucket](/docs/guides/several-machines#mixed-versions)).
 
-Next: [Quickstart](/get-started/quickstart).
+Next: [Quickstart](/docs/get-started/quickstart).

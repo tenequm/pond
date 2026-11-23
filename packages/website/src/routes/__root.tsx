@@ -1,5 +1,5 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from '@tanstack/react-router'
-import { NotFound } from './404.tsx'
+import { NotFound } from './$.tsx'
 import { siteHead } from '../seo.ts'
 import styles from '../styles.css?url'
 

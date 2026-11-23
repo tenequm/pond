@@ -66,23 +66,23 @@ export function staticFiles(): Plugin {
       })
       const links: string[] = []
       const bodies: string[] = []
-      for (const path of [...new Set([...order, ...Object.keys(paths).filter(p => p !== '/'), '/'])]) {
-        const source = path === '/' ? '' : readFileSync(paths[path], 'utf8')
+      for (const path of new Set([...order, ...Object.keys(paths).filter(p => p !== '/')])) {
+        const source = readFileSync(paths[path], 'utf8')
         const body = source.replace(/^---\n[\s\S]*?\n---\n\s*/, '')
-        const meta = path === '/' ? home : (await compilePage(paths[path], source)).meta
-        const slug = path === '/' ? '/index' : path
-        links.push(`- [${meta.title}](${slug})` + (meta.description ? ': ' + meta.description : ''))
+        const { meta } = await compilePage(paths[path], source)
+        links.push(`- [${meta.title}](${path})` + (meta.description ? ': ' + meta.description : ''))
         let expanded = body
-        if (path === '/changelog') {
+        if (path === '/docs/changelog') {
           const releases = await fetchReleases()
           const notes = releases.map(r =>
             `## ${r.tag_name} (${r.published_at.slice(0, 10)})\n\n${r.body?.trim() ?? ''}`)
           expanded = body.replace('::changelog', () => notes.join('\n\n'))
         }
-        const rendered = expanded ? String(markdown.processSync(expanded)) : ''
-        emit(slug.slice(1) + '.md', path === '/spec' ? source : rendered)
+        const rendered = String(markdown.processSync(expanded))
+        emit(path.slice(1) + '.md', path === '/docs/spec' ? source : rendered)
         bodies.push(rendered.trimEnd())
       }
+      links.push(`- [${home.title}](/): ${home.description}`)
       const intro = `# ${site.title}\n\n${site.description}\n\n`
       emit('llms.txt', intro + links.join('\n'))
       emit('llms-full.txt', intro + '<!--\nSitemap:\n' + links.join('\n') + '\n-->\n\n' + bodies.join('\n\n'))

@@ -32,7 +32,7 @@ are you sure that won't break X? check in pond how we struggled with exactly thi
 ```
 
 :::tip
-Install, `pond init`, `pond sync`. -> [Quickstart](/get-started/quickstart).
+Install, `pond init`, `pond sync`. -> [Quickstart](/docs/get-started/quickstart).
 :::
 
 ## Isn't this another memory tool?
@@ -49,12 +49,12 @@ One Rust binary. It ingests sessions from your agentic clients into a canonical 
 |---|---|
 | Claude Code | auto-discovered on disk |
 | Claude Desktop app | auto-discovered on disk |
-| Claude.ai | [official data export](/guides/import-claude-ai) |
+| Claude.ai | [official data export](/docs/guides/import-claude-ai) |
 | Codex CLI | auto-discovered on disk |
 | OpenCode | auto-discovered on disk |
 | Pi coding agent | auto-discovered on disk |
 
-Every adapter is bidirectional, so any stored session can be restored into any of these clients - native restore is lossless, cross-client restore is best-effort in the target's own feature set. A new adapter is one file plus a registry line; more clients (Cursor, aider, Gemini CLI) are on the [roadmap](/spec#9-deferred).
+Every adapter is bidirectional, so any stored session can be restored into any of these clients - native restore is lossless, cross-client restore is best-effort in the target's own feature set. A new adapter is one file plus a registry line; more clients (Cursor, aider, Gemini CLI) are on the [roadmap](/docs/spec#9-deferred).
 
 ## Local by default, nothing phones home
 
@@ -77,8 +77,8 @@ pond's premise: a session should outlive the tool that made it. Three rules foll
 
 ## Next
 
-- [Install](/get-started/install) - Homebrew, Nix, Scoop (Windows), Cargo
-- [Quickstart](/get-started/quickstart) - init -> sync -> ask
-- [Connect your agents](/get-started/connect-your-agents) - register the MCP server
-- [Remote storage](/guides/remote-storage) - S3, R2, B2, GCS
-- [Specification](/spec) - the v1 contract
+- [Install](/docs/get-started/install) - Homebrew, Nix, Scoop (Windows), Cargo
+- [Quickstart](/docs/get-started/quickstart) - init -> sync -> ask
+- [Connect your agents](/docs/get-started/connect-your-agents) - register the MCP server
+- [Remote storage](/docs/guides/remote-storage) - S3, R2, B2, GCS
+- [Specification](/docs/spec) - the v1 contract

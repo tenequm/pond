@@ -20,7 +20,7 @@ POND_CREDS_DEFAULT_ACCESS_KEY_ID=...
 POND_CREDS_DEFAULT_SECRET_ACCESS_KEY=...
 ```
 
-Same URL forms and credential rules as [Remote storage](/guides/remote-storage). Add `POND_EMBEDDINGS_ENABLED=true` only if the store carries embeddings and you want vector search from this host; it loads a ~500 MB model on the first vector query.
+Same URL forms and credential rules as [Remote storage](/docs/guides/remote-storage). Add `POND_EMBEDDINGS_ENABLED=true` only if the store carries embeddings and you want vector search from this host; it loads a ~500 MB model on the first vector query.
 
 ## Bind and name the host
 

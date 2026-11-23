@@ -30,9 +30,9 @@ pond keeps the sessions rather than indexing them. The difference shows up in th
 
 **When the harness deletes the file.** Claude Code removes session files after 30 days by default. ctx's storage documentation says a deleted source "remains available for search" only until the next refresh publishes a new index generation, and automatic refresh is on by default (ctx 1.0.2, `docs/storage.md`, 2026-08-21). deja-vu rebuilds its index without records whose source file is gone; its own test deletes a source file and asserts the session no longer appears (`internal/index/index_test.go`, 2026-08-21). cass is the exception: it keeps a content-addressed mirror of the raw session bytes and scores a hit whose source is gone as "archive-only" rather than dropping it. pond's spec makes survival a requirement: once a session is stored, re-ingest is never the recovery path, because a rotated source cannot supply its rows again.
 
-**Where the copy lives.** All three keep a local index on the machine that ran the harness. deja-vu's roadmap lists cloud sync as not planned; ctx's README says nothing leaves the machine; cass's only mention of S3 in source is a cache-eviction policy. pond writes to a local directory or to a bucket you own (S3, GCS, Azure, any S3-compatible store), and [every machine you run can sync into the same bucket](/guides/several-machines). ctx's own README states the consequence of a single-machine index: if the session is not on your machine, for example because a teammate's agent produced the code, ctx cannot prove the attribution. deja-vu can copy records between machines over ssh, and cass can pull other hosts' files over ssh/rsync into its local index; both gather copies onto one box rather than writing to one place.
+**Where the copy lives.** All three keep a local index on the machine that ran the harness. deja-vu's roadmap lists cloud sync as not planned; ctx's README says nothing leaves the machine; cass's only mention of S3 in source is a cache-eviction policy. pond writes to a local directory or to a bucket you own (S3, GCS, Azure, any S3-compatible store), and [every machine you run can sync into the same bucket](/docs/guides/several-machines). ctx's own README states the consequence of a single-machine index: if the session is not on your machine, for example because a teammate's agent produced the code, ctx cannot prove the attribution. deja-vu can copy records between machines over ssh, and cass can pull other hosts' files over ssh/rsync into its local index; both gather copies onto one box rather than writing to one place.
 
-**What an agent can ask.** ctx and deja-vu answer over MCP; cass is CLI-only (its `--robot` JSON mode, no MCP server as of 2026-08-21). pond answers over MCP and HTTP, and also runs [read-only SQL](/reference/cli#query) over sessions, messages and parts, including tool-call and tool-result bodies, so "which commands failed most often last month" is a query rather than a script.
+**What an agent can ask.** ctx and deja-vu answer over MCP; cass is CLI-only (its `--robot` JSON mode, no MCP server as of 2026-08-21). pond answers over MCP and HTTP, and also runs [read-only SQL](/docs/reference/cli#query) over sessions, messages and parts, including tool-call and tool-result bodies, so "which commands failed most often last month" is a query rather than a script.
 
 Where they beat pond: deja-vu redacts credentials at index time and re-applies it on share and sync; pond redacts nothing today (outbound redaction is [roadmap #167](https://github.com/tenequm/pond/issues/167)). deja-vu publishes a retrieval benchmark anyone can rerun in minutes; pond has published a [usage-trace study of its two search arms](https://github.com/tenequm/pond/tree/main/docs/researches/2608-21-semantic-vs-fts-usage-eval), not a benchmark. cass's search is hybrid by default; pond's is one arm per query: BM25 full-text, or semantic once you enable it.
 
@@ -64,7 +64,7 @@ Some tools argue the opposite of pond's premise: that most of a transcript is no
 
 ## Next
 
-- [Why pond?](/why) - the premise in full
-- [Several machines, one bucket](/guides/several-machines)
-- [Remote storage](/guides/remote-storage) - S3, R2, B2, GCS
-- [MCP tools](/reference/mcp-tools) - what an agent can ask
+- [Why pond?](/docs/why) - the premise in full
+- [Several machines, one bucket](/docs/guides/several-machines)
+- [Remote storage](/docs/guides/remote-storage) - S3, R2, B2, GCS
+- [MCP tools](/docs/reference/mcp-tools) - what an agent can ask

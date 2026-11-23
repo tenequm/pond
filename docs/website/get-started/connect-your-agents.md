@@ -38,7 +38,7 @@ Paste into your agent:
 ```text
 Set up pond as my session memory.
 
-1. Install it for my OS - https://pond.locker/get-started/install
+1. Install it for my OS - https://pond.locker/docs/get-started/install
    (macOS/Linux: brew install tenequm/tap/pond). Never build from
    source. Ask me before bootstrapping Scoop: it changes my
    execution policy.

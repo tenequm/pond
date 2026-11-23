@@ -12,7 +12,7 @@ First stop for anything: `pond status`. It reports store health, per-adapter pen
 
 ## `pond` is not found right after installing
 
-The install added pond's directory to `PATH`, but only processes started afterwards see it. Open a new terminal; if an agent client is running, restart it too. Over SSH on Windows, if the Scoop shim fails with "Could not create process" while local shells work, reinstall from the bucket to regenerate the shim, or call the exe directly (`~\scoop\apps\pond\current\pond.exe`) - see [Over SSH](/get-started/install#over-ssh).
+The install added pond's directory to `PATH`, but only processes started afterwards see it. Open a new terminal; if an agent client is running, restart it too. Over SSH on Windows, if the Scoop shim fails with "Could not create process" while local shells work, reinstall from the bucket to regenerate the shim, or call the exe directly (`~\scoop\apps\pond\current\pond.exe`) - see [Over SSH](/docs/get-started/install#over-ssh).
 
 ## Sync finds no sessions
 
@@ -20,7 +20,7 @@ The install added pond's directory to `PATH`, but only processes started afterwa
 
 ## The pond tools don't appear in my agent
 
-Clients load MCP servers at startup: after `pond init` or `claude mcp add`, restart the client. `claude mcp list` shows whether the registration exists at all. Registered but failing before the first sync is expected: `pond mcp` only reads the store, so it exits naming `pond sync` until a sync has created or upgraded it - run `pond sync` (`pond optimize` on a host with no agent sources, where sync skips the store), then restart the client. On Windows, an entry registered with a Git Bash-style `/c/Users/...` path registers cleanly but never spawns - re-add with bare `pond` or a native `C:\...` path (see [Connect your agents](/get-started/connect-your-agents)).
+Clients load MCP servers at startup: after `pond init` or `claude mcp add`, restart the client. `claude mcp list` shows whether the registration exists at all. Registered but failing before the first sync is expected: `pond mcp` only reads the store, so it exits naming `pond sync` until a sync has created or upgraded it - run `pond sync` (`pond optimize` on a host with no agent sources, where sync skips the store), then restart the client. On Windows, an entry registered with a Git Bash-style `/c/Users/...` path registers cleanly but never spawns - re-add with bare `pond` or a native `C:\...` path (see [Connect your agents](/docs/get-started/connect-your-agents)).
 
 ## The schedule stopped syncing
 
@@ -36,7 +36,7 @@ Sync is single-flight per store: a second `pond sync` waits and names the holder
 
 ## Slow sync or search on Windows
 
-A pond store is many small files and Defender's real-time scanning charges per file. Exclude pond's data directory (`%LOCALAPPDATA%\pond`) - see the [Windows install notes](/get-started/install#windows).
+A pond store is many small files and Defender's real-time scanning charges per file. Exclude pond's data directory (`%LOCALAPPDATA%\pond`) - see the [Windows install notes](/docs/get-started/install#windows).
 
 ## Where everything lives
 
