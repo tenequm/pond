@@ -1,13 +1,64 @@
 import { CornerDownRight, FileText, Hash, Search } from 'lucide-react'
+import MiniSearch from 'minisearch'
 import { Dialog } from 'radix-ui'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { plainClick, SiteLink } from './navigation.tsx'
 
-type Hit = { href: string; page: string; heading: string; text: string }
+type Hit = { href: string; title: string; titles: string; text: string }
+type SearchDoc = (typeof import('virtual:pond-search'))['default'][number]
+
+function tokenize(text: string) {
+  // Keep a whole API identifier searchable alongside its camelCase or snake_case words.
+  return text.split(/[\s./:@-]+/).filter(Boolean).flatMap((word) => {
+    const parts = word
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+      .toLowerCase()
+      .split(/[ _]+/)
+      .filter(Boolean)
+    const whole = word.toLowerCase()
+    return parts.includes(whole) ? parts : [whole, ...parts]
+  })
+}
+
+function buildIndex(docs: SearchDoc[]) {
+  const engine = new MiniSearch<Hit>({
+    fields: ['category', 'subtitle', 'text', 'title', 'titles'],
+    idField: 'href',
+    tokenize,
+    searchOptions: {
+      combineWith: 'AND',
+      fuzzy: 0.2,
+      prefix: true,
+      boost: { title: 4, subtitle: 3, text: 2, category: 1, titles: 1 },
+      // All indexed URLs are below /docs, which Vocs treats as the root for depth.
+      boostDocument: (href: string) => 1.5 / Math.max(1, href.split('/').length - 2),
+    },
+  })
+  const byHref = new Map<string, Hit>()
+  for (const doc of docs) {
+    for (const section of doc.sections) {
+      const href = '/' + doc.slug + (section.id ? '#' + section.id : '')
+      const hit = {
+        href,
+        title: section.id ? section.heading : doc.title,
+        titles: section.id ? [doc.title, ...section.ancestors].join(' > ') : '',
+        text: section.text,
+        category: doc.category,
+        subtitle: section.id ? undefined : doc.subtitle,
+      }
+      engine.add(hit)
+      byHref.set(href, hit)
+    }
+  }
+  return { engine, byHref }
+}
+
+let cachedIndex: ReturnType<typeof buildIndex> | undefined
 const historyKey = 'pond-docs-recent-searches'
 
 export default function SearchPanel({ onClose }: { onClose: () => void }) {
-  const [index, setIndex] = useState<Hit[]>([])
+  const [index, setIndex] = useState<typeof cachedIndex>(undefined)
   const [failed, setFailed] = useState(false)
   const [query, setQuery] = useState('')
   const [recent, setRecent] = useState<string[]>([])
@@ -18,17 +69,7 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
     let mounted = true
     void import('virtual:pond-search')
       .then(({ default: docs }) => {
-        if (!mounted) return
-        setIndex(
-          docs.flatMap((doc) =>
-            doc.sections.map((section) => ({
-              href: '/' + doc.slug + (section.id ? '#' + section.id : ''),
-              heading: section.heading || doc.title,
-              page: doc.title,
-              text: section.text,
-            })),
-          ),
-        )
+        if (mounted) setIndex(cachedIndex ??= buildIndex(docs))
       })
       .catch(() => {
         if (mounted) setFailed(true)
@@ -45,44 +86,16 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
   }, [])
   const terms = useMemo(() => query.trim().toLowerCase().split(/\s+/).filter(Boolean), [query])
   const hits = useMemo(() => {
-    if (!terms.length) return recent.flatMap((href) => index.find((hit) => hit.href === href) ?? [])
-    return index
-      .map((hit) => {
-        const heading = hit.heading.toLowerCase()
-        const text = hit.text.toLowerCase()
-        const scores = terms.map((term) =>
-          heading === term
-            ? 20
-            : heading.includes(term)
-              ? 8
-              : hit.page.toLowerCase().includes(term)
-                ? 4
-                : text.includes(term)
-                  ? 1
-                  : 0,
-        )
-        return { hit, score: scores.includes(0) ? 0 : scores.reduce<number>((a, b) => a + b, 0) }
-      })
-      .filter((entry) => entry.score)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 20)
-      .map((entry) => entry.hit)
-  }, [terms, recent, index])
-  const highlightPattern = useMemo(
-    () =>
-      terms.length
-        ? new RegExp(
-            '(' + terms.map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')',
-            'gi',
-          )
-        : null,
-    [terms],
-  )
-  function highlight(text: string) {
-    return highlightPattern
-      ? text.split(highlightPattern).map((part, i) => (i % 2 ? <mark key={i}>{part}</mark> : part))
-      : text
-  }
+    if (!index) return []
+    if (!terms.length) return recent.flatMap((href) => {
+      const hit = index.byHref.get(href)
+      return hit ? [{ hit, matched: [] as string[] }] : []
+    })
+    return index.engine.search(query).slice(0, 20).map(({ id, terms: matched }) => ({
+      hit: index.byHref.get(id)!,
+      matched,
+    }))
+  }, [query, terms, recent, index])
   function choose(hit: Hit) {
     try {
       localStorage.setItem(
@@ -154,7 +167,7 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
                 {failed
                   ? 'Search could not load.'
                   : terms.length
-                    ? index.length
+                    ? index
                       ? 'No results found'
                       : 'Loading...'
                     : 'Start typing to search...'}
@@ -162,13 +175,17 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
             )}
             {!terms.length && !!hits.length && <small>Recent searches</small>}
             <ul id="search-results" ref={list} role="listbox" aria-label="Search results">
-              {hits.map((hit, i) => {
-                const match = terms.length ? hit.text.toLowerCase().indexOf(terms[0]) : 0
+              {hits.map(({ hit, matched }, i) => {
+                const words = [...new Set([...terms, ...matched])].sort((a, b) => b.length - a.length)
+                const pattern = words.length
+                  ? new RegExp('(' + words.map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi')
+                  : null
+                const highlight = (text: string) => pattern
+                  ? text.split(pattern).map((part, i) => (i % 2 ? <mark key={i}>{part}</mark> : part))
+                  : text
+                const match = pattern ? Math.max(0, hit.text.search(pattern)) : 0
                 const start = Math.max(0, match - 80)
-                const jump =
-                  terms.length > 0 &&
-                  !hit.href.includes('#') &&
-                  hit.page.toLowerCase() === query.trim().toLowerCase()
+                const jump = !hit.titles && hit.title.toLowerCase() === query.trim().toLowerCase()
                 const Icon = jump ? CornerDownRight : hit.href.includes('#') ? Hash : FileText
                 return (
                   <li key={hit.href} id={`search-hit-${i}`} role="option" aria-selected={selected === i}>
@@ -177,15 +194,15 @@ export default function SearchPanel({ onClose }: { onClose: () => void }) {
                       <div>
                         {jump ? (
                           <>
-                            Jump to <strong>{highlight(hit.page)}</strong>
+                            Jump to <strong>{highlight(hit.title)}</strong>
                           </>
                         ) : (
                           <>
-                            {hit.page !== hit.heading && <small>{hit.page}</small>}
-                            <strong>{highlight(hit.heading)}</strong>
+                            {hit.titles && <small>{hit.titles}</small>}
+                            <strong>{highlight(hit.title)}</strong>
                             <span>
                               {start > 0 && '\u2026'}
-                              {highlight(hit.text.slice(start, Math.max(0, match) + 160))}
+                              {highlight(hit.text.slice(start, match + 160))}
                             </span>
                           </>
                         )}

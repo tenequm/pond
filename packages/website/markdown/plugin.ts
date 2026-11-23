@@ -18,8 +18,8 @@ import { parse as parseYaml } from 'yaml'
 import { site } from '../src/site.ts'
 
 export type TocEntry = { depth: number; id: string; text: string }
-export type SearchSection = { id: string; heading: string; text: string }
-export type SearchDoc = { slug: string; title: string; sections: SearchSection[] }
+export type SearchSection = { id: string; heading: string; ancestors: string[]; text: string }
+export type SearchDoc = { slug: string; title: string; subtitle?: string; category?: string; sections: SearchSection[] }
 export type PageMeta = {
   title: string
   subtitle?: string
@@ -195,7 +195,13 @@ const textOf = (node: HastNodes): string =>
 function rehypeCollect() {
   return (tree: HastRoot, file: VFile) => {
     const toc: TocEntry[] = []
-    const sections: SearchSection[] = [{ id: '', heading: '', text: '' }]
+    const sections: SearchSection[] = [{ id: '', heading: '', ancestors: [], text: '' }]
+    const parents: { depth: number; heading: string }[] = []
+    const addSection = (depth: number, id: string, heading: string) => {
+      while (parents.length && parents[parents.length - 1].depth >= depth) parents.pop()
+      sections.push({ id, heading, ancestors: parents.map((parent) => parent.heading), text: '' })
+      if (depth > 1) parents.push({ depth, heading })
+    }
     const walk = (node: HastNodes, inRelease: boolean) => {
       if (node.type === 'text') {
         sections[sections.length - 1].text += node.value
@@ -206,7 +212,7 @@ function rehypeCollect() {
         if (node.tagName === 'release') {
           const version = String(node.properties.version)
           toc.push({ depth: 2, id: version, text: version })
-          sections.push({ id: version, heading: version, text: '' })
+          addSection(2, version, version)
           for (const child of node.children) walk(child, true)
           return
         }
@@ -215,7 +221,7 @@ function rehypeCollect() {
           const id = String(node.properties.id ?? '')
           const heading = textOf(node)
           if (depth === '2' || depth === '3') toc.push({ depth: Number(depth), id, text: heading })
-          sections.push({ id: Number(depth) > 1 ? id : '', heading, text: '' })
+          addSection(Number(depth), depth === '1' ? '' : id, heading)
           return
         }
       }
@@ -276,7 +282,8 @@ export function markdown(): Plugin {
         Object.entries(pageSources()).map(async ([path, file]) => {
           this.addWatchFile(file)
           const { meta, sections } = await compilePage(file)
-          return { slug: path.slice(1), title: meta.title, sections }
+          const category = site.topNav.find((item) => path === item.link || path.startsWith(item.link + '/'))?.text
+          return { slug: path.slice(1), title: meta.title, subtitle: meta.subtitle, category, sections }
         }),
       )
       return `export default ${JSON.stringify(docs)}`
