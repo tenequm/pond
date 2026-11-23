@@ -6,6 +6,7 @@ import remarkStringify from 'remark-stringify'
 import { unified } from 'unified'
 import type { Plugin } from 'vite'
 import { parse } from 'yaml'
+import { fetchReleases } from './markdown/plugin.ts'
 import { home } from './src/seo.ts'
 import { site } from './src/site.ts'
 
@@ -50,14 +51,8 @@ export function staticFiles(): Plugin {
         links.push(`- [${title}](${slug})` + (meta.description ? ': ' + meta.description : ''))
         let expanded = body
         if (path === '/changelog') {
-          const token = process.env.GITHUB_TOKEN
-          const response = await fetch(`https://api.github.com/repos/${site.repo}/releases?per_page=100`, {
-            headers: token ? { Authorization: `Bearer ${token}` } : {},
-          })
-          if (!response.ok) throw new Error(`GitHub releases returned ${response.status}`)
-          type Release = { tag_name: string; published_at: string; body: string | null; draft: boolean; prerelease: boolean }
-          const releases: Release[] = await response.json()
-          const notes = releases.filter(r => !r.draft && !r.prerelease).map(r =>
+          const releases = await fetchReleases(site.repo)
+          const notes = releases.map(r =>
             `## ${r.tag_name} (${r.published_at.slice(0, 10)})\n\n${r.body?.trim() ?? ''}`)
           expanded = body.replace('::changelog', () => notes.join('\n\n'))
         }

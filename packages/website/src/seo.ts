@@ -12,9 +12,7 @@ export function siteHead() {
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      // The migration preserves the public generator tag alongside the other head metadata.
-      { name: 'generator', content: 'Waku' },
-      { name: 'color-scheme', content: 'light dark' },
+      { name: 'color-scheme', content: 'dark' },
       { name: 'robots', content: 'index, follow' },
       { title: site.title },
     ],
@@ -25,7 +23,8 @@ export function siteHead() {
 
 export function pageHead({ title, description = site.description, path }: { title: string; description?: string; path: string }) {
   const pageTitle = title.replace(/ (?:-|\u2013) pond$/, '')
-  const standaloneTitle = ['/', '/why', '/compare'].includes(path)
+  // A title that already names the site stands alone, as on the old site.
+  const standaloneTitle = pageTitle.toLowerCase().includes(site.title)
   const url = site.url + path
   return {
     meta: [

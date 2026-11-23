@@ -29,7 +29,7 @@ export type PageMeta = {
   source: string
 }
 
-type Release = { tag_name: string; published_at: string; html_url: string; body: string | null; draft: boolean }
+export type Release = { tag_name: string; published_at: string; html_url: string; body: string | null; draft: boolean }
 type PageData = { frontmatter?: Record<string, string>; h1?: string; subtitle?: string; toc?: TocEntry[]; sections?: SearchSection[] }
 
 const CODE_THEME = 'github-dark-dimmed'
@@ -39,7 +39,7 @@ const SPEC_ANCHOR = /\s*\{#([\w-]+)\}/g
 const SUBTITLE = /\s*\[([^\]]+)\]\s*$/
 
 let releases: Promise<Release[]> | undefined
-function fetchReleases(repo: string): Promise<Release[]> {
+export function fetchReleases(repo: string): Promise<Release[]> {
   releases ??= (async () => {
     const headers: Record<string, string> = { accept: 'application/vnd.github+json' }
     if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`
