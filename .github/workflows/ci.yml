@@ -1050,6 +1050,7 @@ jobs:
         with: { fetch-depth: 0 } # Page modification dates use file history.
       - uses: ./.github/actions/docs-deploy
         with:
+          rybbit-ingest-key: ${{ secrets.RYBBIT_INGEST_KEY }}
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
@@ -1069,6 +1070,7 @@ jobs:
         with: { ref: main, fetch-depth: 0 } # Page modification dates use file history.
       - uses: ./.github/actions/docs-deploy
         with:
+          rybbit-ingest-key: ${{ secrets.RYBBIT_INGEST_KEY }}
           cloudflare-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           cloudflare-account-id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 

@@ -37,6 +37,27 @@ type ReleaseProps = { version: string; date: string; url: string; children: Reac
 // data-lang is set only when the fence names a language, data-title only for ```sh [Homebrew].
 type PreProps = ComponentProps<'pre'> & { 'data-lang'?: string; 'data-title'?: string }
 
+declare global {
+  interface Window {
+    rybbit?: { event(name: string, props: Record<string, string>): void | Promise<void> }
+  }
+}
+
+const installMethods: [string, RegExp][] = [
+  ['brew', /^\s*brew install (?:tenequm\/tap\/)?pond(?:\s|$)/m],
+  ['nix', /^\s*nix (?:profile (?:add|install)|run|shell) github:tenequm\/pond(?:#pond)?(?:\s|$)/m],
+  ['scoop', /^\s*scoop install (?:tenequm\/)?pond(?:\s|$)/m],
+  ['cargo', /^\s*cargo install pond-db(?:\s|$)/m],
+  ['cargo-binstall', /^\s*cargo binstall pond-db(?:\s|$)/m],
+]
+
+async function trackCommandCopy(text: string) {
+  const method = installMethods.find(([, pattern]) => pattern.test(text))?.[0]
+  const page = window.location.pathname
+  if (method) await window.rybbit?.event('install_command_copied', { method, page })
+  else await window.rybbit?.event('command_copied', { page })
+}
+
 export function CopyButton({
   page,
   line,
@@ -75,6 +96,7 @@ export function CopyButton({
         ])
       }
       setState('copied')
+      if (!page && typeof value === 'string') void trackCommandCopy(value).catch(() => {})
     } catch {
       setState('failed')
     }
@@ -169,7 +191,8 @@ export function CodeBlock({ children, 'data-title': title, ...props }: PreProps)
   const code = isValidElement<ComponentProps<'code'>>(children) ? children : undefined
   const lines = code ? Children.toArray(code.props.children).filter(isValidElement<ComponentProps<'span'>>) : []
   const text = lines.map(codeText)
-  const prompt = /^([#$>%] )/
+  // A leading "# " in shell source is a comment; in a console transcript it can be a root prompt.
+  const prompt = /^(console|terminal)$/.test(props['data-lang'] ?? '') ? /^[#$>%] / : /^[$>%] /
   const commands = text.flatMap((line, i) => {
     if (!shell || !prompt.test(line)) return []
     const command = [line.slice(2)]
