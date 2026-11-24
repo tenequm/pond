@@ -37,7 +37,7 @@ Install, `pond init`, `pond sync`. -> [Quickstart](/docs/get-started/quickstart)
 
 ## Isn't this another memory tool?
 
-No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories.
+No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories. The longer answer, including when to run both: [Claude Code memory vs a session archive](/docs/guides/claude-code-memory-vs-archive).
 
 ## How it works
 
@@ -62,7 +62,7 @@ Everything runs on your machine: ingest, search, SQL, and, if you turn on semant
 
 ## The problem
 
-Agent history is your most valuable byproduct - decisions, dead ends, the command that worked - yet it's siloed per client, in per-tool formats, and disposable: rotate a machine or hit a retention window and it's gone. No cross-tool search, no continuing a Claude Code thread in Codex.
+Agent history is your most valuable byproduct - decisions, dead ends, the command that worked - yet it's siloed per client, in per-tool formats, and disposable: rotate a machine or hit a retention window ([Claude Code's is 30 days](/docs/guides/claude-code-session-retention)) and it's gone. No cross-tool search, no continuing a Claude Code thread in Codex.
 
 pond's premise: a session should outlive the tool that made it. Three rules follow:
 
@@ -80,5 +80,7 @@ pond's premise: a session should outlive the tool that made it. Three rules foll
 - [Install](/docs/get-started/install) - Homebrew, Nix, Scoop (Windows), Cargo
 - [Quickstart](/docs/get-started/quickstart) - init -> sync -> ask
 - [Connect your agents](/docs/get-started/connect-your-agents) - register the MCP server
+- [Where your sessions are stored](/docs/guides/where-claude-code-stores-sessions) - every client's files, and how to read them
+- [Resume a session in a different client](/docs/guides/resume-session-in-another-client) - what restore carries over
 - [Remote storage](/docs/guides/remote-storage) - S3, R2, B2, GCS
 - [Specification](/docs/spec) - the v1 contract
