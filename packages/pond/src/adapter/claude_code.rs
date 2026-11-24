@@ -307,7 +307,7 @@ pub(crate) fn subagent_meta_record(
 /// client `tool_use` whatever executed it: the Messages API pairs a
 /// `tool_result` block only with a `tool_use`, while a real server tool's
 /// result is its own block inside the assistant turn.
-fn answered_call_ids(messages: &[crate::sessions::MessageWithParts]) -> HashSet<String> {
+fn answered_call_ids(messages: &[crate::sessions::MessageWithParts]) -> HashSet<&str> {
     messages
         .iter()
         .flat_map(|message| &message.parts)
@@ -315,7 +315,7 @@ fn answered_call_ids(messages: &[crate::sessions::MessageWithParts]) -> HashSet<
             PartKind::ToolResult {
                 call_id: Some(call_id),
                 ..
-            } => Some((**call_id).clone()),
+            } => Some(call_id.as_str()),
             _ => None,
         })
         .collect()
@@ -325,7 +325,7 @@ fn claude_record(
     session: &crate::sessions::SessionWithMessages,
     message: &crate::sessions::MessageWithParts,
     parent_uuid: Option<&str>,
-    answered_calls: &HashSet<String>,
+    answered_calls: &HashSet<&str>,
 ) -> Option<Value> {
     // Foreign restore into Claude Code (native restore re-emits the stored
     // `raw_record` and never reaches here). Claude Code's transcript has only
@@ -370,17 +370,20 @@ fn claude_record(
     }))
 }
 
-fn claude_part(part: &Part, answered_calls: &HashSet<String>) -> Option<Value> {
+fn claude_part(part: &Part, answered_calls: &HashSet<&str>) -> Option<Value> {
     Some(match &part.kind {
         PartKind::Text { text } => json!({"type": "text", "text": extracted_text(text)}),
         // Claude Code replays prior thinking to the API, which accepts it only
-        // with the signature Anthropic issued; unsigned reasoning (every
-        // non-Anthropic source) has no form here and is dropped.
-        PartKind::Reasoning { text } => json!({
-            "type": "thinking",
-            "thinking": extracted_text(text),
-            "signature": part.options.get("anthropic")?.get("signature")?.as_str()?,
-        }),
+        // with the signature Anthropic issued; reasoning without an
+        // `anthropic.signature` has no form here and is dropped.
+        PartKind::Reasoning { text } => {
+            let signature = part.options.get("anthropic")?.get("signature")?.as_str()?;
+            json!({
+                "type": "thinking",
+                "thinking": extracted_text(text),
+                "signature": signature,
+            })
+        }
         PartKind::ToolCall {
             call_id,
             name,
@@ -440,10 +443,8 @@ fn claude_tool_input(params: &Value) -> Value {
     }
 }
 
-/// `tool_result.content` is a string or an array of the API's content blocks.
-/// Another source's text items (Codex's `input_text`) become `text` blocks and
-/// any other foreign value is carried as its JSON text, so the restored turn is
-/// one the API accepts; an absent result writes no content.
+/// The API accepts `tool_result.content` only as a string or its own content
+/// blocks, so another source's items are recast as `text` or the turn is a 400.
 fn claude_tool_result_content(result: &Value) -> Option<Value> {
     const API_BLOCKS: [&str; 6] = [
         "text",
@@ -460,6 +461,9 @@ fn claude_tool_result_content(result: &Value) -> Option<Value> {
             items
                 .iter()
                 .map(|item| {
+                    if let Value::String(text) = item {
+                        return json!({"type": "text", "text": text});
+                    }
                     let kind = item.get("type").and_then(Value::as_str);
                     let text = item.get("text").and_then(Value::as_str);
                     match (kind, text) {
@@ -1447,7 +1451,11 @@ mod tests {
     )]
 
     use super::*;
-    use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
+    use crate::{
+        handlers::ingest_adapter,
+        sessions::Store,
+        wire::{PartKind, Role},
+    };
     use tempfile::TempDir;
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
@@ -3160,17 +3168,20 @@ mod tests {
         Ok(())
     }
 
+    const CANONICAL_SESSION_ID: &str = "11111111-2222-4333-8444-555555555555";
+    const CANONICAL_CREATED_AT: &str = "2026-11-24T19:58:37Z";
+
     fn canonical_session(
         source_agent: &str,
         messages: Vec<crate::sessions::MessageWithParts>,
     ) -> crate::sessions::SessionWithMessages {
         crate::sessions::SessionWithMessages {
             session: Session {
-                id: "11111111-2222-4333-8444-555555555555".to_owned(),
+                id: CANONICAL_SESSION_ID.to_owned(),
                 parent_session_id: None,
                 parent_message_id: None,
                 source_agent: source_agent.to_owned(),
-                created_at: DateTime::parse_from_rfc3339("2026-11-24T19:58:37Z")
+                created_at: DateTime::parse_from_rfc3339(CANONICAL_CREATED_AT)
                     .unwrap()
                     .with_timezone(&Utc),
                 project: Extracted::from_test_value("/tmp/proj".to_owned()),
@@ -3182,35 +3193,36 @@ mod tests {
 
     fn canonical_message(
         seq: u32,
-        role: &str,
+        role: Role,
         options: ProviderOptions,
         kinds: Vec<(PartKind, ProviderOptions)>,
     ) -> crate::sessions::MessageWithParts {
         let id = format!("m{seq:02}");
-        let session_id = "11111111-2222-4333-8444-555555555555".to_owned();
-        let timestamp = DateTime::parse_from_rfc3339("2026-11-24T19:58:37Z")
+        let session_id = CANONICAL_SESSION_ID.to_owned();
+        let timestamp = DateTime::parse_from_rfc3339(CANONICAL_CREATED_AT)
             .unwrap()
             .with_timezone(&Utc)
             + chrono::Duration::seconds(i64::from(seq));
         let message = match role {
-            "user" => Message::User {
+            Role::User => Message::User {
                 id: id.clone(),
                 session_id: session_id.clone(),
                 timestamp,
                 options,
             },
-            "tool" => Message::Tool {
+            Role::Tool => Message::Tool {
                 id: id.clone(),
                 session_id: session_id.clone(),
                 timestamp,
                 options,
             },
-            _ => Message::Assistant {
+            Role::Assistant => Message::Assistant {
                 id: id.clone(),
                 session_id: session_id.clone(),
                 timestamp,
                 options,
             },
+            Role::System => unreachable!("no test here restores a System message"),
         };
         let parts = kinds
             .into_iter()
@@ -3254,7 +3266,7 @@ mod tests {
             vec![
                 canonical_message(
                     1,
-                    "user",
+                    Role::User,
                     none(),
                     vec![(
                         PartKind::Text {
@@ -3265,7 +3277,7 @@ mod tests {
                 ),
                 canonical_message(
                     2,
-                    "assistant",
+                    Role::Assistant,
                     none(),
                     vec![(
                         PartKind::Reasoning {
@@ -3278,7 +3290,7 @@ mod tests {
                 ),
                 canonical_message(
                     3,
-                    "assistant",
+                    Role::Assistant,
                     none(),
                     vec![(
                         PartKind::ToolCall {
@@ -3292,7 +3304,7 @@ mod tests {
                 ),
                 canonical_message(
                     4,
-                    "tool",
+                    Role::Tool,
                     none(),
                     vec![(
                         PartKind::ToolResult {
@@ -3309,7 +3321,7 @@ mod tests {
                 ),
                 canonical_message(
                     5,
-                    "assistant",
+                    Role::Assistant,
                     none(),
                     vec![(
                         PartKind::Text {
@@ -3387,11 +3399,11 @@ mod tests {
         let mut signed = ProviderOptions::new();
         signed.insert("anthropic".to_owned(), json!({"signature": "sig-1"}));
         let session = canonical_session(
-            "claude-ai-export",
+            "claude-desktop-app",
             vec![
                 canonical_message(
                     1,
-                    "assistant",
+                    Role::Assistant,
                     none(),
                     vec![
                         (
@@ -3422,7 +3434,7 @@ mod tests {
                 ),
                 canonical_message(
                     2,
-                    "tool",
+                    Role::Tool,
                     none(),
                     vec![(
                         PartKind::ToolResult {
@@ -3446,6 +3458,14 @@ mod tests {
         assert_eq!(blocks[2]["type"], "tool_use");
         assert_eq!(blocks[2]["input"], json!({"input": "*** Begin Patch"}));
         assert!(blocks[3].get("content").is_none());
+        assert_eq!(
+            claude_tool_result_content(&json!(["plain", {"type": "input_image"}])),
+            Some(json!([
+                {"type": "text", "text": "plain"},
+                {"type": "text", "text": r#"{"type":"input_image"}"#},
+            ])),
+            "a bare string item is its own text, not its JSON quoting",
+        );
     }
 
     /// Native restore replays the stored source rows and never reaches the
@@ -3463,9 +3483,10 @@ mod tests {
         });
         let mut options = ProviderOptions::new();
         options.insert("source".to_owned(), json!({"line": 1, "raw_record": raw}));
-        let mut session = codex_origin_session();
-        session.session.source_agent = "claude-code".to_owned();
-        session.messages = vec![canonical_message(1, "assistant", options, Vec::new())];
+        let session = canonical_session(
+            "claude-code",
+            vec![canonical_message(1, Role::Assistant, options, Vec::new())],
+        );
         assert_eq!(restored_rows(&session, RestoreFidelity::Native), [raw]);
     }
 }

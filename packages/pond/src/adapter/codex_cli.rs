@@ -1593,10 +1593,12 @@ mod tests {
         Ok(())
     }
 
+    const CLAUDE_ORIGIN_ID: &str = "77f60bfb-7812-4467-808b-cc76c6818a0c";
+
     fn claude_origin_session(options: ProviderOptions) -> crate::sessions::SessionWithMessages {
         crate::sessions::SessionWithMessages {
             session: Session {
-                id: "77f60bfb-7812-4467-808b-cc76c6818a0c".to_owned(),
+                id: CLAUDE_ORIGIN_ID.to_owned(),
                 parent_session_id: None,
                 parent_message_id: None,
                 source_agent: "claude-code".to_owned(),
@@ -1630,7 +1632,7 @@ mod tests {
         );
         assert_eq!(row["type"], "session_meta");
         let payload = &row["payload"];
-        assert_eq!(payload["id"], "77f60bfb-7812-4467-808b-cc76c6818a0c");
+        assert_eq!(payload["id"], CLAUDE_ORIGIN_ID);
         assert_eq!(payload["cwd"], "/tmp/proj");
         assert!(payload["timestamp"].is_string());
         for field in ["originator", "cli_version"] {
@@ -1648,7 +1650,7 @@ mod tests {
         let raw = json!({
             "timestamp": "2026-11-24T19:58:20.000Z",
             "type": "session_meta",
-            "payload": {"id": "77f60bfb-7812-4467-808b-cc76c6818a0c", "originator": "codex_exec", "cli_version": "0.171.0"},
+            "payload": {"id": CLAUDE_ORIGIN_ID, "originator": "codex_exec", "cli_version": "0.171.0"},
         });
         let mut options = ProviderOptions::new();
         options.insert("source".to_owned(), json!({"raw_record": raw}));
