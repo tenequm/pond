@@ -129,6 +129,7 @@ pub(crate) fn claude_serialize(
     // canonical is append-only (spec.md#adapter-integrity-additive-sync).
     let mut records = Vec::with_capacity(messages.len());
     let mut parent_uuid = None::<String>;
+    let answered_calls = answered_call_ids(&messages);
     for message in &messages {
         if fidelity == RestoreFidelity::Native
             && let Some(raw) = raw_record(message.message.options())
@@ -141,9 +142,11 @@ pub(crate) fn claude_serialize(
             records.push(raw);
             continue;
         }
-        // `claude_record` returns `None` for a dropped System message;
-        // `parent_uuid` then stays put so the chain skips over the gap.
-        let Some(record) = claude_record(session, message, parent_uuid.as_deref()) else {
+        // `claude_record` returns `None` for a dropped message (System, or
+        // nothing left the target can express); `parent_uuid` then stays put
+        // so the chain skips over the gap.
+        let Some(record) = claude_record(session, message, parent_uuid.as_deref(), &answered_calls)
+        else {
             continue;
         };
         parent_uuid = record
@@ -300,10 +303,29 @@ pub(crate) fn subagent_meta_record(
     meta.is_object().then(|| meta.clone())
 }
 
+/// Call ids some `ToolResult` part answers. Such a call must be written as a
+/// client `tool_use` whatever executed it: the Messages API pairs a
+/// `tool_result` block only with a `tool_use`, while a real server tool's
+/// result is its own block inside the assistant turn.
+fn answered_call_ids(messages: &[crate::sessions::MessageWithParts]) -> HashSet<&str> {
+    messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter_map(|part| match &part.kind {
+            PartKind::ToolResult {
+                call_id: Some(call_id),
+                ..
+            } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn claude_record(
     session: &crate::sessions::SessionWithMessages,
     message: &crate::sessions::MessageWithParts,
     parent_uuid: Option<&str>,
+    answered_calls: &HashSet<&str>,
 ) -> Option<Value> {
     // Foreign restore into Claude Code (native restore re-emits the stored
     // `raw_record` and never reaches here). Claude Code's transcript has only
@@ -324,10 +346,17 @@ fn claude_record(
         // - a constant, always present on a real assistant row.
         envelope.insert("type".to_owned(), Value::String("message".to_owned()));
     }
-    envelope.insert(
-        "content".to_owned(),
-        Value::Array(message.parts.iter().map(claude_part).collect()),
-    );
+    let content = message
+        .parts
+        .iter()
+        .filter_map(|part| claude_part(part, answered_calls))
+        .collect::<Vec<_>>();
+    // The API rejects an empty turn; a message whose every part was dropped
+    // (a Codex reasoning item, say) has nothing left to restore.
+    if content.is_empty() {
+        return None;
+    }
+    envelope.insert("content".to_owned(), Value::Array(content));
     Some(json!({
         "parentUuid": parent_uuid,
         "isSidechain": false,
@@ -341,34 +370,52 @@ fn claude_record(
     }))
 }
 
-fn claude_part(part: &Part) -> Value {
-    match &part.kind {
+fn claude_part(part: &Part, answered_calls: &HashSet<&str>) -> Option<Value> {
+    Some(match &part.kind {
         PartKind::Text { text } => json!({"type": "text", "text": extracted_text(text)}),
+        // Claude Code replays prior thinking to the API, which accepts it only
+        // with the signature Anthropic issued; reasoning without an
+        // `anthropic.signature` has no form here and is dropped.
         PartKind::Reasoning { text } => {
-            json!({"type": "thinking", "thinking": extracted_text(text)})
+            let signature = part.options.get("anthropic")?.get("signature")?.as_str()?;
+            json!({
+                "type": "thinking",
+                "thinking": extracted_text(text),
+                "signature": signature,
+            })
         }
         PartKind::ToolCall {
             call_id,
             name,
             params,
             provider_executed,
-        } => json!({
-            "type": if *provider_executed { "server_tool_use" } else { "tool_use" },
-            "id": extracted_text(call_id),
-            "name": extracted_text(name),
-            "input": params,
-        }),
+        } => {
+            let answered = call_id
+                .as_deref()
+                .is_some_and(|id| answered_calls.contains(id.as_str()));
+            json!({
+                "type": if *provider_executed && !answered { "server_tool_use" } else { "tool_use" },
+                "id": extracted_text(call_id),
+                "name": extracted_text(name),
+                "input": claude_tool_input(params),
+            })
+        }
         PartKind::ToolResult {
             call_id,
             is_failure,
             result,
             ..
-        } => json!({
-            "type": "tool_result",
-            "tool_use_id": extracted_text(call_id),
-            "is_error": is_failure,
-            "content": result,
-        }),
+        } => {
+            let mut block = json!({
+                "type": "tool_result",
+                "tool_use_id": extracted_text(call_id),
+                "is_error": is_failure,
+            });
+            if let Some(content) = claude_tool_result_content(result) {
+                block["content"] = content;
+            }
+            block
+        }
         PartKind::File {
             media_type,
             file_name,
@@ -382,7 +429,55 @@ fn claude_part(part: &Part) -> Value {
         other => {
             json!({"type": "text", "text": compact_json(&serde_json::to_value(other).unwrap_or(Value::Null))})
         }
+    })
+}
+
+/// A `tool_use.input` must be a JSON object. A source whose call input is a
+/// bare value (Codex's freeform custom tools take a string) keeps it under
+/// that source's own field name, `input`.
+fn claude_tool_input(params: &Value) -> Value {
+    match params {
+        Value::Object(_) => params.clone(),
+        Value::Null => json!({}),
+        other => json!({ "input": other }),
     }
+}
+
+/// The API accepts `tool_result.content` only as a string or its own content
+/// blocks, so another source's items are recast as `text` or the turn is a 400.
+fn claude_tool_result_content(result: &Value) -> Option<Value> {
+    const API_BLOCKS: [&str; 6] = [
+        "text",
+        "image",
+        "document",
+        "search_result",
+        "tool_reference",
+        "browser_state",
+    ];
+    Some(match result {
+        Value::Null => return None,
+        Value::String(_) => result.clone(),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    if let Value::String(text) = item {
+                        return json!({"type": "text", "text": text});
+                    }
+                    let kind = item.get("type").and_then(Value::as_str);
+                    let text = item.get("text").and_then(Value::as_str);
+                    match (kind, text) {
+                        (Some(kind), _) if API_BLOCKS.contains(&kind) => item.clone(),
+                        (Some("input_text" | "output_text"), Some(text)) => {
+                            json!({"type": "text", "text": text})
+                        }
+                        _ => json!({"type": "text", "text": compact_json(item)}),
+                    }
+                })
+                .collect(),
+        ),
+        other => Value::String(compact_json(other)),
+    })
 }
 
 fn file_source(data: &FileData) -> Value {
@@ -1356,7 +1451,11 @@ mod tests {
     )]
 
     use super::*;
-    use crate::{handlers::ingest_adapter, sessions::Store, wire::PartKind};
+    use crate::{
+        handlers::ingest_adapter,
+        sessions::Store,
+        wire::{PartKind, Role},
+    };
     use tempfile::TempDir;
 
     // Manifest-dir anchored: unit tests must not depend on the process cwd
@@ -3067,5 +3166,327 @@ mod tests {
             "journal row must NOT merge even when it carries the parent sessionId",
         );
         Ok(())
+    }
+
+    const CANONICAL_SESSION_ID: &str = "11111111-2222-4333-8444-555555555555";
+    const CANONICAL_CREATED_AT: &str = "2026-11-24T19:58:37Z";
+
+    fn canonical_session(
+        source_agent: &str,
+        messages: Vec<crate::sessions::MessageWithParts>,
+    ) -> crate::sessions::SessionWithMessages {
+        crate::sessions::SessionWithMessages {
+            session: Session {
+                id: CANONICAL_SESSION_ID.to_owned(),
+                parent_session_id: None,
+                parent_message_id: None,
+                source_agent: source_agent.to_owned(),
+                created_at: DateTime::parse_from_rfc3339(CANONICAL_CREATED_AT)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                project: Extracted::from_test_value("/tmp/proj".to_owned()),
+                options: ProviderOptions::new(),
+            },
+            messages,
+        }
+    }
+
+    fn canonical_message(
+        seq: u32,
+        role: Role,
+        options: ProviderOptions,
+        kinds: Vec<(PartKind, ProviderOptions)>,
+    ) -> crate::sessions::MessageWithParts {
+        let id = format!("m{seq:02}");
+        let session_id = CANONICAL_SESSION_ID.to_owned();
+        let timestamp = DateTime::parse_from_rfc3339(CANONICAL_CREATED_AT)
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::seconds(i64::from(seq));
+        let message = match role {
+            Role::User => Message::User {
+                id: id.clone(),
+                session_id: session_id.clone(),
+                timestamp,
+                options,
+            },
+            Role::Tool => Message::Tool {
+                id: id.clone(),
+                session_id: session_id.clone(),
+                timestamp,
+                options,
+            },
+            Role::Assistant => Message::Assistant {
+                id: id.clone(),
+                session_id: session_id.clone(),
+                timestamp,
+                options,
+            },
+            Role::System => unreachable!("no test here restores a System message"),
+        };
+        let parts = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (kind, options))| Part {
+                session_id: session_id.clone(),
+                id: part_id(&id, ordinal),
+                message_id: id.clone(),
+                ordinal: part_ordinal(ordinal),
+                provenance: Provenance::Conversational,
+                options,
+                kind,
+            })
+            .collect();
+        crate::sessions::MessageWithParts { message, parts }
+    }
+
+    fn text(value: &str) -> Option<Extracted<String>> {
+        Some(Extracted::from_test_value(value.to_owned()))
+    }
+
+    fn restored_rows(
+        session: &crate::sessions::SessionWithMessages,
+        fidelity: RestoreFidelity,
+    ) -> Vec<Value> {
+        let files = ClaudeCodeFactory.serialize(session, fidelity).unwrap();
+        std::str::from_utf8(&files[0].bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// A Codex session as codex-cli ingest stores it: a JS-runtime
+    /// `custom_tool_call` (`provider_executed: true`), its output as Codex
+    /// `input_text` items, and an unsigned reasoning item of its own.
+    fn codex_origin_session() -> crate::sessions::SessionWithMessages {
+        let none = ProviderOptions::new;
+        canonical_session(
+            "codex-cli",
+            vec![
+                canonical_message(
+                    1,
+                    Role::User,
+                    none(),
+                    vec![(
+                        PartKind::Text {
+                            text: text("read notes.txt"),
+                        },
+                        none(),
+                    )],
+                ),
+                canonical_message(
+                    2,
+                    Role::Assistant,
+                    none(),
+                    vec![(
+                        PartKind::Reasoning {
+                            text: text(
+                                r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"Reading the file"}]}"#,
+                            ),
+                        },
+                        none(),
+                    )],
+                ),
+                canonical_message(
+                    3,
+                    Role::Assistant,
+                    none(),
+                    vec![(
+                        PartKind::ToolCall {
+                            call_id: text("call_1"),
+                            name: text("exec_command"),
+                            params: json!({"script": "tools.exec_command({cmd: 'cat notes.txt'})"}),
+                            provider_executed: true,
+                        },
+                        none(),
+                    )],
+                ),
+                canonical_message(
+                    4,
+                    Role::Tool,
+                    none(),
+                    vec![(
+                        PartKind::ToolResult {
+                            call_id: text("call_1"),
+                            name: text("exec_command"),
+                            is_failure: false,
+                            result: json!([
+                                {"type": "input_text", "text": "Script completed"},
+                                {"type": "input_text", "text": "fruit: kumquat"},
+                            ]),
+                        },
+                        none(),
+                    )],
+                ),
+                canonical_message(
+                    5,
+                    Role::Assistant,
+                    none(),
+                    vec![(
+                        PartKind::Text {
+                            text: text("Kumquat."),
+                        },
+                        none(),
+                    )],
+                ),
+            ],
+        )
+    }
+
+    fn blocks(rows: &[Value]) -> Vec<&Value> {
+        rows.iter()
+            .flat_map(|row| row["message"]["content"].as_array().unwrap())
+            .collect()
+    }
+
+    /// The Codex call and its output must reach Claude Code as a `tool_use` /
+    /// `tool_result` pair the Messages API accepts: `server_tool_use` is dropped
+    /// by Claude Code, and `input_text` content is a 400.
+    #[test]
+    fn foreign_codex_tool_turns_restore_as_api_valid_tool_use_and_result() {
+        let rows = restored_rows(&codex_origin_session(), RestoreFidelity::Foreign);
+        let blocks = blocks(&rows);
+        let tool_use = blocks
+            .iter()
+            .find(|block| block["id"] == "call_1")
+            .expect("the Codex call is restored");
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "exec_command");
+        assert!(
+            tool_use["input"].is_object(),
+            "tool_use.input must be an object"
+        );
+        let tool_result = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_result")
+            .expect("the Codex output is restored");
+        assert_eq!(tool_result["tool_use_id"], "call_1");
+        assert_eq!(
+            tool_result["content"],
+            json!([
+                {"type": "text", "text": "Script completed"},
+                {"type": "text", "text": "fruit: kumquat"},
+            ]),
+        );
+    }
+
+    /// Unsigned reasoning has no form Claude Code can send back to the API, so
+    /// it is dropped, and the reasoning-only Codex turn with it; the
+    /// `parentUuid` chain skips the gap.
+    #[test]
+    fn foreign_unsigned_reasoning_is_dropped_and_the_chain_skips_it() {
+        let rows = restored_rows(&codex_origin_session(), RestoreFidelity::Foreign);
+        assert!(
+            blocks(&rows)
+                .iter()
+                .all(|block| block["type"] != "thinking"),
+            "no unsigned thinking block may be written",
+        );
+        let uuids = rows.iter().map(|row| &row["uuid"]).collect::<Vec<_>>();
+        assert_eq!(uuids, ["m01", "m03", "m04", "m05"]);
+        assert_eq!(rows[1]["parentUuid"], "m01");
+    }
+
+    /// The same mapping keeps what Claude Code can express from an Anthropic
+    /// source: signed thinking keeps its signature, and a server tool call with
+    /// no `tool_result` answering it stays `server_tool_use`. A bare-value input
+    /// is wrapped into the object the API requires; an absent result writes no
+    /// content.
+    #[test]
+    fn foreign_restore_keeps_signed_thinking_and_unanswered_server_tools() {
+        let none = ProviderOptions::new;
+        let mut signed = ProviderOptions::new();
+        signed.insert("anthropic".to_owned(), json!({"signature": "sig-1"}));
+        let session = canonical_session(
+            "claude-desktop-app",
+            vec![
+                canonical_message(
+                    1,
+                    Role::Assistant,
+                    none(),
+                    vec![
+                        (
+                            PartKind::Reasoning {
+                                text: text("thinking aloud"),
+                            },
+                            signed,
+                        ),
+                        (
+                            PartKind::ToolCall {
+                                call_id: text("srvtoolu_1"),
+                                name: text("web_search"),
+                                params: json!({"query": "kumquat"}),
+                                provider_executed: true,
+                            },
+                            none(),
+                        ),
+                        (
+                            PartKind::ToolCall {
+                                call_id: text("call_2"),
+                                name: text("apply_patch"),
+                                params: json!("*** Begin Patch"),
+                                provider_executed: true,
+                            },
+                            none(),
+                        ),
+                    ],
+                ),
+                canonical_message(
+                    2,
+                    Role::Tool,
+                    none(),
+                    vec![(
+                        PartKind::ToolResult {
+                            call_id: text("call_2"),
+                            name: text("apply_patch"),
+                            is_failure: false,
+                            result: Value::Null,
+                        },
+                        none(),
+                    )],
+                ),
+            ],
+        );
+        let rows = restored_rows(&session, RestoreFidelity::Foreign);
+        let blocks = blocks(&rows);
+        assert_eq!(
+            *blocks[0],
+            json!({"type": "thinking", "thinking": "thinking aloud", "signature": "sig-1"}),
+        );
+        assert_eq!(blocks[1]["type"], "server_tool_use");
+        assert_eq!(blocks[2]["type"], "tool_use");
+        assert_eq!(blocks[2]["input"], json!({"input": "*** Begin Patch"}));
+        assert!(blocks[3].get("content").is_none());
+        assert_eq!(
+            claude_tool_result_content(&json!(["plain", {"type": "input_image"}])),
+            Some(json!([
+                {"type": "text", "text": "plain"},
+                {"type": "text", "text": r#"{"type":"input_image"}"#},
+            ])),
+            "a bare string item is its own text, not its JSON quoting",
+        );
+    }
+
+    /// Native restore replays the stored source rows and never reaches the
+    /// foreign mapping: a recorded `server_tool_use`, unsigned `thinking` and
+    /// non-object input come back exactly as captured.
+    #[test]
+    fn native_restore_replays_source_rows_untouched_by_the_foreign_mapping() {
+        let raw = json!({
+            "type": "assistant",
+            "uuid": "m01",
+            "message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "no signature"},
+                {"type": "server_tool_use", "id": "call_1", "name": "web_search", "input": "q"},
+            ]},
+        });
+        let mut options = ProviderOptions::new();
+        options.insert("source".to_owned(), json!({"line": 1, "raw_record": raw}));
+        let session = canonical_session(
+            "claude-code",
+            vec![canonical_message(1, Role::Assistant, options, Vec::new())],
+        );
+        assert_eq!(restored_rows(&session, RestoreFidelity::Native), [raw]);
     }
 }

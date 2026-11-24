@@ -178,6 +178,12 @@ fn codex_session_meta(session: &crate::sessions::SessionWithMessages) -> Value {
             "id": session.session.id,
             "timestamp": session.session.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             "cwd": &*session.session.project,
+            // Codex refuses a rollout whose `SessionMeta` lacks these two
+            // required strings. No Codex process wrote this one, so they carry
+            // Codex's own "unknown" value, the empty string its reader treats
+            // as absent.
+            "originator": "",
+            "cli_version": "",
         }
     })
 }
@@ -1585,5 +1591,72 @@ mod tests {
             "legacy function_call_output resolves its tool name"
         );
         Ok(())
+    }
+
+    const CLAUDE_ORIGIN_ID: &str = "77f60bfb-7812-4467-808b-cc76c6818a0c";
+
+    fn claude_origin_session(options: ProviderOptions) -> crate::sessions::SessionWithMessages {
+        crate::sessions::SessionWithMessages {
+            session: Session {
+                id: CLAUDE_ORIGIN_ID.to_owned(),
+                parent_session_id: None,
+                parent_message_id: None,
+                source_agent: "claude-code".to_owned(),
+                created_at: DateTime::parse_from_rfc3339("2026-11-24T19:58:20Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                project: Extracted::from_test_value("/tmp/proj".to_owned()),
+                options,
+            },
+            messages: Vec::new(),
+        }
+    }
+
+    fn first_row(
+        session: &crate::sessions::SessionWithMessages,
+        fidelity: RestoreFidelity,
+    ) -> Value {
+        let files = CodexCliFactory.serialize(session, fidelity).unwrap();
+        let text = std::str::from_utf8(&files[0].bytes).unwrap();
+        serde_json::from_str(text.lines().next().unwrap()).unwrap()
+    }
+
+    /// Codex 0.171's `SessionMeta` has `id`, `timestamp`, `cwd`, `originator`
+    /// and `cli_version` as required fields; without the last two the reader
+    /// refuses the rollout ("does not start with session metadata").
+    #[test]
+    fn foreign_restore_starts_with_a_session_meta_codex_accepts() {
+        let row = first_row(
+            &claude_origin_session(ProviderOptions::new()),
+            RestoreFidelity::Foreign,
+        );
+        assert_eq!(row["type"], "session_meta");
+        let payload = &row["payload"];
+        assert_eq!(payload["id"], CLAUDE_ORIGIN_ID);
+        assert_eq!(payload["cwd"], "/tmp/proj");
+        assert!(payload["timestamp"].is_string());
+        for field in ["originator", "cli_version"] {
+            assert!(
+                payload[field].is_string(),
+                "Codex requires session_meta.payload.{field} as a string",
+            );
+        }
+    }
+
+    /// Native restore replays the captured `session_meta` row verbatim; the
+    /// foreign header never replaces it.
+    #[test]
+    fn native_restore_replays_the_captured_session_meta() {
+        let raw = json!({
+            "timestamp": "2026-11-24T19:58:20.000Z",
+            "type": "session_meta",
+            "payload": {"id": CLAUDE_ORIGIN_ID, "originator": "codex_exec", "cli_version": "0.171.0"},
+        });
+        let mut options = ProviderOptions::new();
+        options.insert("source".to_owned(), json!({"raw_record": raw}));
+        assert_eq!(
+            first_row(&claude_origin_session(options), RestoreFidelity::Native),
+            raw,
+        );
     }
 }

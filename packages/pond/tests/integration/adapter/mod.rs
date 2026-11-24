@@ -548,13 +548,28 @@ async fn assert_foreign_pair(
     let (verify_store, _verify_store_dir) = ingest_into_temp_store(target_adapter.as_ref()).await?;
 
     // Re-parse gate: the foreign output must re-ingest as a real session, not
-    // silently collapse to an empty file. Foreign restore drops only System
-    // messages, so the round-tripped message count equals the origin's
-    // non-System count.
-    let origin_non_system = session
+    // silently collapse to an empty file. Foreign restore drops System
+    // messages, and Claude Code also drops a message left with nothing it can
+    // express (no parts, or only reasoning without a string
+    // `anthropic.signature`), so the round-tripped message count equals the
+    // origin's count of the rest.
+    let dropped_by_target = |m: &&pond::sessions::MessageWithParts| match target_root {
+        TargetRoot::Claude => m.parts.iter().all(|part| {
+            matches!(part.kind, PartKind::Reasoning { .. })
+                && part
+                    .options
+                    .get("anthropic")
+                    .and_then(|anthropic| anthropic.get("signature"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+        }),
+        TargetRoot::Codex => false,
+    };
+    let expected_messages = session
         .messages
         .iter()
         .filter(|m| !matches!(m.message, Message::System { .. }))
+        .filter(|m| !dropped_by_target(m))
         .count();
     let restored_ids = verify_store.session_ids().await?;
     assert!(
@@ -568,8 +583,8 @@ async fn assert_foreign_pair(
         }
     }
     assert_eq!(
-        restored_messages, origin_non_system,
-        "foreign restore must carry every non-System message ({snapshot_name})",
+        restored_messages, expected_messages,
+        "foreign restore must carry every message the target can express ({snapshot_name})",
     );
 
     expect_test::expect_file![format!("snapshots/{snapshot_name}.txt")]
