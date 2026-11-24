@@ -25,7 +25,7 @@ pond sync  # import and index - every enabled adapter
 
 `sync` only ingests already-enabled adapters; it never enables on its own. Manage the set with `pond adapters list|discover|enable|disable`.
 
-Discovery looks under your home directory on every OS - `~/.claude/projects`, `~/.codex/sessions`, and the rest live in the same place on Windows (`%USERPROFILE%\.claude\projects`, ...); only the Claude Desktop app's sessions sit elsewhere (`%APPDATA%\Claude` on Windows). Nothing to configure either way - `pond init` and `pond adapters discover` look in the right places for the OS they run on.
+Discovery looks under your home directory on every OS - `~/.claude/projects`, `~/.codex/sessions`, and the rest live in the same place on Windows (`%USERPROFILE%\.claude\projects`, ...); only the Claude Desktop app's sessions sit elsewhere (`%APPDATA%\Claude` on Windows). Nothing to configure either way - `pond init` and `pond adapters discover` look in the right places for the OS they run on. The full list, client by client: [Where Claude Code and Codex store your sessions](/docs/guides/where-claude-code-stores-sessions).
 
 Then confirm it worked:
 

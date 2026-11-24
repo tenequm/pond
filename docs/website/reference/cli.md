@@ -26,7 +26,7 @@ pond <command> --help   # full flags for any command
 - `pond search <query>` - search (`--mode fts|vector`, `--sort-by relevance|recency`, `--from-date` / `--to-date` bounds as `YYYY-MM-DD`); `fts` is the default and `vector` needs [semantic search enabled](/docs/reference/configuration#embeddings); `--explain` for the query plan
 - `pond get-session <ID>` - fetch a session
 - `pond get-message <ID>` - fetch a message
-- `pond sql <query>` - one read-only SQL query over the corpus
+- `pond sql <query>` - one read-only SQL query over the corpus ([worked queries](/docs/guides/sql-analytics))
 - `pond status` - health, row counts, index readiness, schedule state; `--hosts` fleet view, `--include-subagents` count subagents separately
 
 ### `pond status --format json`

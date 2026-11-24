@@ -27,6 +27,15 @@ export const site = {
       ],
     },
     {
+      text: 'Session history',
+      items: [
+        { text: 'Where sessions are stored', link: '/docs/guides/where-claude-code-stores-sessions' },
+        { text: 'Claude Code session retention', link: '/docs/guides/claude-code-session-retention' },
+        { text: 'Codex session history', link: '/docs/guides/codex-session-history' },
+        { text: 'Memory vs a session archive', link: '/docs/guides/claude-code-memory-vs-archive' },
+      ],
+    },
+    {
       text: 'Guides',
       items: [
         { text: 'Remote storage', link: '/docs/guides/remote-storage' },
@@ -34,6 +43,7 @@ export const site = {
         { text: 'Run a remote serve', link: '/docs/guides/remote-serve' },
         { text: 'Backup & restore', link: '/docs/guides/backup-and-restore' },
         { text: 'Import a Claude.ai export', link: '/docs/guides/import-claude-ai' },
+        { text: 'SQL over your sessions', link: '/docs/guides/sql-analytics' },
         { text: 'Troubleshooting', link: '/docs/guides/troubleshooting' },
       ],
     },
