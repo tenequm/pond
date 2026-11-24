@@ -66,7 +66,6 @@ Some tools argue the opposite of pond's premise: that most of a transcript is no
 
 - [Why pond?](/docs/why) - the premise in full
 - [Claude Code memory vs a session archive](/docs/guides/claude-code-memory-vs-archive) - what each keeps, and running both
-- [Resume a session in a different client](/docs/guides/resume-session-in-another-client) - what cross-client restore does and does not carry
 - [Several machines, one bucket](/docs/guides/several-machines)
 - [Remote storage](/docs/guides/remote-storage) - S3, R2, B2, GCS
 - [MCP tools](/docs/reference/mcp-tools) - what an agent can ask

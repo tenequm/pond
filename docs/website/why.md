@@ -81,6 +81,5 @@ pond's premise: a session should outlive the tool that made it. Three rules foll
 - [Quickstart](/docs/get-started/quickstart) - init -> sync -> ask
 - [Connect your agents](/docs/get-started/connect-your-agents) - register the MCP server
 - [Where your sessions are stored](/docs/guides/where-claude-code-stores-sessions) - every client's files, and how to read them
-- [Resume a session in a different client](/docs/guides/resume-session-in-another-client) - what restore carries over
 - [Remote storage](/docs/guides/remote-storage) - S3, R2, B2, GCS
 - [Specification](/docs/spec) - the v1 contract

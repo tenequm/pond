@@ -56,7 +56,7 @@ It is not memory, and it is worth being exact about the difference.
 | pick up your corrections without you writing them down | auto memory, Codex Memories, or a memory layer |
 | find how something was solved months ago, with the exact commands | an archive, searched on demand |
 | answer "which tools fail most" or "what did we work on in March" | an archive, queried with SQL |
-| continue an old session | the client's own resume while the file exists, [an archive after](/docs/guides/resume-session-in-another-client) |
+| continue an old session | the client's own resume while the file exists; after that, `pond resume` writes it back for the client that made it |
 
 The first two rows are about behavior. The last three are about the record. A memory tool is not a worse archive and an archive is not a worse memory tool.
 

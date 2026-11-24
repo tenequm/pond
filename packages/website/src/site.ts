@@ -32,7 +32,6 @@ export const site = {
         { text: 'Where sessions are stored', link: '/docs/guides/where-claude-code-stores-sessions' },
         { text: 'Claude Code session retention', link: '/docs/guides/claude-code-session-retention' },
         { text: 'Codex session history', link: '/docs/guides/codex-session-history' },
-        { text: 'Resume in another client', link: '/docs/guides/resume-session-in-another-client' },
         { text: 'Memory vs a session archive', link: '/docs/guides/claude-code-memory-vs-archive' },
       ],
     },

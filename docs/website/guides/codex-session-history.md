@@ -105,6 +105,5 @@ What pond does not cover: sessions that never reach `~/.codex/sessions` on a mac
 ## Next
 
 - [Install](/docs/get-started/install) - Homebrew, Nix, Scoop, Cargo
-- [Resume a session in a different client](/docs/guides/resume-session-in-another-client) - `codex resume`, and continuing a Codex session in Claude Code
 - [Connect your agents](/docs/get-started/connect-your-agents) - give Codex itself the search, with `codex mcp add pond -- pond mcp`
 - [SQL over your agent sessions](/docs/guides/sql-analytics) - tool failures, activity by project, tokens

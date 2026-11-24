@@ -19,7 +19,7 @@ Everything Claude Code records about a session sits under `~/.claude` (Claude Co
 | `projects/<project>/memory/` | auto memory - Claude's notes to itself, not transcripts |
 | `history.jsonl` | the prompts you typed, for up-arrow recall |
 
-A project's directory name is its path with the separators turned into dashes: sessions started in `/home/you/work/acme-api` land in `~/.claude/projects/-home-you-work-acme-api/`. Setting `CLAUDE_CONFIG_DIR` moves the whole tree somewhere else. To reopen a session rather than read its file, see [Resume a session](/docs/guides/resume-session-in-another-client).
+A project's directory name is its path with the separators turned into dashes: sessions started in `/home/you/work/acme-api` land in `~/.claude/projects/-home-you-work-acme-api/`. Setting `CLAUDE_CONFIG_DIR` moves the whole tree somewhere else.
 
 ## The Claude Code transcript format
 

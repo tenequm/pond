@@ -20,7 +20,7 @@ pond <command> --help   # full flags for any command
 - `pond sync [<adapter>]` - import and fold indexes (embedding inline when enabled); `--dry-run` preview, `--no-wait` skip if locked, `--verify` reconcile, `--format json`
 - `pond optimize` - fold the indexes and embed the backlog (when embeddings are enabled), reporting the expensive conditions it leaves alone with their heal cost; `--full` heals those too; `--only` / `--skip <stage>`
 - `pond copy --from <x> --to <y>` - move data between stores, `.pond` archives, JSONL; `--verify-only`
-- `pond resume <ID> --to <adapter>` - write a stored session back out as that client's own files so you can open it there. Restores the session with its child sessions; never overwrites (an existing target fails the whole operation and names it). `--out-dir` is the root the client's own layout is written under (`~/.pi/agent` for pi-coding-agent); `--format json` for the file list. What carries over between clients: [Resume a session in a different client](/docs/guides/resume-session-in-another-client)
+- `pond resume <ID> --to <adapter>` - write a stored session back out as that client's own files so you can open it there. Restores the session with its child sessions; never overwrites (an existing target fails the whole operation and names it). `--out-dir` is the root the client's own layout is written under (`~/.pi/agent` for pi-coding-agent); `--format json` for the file list
 
 ## Query
 - `pond search <query>` - search (`--mode fts|vector`, `--sort-by relevance|recency`, `--from-date` / `--to-date` bounds as `YYYY-MM-DD`); `fts` is the default and `vector` needs [semantic search enabled](/docs/reference/configuration#embeddings); `--explain` for the query plan

@@ -89,7 +89,7 @@ pond get-session <session-id>                      # read it
 pond resume <session-id> --to claude-code --out-dir ~/.claude/projects
 ```
 
-`pond resume` into the client a session came from replays the stored records value for value, and it refuses to overwrite a file that already exists. See [Resume a session](/docs/guides/resume-session-in-another-client) for what it writes and where.
+`pond resume` into the client a session came from replays the stored records value for value, and it refuses to overwrite a file that already exists. `--out-dir ~/.claude/projects` puts the file back at `<project>/<session-id>.jsonl`, where Claude Code wrote it.
 
 What pond does not do here: it does not stop or delay Claude Code's sweep, it does not redact secrets a tool printed into a transcript, and it covers only sessions that existed on a disk where `pond sync` ran.
 
