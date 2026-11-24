@@ -7,6 +7,16 @@ export const home = {
   summary: 'Pond ingests every AI agent session - Claude Code, Codex, OpenCode, OpenClaw, oh-my-pi, Claude Desktop, Claude.ai, Pi, Letta Code, Grok, Antigravity, Devin, Hermes, nanoclaw - losslessly into storage you own, then makes the whole corpus searchable and SQL-queryable over MCP. One Rust binary, Lance-backed, local by default.',
 }
 
+// The prerendered HTML is the same on every host, so the tag is inserted only when the page is served from the
+// production host: Rybbit's script attributes skip paths, not hosts, and its hostname exclusions filter after sending.
+const loadTracker = `if (location.hostname === ${JSON.stringify(new URL(site.url).hostname)} && !document.querySelector('script[data-site-id]')) {
+  const s = document.createElement('script')
+  s.src = '/mesh/script.js'
+  s.defer = true
+  s.dataset.siteId = '878f707ff553'
+  document.head.appendChild(s)
+}`
+
 export function siteHead() {
   return {
     meta: [
@@ -17,7 +27,7 @@ export function siteHead() {
       { title: site.title },
     ],
     links: [{ rel: 'icon', href: '/icon.png', type: 'image/png' }],
-    scripts: import.meta.env.PROD ? [{ src: '/mesh/script.js', defer: true, 'data-site-id': '878f707ff553' }] : [],
+    scripts: import.meta.env.PROD ? [{ children: loadTracker }] : [],
   }
 }
 
