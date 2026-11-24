@@ -17,6 +17,9 @@ inputs:
   cloudflare-account-id:
     description: Cloudflare account id for the deploy.
     required: true
+  rybbit-ingest-key:
+    description: Optional API key for server-side crawler reporting.
+    required: false
 runs:
   using: composite
   steps:
@@ -51,3 +54,13 @@ runs:
         accountId: ${{ inputs.cloudflare-account-id }}
         wranglerVersion: "4"
         workingDirectory: packages/website
+
+    - name: Set crawler reporting secret
+      if: inputs.rybbit-ingest-key != ''
+      shell: bash
+      working-directory: packages/website
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        RYBBIT_API_KEY: ${{ inputs.rybbit-ingest-key }}
+      run: printf '%s' "$RYBBIT_API_KEY" | ./node_modules/.bin/wrangler secret put RYBBIT_API_KEY

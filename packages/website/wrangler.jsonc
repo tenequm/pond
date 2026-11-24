@@ -7,8 +7,11 @@
     "html_handling": "drop-trailing-slash",
     "not_found_handling": "none",
     "binding": "ASSETS",
+    // Leave media on asset-first routing so a missing /assets file still reaches the uncached 404.
     "run_worker_first": [
-      "/mesh/*"
+      "/mesh/*", "/", "/index", "/*.html", "/*/", "/404", "/docs", "/docs/*",
+      "/why", "/compare", "/spec", "/changelog", "/get-started/*", "/guides/*", "/reference/*",
+      "/llms.txt", "/llms-full.txt", "/robots.txt", "/sitemap.xml"
     ]
   },
   "routes": [
@@ -18,6 +21,7 @@
     }
   ],
   "vars": {
-    "RYBBIT_HOST": "https://analytics.glim.sh"
+    "RYBBIT_HOST": "https://analytics.glim.sh",
+    "RYBBIT_SITE_ID": "878f707ff553"
   }
 }
