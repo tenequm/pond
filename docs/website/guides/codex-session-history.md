@@ -5,7 +5,7 @@ description: Where Codex CLI keeps session history (~/.codex/sessions rollout fi
 
 # Codex session history [Where Codex CLI keeps its sessions, what its own history commands do, and how to search them next to Claude Code's]
 
-Codex CLI keeps each session as a JSONL "rollout" file under `~/.codex/sessions/YYYY/MM/DD/`, named `rollout-<timestamp>-<session-id>.jsonl`, and the prompts you typed in `~/.codex/history.jsonl`. `codex resume` is how you get back to one: it opens a picker of sessions from the current directory, `--all` widens it to every directory, and `--last` reopens the newest. Codex's docs list no automatic cleanup of these files; a session stays until you run `codex delete`.
+Codex CLI keeps each session as a JSONL "rollout" file under `~/.codex/sessions/YYYY/MM/DD/`, named `rollout-<timestamp>-<session-id>.jsonl`, and the prompts you typed in `~/.codex/history.jsonl`. `codex resume` is how you get back to one: it opens a picker of sessions from the current directory, `--all` widens it to every directory, and `--last` reopens the newest. Codex's docs list no automatic cleanup of these files; a session stays on disk until you delete it, with `codex delete` or by hand.
 
 For the same facts about Claude Code and twelve other clients, see [Where Claude Code and Codex store your sessions](/docs/guides/where-claude-code-stores-sessions). This page goes further into Codex.
 
@@ -79,7 +79,7 @@ One query covers every client, and each hit says which one it came from (real ou
 
 ```text
 pond search: 3 matching messages (41822 searchable in scope), showing 2 hits from 2 sessions. Subagent sessions excluded; reach them via `pond sql` (parent_session_id).
-key: session rules group hits by session, ordered by best hit; within a session, messages are newest-first. "--- [n] score | role | time | message_id | project | agent | session ---" delimits each hit
+key: session rules group hits by session, ordered by best hit; within a session, messages are newest-first. "--- [n] score | role | time | message_id | project | agent | session ---" delimits each hit + matched text. `pond get-message <ID>` for full, `pond get-session <ID>` for the session; raise limit for more (no pagination).
 
 --- session [1] best 1.00 | 2/214 matched | /home/you/work/acme-api | codex-cli | 0195c2d4-7b1e-7a3c-9f0e-2d6b8a41c7e5 ---
 
@@ -94,7 +94,7 @@ Capped the reconnect backoff at 30 seconds and added jitter ...
 
 Narrow it with `--project`, `--from-date` and `--to-date`; read a whole hit with `pond get-session <session-id>`. Search is full-text by default (exact whole words) and semantic if you [turn embeddings on](/docs/reference/configuration#embeddings). Over MCP an agent gets the same search as `pond_search`, which also takes a `source_agent` filter, so "search only my Codex sessions" is `source_agent: "codex-cli"`.
 
-To count rather than find, the same sessions are rows in [`pond sql`](/docs/guides/sql-analytics). pond unwraps the `exec` snippet when it ingests, so tool calls carry the real tool name and a failed command is marked as a failure:
+To count rather than find, the same sessions are rows in [`pond sql`](/docs/guides/sql-analytics). pond unwraps the `exec` snippet when it ingests, so a call that wraps one tool carries that tool's name (`exec_command`, `apply_patch`) and a failed command is marked as a failure:
 
 ```sh
 pond sql "SELECT tool_name, COUNT(*) AS calls FROM parts WHERE type = 'tool_call' AND session_id = '<session-id>' GROUP BY tool_name ORDER BY calls DESC"

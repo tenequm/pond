@@ -3,7 +3,7 @@ title: Where Claude Code and Codex store your sessions
 description: Where Claude Code conversations are stored on disk, where Codex and 12 other clients keep theirs, the JSONL transcript format, and how to read it with jq.
 ---
 
-# Where are Claude Code conversations stored? [In ~/.claude/projects, as JSONL transcripts - plus where Codex and every other client keeps its sessions]
+# Where are Claude Code conversations stored? [In ~/.claude/projects, as JSONL transcripts - plus where Codex and 12 other clients keep theirs]
 
 Claude Code stores every conversation on your own disk as a JSONL transcript at `~/.claude/projects/<project>/<session-id>.jsonl`: one file per session, one JSON object per line. `<project>` is the working directory path with every non-alphanumeric character replaced by `-`, and on Windows `~/.claude` is `%USERPROFILE%\.claude`. Codex CLI keeps its sessions the same way, at `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<session-id>.jsonl`. The files are plain text you can read with `jq`, and Claude Code deletes its own after 30 days unless you [change the retention setting](/docs/guides/claude-code-session-retention).
 

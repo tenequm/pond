@@ -31,7 +31,7 @@ There is no "never" value. Anthropic's own advice for long retention is a large 
 
 Four things the setting does not govern:
 
-- **Sessions from Claude Desktop or Cowork.** Since Claude Code v2.1.248, transcripts of sessions started or most recently continued there are kept at any age, unless you set `desktopSessionCleanupPeriodDays`.
+- **Sessions from Claude Desktop or Cowork.** Since Claude Code v2.1.248, transcripts of sessions started or most recently continued there are kept at any age, unless you set `desktopSessionCleanupPeriodDays`. The 30-day rule still applies to them when managed settings set `cleanupPeriodDays` or the HIPAA configuration applies.
 - **Auto memory.** The notes under `projects/<project>/memory/` are excluded from the sweep.
 - **Prompt history.** `~/.claude/history.jsonl`, the prompts you typed, stays until you delete it. It holds your side of the conversation only.
 - **Runs with `--bare`.** A `claude -p --bare` run does not sweep.
@@ -55,7 +55,7 @@ The transcript is the part you cannot regenerate. It is the only record of what 
 
 ## Deleting on purpose
 
-To remove a project's sessions before they age out, `claude purge <path>` deletes its transcripts, task lists, debug logs, file-edit history and prompt-history lines after showing the plan (`--dry-run` to preview). To stop transcripts from being written at all, set `CLAUDE_CODE_SKIP_PROMPT_HISTORY`, or pass `--no-session-persistence` with `claude -p`.
+To remove a project's sessions before they age out, `claude purge <path>` deletes its transcripts, its auto memory, task lists, debug logs, file-edit history and prompt-history lines after showing the plan and asking for confirmation (`--dry-run` to preview). To stop transcripts from being written at all, set `CLAUDE_CODE_SKIP_PROMPT_HISTORY`, or pass `--no-session-persistence` with `claude -p`.
 
 ## Can a deleted Claude Code session be recovered?
 

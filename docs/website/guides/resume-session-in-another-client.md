@@ -44,7 +44,7 @@ So there is a vendor path from Claude Code to Codex for the last 30 days, and no
 
 ## Move a session with pond resume
 
-pond stores every session in one neutral model, and each client adapter can write that model back out in its own format. `pond resume` does that for one session:
+pond stores every session in one neutral model, and eleven of its fourteen client adapters can write that model back out in their own format ([which ones](#which-clients-it-can-restore-into)). `pond resume` does that for one session:
 
 ```sh
 pond search "websocket reconnect backoff"                      # each hit shows its session id
