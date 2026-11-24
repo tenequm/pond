@@ -3,7 +3,7 @@ title: Why pond?
 description: Your AI agent history is scattered across tools that can't search it. pond ingests every session losslessly into storage you own and makes it all searchable.
 ---
 
-# Why pond? [One searchable archive of every AI session, resumable in a different client]
+# Why pond? [One searchable archive of every AI session, restorable into any client]
 
 > "I know we discussed that before. Why can't I find that damn conversation?"
 
@@ -11,7 +11,7 @@ Pond makes every AI agent session you've ever run - Claude Code, Codex, any tool
 
 ![A live pond corpus, then Claude Code answering a three-month-old debugging question from it](/demo-search.gif)
 
-Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP. Sessions stop being locked to the tool that created them: you can [resume a session in a different client](/docs/guides/resume-session-in-another-client) - Claude Code, Codex, OpenCode, Pi and more - and continue it there.
+Your agent history is already on your disk: thousands of sessions full of decisions, fixes, and dead ends - scattered across tools that can't search them. Pond ingests them all automatically and losslessly into storage you own (a local dir or your own S3 bucket), makes the whole corpus searchable and SQL-queryable, and hands that recall back to your agents over MCP. Sessions stop being locked to the tool that created them: any session can be restored into any supported client and continued there.
 
 ```sh
 brew install tenequm/tap/pond   # macOS / Linux; Windows: Scoop, see Install
@@ -37,11 +37,11 @@ Install, `pond init`, `pond sync`. -> [Quickstart](/docs/get-started/quickstart)
 
 ## Isn't this another memory tool?
 
-No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and resumable in a different client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories. The longer answer, including when to run both: [Claude Code memory vs a session archive](/docs/guides/claude-code-memory-vs-archive).
+No - it's the layer underneath one. Memory tools store what they decided you'd need - facts, summaries, filed chunks; the sessions themselves are gone. Pond keeps the sessions: every message, tool call, and result, value-complete, cross-client, in storage you own, never pruned - searchable over MCP and restorable into any client. Memory is a derived view you can always rebuild from an archive; an archive can never be rebuilt from memories. The longer answer, including when to run both: [Claude Code memory vs a session archive](/docs/guides/claude-code-memory-vs-archive).
 
 ## How it works
 
-One Rust binary. It ingests sessions from your agentic clients into a canonical Session / Message / Part interlingua, stores them in Lance (local disk or object storage), and serves search over HTTP and MCP. Eleven of its fourteen adapters are bidirectional codecs, so you can resume a session in a different client - not just the one that made it.
+One Rust binary. It ingests sessions from your agentic clients into a canonical Session / Message / Part interlingua, stores them in Lance (local disk or object storage), and serves search over HTTP and MCP. Every adapter is a bidirectional codec, so any session restores into any client - not just the one that made it.
 
 ## Supported clients
 
@@ -54,7 +54,7 @@ One Rust binary. It ingests sessions from your agentic clients into a canonical 
 | OpenCode | auto-discovered on disk |
 | Pi coding agent | auto-discovered on disk |
 
-These are the main ones; pond reads [fourteen clients](/docs/guides/where-claude-code-stores-sessions#where-codex-and-the-other-clients-keep-sessions). Every client here except Claude.ai, which has no way to load a session back, can take a stored session from any other - native restore is lossless, cross-client restore is best-effort in the target's own feature set ([which clients](/docs/guides/resume-session-in-another-client#which-clients-it-can-restore-into)). A new adapter is one file plus a registry line; more clients (Cursor, aider, Gemini CLI) are on the [roadmap](/docs/spec#9-deferred).
+Every adapter is bidirectional, so any stored session can be restored into any of these clients - native restore is lossless, cross-client restore is best-effort in the target's own feature set. A new adapter is one file plus a registry line; more clients (Cursor, aider, Gemini CLI) are on the [roadmap](/docs/spec#9-deferred).
 
 ## Local by default, nothing phones home
 
@@ -62,11 +62,11 @@ Everything runs on your machine: ingest, search, SQL, and, if you turn on semant
 
 ## The problem
 
-Agent history is your most valuable byproduct - decisions, dead ends, the command that worked - yet it's siloed per client, in per-tool formats, and disposable: rotate a machine or hit a retention window ([Claude Code's is 30 days](/docs/guides/claude-code-session-retention)) and it's gone. No cross-tool search, and beyond Codex's import of recent Claude Code chats, no way to resume a session in a different client - not older sessions, not other pairs, not the reverse.
+Agent history is your most valuable byproduct - decisions, dead ends, the command that worked - yet it's siloed per client, in per-tool formats, and disposable: rotate a machine or hit a retention window ([Claude Code's is 30 days](/docs/guides/claude-code-session-retention)) and it's gone. No cross-tool search, no continuing a Claude Code thread in Codex.
 
 pond's premise: a session should outlive the tool that made it. Three rules follow:
 
-- **Interchange, not storage.** The canonical schema is a format-neutral interlingua. Adapters parse client formats in and, for most clients, serialize them back out, so a session can be resumed in a different client. That schema is the product.
+- **Interchange, not storage.** The canonical schema is a format-neutral interlingua. Adapters parse client formats in and serialize them back out, so any session restores into any client. That schema is the product.
 - **Lossless = value-complete.** Every value round-trips as an equal value. Restore is rederivation, not byte replay - incidental encoding isn't data; nothing that is data is dropped.
 - **Preservation over convenience.** When preserving a session fights readability or size, preservation wins.
 
