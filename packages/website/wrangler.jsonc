@@ -7,12 +7,9 @@
     "html_handling": "drop-trailing-slash",
     "not_found_handling": "none",
     "binding": "ASSETS",
-    // Leave media on asset-first routing so a missing /assets file still reaches the uncached 404.
-    "run_worker_first": [
-      "/mesh/*", "/", "/index", "/*.html", "/*/", "/404", "/docs", "/docs/*",
-      "/why", "/compare", "/spec", "/changelog", "/get-started/*", "/guides/*", "/reference/*",
-      "/llms.txt", "/llms-full.txt", "/robots.txt", "/sitemap.xml"
-    ]
+    // The tracker proxy and the reads the Worker reports. Everything else (media, /assets, legacy
+    // redirects) stays asset-first and still reaches the Worker's uncached 404 on a miss.
+    "run_worker_first": ["/mesh/*", "/", "/docs/*", "/llms.txt", "/llms-full.txt", "/robots.txt", "/sitemap.xml"]
   },
   "routes": [
     {

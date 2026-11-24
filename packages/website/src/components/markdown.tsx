@@ -49,8 +49,6 @@ const installMethods: [string, RegExp][] = [
   ['scoop', /^\s*scoop install (?:tenequm\/)?pond(?:\s|$)/m],
   ['cargo', /^\s*cargo install pond-db(?:\s|$)/m],
   ['cargo-binstall', /^\s*cargo binstall pond-db(?:\s|$)/m],
-  ['curl', /^\s*curl\s+[^|\n]*pond[^|\n]*\|\s*(?:ba)?sh\b/m],
-  ['npm', /^\s*npm (?:install|i|add) (?:-[\w-]+ )*(?:pond(?:-db)?|openclaw-pond|pi-pond)(?:@|\s|$)/m],
 ]
 
 async function trackCommandCopy(text: string) {

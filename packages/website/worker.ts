@@ -3,7 +3,7 @@ const analyticsPath =
   /^\/mesh\/(script\.js|replay\.js|track|identify|site\/tracking-config\/[\w-]+|session-replay\/record\/[\w-]+)$/
 
 const crawler =
-  /(?<!cu)bot|crawl|spider|fetch|python|curl|\bnode\b|axios|go-http|wget|undici|chatgpt-user|anthropic-ai|claude-(?:user|code|web)|perplexity-user|mistralai-user|manus-user|meta-externalagent|googleother|google-(?:extended|agent)|cohere-ai|youchat|slurp|openai\/|cursor\//i
+  /(?<!cu)bot|crawl|spider|fetch|python|curl|\bnode\b|axios|go-http|wget|undici|deno\/|bun\/|okhttp|java\/|libwww|httpie|chatgpt-user|anthropic-ai|claude-(?:user|code|web)|perplexity-user|mistralai-user|manus-user|meta-externalagent|googleother|google-(?:extended|agent)|cohere-ai|youchat|slurp|openai\/|cursor\//i
 
 interface Env {
   ASSETS: { fetch: typeof fetch }
@@ -12,14 +12,16 @@ interface Env {
   RYBBIT_API_KEY?: string
 }
 
-function shouldReport(path: string, response: Response, userAgent: string): boolean {
-  if (response.status < 200 || response.status >= 400) return false
+// Redirects are not reads: the client's request for the target is reported instead.
+function shouldReport(request: Request, path: string, response: Response, userAgent: string): boolean {
+  if (response.status !== 200 && response.status !== 304) return false
   if (path === '/llms.txt' || path === '/llms-full.txt') return true
   if (!crawler.test(userAgent)) return false
   if (path === '/robots.txt' || path === '/sitemap.xml') return true
-  if (response.headers.get('Content-Type')?.startsWith('text/html')) return true
-  // Redirects and conditional page reads can have no Content-Type.
-  return response.status >= 300 && (!/\.[^/]*\/?$/.test(path) || /\.html\/?$/i.test(path))
+  // A navigation comes from a browser engine, which runs the page tracker itself.
+  if (request.headers.get('Sec-Fetch-Mode') === 'navigate') return false
+  // Every other worker-first path is a page or its Markdown twin; a 304 has no Content-Type.
+  return response.status === 304 || /^text\/(html|markdown)/.test(response.headers.get('Content-Type') ?? '')
 }
 
 export default {
@@ -52,7 +54,7 @@ export default {
     }
 
     const userAgent = request.headers.get('User-Agent') ?? ''
-    if (env.RYBBIT_API_KEY && request.method === 'GET' && shouldReport(url.pathname, response, userAgent)) {
+    if (env.RYBBIT_API_KEY && request.method === 'GET' && shouldReport(request, url.pathname, response, userAgent)) {
       ctx.waitUntil(fetch(`${env.RYBBIT_HOST}/api/track`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${env.RYBBIT_API_KEY}`, 'Content-Type': 'application/json' },
