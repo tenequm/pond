@@ -548,13 +548,26 @@ async fn assert_foreign_pair(
     let (verify_store, _verify_store_dir) = ingest_into_temp_store(target_adapter.as_ref()).await?;
 
     // Re-parse gate: the foreign output must re-ingest as a real session, not
-    // silently collapse to an empty file. Foreign restore drops only System
-    // messages, so the round-tripped message count equals the origin's
-    // non-System count.
+    // silently collapse to an empty file. Foreign restore drops System
+    // messages, and Claude Code also drops a message left with nothing it can
+    // express (unsigned reasoning only), so the round-tripped message count
+    // equals the origin's count of the rest.
+    let dropped_by_target = |m: &&pond::sessions::MessageWithParts| match target_root {
+        TargetRoot::Claude => m.parts.iter().all(|part| {
+            matches!(part.kind, PartKind::Reasoning { .. })
+                && part
+                    .options
+                    .get("anthropic")
+                    .and_then(|anthropic| anthropic.get("signature"))
+                    .is_none()
+        }),
+        TargetRoot::Codex => false,
+    };
     let origin_non_system = session
         .messages
         .iter()
         .filter(|m| !matches!(m.message, Message::System { .. }))
+        .filter(|m| !dropped_by_target(m))
         .count();
     let restored_ids = verify_store.session_ids().await?;
     assert!(
