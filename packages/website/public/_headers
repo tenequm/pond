@@ -5,6 +5,8 @@
   Cache-Control: public, max-age=86400
 /*.gif
   Cache-Control: public, max-age=86400
+/*.ico
+  Cache-Control: public, max-age=86400
 /*.mp4
   Cache-Control: public, max-age=86400
 /*.woff2
